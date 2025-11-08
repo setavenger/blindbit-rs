@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["blindbit-cli", "blindbit-lib", "blindbit-test"]
+
+[workspace.package]
+authors = ["Setor"]
