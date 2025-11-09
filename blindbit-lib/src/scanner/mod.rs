@@ -1,4 +1,4 @@
-use bitcoin::secp256k1::{SecretKey, PublicKey};
+use bitcoin::secp256k1::{self, PublicKey, SecretKey};
 use indexer::bdk_chain;
 use indexer::v2::SpIndexerV2;
 use hex;
@@ -13,8 +13,9 @@ use crate::oracle_grpc::{
     BlockIdentifier,
 };
 
+
 use bitcoin::absolute::{Height};
-use bitcoin::{Amount, ScriptBuf};
+use bitcoin::{Amount, ScriptBuf, XOnlyPublicKey};
 use indexer::v2::indexes::Label;
 use bdk_chain::{ConfirmationBlockTime};
 
@@ -258,32 +259,69 @@ impl Scanner {
                 format!("tweak must be a valid secp256k1 public key: {:?}", e)
             ))?;
     
-        // compute potential outputs for the tweak
-        let spks = self.internal_indexer.derive_spks_for_tweak(&tweak);
-    
-        // compare against the shortened 8 byte outputs for the transaction to find a match 
-        // if a match is found, send a notification
-    
-        
-        // we need to do a m x n comparison to find a match
-        // item.outputs_short is a contigous slice of 8 bytes each
-        // iterate for len(outputs_short) / 8 times
-        // todo: this can be slightly optimised by using a modified iterative scanning function 
-        //  modify the common receive scanning function by checking against 8bytes not full pubkeys
-        let outputs_short_len = item.outputs_short.len();
-        for i in 0..outputs_short_len / 8 {
-            let output_short = &item.outputs_short[i * 8..(i + 1) * 8];
-            for spk in spks.iter() {
-                // derive_spks_for_tweak returns a full script pubkey include 51020 prefix
-                if spk[2..10] == *output_short {
-                    println!("Potential match found: {:?}", hex::encode(&spk[2..]));
-                    return Ok(true);
-                }
-            }
+        if self.scan_transaction_short(&tweak, &item.outputs_short) {
+            return Ok(true);
+        } else {
+            return Ok(false);
         }
-    
-        return Ok(false);
+    }
+
+
+    /// Scans a transaction for outputs which COULD belong to us
+    /// only returns true if a probable match is found
+    /// everything else returns false
+    pub fn scan_transaction_short(
+        &self,
+        tweak: &PublicKey,
+        short_pubkeys: &[u8],
+    ) -> bool {
+        let ecdh_shared_secret: PublicKey = bdk_sp::compute_shared_secret(
+            &self.internal_indexer.scan_sk(), tweak,
+        );
+
+        let p_n = bdk_sp::receive::get_silentpayment_pubkey(
+            &self.internal_indexer.spend_pk(),
+            &ecdh_shared_secret,
+            0,
+            None,
+        );
+
+        if match_short_pubkey(&p_n, &short_pubkeys) {
+            return true;
+        }
+
+        for label_pk in self.internal_indexer.index().label_lookup.keys() {
+            let p_n_label = bdk_sp::receive::get_silentpayment_pubkey(
+                &self.internal_indexer.spend_pk(),
+                &ecdh_shared_secret,
+                0,
+                Some(label_pk),
+            );
+
+            if match_short_pubkey(&p_n_label, &short_pubkeys) {
+                return true
+            }
+
+            // todo: check for negated labels?
+        }
+
+        false
     }
 }
 
+
+fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool {
+    let seralised_p_n = p_n.serialize();
+
+    let outputs_short_len = output_short_vector.len();
+    for i in 0..outputs_short_len / 8 {
+        let output_short = &output_short_vector[i * 8..(i + 1) * 8];
+        if seralised_p_n[..8] == *output_short {
+            // we only need to find the first match to assert a probable match
+            return true;
+        }
+    }
+
+    false
+}
 

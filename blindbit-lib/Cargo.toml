@@ -7,7 +7,8 @@ edition = "2024"
 tonic-prost-build = "0.14.2"
 
 [dependencies]
-bitcoin = "0.32.7"
+# bitcoin = "0.32.7"
+# bitcoin = { version = "0.32.7", features = ["secp256k1"] }
 # bdk_sp = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 # indexer = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 bdk_sp = { path = "/Users/setorblagogee/dev/bdk-sp/silentpayments", features = ["serde"] }
@@ -20,4 +21,6 @@ tokio = "1.48.0"
 tonic = { version = "0.14.2", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
 hex = "0.4.3"
+bitcoin = "0.32.7"
+silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", version = "0.4.1" }
 
