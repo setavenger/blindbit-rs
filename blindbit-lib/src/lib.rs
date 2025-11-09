@@ -11,6 +11,3 @@ pub use oracle_grpc::*;
 
 // Scanner
 pub mod scanner;
-
-/// BIP 352 "low level"related functionality
-pub mod bip352;

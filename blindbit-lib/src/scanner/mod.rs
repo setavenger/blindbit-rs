@@ -1,4 +1,4 @@
-use bitcoin::secp256k1::{self, PublicKey, SecretKey};
+use bitcoin::secp256k1::{PublicKey, SecretKey};
 use indexer::bdk_chain;
 use indexer::v2::SpIndexerV2;
 use hex;
@@ -101,10 +101,10 @@ impl Scanner {
         // public spend needed
         let mut indexer = SpIndexerV2::new(secret_scan, public_spend);
 
-        // add_label already modifies the indexer's internal state directly
-        // The returned changeset is for staging/persistence purposes, not for re-applying
-        // _ = indexer.add_label(0);
-        // _ = indexer.add_label(3);
+
+        // always use the change label m=0
+        _ = indexer.add_label(0);
+
         for i in 1..=max_label_num {
             _ = indexer.add_label(i);
         }
@@ -259,10 +259,22 @@ impl Scanner {
                 format!("tweak must be a valid secp256k1 public key: {:?}", e)
             ))?;
     
-        if self.scan_transaction_short(&tweak, &item.outputs_short) {
-            return Ok(true);
-        } else {
-            return Ok(false);
+        // if let Ok(true) = self.scan_transaction_short(&tweak, &item.outputs_short) {
+        //     return Ok(true);
+        // } else if let Ok(false) = self.scan_transaction_short(&tweak, &item.outputs_short) {
+        //     return Ok(false);
+        // } else {
+        //     return Err(std::io::Error::new(
+        //         std::io::ErrorKind::InvalidData,
+        //         "Error scanning transaction short"
+        //     ).into());  
+        // }
+        
+        // Call once and match on the result
+        match self.scan_transaction_short(&tweak, &item.outputs_short) {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -274,7 +286,7 @@ impl Scanner {
         &self,
         tweak: &PublicKey,
         short_pubkeys: &[u8],
-    ) -> bool {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let ecdh_shared_secret: PublicKey = bdk_sp::compute_shared_secret(
             &self.internal_indexer.scan_sk(), tweak,
         );
@@ -286,26 +298,19 @@ impl Scanner {
             None,
         );
 
-        if match_short_pubkey(&p_n, &short_pubkeys) {
-            return true;
+        if match_short_pubkey(&p_n.x_only_public_key().0, &short_pubkeys) {
+            return Ok(true);
         }
 
         for label_pk in self.internal_indexer.index().label_lookup.keys() {
-            let p_n_label = bdk_sp::receive::get_silentpayment_pubkey(
-                &self.internal_indexer.spend_pk(),
-                &ecdh_shared_secret,
-                0,
-                Some(label_pk),
-            );
-
-            if match_short_pubkey(&p_n_label, &short_pubkeys) {
-                return true
+            let p_n_label = p_n.combine(label_pk)
+                .expect("computationally unreachable: can only fail if label = -spend_sk");
+            if match_short_pubkey(&p_n_label.x_only_public_key().0, &short_pubkeys) {
+                return Ok(true);
             }
-
-            // todo: check for negated labels?
         }
 
-        false
+        Ok(false)
     }
 }
 
@@ -325,3 +330,16 @@ fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool 
     false
 }
 
+
+fn _match_short_pubkey_bytes(p_n: &[u8; 32], output_short_vector: &[u8]) -> bool {
+    let outputs_short_len = output_short_vector.len();
+    for i in 0..outputs_short_len / 8 {
+        let output_short = &output_short_vector[i * 8..(i + 1) * 8];
+        if p_n[..8] == *output_short {
+            // we only need to find the first match to assert a probable match
+            return true;
+        }
+    }
+
+    false
+}
