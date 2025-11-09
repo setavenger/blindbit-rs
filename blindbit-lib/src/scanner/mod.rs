@@ -1,23 +1,20 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+use hex;
 use indexer::bdk_chain;
 use indexer::v2::SpIndexerV2;
-use hex;
 // use indexer::v2;
-use tokio::sync::broadcast;
-use tonic::transport::Channel;
 use crate::ComputeIndexTxItem;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
-    RangedBlockHeightRequestFiltered, 
-    BlockScanDataShortResponse,
-    BlockIdentifier,
+    BlockIdentifier, BlockScanDataShortResponse, RangedBlockHeightRequestFiltered,
 };
+use tokio::sync::broadcast;
+use tonic::transport::Channel;
 
-
-use bitcoin::absolute::{Height};
+use bdk_chain::ConfirmationBlockTime;
+use bitcoin::absolute::Height;
 use bitcoin::{Amount, ScriptBuf, XOnlyPublicKey};
 use indexer::v2::indexes::Label;
-use bdk_chain::{ConfirmationBlockTime};
 
 // use serde::{Serialize, Deserialize};
 
@@ -56,7 +53,7 @@ pub struct Scanner {
     internal_indexer: SpIndexerV2<ConfirmationBlockTime>,
 
     /// sends notification when a new utxo is found
-    notify_found_utxos:  broadcast::Sender<usize>,
+    notify_found_utxos: broadcast::Sender<usize>,
 
     /// probabilistic matches found both used for found utxos and spent outpoints
     /// send the txid of the transaction that is of interest
@@ -64,7 +61,7 @@ pub struct Scanner {
 
     /// sends notification when a pubkey was probably spent
     /// contains the blockhash which needs to be verified to assert an actual match
-    notify_spent_outpoints: broadcast::Sender<[u8; 32]>, 
+    notify_spent_outpoints: broadcast::Sender<[u8; 32]>,
 
     /// the last block height that was scanned
     last_scanned_block_height: u64,
@@ -77,7 +74,6 @@ pub struct Scanner {
     owned_outputs: Vec<[u8; 32]>,
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 // #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct OwnedOutput {
@@ -88,7 +84,6 @@ pub struct OwnedOutput {
     pub label: Option<Label>,
     pub spent: Option<bool>,
 }
-
 
 impl Scanner {
     pub fn new(
@@ -101,7 +96,6 @@ impl Scanner {
         // public spend needed
         let mut indexer = SpIndexerV2::new(secret_scan, public_spend);
 
-
         // always use the change label m=0
         _ = indexer.add_label(0);
 
@@ -109,11 +103,11 @@ impl Scanner {
             _ = indexer.add_label(i);
         }
 
-        Self { 
-            client, 
-            internal_indexer: indexer, 
+        Self {
+            client,
+            internal_indexer: indexer,
             notify_probabilistic_matches: broadcast::channel(100).0,
-            notify_found_utxos: broadcast::channel(100).0 ,
+            notify_found_utxos: broadcast::channel(100).0,
             notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: 0,
             last_scanned_block_height_rescan: 0,
@@ -157,14 +151,30 @@ impl Scanner {
 
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
-    pub async fn scan_block_range(&mut self, start: u64, end: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let request = tonic::Request::new(RangedBlockHeightRequestFiltered { start, end, dustlimit: 0, cut_through: false });
-        let mut stream = self.client.stream_block_scan_data_short(request).await.unwrap().into_inner();
+    pub async fn scan_block_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
+            start,
+            end,
+            dustlimit: 0,
+            cut_through: false,
+        });
+        let mut stream = self
+            .client
+            .stream_block_scan_data_short(request)
+            .await
+            .unwrap()
+            .into_inner();
         while let Some(item) = stream.message().await.unwrap() {
             if let Some(ref block_id) = item.block_identifier {
                 println!("received: {}", BlockIdentifierDisplay(block_id));
             } else {
-                println!("\treceived: BlockIdentifier {{ block_hash: <missing>, block_height: <missing> }}");
+                println!(
+                    "\treceived: BlockIdentifier {{ block_hash: <missing>, block_height: <missing> }}"
+                );
             }
             if let Err(e) = self.scan_short_block_data(item) {
                 println!("Error scanning short block data: {:?}", e);
@@ -183,25 +193,35 @@ impl Scanner {
     }
 
     /// scan short block data for new utxos and spent outpoints
-    fn scan_short_block_data(&mut self, block_data: BlockScanDataShortResponse) -> Result<(), Box<dyn std::error::Error>> {
-        // todo: first append to list then push notifications. 
+    fn scan_short_block_data(
+        &mut self,
+        block_data: BlockScanDataShortResponse,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // todo: first append to list then push notifications.
         //  We need to check for the actual match and not just a probablistic match.
 
-
         let Some(block_id) = block_data.block_identifier else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "block identifier is missing").into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "block identifier is missing",
+            )
+            .into());
         };
 
         if block_id.block_hash.len() != 32 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "block hash is not 32 bytes").into());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "block hash is not 32 bytes",
+            )
+            .into());
         }
 
-        let block_hash: [u8; 32] = block_id.block_hash.try_into()
-            .map_err(|_| std::io::Error::new(
+        let block_hash: [u8; 32] = block_id.block_hash.try_into().map_err(|_| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "block hash is not 32 bytes"
-            ))?;
-
+                "block hash is not 32 bytes",
+            )
+        })?;
 
         for item in block_data.comp_index {
             match self.probabilistic_match(&item) {
@@ -210,11 +230,12 @@ impl Scanner {
                     if self.notify_probabilistic_matches.receiver_count() > 0 {
                         let txid_len = item.txid.len();
                         // tood: clean this up
-                        let txid_array: [u8; 32] = item.txid.try_into()
-                            .map_err(|_| std::io::Error::new(
+                        let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
+                            std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                format!("txid must be exactly 32 bytes, got {} bytes", txid_len)
-                            ))?;
+                                format!("txid must be exactly 32 bytes, got {} bytes", txid_len),
+                            )
+                        })?;
                         if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
                             println!("Error probabilistic match notification: {:?}", e);
                         }
@@ -227,7 +248,7 @@ impl Scanner {
         }
 
         // make spent pubkey check
-        let spent_outputs_count = block_data.spent_outputs.len() /8 as usize;
+        let spent_outputs_count = block_data.spent_outputs.len() / 8 as usize;
         for i in 0..spent_outputs_count {
             let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
             for pubkey in self.owned_outputs.iter() {
@@ -244,32 +265,26 @@ impl Scanner {
         }
 
         Ok(())
-    }   
+    }
 
-    fn probabilistic_match(&mut self, item: &ComputeIndexTxItem) -> Result<bool, Box<dyn std::error::Error>> {
+    fn probabilistic_match(
+        &mut self,
+        item: &ComputeIndexTxItem,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let tweak_len = item.tweak.len();
-        let tweak_data: [u8; 33] = item.tweak.clone().try_into()
-            .map_err(|_| std::io::Error::new(
+        let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("tweak must be exactly 33 bytes, got {} bytes", tweak_len)
-            ))?;
-        let tweak = PublicKey::from_slice(&tweak_data)
-            .map_err(|e| std::io::Error::new(
+                format!("tweak must be exactly 33 bytes, got {} bytes", tweak_len),
+            )
+        })?;
+        let tweak = PublicKey::from_slice(&tweak_data).map_err(|e| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("tweak must be a valid secp256k1 public key: {:?}", e)
-            ))?;
-    
-        // if let Ok(true) = self.scan_transaction_short(&tweak, &item.outputs_short) {
-        //     return Ok(true);
-        // } else if let Ok(false) = self.scan_transaction_short(&tweak, &item.outputs_short) {
-        //     return Ok(false);
-        // } else {
-        //     return Err(std::io::Error::new(
-        //         std::io::ErrorKind::InvalidData,
-        //         "Error scanning transaction short"
-        //     ).into());  
-        // }
-        
+                format!("tweak must be a valid secp256k1 public key: {:?}", e),
+            )
+        })?;
+
         // Call once and match on the result
         match self.scan_transaction_short(&tweak, &item.outputs_short) {
             Ok(true) => Ok(true),
@@ -277,7 +292,6 @@ impl Scanner {
             Err(e) => Err(e),
         }
     }
-
 
     /// Scans a transaction for outputs which COULD belong to us
     /// only returns true if a probable match is found
@@ -287,9 +301,8 @@ impl Scanner {
         tweak: &PublicKey,
         short_pubkeys: &[u8],
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let ecdh_shared_secret: PublicKey = bdk_sp::compute_shared_secret(
-            &self.internal_indexer.scan_sk(), tweak,
-        );
+        let ecdh_shared_secret: PublicKey =
+            bdk_sp::compute_shared_secret(&self.internal_indexer.scan_sk(), tweak);
 
         let p_n = bdk_sp::receive::get_silentpayment_pubkey(
             &self.internal_indexer.spend_pk(),
@@ -303,7 +316,8 @@ impl Scanner {
         }
 
         for label_pk in self.internal_indexer.index().label_lookup.keys() {
-            let p_n_label = p_n.combine(label_pk)
+            let p_n_label = p_n
+                .combine(label_pk)
                 .expect("computationally unreachable: can only fail if label = -spend_sk");
             if match_short_pubkey(&p_n_label.x_only_public_key().0, &short_pubkeys) {
                 return Ok(true);
@@ -313,7 +327,6 @@ impl Scanner {
         Ok(false)
     }
 }
-
 
 fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool {
     let seralised_p_n = p_n.serialize();
@@ -329,7 +342,6 @@ fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool 
 
     false
 }
-
 
 fn _match_short_pubkey_bytes(p_n: &[u8; 32], output_short_vector: &[u8]) -> bool {
     let outputs_short_len = output_short_vector.len();
