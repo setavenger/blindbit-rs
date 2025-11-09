@@ -4,3 +4,6 @@ members = ["blindbit-cli", "blindbit-lib", "blindbit-test"]
 
 [workspace.package]
 authors = ["Setor"]
+
+[profile.release]
+debug = "line-tables-only"
