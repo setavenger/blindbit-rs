@@ -1,19 +1,25 @@
+use bdk_sp::receive::SpOut;
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
 use indexer::bdk_chain;
 use indexer::v2::SpIndexerV2;
 // use indexer::v2;
-use crate::ComputeIndexTxItem;
+
+use crate::BlockHeightRequest;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
-    BlockIdentifier, BlockScanDataShortResponse, RangedBlockHeightRequestFiltered,
+    BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
+    RangedBlockHeightRequestFiltered,
 };
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
 use bdk_chain::ConfirmationBlockTime;
 use bitcoin::absolute::Height;
-use bitcoin::{Amount, ScriptBuf, XOnlyPublicKey};
+use bitcoin::{
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
+};
 use indexer::v2::indexes::Label;
 
 // use serde::{Serialize, Deserialize};
@@ -83,6 +89,19 @@ pub struct OwnedOutput {
     pub script: ScriptBuf,
     pub label: Option<Label>,
     pub spent: Option<bool>,
+}
+
+/// ProbableMatch is a struct that contains a list of txids that are probable matches
+/// and a boolean indicating if a utxo might be spent
+struct ProbableMatch {
+    pub txid: Vec<[u8; 32]>,
+    pub spent: bool,
+}
+
+impl ProbableMatch {
+    pub fn new(txid: Vec<[u8; 32]>, spent: bool) -> Self {
+        Self { txid, spent }
+    }
 }
 
 impl Scanner {
@@ -169,16 +188,50 @@ impl Scanner {
             .unwrap()
             .into_inner();
         while let Some(item) = stream.message().await.unwrap() {
-            if let Some(ref block_id) = item.block_identifier {
-                println!("received: {}", BlockIdentifierDisplay(block_id));
-            } else {
-                println!(
-                    "\treceived: BlockIdentifier {{ block_hash: <missing>, block_height: <missing> }}"
-                );
-            }
-            if let Err(e) = self.scan_short_block_data(item) {
-                println!("Error scanning short block data: {:?}", e);
-                return Err(e);
+            let Some(block_identifier) = item.block_identifier.clone() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "block identifier is missing",
+                )
+                .into());
+            };
+            let block_id = BlockIdentifierDisplay(&block_identifier);
+            println!("received: {}", block_id.0.block_height);
+
+            match self.scan_short_block_data(item) {
+                Ok(probable_match) => {
+                    // pull the full block data
+                    let full_block = self
+                        .client
+                        .get_full_block(BlockHeightRequest {
+                            block_height: block_identifier.block_height,
+                        })
+                        .await
+                        .unwrap();
+
+                    for item in full_block.get_ref().index.iter() {
+                        if probable_match.spent {
+                            // todo: we will need to look at all spent outpoints in this
+                            // block and find the relevant txids for spent
+                        }
+
+                        for txid in probable_match.txid.iter() {
+                            if txid.as_slice() != item.txid.as_slice() {
+                                continue;
+                            }
+                            let txid = Txid::from_byte_array(*txid);
+                            println!("txid confirm interest: {:?}", txid);
+                            let spouts = self.scan_transaction_full(&item).unwrap();
+                            for spout in spouts {
+                                println!("spout: {:?}", spout);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Error scanning short block data: {:?}", e);
+                    return Err(e);
+                }
             }
         }
 
@@ -196,7 +249,7 @@ impl Scanner {
     fn scan_short_block_data(
         &mut self,
         block_data: BlockScanDataShortResponse,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<ProbableMatch, Box<dyn std::error::Error>> {
         // todo: first append to list then push notifications.
         //  We need to check for the actual match and not just a probablistic match.
 
@@ -223,24 +276,29 @@ impl Scanner {
             )
         })?;
 
+        let mut probable_match = ProbableMatch::new(vec![], false);
+
         for item in block_data.comp_index {
             match self.probabilistic_match(&item) {
                 Ok(true) => {
                     println!("TxId of interest: {:?}", hex::encode(&item.txid));
+                    let txid_len = item.txid.len();
+                    // todo: clean this up
+                    let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("txid must be exactly 32 bytes, got {} bytes", txid_len),
+                        )
+                    })?;
+
+                    probable_match.txid.push(txid_array);
+
                     if self.notify_probabilistic_matches.receiver_count() > 0 {
-                        let txid_len = item.txid.len();
-                        // tood: clean this up
-                        let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("txid must be exactly 32 bytes, got {} bytes", txid_len),
-                            )
-                        })?;
                         if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
                             println!("Error probabilistic match notification: {:?}", e);
                         }
                     }
-                    return Ok(());
+                    // return Ok(true);
                 }
                 Ok(false) => continue,
                 Err(e) => return Err(e),
@@ -253,18 +311,19 @@ impl Scanner {
             let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
             for pubkey in self.owned_outputs.iter() {
                 if pubkey[..8] == *spent_output {
+                    probable_match.spent = true;
+
                     println!("Spent output: {:?}", hex::encode(&pubkey));
                     if self.notify_spent_outpoints.receiver_count() > 0 {
                         if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
                             println!("Error spent output notification: {:?}", e);
                         }
                     }
-                    return Ok(());
                 }
             }
         }
 
-        Ok(())
+        return Ok(probable_match);
     }
 
     fn probabilistic_match(
@@ -326,6 +385,33 @@ impl Scanner {
 
         Ok(false)
     }
+
+    /// Scans a transaction for outputs which definitely belong to us
+    /// returns an array of 'OwnedOutput's
+    pub fn scan_transaction_full(
+        &mut self,
+        item: &FullTxItem,
+    ) -> Result<Vec<SpOut>, Box<dyn std::error::Error>> {
+        let tweak =
+            PublicKey::from_slice(&item.tweak).expect("tweak must be a valid secp256k1 public key");
+
+        let ecdh_shared_secret: PublicKey =
+            bdk_sp::compute_shared_secret(&self.internal_indexer.scan_sk(), &tweak);
+
+        let dummy_tx = construct_dummy_tx(item);
+
+        match bdk_sp::receive::scan_txouts(
+            self.internal_indexer.spend_pk().clone(),
+            &self.internal_indexer.index().label_lookup,
+            &dummy_tx,
+            ecdh_shared_secret,
+        ) {
+            Ok(spouts) => {
+                return Ok(spouts);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool {
@@ -354,4 +440,48 @@ fn _match_short_pubkey_bytes(p_n: &[u8; 32], output_short_vector: &[u8]) -> bool
     }
 
     false
+}
+
+fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
+    let mut inputs = Vec::new();
+    let input_count = item.inputs.len() / 36;
+    for i in 0..input_count {
+        let offset = i * 36;
+        let txid_bytes: [u8; 32] = item.inputs[offset..offset + 32]
+            .try_into()
+            .expect("input txid must be 32 bytes");
+        let txid = Txid::from_byte_array(txid_bytes);
+
+        let vout_bytes: [u8; 4] = item.inputs[offset + 32..offset + 36]
+            .try_into()
+            .expect("input vout must be 4 bytes");
+        let vout = u32::from_le_bytes(vout_bytes);
+
+        inputs.push(TxIn {
+            previous_output: OutPoint { txid, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        });
+    }
+
+    let mut outputs = Vec::new();
+    for utxo in &item.utxos {
+        let pubkey = XOnlyPublicKey::from_slice(&utxo.pubkey).expect("invalid pubkey");
+        let mut script = ScriptBuf::new();
+        script.push_opcode(bitcoin::opcodes::all::OP_PUSHNUM_1);
+        script.push_slice(pubkey.serialize());
+
+        outputs.push(TxOut {
+            value: Amount::from_sat(utxo.amount),
+            script_pubkey: script,
+        });
+    }
+
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: inputs,
+        output: outputs,
+    }
 }
