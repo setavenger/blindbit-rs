@@ -1,7 +1,5 @@
-use std::usize;
-
 use bdk_sp::receive::SpOut;
-use bitcoin::hashes::{sha256d, Hash};
+use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
 use indexer::bdk_chain::{self};
@@ -189,8 +187,8 @@ impl Scanner {
             .await
             .unwrap()
             .into_inner();
-        while let Some(item) = stream.message().await.unwrap() {
-            let Some(block_identifier) = item.block_identifier.clone() else {
+        while let Some(block_scan_data) = stream.message().await.unwrap() {
+            let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "block identifier is missing",
@@ -200,7 +198,7 @@ impl Scanner {
             let block_id = BlockIdentifierDisplay(&block_identifier);
             println!("received: {}", block_id.0.block_height);
 
-            match self.scan_short_block_data(item) {
+            match self.scan_short_block_data(block_scan_data) {
                 Ok(probable_match) => {
                     // pull the full block data
                     let full_block = self
@@ -218,18 +216,29 @@ impl Scanner {
                         }
 
                         for txid in probable_match.txid.iter() {
+                            // this check should be optimised to a map lookup on all items
                             if txid.as_slice() != item.txid.as_slice() {
                                 continue;
                             }
-                            // let txid = Txid::from_byte_array(*txid);
                             let spouts = self.scan_transaction_full(item).unwrap();
-                            for spout in spouts.iter() {
-                                println!("spout: {:?}", spout);
-                                // Verify the stored txid matches (Debug shows reversed, but stored value is correct)
-                                println!("  stored txid: {}", hex::encode(spout.outpoint.txid.as_byte_array()));
-                            }
                             if !spouts.is_empty() {
                                 println!("confirmed txid: {:?}", hex::encode(txid));
+                            }
+                            for spout in spouts.iter() {
+                                let pubkey_slice = spout.script_pubkey.as_bytes();
+                                if pubkey_slice.len() != 34 {
+                                    // technically we can panic here as this would mean a critical
+                                    // bug in the software
+                                    println!("invalid pubkey");
+                                    continue;
+                                }
+
+                                println!("======= START MATCHED SPOUT DETAILS =======");
+                                println!("outpoint: {}", spout.outpoint);
+                                println!("amount: {}", spout.amount);
+                                println!("pubkey: {}", hex::encode(&pubkey_slice[2..]));
+                                println!("label:  {:?}", spout.label);
+                                println!("=======  END MATCHED SPOUT DETAILS  =======");
                             }
                         }
                     }
@@ -299,7 +308,7 @@ impl Scanner {
 
                     probable_match.txid.push(txid_array);
 
-                    if self.notify_probabilistic_matches.receiver_count() > 0 {
+                    if !self.notify_probabilistic_matches.is_empty() {
                         if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
                             println!("Error probabilistic match notification: {:?}", e);
                         }
@@ -319,8 +328,8 @@ impl Scanner {
                 if pubkey[..8] == *spent_output {
                     probable_match.spent = true;
 
-                    println!("Spent output: {:?}", hex::encode(&pubkey));
-                    if self.notify_spent_outpoints.receiver_count() > 0 {
+                    println!("Spent output: {:?}", hex::encode(pubkey));
+                    if !self.notify_spent_outpoints.is_empty() {
                         if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
                             println!("Error spent output notification: {:?}", e);
                         }
@@ -367,16 +376,16 @@ impl Scanner {
         short_pubkeys: &[u8],
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let ecdh_shared_secret: PublicKey =
-            bdk_sp::compute_shared_secret(&self.internal_indexer.scan_sk(), tweak);
+            bdk_sp::compute_shared_secret(self.internal_indexer.scan_sk(), tweak);
 
         let p_n = bdk_sp::receive::get_silentpayment_pubkey(
-            &self.internal_indexer.spend_pk(),
+            self.internal_indexer.spend_pk(),
             &ecdh_shared_secret,
             0,
             None,
         );
 
-        if match_short_pubkey(&p_n.x_only_public_key().0, &short_pubkeys) {
+        if match_short_pubkey(&p_n.x_only_public_key().0, short_pubkeys) {
             return Ok(true);
         }
 
@@ -384,7 +393,7 @@ impl Scanner {
             let p_n_label = p_n
                 .combine(label_pk)
                 .expect("computationally unreachable: can only fail if label = -spend_sk");
-            if match_short_pubkey(&p_n_label.x_only_public_key().0, &short_pubkeys) {
+            if match_short_pubkey(&p_n_label.x_only_public_key().0, short_pubkeys) {
                 return Ok(true);
             }
         }
@@ -399,31 +408,33 @@ impl Scanner {
         item: &FullTxItem,
     ) -> Result<Vec<SpOut>, Box<dyn std::error::Error>> {
         let tweak =
-            PublicKey::from_slice(&item.tweak).
-            expect("tweak must be a valid secp256k1 public key");
+            PublicKey::from_slice(&item.tweak).expect("tweak must be a valid secp256k1 public key");
 
         let ecdh_shared_secret: PublicKey =
-            bdk_sp::compute_shared_secret(&self.internal_indexer.scan_sk(), &tweak);
+            bdk_sp::compute_shared_secret(self.internal_indexer.scan_sk(), &tweak);
 
         let dummy_tx = construct_dummy_tx(item);
 
-        // Ensure we have exactly 32 bytes
-        let txid_array: [u8; 32] = item
-            .txid
-            .clone()
-            .try_into()
-            .expect("Vec<u8> must be exactly 32 bytes long");
-
-        // Construct Txid directly from the byte array (preserves byte order)
-        let txid = Txid::from_byte_array(txid_array);
-
         match bdk_sp::receive::scan_txouts(
-            self.internal_indexer.spend_pk().clone(),
+            *self.internal_indexer.spend_pk(),
             &self.internal_indexer.index().label_lookup,
             &dummy_tx,
             ecdh_shared_secret,
         ) {
             Ok(mut spouts) => {
+                // todo: come back here if something does not work due to wrong txids being used in
+                // spuot outpoints
+
+                // Ensure we have exactly 32 bytes
+                let mut reversed_txid_slice = item.txid.clone();
+                reversed_txid_slice.reverse();
+                let txid_array: [u8; 32] = reversed_txid_slice
+                    .try_into()
+                    .expect("Vec<u8> must be exactly 32 bytes long");
+
+                // Construct Txid directly from the byte array (preserves byte order)
+                let txid = Txid::from_byte_array(txid_array);
+
                 // we need to change the txid to match the item's txid
                 for spout in spouts.iter_mut() {
                     spout.outpoint = OutPoint {
