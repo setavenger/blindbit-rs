@@ -1,17 +1,19 @@
+use std::usize;
+
 use bdk_sp::receive::SpOut;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
-use indexer::bdk_chain;
+use indexer::bdk_chain::{self};
 use indexer::v2::SpIndexerV2;
 // use indexer::v2;
 
-use crate::BlockHeightRequest;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
     BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
     RangedBlockHeightRequestFiltered,
 };
+use crate::BlockHeightRequest;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
@@ -219,11 +221,15 @@ impl Scanner {
                             if txid.as_slice() != item.txid.as_slice() {
                                 continue;
                             }
-                            let txid = Txid::from_byte_array(*txid);
-                            println!("txid confirm interest: {:?}", txid);
-                            let spouts = self.scan_transaction_full(&item).unwrap();
-                            for spout in spouts {
+                            // let txid = Txid::from_byte_array(*txid);
+                            let spouts = self.scan_transaction_full(item).unwrap();
+                            for spout in spouts.iter() {
                                 println!("spout: {:?}", spout);
+                                // Verify the stored txid matches (Debug shows reversed, but stored value is correct)
+                                println!("  stored txid: {}", hex::encode(spout.outpoint.txid.as_byte_array()));
+                            }
+                            if !spouts.is_empty() {
+                                println!("confirmed txid: {:?}", hex::encode(txid));
                             }
                         }
                     }
@@ -393,12 +399,23 @@ impl Scanner {
         item: &FullTxItem,
     ) -> Result<Vec<SpOut>, Box<dyn std::error::Error>> {
         let tweak =
-            PublicKey::from_slice(&item.tweak).expect("tweak must be a valid secp256k1 public key");
+            PublicKey::from_slice(&item.tweak).
+            expect("tweak must be a valid secp256k1 public key");
 
         let ecdh_shared_secret: PublicKey =
             bdk_sp::compute_shared_secret(&self.internal_indexer.scan_sk(), &tweak);
 
         let dummy_tx = construct_dummy_tx(item);
+
+        // Ensure we have exactly 32 bytes
+        let txid_array: [u8; 32] = item
+            .txid
+            .clone()
+            .try_into()
+            .expect("Vec<u8> must be exactly 32 bytes long");
+
+        // Construct Txid directly from the byte array (preserves byte order)
+        let txid = Txid::from_byte_array(txid_array);
 
         match bdk_sp::receive::scan_txouts(
             self.internal_indexer.spend_pk().clone(),
@@ -406,10 +423,17 @@ impl Scanner {
             &dummy_tx,
             ecdh_shared_secret,
         ) {
-            Ok(spouts) => {
-                return Ok(spouts);
+            Ok(mut spouts) => {
+                // we need to change the txid to match the item's txid
+                for spout in spouts.iter_mut() {
+                    spout.outpoint = OutPoint {
+                        txid,
+                        vout: spout.outpoint.vout,
+                    };
+                }
+                Ok(spouts)
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -466,11 +490,18 @@ fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
     }
 
     let mut outputs = Vec::new();
-    for utxo in &item.utxos {
+    for (idx, utxo) in item.utxos.iter().enumerate() {
         let pubkey = XOnlyPublicKey::from_slice(&utxo.pubkey).expect("invalid pubkey");
         let mut script = ScriptBuf::new();
         script.push_opcode(bitcoin::opcodes::all::OP_PUSHNUM_1);
         script.push_slice(pubkey.serialize());
+
+        if idx < utxo.vout as usize {
+            outputs.push(TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::default(),
+            })
+        }
 
         outputs.push(TxOut {
             value: Amount::from_sat(utxo.amount),
