@@ -308,12 +308,13 @@ impl Scanner {
 
                     probable_match.txid.push(txid_array);
 
-                    if !self.notify_probabilistic_matches.is_empty() {
-                        if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
-                            println!("Error probabilistic match notification: {:?}", e);
-                        }
+                    if self.notify_probabilistic_matches.is_empty() {
+                        continue;
                     }
-                    // return Ok(true);
+                    if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
+                        println!("Error probabilistic match notification: {:?}", e);
+                    }
+                    // continue;
                 }
                 Ok(false) => continue,
                 Err(e) => return Err(e),
@@ -321,7 +322,7 @@ impl Scanner {
         }
 
         // make spent pubkey check
-        let spent_outputs_count = block_data.spent_outputs.len() / 8 as usize;
+        let spent_outputs_count = block_data.spent_outputs.len() / 8;
         for i in 0..spent_outputs_count {
             let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
             for pubkey in self.owned_outputs.iter() {
@@ -329,16 +330,17 @@ impl Scanner {
                     probable_match.spent = true;
 
                     println!("Spent output: {:?}", hex::encode(pubkey));
-                    if !self.notify_spent_outpoints.is_empty() {
-                        if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                            println!("Error spent output notification: {:?}", e);
-                        }
+                    if self.notify_spent_outpoints.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
+                        println!("Error spent output notification: {:?}", e);
                     }
                 }
             }
         }
 
-        return Ok(probable_match);
+        Ok(probable_match)
     }
 
     fn probabilistic_match(
