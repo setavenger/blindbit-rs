@@ -6,12 +6,12 @@ use indexer::bdk_chain::{self};
 use indexer::v2::SpIndexerV2;
 // use indexer::v2;
 
+use crate::BlockHeightRequest;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
     BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
     RangedBlockHeightRequestFiltered,
 };
-use crate::BlockHeightRequest;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
