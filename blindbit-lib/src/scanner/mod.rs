@@ -236,6 +236,7 @@ impl Scanner {
                                 println!("======= START MATCHED SPOUT DETAILS =======");
                                 println!("outpoint: {}", spout.outpoint);
                                 println!("amount: {}", spout.amount);
+                                println!("tweak: {}", hex::encode(spout.tweak.secret_bytes()));
                                 println!("pubkey: {}", hex::encode(&pubkey_slice[2..]));
                                 println!("label:  {:?}", spout.label);
                                 println!("=======  END MATCHED SPOUT DETAILS  =======");
