@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use bdk_sp::receive::SpOut;
+use bip157::{BlockHash, IndexedBlock};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
@@ -6,7 +9,6 @@ use indexer::bdk_chain::{self};
 use indexer::v2::SpIndexerV2;
 // use indexer::v2;
 
-use crate::BlockHeightRequest;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
     BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
@@ -52,7 +54,11 @@ impl<'a> std::fmt::Debug for BlockIdentifierDisplay<'a> {
 }
 
 pub struct Scanner {
+    /// Client to connect to BlindBit Oracle via gRPC
     client: OracleServiceClient<Channel>,
+
+    /// kyoto node to pull full blocks via the p2p network
+    p2p_client: bip157::Client,
 
     /// the internal indexer used for cryptographic scanning computations
     /// specific to BIP 352
@@ -94,13 +100,14 @@ pub struct OwnedOutput {
 /// ProbableMatch is a struct that contains a list of txids that are probable matches
 /// and a boolean indicating if a utxo might be spent
 struct ProbableMatch {
-    pub txid: Vec<[u8; 32]>,
+    /// txids is a tuple of txid and tweak
+    pub matched_txs: Vec<([u8; 32], PublicKey)>,
     pub spent: bool,
 }
 
 impl ProbableMatch {
-    pub fn new(txid: Vec<[u8; 32]>, spent: bool) -> Self {
-        Self { txid, spent }
+    pub fn new(matched_txs: Vec<([u8; 32], PublicKey)>, spent: bool) -> Self {
+        Self { matched_txs, spent }
     }
 }
 
@@ -122,8 +129,24 @@ impl Scanner {
             _ = indexer.add_label(i);
         }
 
+        let (node, ky_client) = {
+            // todo: make network variable
+            let builder = bip157::Builder::new(bip157::Network::Bitcoin);
+            // todo: add checkpoint
+            // todo: add whitelisted peers?
+            builder.required_peers(2).build()
+        };
+
+        tokio::task::spawn(async move {
+            if let Err(e) = node.run().await {
+                return Err(e);
+            }
+            Ok(())
+        });
+
         Self {
             client,
+            p2p_client: ky_client,
             internal_indexer: indexer,
             notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
@@ -199,49 +222,68 @@ impl Scanner {
             println!("received: {}", block_id.0.block_height);
 
             match self.scan_short_block_data(block_scan_data) {
-                Ok(probable_match) => {
+                Ok(probable_match_opt) => {
+                    let probable_match = match probable_match_opt {
+                        None => continue,
+                        Some(probable_match) => probable_match,
+                    };
                     // pull the full block data
-                    let full_block = self
-                        .client
-                        .get_full_block(BlockHeightRequest {
-                            block_height: block_identifier.block_height,
-                        })
-                        .await
-                        .unwrap();
 
-                    for item in full_block.get_ref().index.iter() {
+                    // Ensure we have exactly 32 bytes
+                    let mut reversed_block_hash_slice = block_identifier.block_hash.clone();
+                    // reversed_block_hash_slice.reverse();
+                    let block_hash_arr: [u8; 32] = reversed_block_hash_slice
+                        .try_into()
+                        .expect("this should always work");
+
+                    let block_hash = BlockHash::from_byte_array(block_hash_arr);
+
+                    println!("block_hash: {}", block_hash);
+
+                    let IndexedBlock { block, .. } =
+                        self.p2p_client.requester.get_block(block_hash).await?;
+
+                    // build partial secret hashmap, only populate with txids and secrets where we
+                    // suspect matches, skip the rest
+                    let mut partial_secrets =
+                        HashMap::with_capacity(probable_match.matched_txs.len());
+
+                    //     tx.txid()
+                    // }
+
+                    for tx in block.txdata.iter() {
                         if probable_match.spent {
                             // todo: we will need to look at all spent outpoints in this
                             // block and find the relevant txids for spent
                         }
 
-                        for txid in probable_match.txid.iter() {
+                        for (txid_arr, tweak) in probable_match.matched_txs.iter() {
                             // this check should be optimised to a map lookup on all items
-                            if txid.as_slice() != item.txid.as_slice() {
+                            let mut item_txid = *txid_arr;
+                            item_txid.reverse();
+
+                            if Txid::from_byte_array(item_txid) != tx.compute_txid() {
                                 continue;
                             }
-                            let spouts = self.scan_transaction_full(item).unwrap();
-                            if !spouts.is_empty() {
-                                println!("confirmed txid: {:?}", hex::encode(txid));
-                            }
-                            for spout in spouts.iter() {
-                                let pubkey_slice = spout.script_pubkey.as_bytes();
-                                if pubkey_slice.len() != 34 {
-                                    // technically we can panic here as this would mean a critical
-                                    // bug in the software
-                                    println!("invalid pubkey");
-                                    continue;
-                                }
 
-                                println!("======= START MATCHED SPOUT DETAILS =======");
-                                println!("outpoint: {}", spout.outpoint);
-                                println!("amount: {}", spout.amount);
-                                println!("tweak: {}", hex::encode(spout.tweak.secret_bytes()));
-                                println!("pubkey: {}", hex::encode(&pubkey_slice[2..]));
-                                println!("label:  {:?}", spout.label);
-                                println!("=======  END MATCHED SPOUT DETAILS  =======");
-                            }
+                            let txid = byte_array_to_txid(txid_arr);
+                            let ecdh_shared_secret: PublicKey = bdk_sp::compute_shared_secret(
+                                self.internal_indexer.scan_sk(),
+                                tweak,
+                            );
+
+                            partial_secrets.insert(txid, ecdh_shared_secret);
                         }
+                    }
+                    _ = self.internal_indexer.apply_block(
+                        &block,
+                        partial_secrets,
+                        block_identifier.block_height as u32,
+                    );
+                    println!();
+                    println!("Printing for height: {}", block_identifier.block_height);
+                    for inner_tx in self.internal_indexer.graph().full_txs() {
+                        println!("txid: {}", inner_tx.txid)
                     }
                 }
                 Err(e) => {
@@ -265,7 +307,7 @@ impl Scanner {
     fn scan_short_block_data(
         &mut self,
         block_data: BlockScanDataShortResponse,
-    ) -> Result<ProbableMatch, Box<dyn std::error::Error>> {
+    ) -> Result<Option<ProbableMatch>, Box<dyn std::error::Error>> {
         // todo: first append to list then push notifications.
         //  We need to check for the actual match and not just a probablistic match.
 
@@ -307,7 +349,10 @@ impl Scanner {
                         )
                     })?;
 
-                    probable_match.txid.push(txid_array);
+                    let tweak = PublicKey::from_slice(&item.tweak)
+                        .expect("tweak must be a valid secp256k1 public key");
+
+                    probable_match.matched_txs.push((txid_array, tweak));
 
                     if self.notify_probabilistic_matches.is_empty() {
                         continue;
@@ -341,7 +386,7 @@ impl Scanner {
             }
         }
 
-        Ok(probable_match)
+        Ok(Some(probable_match))
     }
 
     fn probabilistic_match(
@@ -529,4 +574,14 @@ fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
         input: inputs,
         output: outputs,
     }
+}
+
+fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
+    // Ensure we have exactly 32 bytes
+    let mut reversed_txid_slice = *txid;
+    reversed_txid_slice.reverse();
+    let txid_array: [u8; 32] = reversed_txid_slice;
+
+    // Construct Txid directly from the byte array (preserves byte order)
+    Txid::from_byte_array(txid_array)
 }
