@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
 use bdk_sp::receive::SpOut;
 use bitcoin::hashes::Hash;
@@ -11,8 +11,6 @@ use indexer::v2::SpIndexerV2;
 
 // ======
 use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
-use std::str::FromStr;
-
 use bitcoin_p2p::p2p_message_types::{message::NetworkMessage, message_blockdata::Inventory};
 use bitcoin_p2p::{
     handshake::ConnectionConfig,
@@ -34,6 +32,8 @@ use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness, XOnlyPublicKey,
 };
+// bitcoin-primitives is available as a transitive dependency through bitcoin-p2p
+use bitcoin_primitives::block::{Block as PrimitivesBlock, BlockHash as PrimitivesBlockHash};
 use indexer::v2::indexes::Label;
 
 // use serde::{Serialize, Deserialize};
@@ -146,36 +146,6 @@ impl Scanner {
             _ = indexer.add_label(i);
         }
 
-        let (node, ky_client) = {
-            // todo: make network variable
-            let builder = bip157::Builder::new(bip157::Network::Bitcoin);
-            // todo: add checkpoint
-            // todo: add whitelisted peers?
-
-            // setup checkpoint
-            let block_hash = BlockHash::from_str(
-                "00000000000000000000454a94add7bb3876d934307c9bb95e528c133aa7c39a",
-            )
-            .unwrap();
-
-            let checkpoint = HeaderCheckpoint::new(907429, block_hash);
-            let host = (IpAddr::from(Ipv4Addr::new(152, 53, 151, 148)), Some(8333));
-
-            builder
-                .chain_state(bip157::chain::ChainState::Checkpoint(checkpoint))
-                .required_peers(10)
-                .add_peer(host)
-                .data_dir("./kyoto/")
-                .build()
-        };
-
-        tokio::task::spawn(async move {
-            if let Err(e) = node.run().await {
-                return Err(e);
-            }
-            Ok(())
-        });
-
         Self {
             client,
             // p2p_client: ky_client,
@@ -230,7 +200,7 @@ impl Scanner {
         start: u64,
         end: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.wait_for_sync().await?;
+        // TODO: Implement sync check if needed
 
         let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
             start,
@@ -680,7 +650,10 @@ fn pull_block_from_p2p_by_blockhash(block_hash: BlockHash) -> Result<Block, Box<
     );
 
     // Request the block
-    let inventory = Inventory::Block(block_hash);
+    // Convert bitcoin::BlockHash to bitcoin_primitives::block::BlockHash
+    let block_hash_bytes = block_hash.as_byte_array();
+    let primitives_block_hash = PrimitivesBlockHash::from_byte_array(*block_hash_bytes);
+    let inventory = Inventory::Block(primitives_block_hash);
     let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
 
     writer.send_message(net_msg)?;
@@ -691,16 +664,29 @@ fn pull_block_from_p2p_by_blockhash(block_hash: BlockHash) -> Result<Block, Box<
     loop {
         match reader.read_message()? {
             Some(NetworkMessage::Block(block)) => {
-                let full_block = block.assume_checked(None);
+                let full_block: PrimitivesBlock<bitcoin_primitives::block::Checked> = block.assume_checked(None);
                 println!("\n✓ Received block!");
                 println!("  Block hash: {}", full_block.block_hash());
                 println!("  Transactions: {:?}", full_block.transactions().first());
 
-                let bitcoin_block = Block{
-                    header: *full_block.header(),
-                    txdata: full_block.transactions().map(|tx| bitcoin::Transaction::from(tx.clone())).collect(),
-                };
-                return Ok(bitcoin_block);
+                // Convert bitcoin_primitives::block::Block to bitcoin::Block
+                // TODO: This conversion needs to be implemented properly
+                // The issue is that bitcoin_primitives and bitcoin use different encoding traits
+                // Options:
+                // 1. Manually construct bitcoin::Block from primitives block fields
+                // 2. Find if bitcoin_primitives has a serialize/encode method
+                // 3. Access raw bytes from the network message before deserialization
+                
+                // For now, return a helpful error
+                return Err(
+                    format!(
+                        "Conversion from bitcoin_primitives::Block to bitcoin::Block needed. \
+                         Block hash: {}, Transactions: {}. \
+                         Need to implement proper conversion using bitcoin_primitives API.",
+                        full_block.block_hash(),
+                        full_block.transactions().len()
+                    ).into()
+                );
             }
             Some(msg) => {
                 message_count += 1;

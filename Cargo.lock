@@ -458,6 +458,7 @@ dependencies = [
  "bdk_sp",
  "bitcoin 0.32.7",
  "bitcoin-p2p",
+ "bitcoin-primitives",
  "hex",
  "indexer",
  "prost",

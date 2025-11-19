@@ -27,4 +27,5 @@ hex = "0.4.3"
 bitcoin = "0.32.7"
 silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", version = "0.4.1" }
 bitcoin-p2p = { git = "https://github.com/2140-dev/bitcoin-p2p", version = "0.1.0" }
+bitcoin-primitives = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598" }
 
