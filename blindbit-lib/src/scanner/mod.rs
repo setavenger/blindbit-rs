@@ -1,13 +1,24 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bdk_sp::receive::SpOut;
-use bip157::{BlockHash, IndexedBlock};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
 use indexer::bdk_chain::{self};
 use indexer::v2::SpIndexerV2;
 // use indexer::v2;
+
+// ======
+use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
+use std::str::FromStr;
+
+use bitcoin_p2p::p2p_message_types::{message::NetworkMessage, message_blockdata::Inventory};
+use bitcoin_p2p::{
+    handshake::ConnectionConfig,
+    net::{ConnectionExt, TimeoutParams},
+};
+// ======
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
@@ -20,11 +31,15 @@ use tonic::transport::Channel;
 use bdk_chain::ConfirmationBlockTime;
 use bitcoin::absolute::Height;
 use bitcoin::{
-    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
+    Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness, XOnlyPublicKey,
 };
 use indexer::v2::indexes::Label;
 
 // use serde::{Serialize, Deserialize};
+
+// TODO: Replace with your peer address
+const PEER: &str = "152.53.151.148:8333";
 
 // todo: make scanner data pulling engine flexible
 
@@ -57,9 +72,11 @@ pub struct Scanner {
     /// Client to connect to BlindBit Oracle via gRPC
     client: OracleServiceClient<Channel>,
 
-    /// kyoto node to pull full blocks via the p2p network
-    p2p_client: bip157::Client,
+    /// kyoto client for node (p2p_node) to pull full blocks via the p2p network
+    // p2p_client: bip157::Client,
 
+    // // kyoto node
+    // p2p_node: bip157::node::Node,
     /// the internal indexer used for cryptographic scanning computations
     /// specific to BIP 352
     internal_indexer: SpIndexerV2<ConfirmationBlockTime>,
@@ -134,7 +151,22 @@ impl Scanner {
             let builder = bip157::Builder::new(bip157::Network::Bitcoin);
             // todo: add checkpoint
             // todo: add whitelisted peers?
-            builder.required_peers(2).build()
+
+            // setup checkpoint
+            let block_hash = BlockHash::from_str(
+                "00000000000000000000454a94add7bb3876d934307c9bb95e528c133aa7c39a",
+            )
+            .unwrap();
+
+            let checkpoint = HeaderCheckpoint::new(907429, block_hash);
+            let host = (IpAddr::from(Ipv4Addr::new(152, 53, 151, 148)), Some(8333));
+
+            builder
+                .chain_state(bip157::chain::ChainState::Checkpoint(checkpoint))
+                .required_peers(10)
+                .add_peer(host)
+                .data_dir("./kyoto/")
+                .build()
         };
 
         tokio::task::spawn(async move {
@@ -146,7 +178,7 @@ impl Scanner {
 
         Self {
             client,
-            p2p_client: ky_client,
+            // p2p_client: ky_client,
             internal_indexer: indexer,
             notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
@@ -198,6 +230,8 @@ impl Scanner {
         start: u64,
         end: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.wait_for_sync().await?;
+
         let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
             start,
             end,
@@ -231,7 +265,7 @@ impl Scanner {
 
                     // Ensure we have exactly 32 bytes
                     let mut reversed_block_hash_slice = block_identifier.block_hash.clone();
-                    // reversed_block_hash_slice.reverse();
+                    reversed_block_hash_slice.reverse();
                     let block_hash_arr: [u8; 32] = reversed_block_hash_slice
                         .try_into()
                         .expect("this should always work");
@@ -240,16 +274,27 @@ impl Scanner {
 
                     println!("block_hash: {}", block_hash);
 
-                    let IndexedBlock { block, .. } =
-                        self.p2p_client.requester.get_block(block_hash).await?;
+                    // Make multiple parallel requests and wait for the first successful one
+                    let block = match pull_block_from_p2p_by_blockhash(block_hash) {
+                        Ok(full_block) => full_block,
+                        Err(err) => {
+                            println!("{}", err);
+                            return Err(err);
+                        },
+                    };
 
                     // build partial secret hashmap, only populate with txids and secrets where we
                     // suspect matches, skip the rest
                     let mut partial_secrets =
                         HashMap::with_capacity(probable_match.matched_txs.len());
 
-                    //     tx.txid()
-                    // }
+                    let mut found = false;
+                    let mut tx_to_check: Transaction = Transaction {
+                        version: bitcoin::transaction::Version::TWO,
+                        lock_time: bitcoin::absolute::LockTime::ZERO,
+                        input: vec![],
+                        output: vec![],
+                    };
 
                     for tx in block.txdata.iter() {
                         if probable_match.spent {
@@ -272,15 +317,28 @@ impl Scanner {
                                 tweak,
                             );
 
+                            if !found {
+                                tx_to_check = tx.clone();
+                                found = true;
+                            }
+
                             partial_secrets.insert(txid, ecdh_shared_secret);
                         }
                     }
-                    _ = self.internal_indexer.apply_block(
+                    println!();
+                    println!("partial_secrets: {:?}", partial_secrets);
+                    println!("partial_secrets length: {}", partial_secrets.len());
+                    _ = self.internal_indexer.apply_block_relevant(
                         &block,
                         partial_secrets,
                         block_identifier.block_height as u32,
                     );
-                    println!();
+                    println!("is_tx_relevant: {}", tx_to_check.compute_txid());
+                    if is_tx_relevant(&self.internal_indexer, &tx_to_check) {
+                        println!("is relevant")
+                    } else {
+                        println!("apparently not relevant")
+                    }
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
                         println!("txid: {}", inner_tx.txid)
@@ -386,7 +444,11 @@ impl Scanner {
             }
         }
 
-        Ok(Some(probable_match))
+        if !probable_match.spent && probable_match.matched_txs.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(probable_match))
+        }
     }
 
     fn probabilistic_match(
@@ -584,4 +646,71 @@ fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
 
     // Construct Txid directly from the byte array (preserves byte order)
     Txid::from_byte_array(txid_array)
+}
+
+fn is_tx_relevant(indexer: &SpIndexerV2<ConfirmationBlockTime>, tx: &Transaction) -> bool {
+    let txid = tx.compute_txid();
+    let output_matches = (0..tx.output.len() as u32)
+        .map(|vout| OutPoint::new(txid, vout))
+        .any(|outpoint| indexer.index().by_shared_secret.contains_key(&outpoint));
+    let input_matches = tx.input.iter().any(|input| {
+        indexer
+            .index()
+            .by_shared_secret
+            .contains_key(&input.previous_output)
+    });
+    output_matches || input_matches
+}
+
+fn pull_block_from_p2p_by_blockhash(block_hash: BlockHash) -> Result<Block, Box<dyn std::error::Error>> {
+    let peer_addr: SocketAddr = PEER.parse()?;
+    // let block_hash = BlockHash::from_str(BLOCK_HASH_STR)?;
+
+    println!("Connecting to peer: {}", peer_addr);
+    println!("Requesting block: {}", block_hash);
+
+    // Connect to peer
+    let (writer, mut reader, metadata) =
+        ConnectionConfig::new().open_connection(peer_addr, TimeoutParams::default())?;
+
+    println!(
+        "Connected! Peer height: {}, services: {}",
+        metadata.feeler_data().reported_height,
+        metadata.feeler_data().services
+    );
+
+    // Request the block
+    let inventory = Inventory::Block(block_hash);
+    let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
+
+    writer.send_message(net_msg)?;
+    println!("Sent GetData request, waiting for block...");
+
+    // Read messages until we receive the block
+    let mut message_count = 0;
+    loop {
+        match reader.read_message()? {
+            Some(NetworkMessage::Block(block)) => {
+                let full_block = block.assume_checked(None);
+                println!("\n✓ Received block!");
+                println!("  Block hash: {}", full_block.block_hash());
+                println!("  Transactions: {:?}", full_block.transactions().first());
+
+                let bitcoin_block = Block{
+                    header: *full_block.header(),
+                    txdata: full_block.transactions().map(|tx| bitcoin::Transaction::from(tx.clone())).collect(),
+                };
+                return Ok(bitcoin_block);
+            }
+            Some(msg) => {
+                message_count += 1;
+                if message_count <= 5 {
+                    println!("  Received: {:?} (waiting for block...)", msg.command());
+                } else if message_count == 6 {
+                    println!("  ... (continuing to wait for block)");
+                }
+            }
+            None => continue,
+        }
+    }
 }
