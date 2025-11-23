@@ -7,7 +7,6 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
 use indexer::bdk_chain::{self};
 use indexer::v2::SpIndexerV2;
-// use indexer::v2;
 
 // ======
 use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
@@ -32,14 +31,11 @@ use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness, XOnlyPublicKey,
 };
-// bitcoin-primitives is available as a transitive dependency through bitcoin-p2p
-use bitcoin_primitives::block::{Block as PrimitivesBlock, BlockHash as PrimitivesBlockHash};
 use indexer::v2::indexes::Label;
 
-// use serde::{Serialize, Deserialize};
-
-// TODO: Replace with your peer address
-const PEER: &str = "152.53.151.148:8333";
+// rust-bitcoin on speciic commit for use with bitcoin-p2p library
+use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
+use bitcoin_rev::consensus::encode;
 
 // todo: make scanner data pulling engine flexible
 
@@ -72,11 +68,10 @@ pub struct Scanner {
     /// Client to connect to BlindBit Oracle via gRPC
     client: OracleServiceClient<Channel>,
 
-    /// kyoto client for node (p2p_node) to pull full blocks via the p2p network
-    // p2p_client: bip157::Client,
+    /// p2p_peer as of now one fixed peer connection.
+    // todo: use DNS to find peers at random
+    p2p_peer: SocketAddr,
 
-    // // kyoto node
-    // p2p_node: bip157::node::Node,
     /// the internal indexer used for cryptographic scanning computations
     /// specific to BIP 352
     internal_indexer: SpIndexerV2<ConfirmationBlockTime>,
@@ -131,6 +126,7 @@ impl ProbableMatch {
 impl Scanner {
     pub fn new(
         client: OracleServiceClient<Channel>,
+        p2p_socket_addr: SocketAddr,
         secret_scan: SecretKey,
         public_spend: PublicKey,
         max_label_num: u32, // highest m for label index
@@ -148,7 +144,7 @@ impl Scanner {
 
         Self {
             client,
-            // p2p_client: ky_client,
+            p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
             notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
@@ -245,26 +241,18 @@ impl Scanner {
                     println!("block_hash: {}", block_hash);
 
                     // Make multiple parallel requests and wait for the first successful one
-                    let block = match pull_block_from_p2p_by_blockhash(block_hash) {
+                    let block = match self.pull_block_from_p2p_by_blockhash(block_hash) {
                         Ok(full_block) => full_block,
                         Err(err) => {
                             println!("{}", err);
                             return Err(err);
-                        },
+                        }
                     };
 
                     // build partial secret hashmap, only populate with txids and secrets where we
                     // suspect matches, skip the rest
                     let mut partial_secrets =
                         HashMap::with_capacity(probable_match.matched_txs.len());
-
-                    let mut found = false;
-                    let mut tx_to_check: Transaction = Transaction {
-                        version: bitcoin::transaction::Version::TWO,
-                        lock_time: bitcoin::absolute::LockTime::ZERO,
-                        input: vec![],
-                        output: vec![],
-                    };
 
                     for tx in block.txdata.iter() {
                         if probable_match.spent {
@@ -282,33 +270,15 @@ impl Scanner {
                             }
 
                             let txid = byte_array_to_txid(txid_arr);
-                            let ecdh_shared_secret: PublicKey = bdk_sp::compute_shared_secret(
-                                self.internal_indexer.scan_sk(),
-                                tweak,
-                            );
 
-                            if !found {
-                                tx_to_check = tx.clone();
-                                found = true;
-                            }
-
-                            partial_secrets.insert(txid, ecdh_shared_secret);
+                            partial_secrets.insert(txid, *tweak);
                         }
                     }
-                    println!();
-                    println!("partial_secrets: {:?}", partial_secrets);
-                    println!("partial_secrets length: {}", partial_secrets.len());
                     _ = self.internal_indexer.apply_block_relevant(
                         &block,
                         partial_secrets,
                         block_identifier.block_height as u32,
                     );
-                    println!("is_tx_relevant: {}", tx_to_check.compute_txid());
-                    if is_tx_relevant(&self.internal_indexer, &tx_to_check) {
-                        println!("is relevant")
-                    } else {
-                        println!("apparently not relevant")
-                    }
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
                         println!("txid: {}", inner_tx.txid)
@@ -527,6 +497,68 @@ impl Scanner {
             Err(e) => Err(e.into()),
         }
     }
+
+    fn pull_block_from_p2p_by_blockhash(
+        &self,
+        block_hash: BlockHash,
+    ) -> Result<Block, Box<dyn std::error::Error>> {
+        // let peer_addr: SocketAddr = PEER.parse()?;
+        // let block_hash = BlockHash::from_str(BLOCK_HASH_STR)?;
+
+        println!("Connecting to peer: {}", self.p2p_peer);
+        println!("Requesting block: {}", block_hash);
+
+        // Connect to peer
+        let (writer, mut reader, metadata) =
+            ConnectionConfig::new().open_connection(self.p2p_peer, TimeoutParams::default())?;
+
+        println!(
+            "Connected! Peer height: {}, services: {}",
+            metadata.feeler_data().reported_height,
+            metadata.feeler_data().services
+        );
+
+        // Request the block
+        // Convert bitcoin::BlockHash to bitcoin_primitives::block::BlockHash
+        let block_hash_bytes = block_hash.as_byte_array();
+        let primitives_block_hash = PrimitivesBlockHash::from_byte_array(*block_hash_bytes);
+        let inventory = Inventory::Block(primitives_block_hash);
+        let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
+
+        writer.send_message(net_msg)?;
+        println!("Sent GetData request, waiting for block...");
+
+        // Read messages until we receive the block
+        let mut message_count = 0;
+        loop {
+            match reader.read_message()? {
+                Some(NetworkMessage::Block(block)) => {
+                    // let full_block: PrimitivesBlock = block;
+                    // let full_block: PrimitivesBlock<bitcoin_primitives::block::Checked> =
+                    //     block.assume_checked(None);
+                    // // full_block.transactions()
+
+                    // Convert bitcoin_primitives::block::Block to bitcoin::Block
+                    let block_bytes = encode::serialize(&block);
+
+                    let block: Block = bitcoin::consensus::encode::deserialize(&block_bytes)?;
+                    println!("\n✓ Received block!");
+                    println!("  Block hash: {}", block.block_hash());
+                    println!("  Transactions: {:?}", block.txdata.len());
+                    return Ok(block);
+                }
+                Some(msg) => {
+                    message_count += 1;
+                    if message_count <= 5 {
+                        println!("  Received: {:?} (waiting for block...)", msg.command());
+                    } else if message_count == 6 {
+                        println!("  ... (continuing to wait for block)");
+                    }
+                }
+                None => continue,
+            }
+        }
+    }
 }
 
 fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> bool {
@@ -630,73 +662,4 @@ fn is_tx_relevant(indexer: &SpIndexerV2<ConfirmationBlockTime>, tx: &Transaction
             .contains_key(&input.previous_output)
     });
     output_matches || input_matches
-}
-
-fn pull_block_from_p2p_by_blockhash(block_hash: BlockHash) -> Result<Block, Box<dyn std::error::Error>> {
-    let peer_addr: SocketAddr = PEER.parse()?;
-    // let block_hash = BlockHash::from_str(BLOCK_HASH_STR)?;
-
-    println!("Connecting to peer: {}", peer_addr);
-    println!("Requesting block: {}", block_hash);
-
-    // Connect to peer
-    let (writer, mut reader, metadata) =
-        ConnectionConfig::new().open_connection(peer_addr, TimeoutParams::default())?;
-
-    println!(
-        "Connected! Peer height: {}, services: {}",
-        metadata.feeler_data().reported_height,
-        metadata.feeler_data().services
-    );
-
-    // Request the block
-    // Convert bitcoin::BlockHash to bitcoin_primitives::block::BlockHash
-    let block_hash_bytes = block_hash.as_byte_array();
-    let primitives_block_hash = PrimitivesBlockHash::from_byte_array(*block_hash_bytes);
-    let inventory = Inventory::Block(primitives_block_hash);
-    let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
-
-    writer.send_message(net_msg)?;
-    println!("Sent GetData request, waiting for block...");
-
-    // Read messages until we receive the block
-    let mut message_count = 0;
-    loop {
-        match reader.read_message()? {
-            Some(NetworkMessage::Block(block)) => {
-                let full_block: PrimitivesBlock<bitcoin_primitives::block::Checked> = block.assume_checked(None);
-                println!("\n✓ Received block!");
-                println!("  Block hash: {}", full_block.block_hash());
-                println!("  Transactions: {:?}", full_block.transactions().first());
-
-                // Convert bitcoin_primitives::block::Block to bitcoin::Block
-                // TODO: This conversion needs to be implemented properly
-                // The issue is that bitcoin_primitives and bitcoin use different encoding traits
-                // Options:
-                // 1. Manually construct bitcoin::Block from primitives block fields
-                // 2. Find if bitcoin_primitives has a serialize/encode method
-                // 3. Access raw bytes from the network message before deserialization
-                
-                // For now, return a helpful error
-                return Err(
-                    format!(
-                        "Conversion from bitcoin_primitives::Block to bitcoin::Block needed. \
-                         Block hash: {}, Transactions: {}. \
-                         Need to implement proper conversion using bitcoin_primitives API.",
-                        full_block.block_hash(),
-                        full_block.transactions().len()
-                    ).into()
-                );
-            }
-            Some(msg) => {
-                message_count += 1;
-                if message_count <= 5 {
-                    println!("  Received: {:?} (waiting for block...)", msg.command());
-                } else if message_count == 6 {
-                    println!("  ... (continuing to wait for block)");
-                }
-            }
-            None => continue,
-        }
-    }
 }

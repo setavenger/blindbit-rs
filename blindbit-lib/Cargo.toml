@@ -6,6 +6,9 @@ edition = "2024"
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 
+[[example]]
+name = "stream_oracle"
+
 [dependencies]
 # bitcoin = "0.32.7"
 # bitcoin = { version = "0.32.7", features = ["secp256k1"] }
@@ -25,7 +28,12 @@ tonic = { version = "0.14.2", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
 hex = "0.4.3"
 bitcoin = "0.32.7"
+# due to bitcoin-p2p using a different version
+bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598", package = "bitcoin" }
+
+
 silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", version = "0.4.1" }
+
+# bitcoin-p2p is on a specific revision of rust-bitcoin which creates some issues
 bitcoin-p2p = { git = "https://github.com/2140-dev/bitcoin-p2p", version = "0.1.0" }
-bitcoin-primitives = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598" }
 

@@ -2,7 +2,7 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use blindbit_lib::oracle_grpc::oracle_service_client::OracleServiceClient;
 use blindbit_lib::scanner;
 use clap::{Parser, Subcommand};
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr};
 
 #[derive(Parser)]
 #[command(name = "blindbit-cli")]
@@ -32,6 +32,9 @@ enum Commands {
         #[arg(long)]
         end_height: u64,
 
+        #[arg(long)]
+        p2p_node_addr: String,
+
         /// Maximum label number
         #[arg(long, default_value = "0")]
         max_label_num: u32,
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             spend_pubkey,
             start_height,
             end_height,
+            p2p_node_addr,
             max_label_num,
             oracle_url,
         } => {
@@ -67,9 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Connecting to oracle service at {}...", oracle_url);
             let client = OracleServiceClient::connect(oracle_url.clone()).await?;
 
+            let addr = SocketAddr::from_str(&p2p_node_addr).unwrap();
+
             // Create the scanner
             let mut sp_scanner =
-                scanner::Scanner::new(client, secret_scan, public_spend, max_label_num);
+                scanner::Scanner::new(client, addr, secret_scan, public_spend, max_label_num);
 
             // Scan the block range
             println!("Scanning blocks from {} to {}...", start_height, end_height);
