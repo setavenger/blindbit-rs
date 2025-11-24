@@ -26,6 +26,9 @@ use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
 use bdk_chain::ConfirmationBlockTime;
+use bdk_chain::local_chain::LocalChain;
+use bdk_chain::BlockId;
+use bdk_chain::CanonicalizationParams;
 use bitcoin::absolute::Height;
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -75,6 +78,9 @@ pub struct Scanner {
     /// the internal indexer used for cryptographic scanning computations
     /// specific to BIP 352
     internal_indexer: SpIndexerV2<ConfirmationBlockTime>,
+
+    /// Local chain state for balance calculations
+    local_chain: LocalChain,
 
     /// sends notification when a new utxo is found
     notify_found_utxos: broadcast::Sender<usize>,
@@ -142,10 +148,16 @@ impl Scanner {
             _ = indexer.add_label(i);
         }
 
+        // Initialize LocalChain - start with genesis block (Bitcoin mainnet genesis)
+        // Using all zeros as a placeholder - in production you'd use the actual genesis hash
+        let genesis_hash = BlockHash::from_byte_array([0u8; 32]);
+        let (local_chain, _) = LocalChain::from_genesis_hash(genesis_hash);
+
         Self {
             client,
             p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
+            local_chain,
             notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
             notify_spent_outpoints: broadcast::channel(100).0,
@@ -279,10 +291,51 @@ impl Scanner {
                         partial_secrets,
                         block_identifier.block_height as u32,
                     );
+                    
+                    // Update LocalChain with the new block
+                    let block_height_u32 = block_identifier.block_height as u32;
+                    let block_hash = block.block_hash();
+                    let block_id = BlockId { height: block_height_u32, hash: block_hash };
+                    // Create a new checkpoint - LocalChain will handle connecting it
+                    let new_checkpoint = bdk_chain::local_chain::CheckPoint::new(block_id);
+                    if let Err(e) = self.local_chain.apply_update(new_checkpoint) {
+                        println!("Warning: Failed to update local_chain: {:?}", e);
+                        // If update fails, try to initialize from this block
+                        let (new_chain, _) = LocalChain::from_genesis_hash(block_hash);
+                        self.local_chain = new_chain;
+                    }
+                    
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
                         println!("txid: {}", inner_tx.txid)
                     }
+                    
+                    // Print balance from the graph
+                    // Following the bdk-sp pattern: get outpoints from index and pass to balance
+                    let graph = self.internal_indexer.graph();
+                    let tip = self.local_chain.tip().block_id();
+                    // Get all outpoints from by_shared_secret - these are our UTXOs
+                    // The balance method expects (u32, OutPoint) where u32 is txout_index
+                    // We'll use the vout from the OutPoint as the txout_index
+                    let outpoints: Vec<(u32, OutPoint)> = self.internal_indexer
+                        .index()
+                        .by_shared_secret
+                        .keys()
+                        .map(|outpoint| (outpoint.vout, *outpoint))
+                        .collect();
+                    let balance = graph.balance(
+                        &self.local_chain,
+                        tip,
+                        CanonicalizationParams::default(),
+                        outpoints.iter().copied(),  // confirmed outpoints from our index
+                        |_txout_index, _script| true,  // include all pending outputs
+                    );
+                    println!("Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
+                        balance.total(),
+                        balance.confirmed,
+                        balance.trusted_pending,
+                        balance.untrusted_pending
+                    );
                 }
                 Err(e) => {
                     println!("Error scanning short block data: {:?}", e);
