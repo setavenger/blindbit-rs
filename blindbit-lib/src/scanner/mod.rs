@@ -25,10 +25,10 @@ use crate::oracle_grpc::{
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
-use bdk_chain::ConfirmationBlockTime;
-use bdk_chain::local_chain::LocalChain;
 use bdk_chain::BlockId;
 use bdk_chain::CanonicalizationParams;
+use bdk_chain::ConfirmationBlockTime;
+use bdk_chain::local_chain::LocalChain;
 use bitcoin::absolute::Height;
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -45,7 +45,7 @@ use bitcoin_rev::consensus::encode;
 /// Wrapper for BlockIdentifier that implements Display with hex formatting
 pub struct BlockIdentifierDisplay<'a>(pub &'a BlockIdentifier);
 
-impl<'a> std::fmt::Display for BlockIdentifierDisplay<'a> {
+impl std::fmt::Display for BlockIdentifierDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -56,7 +56,7 @@ impl<'a> std::fmt::Display for BlockIdentifierDisplay<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for BlockIdentifierDisplay<'a> {
+impl std::fmt::Debug for BlockIdentifierDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -291,11 +291,14 @@ impl Scanner {
                         partial_secrets,
                         block_identifier.block_height as u32,
                     );
-                    
+
                     // Update LocalChain with the new block
                     let block_height_u32 = block_identifier.block_height as u32;
                     let block_hash = block.block_hash();
-                    let block_id = BlockId { height: block_height_u32, hash: block_hash };
+                    let block_id = BlockId {
+                        height: block_height_u32,
+                        hash: block_hash,
+                    };
                     // Create a new checkpoint - LocalChain will handle connecting it
                     let new_checkpoint = bdk_chain::local_chain::CheckPoint::new(block_id);
                     if let Err(e) = self.local_chain.apply_update(new_checkpoint) {
@@ -304,12 +307,12 @@ impl Scanner {
                         let (new_chain, _) = LocalChain::from_genesis_hash(block_hash);
                         self.local_chain = new_chain;
                     }
-                    
+
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
                         println!("txid: {}", inner_tx.txid)
                     }
-                    
+
                     // Print balance from the graph
                     // Following the bdk-sp pattern: get outpoints from index and pass to balance
                     let graph = self.internal_indexer.graph();
@@ -317,7 +320,8 @@ impl Scanner {
                     // Get all outpoints from by_shared_secret - these are our UTXOs
                     // The balance method expects (u32, OutPoint) where u32 is txout_index
                     // We'll use the vout from the OutPoint as the txout_index
-                    let outpoints: Vec<(u32, OutPoint)> = self.internal_indexer
+                    let outpoints: Vec<(u32, OutPoint)> = self
+                        .internal_indexer
                         .index()
                         .by_shared_secret
                         .keys()
@@ -327,10 +331,11 @@ impl Scanner {
                         &self.local_chain,
                         tip,
                         CanonicalizationParams::default(),
-                        outpoints.iter().copied(),  // confirmed outpoints from our index
-                        |_txout_index, _script| true,  // include all pending outputs
+                        outpoints.iter().copied(), // confirmed outpoints from our index
+                        |_txout_index, _script| true, // include all pending outputs
                     );
-                    println!("Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
+                    println!(
+                        "Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
                         balance.total(),
                         balance.confirmed,
                         balance.trusted_pending,
@@ -701,18 +706,4 @@ fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
 
     // Construct Txid directly from the byte array (preserves byte order)
     Txid::from_byte_array(txid_array)
-}
-
-fn is_tx_relevant(indexer: &SpIndexerV2<ConfirmationBlockTime>, tx: &Transaction) -> bool {
-    let txid = tx.compute_txid();
-    let output_matches = (0..tx.output.len() as u32)
-        .map(|vout| OutPoint::new(txid, vout))
-        .any(|outpoint| indexer.index().by_shared_secret.contains_key(&outpoint));
-    let input_matches = tx.input.iter().any(|input| {
-        indexer
-            .index()
-            .by_shared_secret
-            .contains_key(&input.previous_output)
-    });
-    output_matches || input_matches
 }

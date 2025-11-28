@@ -14,11 +14,9 @@ name = "stream_oracle"
 # bitcoin = { version = "0.32.7", features = ["secp256k1"] }
 # bdk_sp = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 # indexer = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
-# bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
-# indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
+bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
+indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
 
-bdk_sp = { path = "/Users/setorblagogee/dev/bdk-sp/silentpayments", features = ["serde"], version = "0.1.0" }
-indexer = { path = "/Users/setorblagogee/dev/bdk-sp/indexer", features = ["serde"], version = "0.1.0" }
 
 prost = "0.14.1"
 prost-types = "0.14.1"
