@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["blindbit-cli", "blindbit-lib"]
+members = ["blindbit-cli", "blindbit-lib", "friglet"]
 
 [workspace.package]
 authors = ["Setor"]
