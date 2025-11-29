@@ -61,14 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
-                .map_err(|e| format!("Invalid scan_secret: {}. Must be a valid 32-byte hex string representing a secp256k1 secret key", e))?;
+                .map_err(|e| format!("Invalid scan_secret: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"))?;
 
             // Parse the spend public key (33 bytes hex)
             let public_spend = PublicKey::from_str(&spend_pubkey)
-                .map_err(|e| format!("Invalid spend_pubkey: {}. Must be a valid 33-byte hex string representing a secp256k1 public key", e))?;
+                .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
             // Connect to the oracle service
-            println!("Connecting to oracle service at {}...", oracle_url);
+            println!("Connecting to oracle service at {oracle_url}...");
             let client = OracleServiceClient::connect(oracle_url.clone()).await?;
 
             let addr = SocketAddr::from_str(&p2p_node_addr).unwrap();
@@ -78,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scanner::Scanner::new(client, addr, secret_scan, public_spend, max_label_num);
 
             // Scan the block range
-            println!("Scanning blocks from {} to {}...", start_height, end_height);
+            println!("Scanning blocks from {start_height} to {end_height}...");
             sp_scanner
                 .scan_block_range(start_height, end_height)
                 .await?;

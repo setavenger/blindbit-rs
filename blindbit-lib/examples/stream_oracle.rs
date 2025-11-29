@@ -5,12 +5,12 @@ static ORACLE_URL: &str = "https://oracle.setor.dev";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Connecting to oracle service at {}...", ORACLE_URL);
+    println!("Connecting to oracle service at {ORACLE_URL}...");
     let mut client = OracleServiceClient::connect(ORACLE_URL).await?;
 
     let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
-        start: 901000,
-        end: 901010,
+        start: 901_000,
+        end: 901_010,
         dustlimit: 0,
         cut_through: false,
     });

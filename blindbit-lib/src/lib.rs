@@ -1,4 +1,5 @@
 // Generated gRPC client code
+#[allow(clippy::all)]
 pub mod oracle_grpc {
     tonic::include_proto!("blindbit.oracle.v1");
 }

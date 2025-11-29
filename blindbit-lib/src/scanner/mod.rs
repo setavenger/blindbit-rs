@@ -42,7 +42,7 @@ use bitcoin_rev::consensus::encode;
 
 // todo: make scanner data pulling engine flexible
 
-/// Wrapper for BlockIdentifier that implements Display with hex formatting
+/// Wrapper for `BlockIdentifier` that implements Display with hex formatting
 pub struct BlockIdentifierDisplay<'a>(pub &'a BlockIdentifier);
 
 impl std::fmt::Display for BlockIdentifierDisplay<'_> {
@@ -68,10 +68,10 @@ impl std::fmt::Debug for BlockIdentifierDisplay<'_> {
 }
 
 pub struct Scanner {
-    /// Client to connect to BlindBit Oracle via gRPC
+    /// Client to connect to `BlindBit` Oracle via gRPC
     client: OracleServiceClient<Channel>,
 
-    /// p2p_peer as of now one fixed peer connection.
+    /// `p2p_peer` as of now one fixed peer connection.
     // todo: use DNS to find peers at random
     p2p_peer: SocketAddr,
 
@@ -115,7 +115,7 @@ pub struct OwnedOutput {
     pub spent: Option<bool>,
 }
 
-/// ProbableMatch is a struct that contains a list of txids that are probable matches
+/// `ProbableMatch` is a struct that contains a list of txids that are probable matches
 /// and a boolean indicating if a utxo might be spent
 struct ProbableMatch {
     /// txids is a tuple of txid and tweak
@@ -250,13 +250,13 @@ impl Scanner {
 
                     let block_hash = BlockHash::from_byte_array(block_hash_arr);
 
-                    println!("block_hash: {}", block_hash);
+                    println!("block_hash: {block_hash}");
 
                     // Make multiple parallel requests and wait for the first successful one
                     let block = match self.pull_block_from_p2p_by_blockhash(block_hash) {
                         Ok(full_block) => full_block,
                         Err(err) => {
-                            println!("{}", err);
+                            println!("{err}");
                             return Err(err);
                         }
                     };
@@ -266,13 +266,13 @@ impl Scanner {
                     let mut partial_secrets =
                         HashMap::with_capacity(probable_match.matched_txs.len());
 
-                    for tx in block.txdata.iter() {
+                    for tx in &block.txdata {
                         if probable_match.spent {
                             // todo: we will need to look at all spent outpoints in this
                             // block and find the relevant txids for spent
                         }
 
-                        for (txid_arr, tweak) in probable_match.matched_txs.iter() {
+                        for (txid_arr, tweak) in &probable_match.matched_txs {
                             // this check should be optimised to a map lookup on all items
                             let mut item_txid = *txid_arr;
                             item_txid.reverse();
@@ -302,7 +302,7 @@ impl Scanner {
                     // Create a new checkpoint - LocalChain will handle connecting it
                     let new_checkpoint = bdk_chain::local_chain::CheckPoint::new(block_id);
                     if let Err(e) = self.local_chain.apply_update(new_checkpoint) {
-                        println!("Warning: Failed to update local_chain: {:?}", e);
+                        println!("Warning: Failed to update local_chain: {e:?}");
                         // If update fails, try to initialize from this block
                         let (new_chain, _) = LocalChain::from_genesis_hash(block_hash);
                         self.local_chain = new_chain;
@@ -310,7 +310,7 @@ impl Scanner {
 
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
-                        println!("txid: {}", inner_tx.txid)
+                        println!("txid: {}", inner_tx.txid);
                     }
 
                     // Print balance from the graph
@@ -343,7 +343,7 @@ impl Scanner {
                     );
                 }
                 Err(e) => {
-                    println!("Error scanning short block data: {:?}", e);
+                    println!("Error scanning short block data: {e:?}");
                     return Err(e);
                 }
             }
@@ -401,7 +401,7 @@ impl Scanner {
                     let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("txid must be exactly 32 bytes, got {} bytes", txid_len),
+                            format!("txid must be exactly 32 bytes, got {txid_len} bytes"),
                         )
                     })?;
 
@@ -414,7 +414,7 @@ impl Scanner {
                         continue;
                     }
                     if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
-                        println!("Error probabilistic match notification: {:?}", e);
+                        println!("Error probabilistic match notification: {e:?}");
                     }
                     // continue;
                 }
@@ -427,7 +427,7 @@ impl Scanner {
         let spent_outputs_count = block_data.spent_outputs.len() / 8;
         for i in 0..spent_outputs_count {
             let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
-            for pubkey in self.owned_outputs.iter() {
+            for pubkey in &self.owned_outputs {
                 if pubkey[..8] == *spent_output {
                     probable_match.spent = true;
 
@@ -436,7 +436,7 @@ impl Scanner {
                         continue;
                     }
                     if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                        println!("Error spent output notification: {:?}", e);
+                        println!("Error spent output notification: {e:?}");
                     }
                 }
             }
@@ -457,13 +457,13 @@ impl Scanner {
         let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("tweak must be exactly 33 bytes, got {} bytes", tweak_len),
+                format!("tweak must be exactly 33 bytes, got {tweak_len} bytes"),
             )
         })?;
         let tweak = PublicKey::from_slice(&tweak_data).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("tweak must be a valid secp256k1 public key: {:?}", e),
+                format!("tweak must be a valid secp256k1 public key: {e:?}"),
             )
         })?;
 
@@ -510,7 +510,7 @@ impl Scanner {
     }
 
     /// Scans a transaction for outputs which definitely belong to us
-    /// returns an array of 'OwnedOutput's
+    /// returns an array of '`OwnedOutput`'s
     pub fn scan_transaction_full(
         &mut self,
         item: &FullTxItem,
@@ -544,7 +544,7 @@ impl Scanner {
                 let txid = Txid::from_byte_array(txid_array);
 
                 // we need to change the txid to match the item's txid
-                for spout in spouts.iter_mut() {
+                for spout in &mut spouts {
                     spout.outpoint = OutPoint {
                         txid,
                         vout: spout.outpoint.vout,
@@ -564,7 +564,7 @@ impl Scanner {
         // let block_hash = BlockHash::from_str(BLOCK_HASH_STR)?;
 
         println!("Connecting to peer: {}", self.p2p_peer);
-        println!("Requesting block: {}", block_hash);
+        println!("Requesting block: {block_hash}");
 
         // Connect to peer
         let (writer, mut reader, metadata) =
@@ -681,7 +681,7 @@ fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
             outputs.push(TxOut {
                 value: Amount::from_sat(0),
                 script_pubkey: ScriptBuf::default(),
-            })
+            });
         }
 
         outputs.push(TxOut {
