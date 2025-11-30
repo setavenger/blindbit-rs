@@ -5,3 +5,4 @@ edition = "2024"
 authors.workspace = true
 
 [dependencies]
+axum = "0.8.7"
