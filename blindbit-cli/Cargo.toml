@@ -9,7 +9,7 @@ name = "blindbit-cli"
 path = "src/main.rs"
 
 [dependencies]
-blindbit-lib = { path = "../blindbit-lib" }
+blindbit-lib = { path = "../blindbit-lib", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
 bitcoin = "0.32.7"

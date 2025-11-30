@@ -2,7 +2,7 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use blindbit_lib::oracle_grpc::oracle_service_client::OracleServiceClient;
 use blindbit_lib::scanner;
 use clap::{Parser, Subcommand};
-use std::{net::SocketAddr, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 #[derive(Parser)]
 #[command(name = "blindbit-cli")]
@@ -42,6 +42,10 @@ enum Commands {
         /// Oracle service URL
         #[arg(long, default_value = "https://oracle.setor.dev")]
         oracle_url: String,
+
+        /// Path to save/load scanner state (default: scanner_state.json)
+        #[arg(long, default_value = "scanner_state.json")]
+        state_file: PathBuf,
     },
 }
 
@@ -58,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             p2p_node_addr,
             max_label_num,
             oracle_url,
+            state_file,
         } => {
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
@@ -73,15 +78,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let addr = SocketAddr::from_str(&p2p_node_addr).unwrap();
 
-            // Create the scanner
-            let mut sp_scanner =
-                scanner::Scanner::new(client, addr, secret_scan, public_spend, max_label_num);
+            // Try to load existing state, or create a new scanner
+            let mut sp_scanner = if state_file.exists() {
+                println!("Loading scanner state from {}...", state_file.display());
+                match scanner::Scanner::load_from_file(&state_file) {
+                    Ok(changeset) => {
+                        // Clone client for the from_changeset call
+                        let client_clone = OracleServiceClient::connect(oracle_url.clone()).await?;
+                        match scanner::Scanner::from_changeset(client_clone, addr, changeset) {
+                            Ok(scanner) => {
+                                let last_height = scanner.get_last_scanned_block_height();
+                                println!("Loaded state. Last scanned height: {}", last_height);
+                                scanner
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Failed to restore from state file: {e}");
+                                eprintln!("Creating new scanner...");
+                                scanner::Scanner::new(
+                                    client,
+                                    addr,
+                                    secret_scan,
+                                    public_spend,
+                                    max_label_num,
+                                )
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load state file: {e}");
+                        eprintln!("Creating new scanner...");
+                        scanner::Scanner::new(
+                            client,
+                            addr,
+                            secret_scan,
+                            public_spend,
+                            max_label_num,
+                        )
+                    }
+                }
+            } else {
+                println!("No existing state file found. Creating new scanner...");
+                scanner::Scanner::new(client, addr, secret_scan, public_spend, max_label_num)
+            };
 
             // Scan the block range
             println!("Scanning blocks from {start_height} to {end_height}...");
-            sp_scanner
-                .scan_block_range(start_height, end_height)
-                .await?;
+
+            // Use a result to capture any errors during scanning
+            let scan_result = sp_scanner.scan_block_range(start_height, end_height).await;
+
+            // Always try to save state, even if scanning failed
+            println!("Saving scanner state to {}...", state_file.display());
+            if let Err(save_err) = sp_scanner.save_to_file(&state_file) {
+                eprintln!("Warning: Failed to save state: {save_err}");
+            } else {
+                println!("State saved successfully!");
+            }
+
+            // Return the scan result (will propagate any errors)
+            scan_result?;
 
             println!("Scan completed successfully!");
         }

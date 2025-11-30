@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use bitcoin::hashes::Hash;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+#[cfg(feature = "serde")]
+use std::path::Path;
 
 use bdk_sp::receive::SpOut;
-use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use hex;
 use indexer::bdk_chain::{self};
@@ -28,6 +30,7 @@ use tonic::transport::Channel;
 use bdk_chain::BlockId;
 use bdk_chain::CanonicalizationParams;
 use bdk_chain::ConfirmationBlockTime;
+use bdk_chain::bdk_core::Merge;
 use bdk_chain::local_chain::LocalChain;
 use bitcoin::absolute::Height;
 use bitcoin::{
@@ -41,6 +44,119 @@ use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
 use bitcoin_rev::consensus::encode;
 
 // todo: make scanner data pulling engine flexible
+
+/// Helper module for hex encoding/decoding byte arrays in serialization
+#[cfg(feature = "serde")]
+mod serde_hex {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize_vec<S>(vec: &Vec<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex_strings: Vec<String> = vec.iter().map(|bytes| hex::encode(bytes)).collect();
+        hex_strings.serialize(serializer)
+    }
+
+    pub fn deserialize_vec<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_strings: Vec<String> = Vec::deserialize(deserializer)?;
+        let mut result = Vec::new();
+        for hex_string in hex_strings {
+            let bytes = hex::decode(&hex_string)
+                .map_err(|e| serde::de::Error::custom(format!("Invalid hex string: {}", e)))?;
+            let bytes_array: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("Expected 32 bytes"))?;
+            result.push(bytes_array);
+        }
+        Ok(result)
+    }
+}
+
+/// Represents a set of changes that can be applied to a [`Scanner`].
+///
+/// This struct is used to stage updates to the scanner's internal state,
+/// including chain data, indexer data, and metadata.
+///
+/// It implements [`Merge`] to combine multiple change sets and can be
+/// serialized/deserialized when the serde feature is enabled.
+#[derive(Default, Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[must_use]
+pub struct ChangeSet {
+    /// Sparse block checkpoints: only blocks where we found something (height -> hash)
+    pub block_checkpoints: BTreeMap<u32, BlockHash>,
+    /// Changes related to the Silent Payments indexer data.
+    pub indexer: indexer::v2::ChangeSet<ConfirmationBlockTime>,
+    /// The last block height that was scanned
+    pub last_scanned_block_height: u64,
+    /// The last block height that was scanned on most recent rescan
+    pub last_scanned_block_height_rescan: u64,
+    /// Owned output pubkeys; used to check for spent outputs (hex encoded in JSON)
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            serialize_with = "serde_hex::serialize_vec",
+            deserialize_with = "serde_hex::deserialize_vec"
+        )
+    )]
+    pub owned_outputs: Vec<[u8; 32]>,
+    /// Secret scan key (hex encoded) - needed to reconstruct the indexer
+    pub secret_scan_hex: Option<String>,
+    /// Public spend key (hex encoded) - needed to reconstruct the indexer
+    pub public_spend_hex: Option<String>,
+    /// Maximum label number used
+    pub max_label_num: u32,
+}
+
+impl Merge for ChangeSet {
+    /// Merges another [`ChangeSet`] into the current one.
+    fn merge(&mut self, other: Self) {
+        // Merge block checkpoints (extend with new ones)
+        self.block_checkpoints.extend(other.block_checkpoints);
+        Merge::merge(&mut self.indexer, other.indexer);
+
+        // Update metadata with the latest values
+        if other.last_scanned_block_height > self.last_scanned_block_height {
+            self.last_scanned_block_height = other.last_scanned_block_height;
+        }
+        if other.last_scanned_block_height_rescan > self.last_scanned_block_height_rescan {
+            self.last_scanned_block_height_rescan = other.last_scanned_block_height_rescan;
+        }
+
+        // Merge owned_outputs (deduplicate)
+        for output in other.owned_outputs {
+            if !self.owned_outputs.contains(&output) {
+                self.owned_outputs.push(output);
+            }
+        }
+
+        // Preserve keys if not set
+        if self.secret_scan_hex.is_none() {
+            self.secret_scan_hex = other.secret_scan_hex;
+        }
+        if self.public_spend_hex.is_none() {
+            self.public_spend_hex = other.public_spend_hex;
+        }
+
+        // Use the maximum label number
+        if other.max_label_num > self.max_label_num {
+            self.max_label_num = other.max_label_num;
+        }
+    }
+
+    /// Checks if the [`ChangeSet`] is empty (contains no changes).
+    fn is_empty(&self) -> bool {
+        self.block_checkpoints.is_empty()
+            && self.indexer.is_empty()
+            && self.last_scanned_block_height == 0
+            && self.last_scanned_block_height_rescan == 0
+            && self.owned_outputs.is_empty()
+    }
+}
 
 /// Wrapper for `BlockIdentifier` that implements Display with hex formatting
 pub struct BlockIdentifierDisplay<'a>(pub &'a BlockIdentifier);
@@ -79,8 +195,9 @@ pub struct Scanner {
     /// specific to BIP 352
     internal_indexer: SpIndexerV2<ConfirmationBlockTime>,
 
-    /// Local chain state for balance calculations
-    local_chain: LocalChain,
+    /// Sparse block checkpoints: only blocks where we found something (height -> hash)
+    /// This avoids storing every block and only tracks blocks with relevant transactions
+    block_checkpoints: BTreeMap<u32, BlockHash>,
 
     /// sends notification when a new utxo is found
     notify_found_utxos: broadcast::Sender<usize>,
@@ -102,6 +219,9 @@ pub struct Scanner {
     /// owned output pubkeys; used to check for spent outputs
     // todo: should this be a hashmap instead of a vector?
     owned_outputs: Vec<[u8; 32]>,
+
+    /// Staged changes that can be persisted
+    stage: ChangeSet,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,22 +268,44 @@ impl Scanner {
             _ = indexer.add_label(i);
         }
 
-        // Initialize LocalChain - start with genesis block (Bitcoin mainnet genesis)
-        // Using all zeros as a placeholder - in production you'd use the actual genesis hash
-        let genesis_hash = BlockHash::from_byte_array([0u8; 32]);
-        let (local_chain, _) = LocalChain::from_genesis_hash(genesis_hash);
+        // Initialize sparse checkpoints with genesis block
+        // This ensures LocalChain::from_blocks can always create a valid chain
+        let genesis_hash = BlockHash::from_byte_array(
+            bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
+        );
+        let mut block_checkpoints = BTreeMap::new();
+        block_checkpoints.insert(0, genesis_hash);
+
+        // Initialize the staged changeset with initial state
+        let mut stage = ChangeSet {
+            block_checkpoints: block_checkpoints.clone(),
+            indexer: indexer.initial_changeset(),
+            last_scanned_block_height: 0,
+            last_scanned_block_height_rescan: 0,
+            owned_outputs: vec![],
+            secret_scan_hex: Some(hex::encode(secret_scan.secret_bytes())),
+            public_spend_hex: Some(hex::encode(public_spend.serialize())),
+            max_label_num,
+        };
+
+        // Merge the initial label changes
+        stage.indexer.merge(indexer.add_label(0));
+        for i in 1..=max_label_num {
+            stage.indexer.merge(indexer.add_label(i));
+        }
 
         Self {
             client,
             p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
-            local_chain,
+            block_checkpoints,
             notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
             notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: 0,
             last_scanned_block_height_rescan: 0,
             owned_outputs: vec![],
+            stage,
         }
     }
 
@@ -199,6 +341,122 @@ impl Scanner {
             self.owned_outputs.push(pubkey);
         }
     }
+
+    /// Returns an optional reference to the currently staged [`ChangeSet`].
+    ///
+    /// # Returns
+    ///
+    /// `Some(&ChangeSet)` if changes are staged, `None` otherwise.
+    pub fn staged(&self) -> Option<&ChangeSet> {
+        if self.stage.is_empty() {
+            None
+        } else {
+            Some(&self.stage)
+        }
+    }
+
+    /// Returns an optional mutable reference to the currently staged [`ChangeSet`].
+    ///
+    /// # Returns
+    ///
+    /// `Some(&mut ChangeSet)` if changes are staged, `None` otherwise.
+    pub fn staged_mut(&mut self) -> Option<&mut ChangeSet> {
+        if self.stage.is_empty() {
+            None
+        } else {
+            Some(&mut self.stage)
+        }
+    }
+
+    /// Takes ownership of the currently staged [`ChangeSet`], leaving an empty [`ChangeSet`] in its place.
+    ///
+    /// This is useful for atomically applying or persisting the staged changes.
+    ///
+    /// # Returns
+    ///
+    /// `Some(ChangeSet)` if changes were staged, `None` otherwise.
+    pub fn take_staged(&mut self) -> Option<ChangeSet> {
+        if self.stage.is_empty() {
+            None
+        } else {
+            let changes = self.stage.clone();
+            self.stage = ChangeSet::default();
+            Some(changes)
+        }
+    }
+
+    /// Save the current staged changes to a file using JSON serialization.
+    ///
+    /// This saves the ChangeSet which contains all the indexer and chain state changes.
+    /// The ChangeSet can be used to reconstruct the scanner state on restart.
+    ///
+    /// Requires the `serde` feature to be enabled.
+    #[cfg(feature = "serde")]
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure we have the keys in the changeset for reconstruction
+        let mut changeset = self.stage.clone();
+        if changeset.secret_scan_hex.is_none() {
+            let secret_scan_bytes: [u8; 32] = self.internal_indexer.scan_sk().secret_bytes();
+            changeset.secret_scan_hex = Some(hex::encode(secret_scan_bytes));
+        }
+        if changeset.public_spend_hex.is_none() {
+            let public_spend_bytes = self.internal_indexer.spend_pk().serialize();
+            changeset.public_spend_hex = Some(hex::encode(&public_spend_bytes));
+        }
+        if changeset.max_label_num == 0 {
+            let label_count = self.internal_indexer.index().label_lookup.len();
+            changeset.max_label_num = if label_count > 0 {
+                (label_count - 1) as u32
+            } else {
+                0
+            };
+        }
+        changeset.last_scanned_block_height = self.last_scanned_block_height;
+        changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
+        changeset.owned_outputs = self.owned_outputs.clone();
+
+        let json = serde_json::to_string_pretty(&changeset)?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load scanner state from a file using JSON deserialization.
+    /// Returns the ChangeSet which can be used to restore a Scanner.
+    ///
+    /// Requires the `serde` feature to be enabled.
+    #[cfg(feature = "serde")]
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<ChangeSet, Box<dyn std::error::Error>> {
+        let json = std::fs::read_to_string(path)?;
+        let mut json_value: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+
+        // The issue: label_lookup entries are stored as arrays of integers, but the deserializer
+        // expects hex strings. However, we don't actually need label_lookup data because we regenerate
+        // labels from max_label_num in from_changeset(). So we can just remove/nullify label_lookup.
+        
+        // Remove label_lookup from the indexer - we'll regenerate it from max_label_num anyway
+        if let Some(indexer_obj) = json_value.get_mut("indexer").and_then(|v| v.as_object_mut()) {
+            // Set label_lookup to an empty array (or remove it entirely)
+            indexer_obj.insert("label_lookup".to_string(), serde_json::Value::Array(vec![]));
+        }
+        
+        // Now try to deserialize
+        serde_json::from_value::<ChangeSet>(json_value)
+            .map_err(|e| {
+                format!(
+                    "Failed to deserialize ChangeSet. Error: {}",
+                    e
+                ).into()
+            })
+    }
+
+    /// Update the last scanned block height
+    pub fn update_last_scanned_block_height(&mut self, height: u64) {
+        self.last_scanned_block_height = height;
+        self.stage.last_scanned_block_height = height;
+    }
 }
 
 impl Scanner {
@@ -222,6 +480,16 @@ impl Scanner {
             .await
             .unwrap()
             .into_inner();
+
+        let genesis_hash = BlockHash::from_byte_array(
+            bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
+        );
+
+        let mut last_block_id: BlockId = BlockId {
+            height: 0,
+            hash: genesis_hash,
+        };
+
         while let Some(block_scan_data) = stream.message().await.unwrap() {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
@@ -286,27 +554,26 @@ impl Scanner {
                             partial_secrets.insert(txid, *tweak);
                         }
                     }
-                    _ = self.internal_indexer.apply_block_relevant(
+                    // Apply block to indexer and stage the changes
+                    let indexer_changes = self.internal_indexer.apply_block_relevant(
                         &block,
                         partial_secrets,
                         block_identifier.block_height as u32,
                     );
+                    self.stage.indexer.merge(indexer_changes);
 
-                    // Update LocalChain with the new block
+                    // Update block checkpoints: only store blocks where we found something
                     let block_height_u32 = block_identifier.block_height as u32;
                     let block_hash = block.block_hash();
                     let block_id = BlockId {
                         height: block_height_u32,
                         hash: block_hash,
                     };
-                    // Create a new checkpoint - LocalChain will handle connecting it
-                    let new_checkpoint = bdk_chain::local_chain::CheckPoint::new(block_id);
-                    if let Err(e) = self.local_chain.apply_update(new_checkpoint) {
-                        println!("Warning: Failed to update local_chain: {e:?}");
-                        // If update fails, try to initialize from this block
-                        let (new_chain, _) = LocalChain::from_genesis_hash(block_hash);
-                        self.local_chain = new_chain;
-                    }
+                    last_block_id = block_id;
+
+                    // Add this block as a checkpoint since we found something in it
+                    self.block_checkpoints.insert(block_height_u32, block_hash);
+                    self.stage.block_checkpoints.insert(block_height_u32, block_hash);
 
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
@@ -316,7 +583,6 @@ impl Scanner {
                     // Print balance from the graph
                     // Following the bdk-sp pattern: get outpoints from index and pass to balance
                     let graph = self.internal_indexer.graph();
-                    let tip = self.local_chain.tip().block_id();
                     // Get all outpoints from by_shared_secret - these are our UTXOs
                     // The balance method expects (u32, OutPoint) where u32 is txout_index
                     // We'll use the vout from the OutPoint as the txout_index
@@ -327,9 +593,14 @@ impl Scanner {
                         .keys()
                         .map(|outpoint| (outpoint.vout, *outpoint))
                         .collect();
+                    
+                    // Create LocalChain from sparse checkpoints for balance calculation
+                    let local_chain = LocalChain::from_blocks(self.block_checkpoints.clone())
+                        .expect("Failed to create LocalChain from checkpoints");
+                    
                     let balance = graph.balance(
-                        &self.local_chain,
-                        tip,
+                        &local_chain,
+                        block_id,
                         CanonicalizationParams::default(),
                         outpoints.iter().copied(), // confirmed outpoints from our index
                         |_txout_index, _script| true, // include all pending outputs
@@ -341,6 +612,10 @@ impl Scanner {
                         balance.trusted_pending,
                         balance.untrusted_pending
                     );
+
+                    // Update last scanned block height and stage it
+                    self.last_scanned_block_height = block_identifier.block_height;
+                    self.stage.last_scanned_block_height = block_identifier.block_height;
                 }
                 Err(e) => {
                     println!("Error scanning short block data: {e:?}");
@@ -348,6 +623,33 @@ impl Scanner {
                 }
             }
         }
+
+        let outpoints: Vec<(u32, OutPoint)> = self
+            .internal_indexer
+            .index()
+            .by_shared_secret
+            .keys()
+            .map(|outpoint| (outpoint.vout, *outpoint))
+            .collect();
+
+        // Create LocalChain from sparse checkpoints for balance calculation
+        let local_chain = LocalChain::from_blocks(self.block_checkpoints.clone())
+            .expect("Failed to create LocalChain from checkpoints");
+        
+        let balance = self.internal_indexer.graph().balance(
+            &local_chain,
+            last_block_id,
+            CanonicalizationParams::default(),
+            outpoints.iter().copied(), // confirmed outpoints from our index
+            |_txout_index, _script| true, // include all pending outputs
+        );
+        println!(
+            "Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
+            balance.total(),
+            balance.confirmed,
+            balance.trusted_pending,
+            balance.untrusted_pending
+        );
 
         Ok(())
     }
@@ -706,4 +1008,77 @@ fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
 
     // Construct Txid directly from the byte array (preserves byte order)
     Txid::from_byte_array(txid_array)
+}
+
+impl Scanner {
+    /// Create a new Scanner from a ChangeSet.
+    ///
+    /// This allows restoring a scanner's state from persisted changes.
+    /// The client and p2p_peer must be provided separately as they can't be serialized.
+    ///
+    /// Note: Labels are recomputed from the keys and max_label_num on startup,
+    /// so label_lookup data in the changeset is redundant but harmless.
+    pub fn from_changeset(
+        client: OracleServiceClient<Channel>,
+        p2p_socket_addr: SocketAddr,
+        mut changeset: ChangeSet,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Extract keys from changeset
+        let secret_scan_hex = changeset
+            .secret_scan_hex
+            .take()
+            .ok_or("secret_scan_hex missing in ChangeSet")?;
+        let public_spend_hex = changeset
+            .public_spend_hex
+            .take()
+            .ok_or("public_spend_hex missing in ChangeSet")?;
+
+        let secret_scan_bytes = hex::decode(&secret_scan_hex)?;
+        let public_spend_bytes = hex::decode(&public_spend_hex)?;
+
+        // Verify keys are valid (the indexer will be reconstructed from changeset which already contains keys)
+        let _secret_scan = SecretKey::from_slice(&secret_scan_bytes)?;
+        let _public_spend = PublicKey::from_slice(&public_spend_bytes)?;
+
+        // Reconstruct the indexer from the changeset (this restores the graph and transaction data)
+        let mut indexer = SpIndexerV2::try_from(changeset.indexer.clone())
+            .map_err(|e| format!("Failed to reconstruct indexer from changeset: {:?}", e))?;
+
+        // Regenerate labels
+        // ignore change set and be aligned with max_label_num
+        let max_label_num = changeset.max_label_num;
+        _ = indexer.add_label(0);
+        for i in 1..=max_label_num {
+            _ = indexer.add_label(i);
+        }
+
+        // Reconstruct block checkpoints from the changeset
+        let mut block_checkpoints = changeset.block_checkpoints.clone();
+        
+        // Ensure genesis block is always present for LocalChain::from_blocks to work
+        if !block_checkpoints.contains_key(&0) {
+            let genesis_hash = BlockHash::from_byte_array(
+                bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
+            );
+            block_checkpoints.insert(0, genesis_hash);
+        }
+
+        // Restore the keys in the changeset for future saves
+        changeset.secret_scan_hex = Some(secret_scan_hex);
+        changeset.public_spend_hex = Some(public_spend_hex);
+
+        Ok(Self {
+            client,
+            p2p_peer: p2p_socket_addr,
+            internal_indexer: indexer,
+            block_checkpoints,
+            notify_probabilistic_matches: broadcast::channel(100).0,
+            notify_found_utxos: broadcast::channel(100).0,
+            notify_spent_outpoints: broadcast::channel(100).0,
+            last_scanned_block_height: changeset.last_scanned_block_height,
+            last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
+            owned_outputs: changeset.owned_outputs.clone(),
+            stage: changeset,
+        })
+    }
 }
