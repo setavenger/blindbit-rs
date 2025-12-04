@@ -429,27 +429,25 @@ impl Scanner {
         path: P,
     ) -> Result<ChangeSet, Box<dyn std::error::Error>> {
         let json = std::fs::read_to_string(path)?;
-        let mut json_value: serde_json::Value = serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+        let mut json_value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
         // The issue: label_lookup entries are stored as arrays of integers, but the deserializer
         // expects hex strings. However, we don't actually need label_lookup data because we regenerate
         // labels from max_label_num in from_changeset(). So we can just remove/nullify label_lookup.
-        
+
         // Remove label_lookup from the indexer - we'll regenerate it from max_label_num anyway
-        if let Some(indexer_obj) = json_value.get_mut("indexer").and_then(|v| v.as_object_mut()) {
+        if let Some(indexer_obj) = json_value
+            .get_mut("indexer")
+            .and_then(|v| v.as_object_mut())
+        {
             // Set label_lookup to an empty array (or remove it entirely)
             indexer_obj.insert("label_lookup".to_string(), serde_json::Value::Array(vec![]));
         }
-        
+
         // Now try to deserialize
         serde_json::from_value::<ChangeSet>(json_value)
-            .map_err(|e| {
-                format!(
-                    "Failed to deserialize ChangeSet. Error: {}",
-                    e
-                ).into()
-            })
+            .map_err(|e| format!("Failed to deserialize ChangeSet. Error: {}", e).into())
     }
 
     /// Update the last scanned block height
@@ -573,7 +571,9 @@ impl Scanner {
 
                     // Add this block as a checkpoint since we found something in it
                     self.block_checkpoints.insert(block_height_u32, block_hash);
-                    self.stage.block_checkpoints.insert(block_height_u32, block_hash);
+                    self.stage
+                        .block_checkpoints
+                        .insert(block_height_u32, block_hash);
 
                     println!("Printing for height: {}", block_identifier.block_height);
                     for inner_tx in self.internal_indexer.graph().full_txs() {
@@ -593,11 +593,11 @@ impl Scanner {
                         .keys()
                         .map(|outpoint| (outpoint.vout, *outpoint))
                         .collect();
-                    
+
                     // Create LocalChain from sparse checkpoints for balance calculation
                     let local_chain = LocalChain::from_blocks(self.block_checkpoints.clone())
                         .expect("Failed to create LocalChain from checkpoints");
-                    
+
                     let balance = graph.balance(
                         &local_chain,
                         block_id,
@@ -635,7 +635,7 @@ impl Scanner {
         // Create LocalChain from sparse checkpoints for balance calculation
         let local_chain = LocalChain::from_blocks(self.block_checkpoints.clone())
             .expect("Failed to create LocalChain from checkpoints");
-        
+
         let balance = self.internal_indexer.graph().balance(
             &local_chain,
             last_block_id,
@@ -1054,14 +1054,11 @@ impl Scanner {
 
         // Reconstruct block checkpoints from the changeset
         let mut block_checkpoints = changeset.block_checkpoints.clone();
-        
-        // Ensure genesis block is always present for LocalChain::from_blocks to work
-        if !block_checkpoints.contains_key(&0) {
-            let genesis_hash = BlockHash::from_byte_array(
+        block_checkpoints.entry(0).or_insert_with(|| {
+            BlockHash::from_byte_array(
                 bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
-            );
-            block_checkpoints.insert(0, genesis_hash);
-        }
+            )
+        });
 
         // Restore the keys in the changeset for future saves
         changeset.secret_scan_hex = Some(secret_scan_hex);
