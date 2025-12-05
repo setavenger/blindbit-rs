@@ -62,7 +62,13 @@ impl Scanner {
             match self.scan_short_block_data(block_scan_data) {
                 Ok(probable_match_opt) => {
                     let probable_match = match probable_match_opt {
-                        None => continue,
+                        None => {
+                            // No match found, but we successfully scanned this block
+                            // Update last scanned block height and continue
+                            self.last_scanned_block_height = block_identifier.block_height;
+                            self.stage.last_scanned_block_height = block_identifier.block_height;
+                            continue;
+                        }
                         Some(probable_match) => probable_match,
                     };
                     // pull the full block data
@@ -173,16 +179,16 @@ impl Scanner {
                         balance.trusted_pending,
                         balance.untrusted_pending
                     );
-
-                    // Update last scanned block height and stage it
-                    self.last_scanned_block_height = block_identifier.block_height;
-                    self.stage.last_scanned_block_height = block_identifier.block_height;
                 }
                 Err(e) => {
                     println!("Error scanning short block data: {e:?}");
                     return Err(e);
                 }
             }
+
+            // Update last scanned block height and stage it
+            self.last_scanned_block_height = block_identifier.block_height;
+            self.stage.last_scanned_block_height = block_identifier.block_height;
         }
 
         let outpoints: Vec<(u32, OutPoint)> = self
