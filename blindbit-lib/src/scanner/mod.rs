@@ -1,13 +1,13 @@
 // todo: make scanner data pulling engine flexible
 
 mod changeset;
-mod types;
+mod p2p;
 mod scanner;
 mod scanning;
-mod p2p;
+mod types;
 mod utils;
 
 // Re-export public types and the main Scanner struct
 pub use changeset::ChangeSet;
-pub use types::{BlockIdentifierDisplay, OwnedOutput};
 pub use scanner::Scanner;
+pub use types::{BlockIdentifierDisplay, OwnedOutput};

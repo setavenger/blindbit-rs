@@ -3,16 +3,16 @@ use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
 
+use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin::BlockHash;
-use indexer::v2::SpIndexerV2;
 use indexer::bdk_chain::bdk_core::Merge;
+use indexer::v2::SpIndexerV2;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
-use indexer::bdk_chain::ConfirmationBlockTime;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
+use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::ChangeSet;
 
@@ -333,4 +333,3 @@ impl Scanner {
         })
     }
 }
-

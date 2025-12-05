@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
 use bitcoin::BlockHash;
 use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::bdk_chain::bdk_core::Merge;
+use std::collections::BTreeMap;
 
 /// Helper module for hex encoding/decoding byte arrays in serialization
 #[cfg(feature = "serde")]
@@ -115,4 +115,3 @@ impl Merge for ChangeSet {
             && self.owned_outputs.is_empty()
     }
 }
-

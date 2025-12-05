@@ -1,5 +1,7 @@
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey};
+use bitcoin::{
+    Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, XOnlyPublicKey,
+};
 
 use crate::oracle_grpc::FullTxItem;
 
@@ -95,4 +97,3 @@ pub fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
     // Construct Txid directly from the byte array (preserves byte order)
     Txid::from_byte_array(txid_array)
 }
-

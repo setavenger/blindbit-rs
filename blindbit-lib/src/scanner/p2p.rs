@@ -1,8 +1,8 @@
 use std::net::SocketAddr;
 
-use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use bitcoin::BlockHash;
+use bitcoin::hashes::Hash;
 
 use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
 use bitcoin_p2p::p2p_message_types::{message::NetworkMessage, message_blockdata::Inventory};
@@ -69,4 +69,3 @@ pub fn pull_block_from_p2p_by_blockhash(
         }
     }
 }
-

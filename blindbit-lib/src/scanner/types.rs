@@ -1,8 +1,8 @@
-use bitcoin::absolute::Height;
-use bitcoin::{Amount, ScriptBuf};
-use bitcoin::secp256k1::PublicKey;
-use indexer::v2::indexes::Label;
 use crate::oracle_grpc::BlockIdentifier;
+use bitcoin::absolute::Height;
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Amount, ScriptBuf};
+use indexer::v2::indexes::Label;
 
 /// Wrapper for `BlockIdentifier` that implements Display with hex formatting
 pub struct BlockIdentifierDisplay<'a>(pub &'a BlockIdentifier);
@@ -52,4 +52,3 @@ impl ProbableMatch {
         Self { matched_txs, spent }
     }
 }
-

@@ -4,18 +4,18 @@ use bdk_sp::receive::SpOut;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, OutPoint, Txid};
-use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::bdk_chain::local_chain::LocalChain;
+use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 
 use crate::oracle_grpc::{
     BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
 };
 
+use super::p2p;
 use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
-use super::p2p;
 
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
@@ -79,16 +79,14 @@ impl Scanner {
                     println!("block_hash: {block_hash}");
 
                     // Make multiple parallel requests and wait for the first successful one
-                    let block = match p2p::pull_block_from_p2p_by_blockhash(
-                        self.p2p_peer,
-                        block_hash,
-                    ) {
-                        Ok(full_block) => full_block,
-                        Err(err) => {
-                            println!("{err}");
-                            return Err(err);
-                        }
-                    };
+                    let block =
+                        match p2p::pull_block_from_p2p_by_blockhash(self.p2p_peer, block_hash) {
+                            Ok(full_block) => full_block,
+                            Err(err) => {
+                                println!("{err}");
+                                return Err(err);
+                            }
+                        };
 
                     // build partial secret hashmap, only populate with txids and secrets where we
                     // suspect matches, skip the rest
@@ -421,4 +419,3 @@ impl Scanner {
         }
     }
 }
-
