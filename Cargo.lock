@@ -456,6 +456,7 @@ name = "blindbit-cli"
 version = "0.1.0"
 dependencies = [
  "bitcoin 0.32.7",
+ "bitcoin 0.33.0-alpha.0",
  "blindbit-lib",
  "clap",
  "tokio",

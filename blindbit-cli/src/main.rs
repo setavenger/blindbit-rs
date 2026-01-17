@@ -4,6 +4,8 @@ use blindbit_lib::scanner;
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
+use bitcoin_rev::Network;
+
 #[derive(Parser)]
 #[command(name = "blindbit-cli")]
 #[command(about = "A CLI tool for scanning Bitcoin blocks", long_about = None)]
@@ -46,6 +48,9 @@ enum Commands {
         /// Path to save/load scanner state (default: scanner_state.json)
         #[arg(long, default_value = "scanner_state.json")]
         state_file: PathBuf,
+
+        #[arg(long, default_value = "bitcoin")]
+        network: Network,
     },
 }
 
@@ -63,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_label_num,
             oracle_url,
             state_file,
+            network,
         } => {
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
@@ -90,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             addr,
                             changeset,
                             state_file.clone(),
+                            network,
                         ) {
                             Ok(scanner) => {
                                 let last_height = scanner.get_last_scanned_block_height();
@@ -106,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     public_spend,
                                     max_label_num,
                                     state_file.clone(),
+                                    network,
                                 )
                             }
                         }
@@ -120,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             public_spend,
                             max_label_num,
                             state_file.clone(),
+                            network,
                         )
                     }
                 }
@@ -132,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     public_spend,
                     max_label_num,
                     state_file.clone(),
+                    network,
                 )
             };
 

@@ -12,6 +12,7 @@ use bitcoin_p2p::{
 };
 
 // rust-bitcoin on specific commit for use with bitcoin-p2p library
+use bitcoin_rev::Network;
 use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
 use bitcoin_rev::consensus::encode;
 
@@ -19,13 +20,17 @@ use bitcoin_rev::consensus::encode;
 pub fn pull_block_from_p2p_by_blockhash(
     p2p_peer: SocketAddr,
     block_hash: BlockHash,
+    network: Network,
 ) -> Result<Block, Box<dyn std::error::Error>> {
     println!("Connecting to peer: {}", p2p_peer);
     println!("Requesting block: {block_hash}");
 
+    let connection_config = ConnectionConfig::new();
+    let connection_config = connection_config.change_network(network);
+
     // Connect to peer
     let (writer, mut reader, metadata) =
-        ConnectionConfig::new().open_connection(p2p_peer, TimeoutParams::default())?;
+        connection_config.open_connection(p2p_peer, TimeoutParams::default())?;
 
     println!(
         "Connected! Peer height: {}, services: {}",

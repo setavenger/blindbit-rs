@@ -85,14 +85,17 @@ impl Scanner {
                     println!("block_hash: {block_hash}");
 
                     // Make multiple parallel requests and wait for the first successful one
-                    let block =
-                        match p2p::pull_block_from_p2p_by_blockhash(self.p2p_peer, block_hash) {
-                            Ok(full_block) => full_block,
-                            Err(err) => {
-                                println!("{err}");
-                                return Err(err);
-                            }
-                        };
+                    let block = match p2p::pull_block_from_p2p_by_blockhash(
+                        self.p2p_peer,
+                        block_hash,
+                        self.network,
+                    ) {
+                        Ok(full_block) => full_block,
+                        Err(err) => {
+                            println!("{err}");
+                            return Err(err);
+                        }
+                    };
 
                     // build partial secret hashmap, only populate with txids and secrets where we
                     // suspect matches, skip the rest
