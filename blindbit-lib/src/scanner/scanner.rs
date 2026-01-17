@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin_rev::Network;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::broadcast;
@@ -60,9 +61,13 @@ pub struct Scanner {
 
     /// Contains the state of the scanner
     pub(crate) state_file: PathBuf,
+
+    /// P2P network setting, important for p2p communication
+    pub(crate) network: Network,
 }
 
 impl Scanner {
+    // TODO: create a config with defaults instead of a long list of args
     pub fn new(
         client: OracleServiceClient<Channel>,
         p2p_socket_addr: SocketAddr,
@@ -70,6 +75,7 @@ impl Scanner {
         public_spend: PublicKey,
         max_label_num: u32, // highest m for label index
         state_file: PathBuf,
+        network: Network,
     ) -> Self {
         // secret scan needed
         // public spend needed
@@ -121,6 +127,7 @@ impl Scanner {
             owned_outputs: vec![],
             stage,
             state_file,
+            network,
         }
     }
 
@@ -285,6 +292,7 @@ impl Scanner {
         p2p_socket_addr: SocketAddr,
         mut changeset: ChangeSet,
         state_file: PathBuf,
+        network: Network,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Extract keys from changeset
         let secret_scan_hex = changeset
@@ -340,6 +348,7 @@ impl Scanner {
             owned_outputs: changeset.owned_outputs.clone(),
             stage: changeset,
             state_file: state_file,
+            network: network,
         })
     }
 }
