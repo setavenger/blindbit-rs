@@ -172,6 +172,12 @@ impl Scanner {
                         outpoints.iter().copied(), // confirmed outpoints from our index
                         |_txout_index, _script| true, // include all pending outputs
                     );
+
+                    if let Err(save_err) = self.save_to_file(&self.state_file) {
+                        eprintln!("Warning: Failed to save state: {save_err}");
+                    } else {
+                        println!("State saved successfully!");
+                    }
                     println!(
                         "Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
                         balance.total(),
