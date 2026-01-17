@@ -85,7 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(changeset) => {
                         // Clone client for the from_changeset call
                         let client_clone = OracleServiceClient::connect(oracle_url.clone()).await?;
-                        match scanner::Scanner::from_changeset(client_clone, addr, changeset) {
+                        match scanner::Scanner::from_changeset(
+                            client_clone,
+                            addr,
+                            changeset,
+                            state_file.clone(),
+                        ) {
                             Ok(scanner) => {
                                 let last_height = scanner.get_last_scanned_block_height();
                                 println!("Loaded state. Last scanned height: {}", last_height);
@@ -100,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     secret_scan,
                                     public_spend,
                                     max_label_num,
+                                    state_file.clone(),
                                 )
                             }
                         }
@@ -113,12 +119,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             secret_scan,
                             public_spend,
                             max_label_num,
+                            state_file.clone(),
                         )
                     }
                 }
             } else {
                 println!("No existing state file found. Creating new scanner...");
-                scanner::Scanner::new(client, addr, secret_scan, public_spend, max_label_num)
+                scanner::Scanner::new(
+                    client,
+                    addr,
+                    secret_scan,
+                    public_spend,
+                    max_label_num,
+                    state_file.clone(),
+                )
             };
 
             // Scan the block range

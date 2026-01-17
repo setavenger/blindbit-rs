@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
+use std::path::PathBuf;
 
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
@@ -56,6 +57,9 @@ pub struct Scanner {
 
     /// Staged changes that can be persisted
     pub(crate) stage: ChangeSet,
+
+    /// Contains the state of the scanner
+    pub(crate) state_file: PathBuf,
 }
 
 impl Scanner {
@@ -65,6 +69,7 @@ impl Scanner {
         secret_scan: SecretKey,
         public_spend: PublicKey,
         max_label_num: u32, // highest m for label index
+        state_file: PathBuf,
     ) -> Self {
         // secret scan needed
         // public spend needed
@@ -115,6 +120,7 @@ impl Scanner {
             last_scanned_block_height_rescan: 0,
             owned_outputs: vec![],
             stage,
+            state_file,
         }
     }
 
@@ -202,6 +208,8 @@ impl Scanner {
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+        // TODO:Create directory if it does not exist?
+
         // Ensure we have the keys in the changeset for reconstruction
         let mut changeset = self.stage.clone();
         if changeset.secret_scan_hex.is_none() {
@@ -276,6 +284,7 @@ impl Scanner {
         client: OracleServiceClient<Channel>,
         p2p_socket_addr: SocketAddr,
         mut changeset: ChangeSet,
+        state_file: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Extract keys from changeset
         let secret_scan_hex = changeset
@@ -330,6 +339,7 @@ impl Scanner {
             last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
             owned_outputs: changeset.owned_outputs.clone(),
             stage: changeset,
+            state_file: state_file,
         })
     }
 }
