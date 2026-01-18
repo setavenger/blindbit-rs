@@ -17,6 +17,7 @@ use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::ChangeSet;
+use super::config::ScannerConfig;
 
 /// Main scanner struct for scanning the blockchain for Silent Payments outputs
 pub struct Scanner {
@@ -129,6 +130,28 @@ impl Scanner {
             state_file,
             network,
         }
+    }
+
+    /// Create a new Scanner from configuration
+    ///
+    /// This is a convenience constructor that takes a ScannerConfig instead of
+    /// individual parameters. The Oracle client will be created automatically.
+    pub async fn from_config(config: &ScannerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        // Validate configuration
+        config.validate()?;
+
+        // Connect to oracle service
+        let client = OracleServiceClient::connect(config.oracle_url.clone()).await?;
+
+        Ok(Self::new(
+            client,
+            config.p2p_socket_addr,
+            config.secret_scan,
+            config.public_spend,
+            config.max_label_num,
+            config.state_file.clone(),
+            config.network,
+        ))
     }
 
     /// get the last block height that was scanned
