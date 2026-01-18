@@ -612,6 +612,9 @@ name = "friglet"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blindbit-lib",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 // todo: make scanner data pulling engine flexible
 
 mod changeset;
+mod load;
 mod p2p;
 mod scanner;
 mod scanning;
