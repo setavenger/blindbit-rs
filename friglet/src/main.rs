@@ -1,7 +1,8 @@
 use bitcoin_rev::Network;
 use clap::{Parser, Subcommand};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use tokio::sync::Mutex;
 
 use axum::{Extension, Json, Router, routing::get};
 use blindbit_lib::scanner;
@@ -101,11 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
             // launch the scanner in the background
-            let bg_scanner = scanner_instance.clone();
+            let bg_scanner_clone = scanner_instance.clone();
+            let start = start_height;
+            let end = end_height;
             tokio::spawn(async move {
-                let mut s = bg_scanner.lock().unwrap();
-                s.scan_block_range(start_height, end_height).await.unwrap();
+                let mut s = bg_scanner_clone.lock().await;
+                s.scan_block_range(start, end).await.unwrap();
             });
+
+            let bg_scanner = scanner_instance.clone();
 
             // 4. Create HTTP server
             let app = Router::new()
@@ -120,7 +125,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await.unwrap();
             Ok(())
         }
-        _ => Ok(()),
     }
 }
 
@@ -132,7 +136,7 @@ struct HeightResponse {
 async fn get_height(
     Extension(sp_scanner): Extension<Arc<Mutex<scanner::Scanner>>>,
 ) -> Json<HeightResponse> {
-    let s = sp_scanner.lock().unwrap();
+    let s = sp_scanner.lock().await;
     Json(HeightResponse {
         height: s.get_last_scanned_block_height(),
     })
