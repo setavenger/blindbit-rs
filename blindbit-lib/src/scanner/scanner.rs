@@ -5,9 +5,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use bitcoin::BlockHash;
+use bitcoin::Network as BTCNetwork;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin_rev::Network;
+use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::broadcast;
@@ -161,6 +163,12 @@ impl Scanner {
 
     pub fn get_last_scanned_block_height_rescan(&self) -> u64 {
         self.last_scanned_block_height_rescan
+    }
+
+    pub fn get_scanner_sp_address(&self) -> String {
+        self.internal_indexer
+            .get_address(convert_network(self.network))
+            .to_string()
     }
 
     /// subscribe to notifications when a new utxo is found
@@ -373,5 +381,16 @@ impl Scanner {
             state_file: state_file,
             network: network,
         })
+    }
+}
+
+fn convert_network(nw: Network) -> BTCNetwork {
+    match nw {
+        Network::Bitcoin => BTCNetwork::Bitcoin,
+        Network::Signet => BTCNetwork::Signet,
+        Network::Regtest => BTCNetwork::Regtest,
+        // if Testnet V4 is sepcified otherwise we use V3
+        Network::Testnet(TestnetVersion::V4) => BTCNetwork::Testnet4,
+        Network::Testnet(_) => BTCNetwork::Testnet,
     }
 }

@@ -1,12 +1,14 @@
+mod server;
+
 use bitcoin_rev::Network;
 use clap::{Parser, Subcommand};
+// use server::{FrigateHistory, FrigateResponse, FrigateSubscription};
 use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 use tokio::sync::Mutex;
 
-use axum::{Extension, Json, Router, routing::get};
+use axum::{Extension, Router, routing::get};
 use blindbit_lib::scanner;
-use serde::Serialize;
 use tokio;
 
 use bitcoin::secp256k1::{PublicKey, SecretKey};
@@ -115,7 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 4. Create HTTP server
             let app = Router::new()
                 // .route("/utxos", get(get_utxos))
-                .route("/height", get(get_height))
+                .route("/height", get(server::get_height))
+                .route("/subscribe", get(server::subscribe))
                 .layer(Extension(bg_scanner));
 
             // 5. Start server
@@ -126,18 +129,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
-}
-
-#[derive(Serialize)]
-struct HeightResponse {
-    height: u64,
-}
-
-async fn get_height(
-    Extension(sp_scanner): Extension<Arc<Mutex<scanner::Scanner>>>,
-) -> Json<HeightResponse> {
-    let s = sp_scanner.lock().await;
-    Json(HeightResponse {
-        height: s.get_last_scanned_block_height(),
-    })
 }
