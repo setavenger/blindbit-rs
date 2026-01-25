@@ -1,5 +1,7 @@
 use crate::scanner;
 use axum::{Extension, Json};
+use blindbit_lib::scanner::OwnedOutput;
+use hex;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -26,8 +28,18 @@ pub struct FrigateSubscription {
 #[derive(Serialize)]
 pub struct FrigateHistory {
     pub height: u64,
-    pub tx_response: String,
+    pub tx_hash: String,
     pub tweak_key: String,
+}
+
+impl FrigateHistory {
+    pub fn from_owned_output(out: &OwnedOutput) -> FrigateHistory {
+        FrigateHistory {
+            height: u64::from(out.blockheight.to_consensus_u32()),
+            tx_hash: out.outpoint.txid.to_string(),
+            tweak_key: hex::encode(out.tweak),
+        }
+    }
 }
 
 pub async fn get_height(
@@ -44,13 +56,20 @@ pub async fn subscribe(
 ) -> Json<FrigateResponse> {
     let s = sp_scanner.lock().await;
 
+    let outputs = s.get_outputs();
+
+    let history: Vec<FrigateHistory> = outputs
+        .iter()
+        .map(|out| FrigateHistory::from_owned_output(out))
+        .collect();
+
     Json(FrigateResponse {
         subscription: FrigateSubscription {
             address: s.get_scanner_sp_address(),
             start_height: s.get_last_scanned_block_height(),
-            labels: (1..=s.get_max_label_num()).collect(),
+            labels: (0..=s.get_max_label_num()).collect(),
         },
         progress: 1.0,
-        history: Vec::new(),
+        history: history,
     })
 }

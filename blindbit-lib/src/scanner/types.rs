@@ -1,7 +1,7 @@
 use crate::oracle_grpc::BlockIdentifier;
 use bitcoin::absolute::Height;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::{Amount, ScriptBuf};
+use bitcoin::{Amount, OutPoint, ScriptBuf};
 use indexer::v2::indexes::Label;
 
 /// Wrapper for `BlockIdentifier` that implements Display with hex formatting
@@ -31,6 +31,7 @@ impl std::fmt::Debug for BlockIdentifierDisplay<'_> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnedOutput {
+    pub outpoint: OutPoint,
     pub blockheight: Height,
     pub tweak: [u8; 32], // scalar in big endian format
     pub amount: Amount,
