@@ -67,6 +67,9 @@ pub struct Scanner {
 
     /// P2P network setting, important for p2p communication
     pub(crate) network: Network,
+
+    /// highest number m used for a lable, uses continuous gapless labels
+    pub(crate) max_label_num: u32,
 }
 
 impl Scanner {
@@ -131,6 +134,7 @@ impl Scanner {
             stage,
             state_file,
             network,
+            max_label_num,
         }
     }
 
@@ -169,6 +173,10 @@ impl Scanner {
         self.internal_indexer
             .get_address(convert_network(self.network))
             .to_string()
+    }
+
+    pub fn get_max_label_num(&self) -> u32 {
+        self.max_label_num
     }
 
     /// subscribe to notifications when a new utxo is found
@@ -380,6 +388,7 @@ impl Scanner {
             stage: changeset,
             state_file: state_file,
             network: network,
+            max_label_num,
         })
     }
 }

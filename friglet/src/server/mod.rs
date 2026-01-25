@@ -43,11 +43,12 @@ pub async fn subscribe(
     Extension(sp_scanner): Extension<Arc<Mutex<scanner::Scanner>>>,
 ) -> Json<FrigateResponse> {
     let s = sp_scanner.lock().await;
+
     Json(FrigateResponse {
         subscription: FrigateSubscription {
             address: s.get_scanner_sp_address(),
             start_height: s.get_last_scanned_block_height(),
-            labels: Vec::new(),
+            labels: (1..=s.get_max_label_num()).collect(),
         },
         progress: 1.0,
         history: Vec::new(),
