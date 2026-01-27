@@ -4,24 +4,19 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 
-use bitcoin::Amount;
 use bitcoin::BlockHash;
 use bitcoin::Network as BTCNetwork;
-use bitcoin::OutPoint;
-use bitcoin::ScriptBuf;
-use bitcoin::absolute::Height;
+use bitcoin::Txid;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin_rev::Network;
 use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
-use indexer::bdk_chain::miniscript::ToPublicKey;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::broadcast;
 use tonic::transport::Channel;
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
-use crate::scanner::OwnedOutput;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::ChangeSet;
@@ -185,12 +180,10 @@ impl Scanner {
         self.max_label_num
     }
 
-    pub fn get_outputs(&self) -> Vec<OwnedOutput> {
-        let mut outputs: Vec<OwnedOutput> = Vec::new();
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            println!("txid: {}", inner_tx.txid);
-            println!("more: {:?}", inner_tx.anchors.first());
+    pub fn get_relevant_txs(&self) -> Vec<(Txid, &PublicKey, u32)> {
+        let mut txs: Vec<(Txid, &PublicKey, u32)> = Vec::new();
 
+        for inner_tx in self.internal_indexer.graph().full_txs() {
             let Some(anchor) = inner_tx.anchors.first() else {
                 continue;
             };
@@ -203,23 +196,30 @@ impl Scanner {
                 continue;
             };
 
-            println!("shared_secret_tx: {:?}", shared_secret_tx);
-
-            outputs.push(OwnedOutput {
-                outpoint: OutPoint {
-                    txid: inner_tx.txid,
-                    vout: 0,
-                },
-                blockheight: Height::from_consensus(anchor.block_id.height).unwrap(),
-                tweak: shared_secret_tx.to_x_only_pubkey().serialize(),
-                amount: Amount::from_sat(0),
-                script: ScriptBuf::new(),
-                label: None,
-                spent: None,
-            });
+            txs.push((inner_tx.txid, shared_secret_tx, anchor.block_id.height));
         }
-        outputs
+
+        txs
     }
+
+    // pub fn get_outputs(&self) -> Vec<OwnedOutput> {
+    //     let mut outputs: Vec<OwnedOutput> = Vec::new();
+    //     self.internal_indexer.index().index_spout(outpoint, spout);
+    //     self.internal_indexer.index().txid_to_partial_secret
+    //         outputs.push(OwnedOutput {
+    //             outpoint: OutPoint {
+    //                 txid: inner_tx.txid,
+    //                 vout: 0,
+    //             },
+    //             blockheight: Height::from_consensus(anchor.block_id.height).unwrap(),
+    //             tweak: shared_secret_tx.to_x_only_pubkey().serialize(),
+    //             amount: Amount::from_sat(0),
+    //             script: ScriptBuf::new(),
+    //             label: None,
+    //             spent: None,
+    //         });
+    //     outputs
+    // }
 
     /// subscribe to notifications when a new utxo is found
     pub fn subscribe_to_found_utxos(&self) -> broadcast::Receiver<usize> {

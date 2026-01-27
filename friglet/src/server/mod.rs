@@ -1,7 +1,7 @@
 use crate::scanner;
 use axum::{Extension, Json};
-use blindbit_lib::scanner::OwnedOutput;
-use hex;
+use bitcoin::Txid;
+use bitcoin::secp256k1::PublicKey;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -33,13 +33,21 @@ pub struct FrigateHistory {
 }
 
 impl FrigateHistory {
-    pub fn from_owned_output(out: &OwnedOutput) -> FrigateHistory {
+    pub fn from_relavant_tx_data(out: &(Txid, &PublicKey, u32)) -> FrigateHistory {
         FrigateHistory {
-            height: u64::from(out.blockheight.to_consensus_u32()),
-            tx_hash: out.outpoint.txid.to_string(),
-            tweak_key: hex::encode(out.tweak),
+            height: u64::from(out.2),
+            tx_hash: out.0.to_string(),
+            tweak_key: out.1.to_string(),
         }
     }
+
+    // pub fn from_owned_output(out: &OwnedOutput) -> FrigateHistory {
+    //     FrigateHistory {
+    //         height: u64::from(out.blockheight.to_consensus_u32()),
+    //         tx_hash: out.outpoint.txid.to_string(),
+    //         tweak_key: hex::encode(out.tweak),
+    //     }
+    // }
 }
 
 pub async fn get_height(
@@ -56,11 +64,11 @@ pub async fn subscribe(
 ) -> Json<FrigateResponse> {
     let s = sp_scanner.lock().await;
 
-    let outputs = s.get_outputs();
+    let outputs = s.get_relevant_txs();
 
     let history: Vec<FrigateHistory> = outputs
         .iter()
-        .map(|out| FrigateHistory::from_owned_output(out))
+        .map(|out| FrigateHistory::from_relavant_tx_data(out))
         .collect();
 
     Json(FrigateResponse {
