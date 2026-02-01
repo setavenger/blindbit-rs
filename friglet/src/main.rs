@@ -1,4 +1,6 @@
+mod electrum;
 mod server;
+mod types;
 
 use bitcoin_rev::Network;
 use clap::{Parser, Subcommand};
@@ -58,6 +60,14 @@ enum Commands {
 
         #[arg(long, default_value = "bitcoin")]
         network: Network,
+
+        /// HTTP server address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        http_addr: String,
+
+        /// Electrum TCP server address
+        #[arg(long, default_value = "127.0.0.1:50001")]
+        electrum_addr: String,
     },
 }
 
@@ -76,6 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             oracle_url,
             state_file,
             network,
+            http_addr,
+            electrum_addr,
         } => {
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
@@ -119,13 +131,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // .route("/utxos", get(get_utxos))
                 .route("/height", get(server::get_height))
                 .route("/subscribe", get(server::subscribe))
-                .layer(Extension(bg_scanner));
+                .layer(Extension(bg_scanner.clone()));
 
-            // 5. Start server
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
-                .await
-                .unwrap();
-            axum::serve(listener, app).await.unwrap();
+            // 5. Start both HTTP and Electrum servers in parallel
+            let http_addr_clone = http_addr.clone();
+            let http_server = async move {
+                let listener = tokio::net::TcpListener::bind(&http_addr_clone)
+                    .await
+                    .expect("Failed to bind HTTP server");
+                println!("HTTP server listening on {}", http_addr_clone);
+                axum::serve(listener, app)
+                    .await
+                    .expect("HTTP server failed");
+            };
+
+            let electrum_scanner = bg_scanner.clone();
+            let electrum_server = async move {
+                if let Err(e) = electrum::run(electrum_scanner, &electrum_addr).await {
+                    eprintln!("Electrum server error: {}", e);
+                }
+            };
+
+            // Run both servers concurrently
+            tokio::select! {
+                _ = http_server => {
+                    println!("HTTP server stopped");
+                }
+                _ = electrum_server => {
+                    println!("Electrum server stopped");
+                }
+            }
+
             Ok(())
         }
     }
