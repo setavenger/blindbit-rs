@@ -5,9 +5,12 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use bitcoin::BlockHash;
+use bitcoin::Network as BTCNetwork;
+use bitcoin::Txid;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin_rev::Network;
+use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::broadcast;
@@ -17,6 +20,7 @@ use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::ChangeSet;
+use super::config::ScannerConfig;
 
 /// Main scanner struct for scanning the blockchain for Silent Payments outputs
 pub struct Scanner {
@@ -64,6 +68,9 @@ pub struct Scanner {
 
     /// P2P network setting, important for p2p communication
     pub(crate) network: Network,
+
+    /// highest number m used for a lable, uses continuous gapless labels
+    pub(crate) max_label_num: u32,
 }
 
 impl Scanner {
@@ -128,7 +135,30 @@ impl Scanner {
             stage,
             state_file,
             network,
+            max_label_num,
         }
+    }
+
+    /// Create a new Scanner from configuration
+    ///
+    /// This is a convenience constructor that takes a ScannerConfig instead of
+    /// individual parameters. The Oracle client will be created automatically.
+    pub async fn from_config(config: &ScannerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        // Validate configuration
+        config.validate()?;
+
+        // Connect to oracle service
+        let client = OracleServiceClient::connect(config.oracle_url.clone()).await?;
+
+        Ok(Self::new(
+            client,
+            config.p2p_socket_addr,
+            config.secret_scan,
+            config.public_spend,
+            config.max_label_num,
+            config.state_file.clone(),
+            config.network,
+        ))
     }
 
     /// get the last block height that was scanned
@@ -139,6 +169,57 @@ impl Scanner {
     pub fn get_last_scanned_block_height_rescan(&self) -> u64 {
         self.last_scanned_block_height_rescan
     }
+
+    pub fn get_scanner_sp_address(&self) -> String {
+        self.internal_indexer
+            .get_address(convert_network(self.network))
+            .to_string()
+    }
+
+    pub fn get_max_label_num(&self) -> u32 {
+        self.max_label_num
+    }
+
+    pub fn get_relevant_txs(&self) -> Vec<(Txid, &PublicKey, u32)> {
+        let mut txs: Vec<(Txid, &PublicKey, u32)> = Vec::new();
+
+        for inner_tx in self.internal_indexer.graph().full_txs() {
+            let Some(anchor) = inner_tx.anchors.first() else {
+                continue;
+            };
+            let Some(shared_secret_tx) = self
+                .internal_indexer
+                .index()
+                .txid_to_partial_secret
+                .get(&inner_tx.txid)
+            else {
+                continue;
+            };
+
+            txs.push((inner_tx.txid, shared_secret_tx, anchor.block_id.height));
+        }
+
+        txs
+    }
+
+    // pub fn get_outputs(&self) -> Vec<OwnedOutput> {
+    //     let mut outputs: Vec<OwnedOutput> = Vec::new();
+    //     self.internal_indexer.index().index_spout(outpoint, spout);
+    //     self.internal_indexer.index().txid_to_partial_secret
+    //         outputs.push(OwnedOutput {
+    //             outpoint: OutPoint {
+    //                 txid: inner_tx.txid,
+    //                 vout: 0,
+    //             },
+    //             blockheight: Height::from_consensus(anchor.block_id.height).unwrap(),
+    //             tweak: shared_secret_tx.to_x_only_pubkey().serialize(),
+    //             amount: Amount::from_sat(0),
+    //             script: ScriptBuf::new(),
+    //             label: None,
+    //             spent: None,
+    //         });
+    //     outputs
+    // }
 
     /// subscribe to notifications when a new utxo is found
     pub fn subscribe_to_found_utxos(&self) -> broadcast::Receiver<usize> {
@@ -349,6 +430,18 @@ impl Scanner {
             stage: changeset,
             state_file: state_file,
             network: network,
+            max_label_num,
         })
+    }
+}
+
+fn convert_network(nw: Network) -> BTCNetwork {
+    match nw {
+        Network::Bitcoin => BTCNetwork::Bitcoin,
+        Network::Signet => BTCNetwork::Signet,
+        Network::Regtest => BTCNetwork::Regtest,
+        // if Testnet V4 is sepcified otherwise we use V3
+        Network::Testnet(TestnetVersion::V4) => BTCNetwork::Testnet4,
+        Network::Testnet(_) => BTCNetwork::Testnet,
     }
 }

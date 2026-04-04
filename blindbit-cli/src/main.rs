@@ -1,6 +1,5 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use blindbit_lib::oracle_grpc::oracle_service_client::OracleServiceClient;
-use blindbit_lib::scanner;
+use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
@@ -78,72 +77,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let public_spend = PublicKey::from_str(&spend_pubkey)
                 .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
-            // Connect to the oracle service
-            println!("Connecting to oracle service at {oracle_url}...");
-            let client = OracleServiceClient::connect(oracle_url.clone()).await?;
+            // Parse the P2P socket address
+            let p2p_socket_addr = SocketAddr::from_str(&p2p_node_addr)
+                .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
 
-            let addr = SocketAddr::from_str(&p2p_node_addr).unwrap();
+            // Create scanner configuration
+            let config = ScannerConfig::new(
+                oracle_url,
+                p2p_socket_addr,
+                secret_scan,
+                public_spend,
+                max_label_num,
+                state_file.clone(),
+                network,
+            );
 
-            // Try to load existing state, or create a new scanner
-            let mut sp_scanner = if state_file.exists() {
-                println!("Loading scanner state from {}...", state_file.display());
-                match scanner::Scanner::load_from_file(&state_file) {
-                    Ok(changeset) => {
-                        // Clone client for the from_changeset call
-                        let client_clone = OracleServiceClient::connect(oracle_url.clone()).await?;
-                        match scanner::Scanner::from_changeset(
-                            client_clone,
-                            addr,
-                            changeset,
-                            state_file.clone(),
-                            network,
-                        ) {
-                            Ok(scanner) => {
-                                let last_height = scanner.get_last_scanned_block_height();
-                                println!("Loaded state. Last scanned height: {}", last_height);
-                                scanner
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: Failed to restore from state file: {e}");
-                                eprintln!("Creating new scanner...");
-                                scanner::Scanner::new(
-                                    client,
-                                    addr,
-                                    secret_scan,
-                                    public_spend,
-                                    max_label_num,
-                                    state_file.clone(),
-                                    network,
-                                )
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to load state file: {e}");
-                        eprintln!("Creating new scanner...");
-                        scanner::Scanner::new(
-                            client,
-                            addr,
-                            secret_scan,
-                            public_spend,
-                            max_label_num,
-                            state_file.clone(),
-                            network,
-                        )
-                    }
-                }
-            } else {
-                println!("No existing state file found. Creating new scanner...");
-                scanner::Scanner::new(
-                    client,
-                    addr,
-                    secret_scan,
-                    public_spend,
-                    max_label_num,
-                    state_file.clone(),
-                    network,
-                )
-            };
+            // Load scanner using the new config-based approach
+            println!("Connecting to oracle service at {}...", config.oracle_url);
+            let mut sp_scanner = scanner::load_scanner(&config).await?;
 
             // Scan the block range
             println!("Scanning blocks from {start_height} to {end_height}...");
