@@ -120,13 +120,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
+            // Grab Electrum index + push receiver before the scan task locks the scanner.
+            let (electrum_index, found_utxos_rx) = {
+                let s = scanner_instance.lock().await;
+                let index = s.electrum_index();
+                {
+                    let mut idx = index.lock().await;
+                    idx.sp_start_height = start_height;
+                }
+                (index, s.subscribe_to_found_utxos())
+            };
+
             // launch the scanner in the background
             let bg_scanner_clone = scanner_instance.clone();
             let start = start_height;
             let end = end_height;
             tokio::spawn(async move {
                 let mut s = bg_scanner_clone.lock().await;
-                s.scan_block_range(start, end).await.unwrap();
+                if let Err(e) = s.scan_block_range(start, end).await {
+                    eprintln!("Scan error: {e}");
+                }
             });
 
             let bg_scanner = scanner_instance.clone();
@@ -151,14 +164,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .expect("HTTP server failed");
             };
 
-            let electrum_scanner = bg_scanner.clone();
-            let electrum_start_height = start_height;
             let electrum_p2p_addr = p2p_socket_addr;
             let electrum_network = network;
             let electrum_server = async move {
                 if let Err(e) = electrum::run(
-                    electrum_scanner,
-                    electrum_start_height,
+                    electrum_index,
+                    found_utxos_rx,
                     &electrum_addr,
                     electrum_p2p_addr,
                     electrum_network,

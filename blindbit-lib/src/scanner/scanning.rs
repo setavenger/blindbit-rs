@@ -72,8 +72,13 @@ impl Scanner {
                 Ok(probable_match_opt) => {
                     let probable_match = match probable_match_opt {
                         None => {
-                            // No match found, but we successfully scanned this block
-                            // Update last scanned block height and continue
+                            // No match — still advance tip/progress so Sparrow sees sync moving.
+                            self.notify_electrum_scan_progress(
+                                block_identifier.block_height,
+                                start,
+                                end,
+                            )
+                            .await;
                             self.last_scanned_block_height = block_identifier.block_height;
                             self.stage.last_scanned_block_height = block_identifier.block_height;
                             continue;
@@ -274,15 +279,17 @@ impl Scanner {
                         }
 
                         // Track progress for incremental SP notifications.
-                        // start/end are block_scan_data range params — available in scope.
                         let scanned = block_identifier.block_height.saturating_sub(start) + 1;
                         let total = end.saturating_sub(start) + 1;
                         idx.scan_progress = (scanned as f32 / total as f32).min(1.0);
                     }
 
-                    // Signal the Electrum push task that the index has new data.
-                    let utxo_count = self.internal_indexer.index().by_shared_secret.len();
-                    let _ = self.notify_found_utxos.send(utxo_count);
+                    self.notify_electrum_scan_progress(
+                        block_identifier.block_height,
+                        start,
+                        end,
+                    )
+                    .await;
                 }
                 Err(e) => {
                     println!("Error scanning short block data: {e:?}");
@@ -323,6 +330,29 @@ impl Scanner {
         );
 
         Ok(())
+    }
+
+    /// Update Electrum tip height and scan progress after each scanned block.
+    /// Fires a push notification even when no wallet outputs were found.
+    async fn notify_electrum_scan_progress(&self, block_height: u64, start: u64, end: u64) {
+        let height_u32 = block_height as u32;
+        let scanned = block_height.saturating_sub(start) + 1;
+        let total = end.saturating_sub(start) + 1;
+        let progress = (scanned as f32 / total as f32).min(1.0);
+
+        {
+            let mut idx = self.electrum_index.lock().await;
+            idx.scan_progress = progress;
+            let header_hex = idx
+                .tip
+                .as_ref()
+                .map(|(_, hex)| hex.clone())
+                .unwrap_or_default();
+            idx.tip = Some((height_u32, header_hex));
+        }
+
+        let utxo_count = self.internal_indexer.index().by_shared_secret.len();
+        let _ = self.notify_found_utxos.send(utxo_count);
     }
 
     /// watch the chain for new utxos and spent outpoints

@@ -22,7 +22,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast};
 
 use bitcoin_rev::Network;
-use blindbit_lib::scanner::Scanner;
 use blindbit_lib::scanner::{WalletElectrumIndex, electrum_status};
 use blindbit_lib::scanner::broadcast_tx;
 
@@ -104,26 +103,15 @@ struct ElectrumServerState {
 
 /// Run the Electrum TCP server.
 ///
-/// `scan_start_height` is forwarded to the SP subscription so Sparrow's
-/// subscription key matches across reconnects.
+/// `index` and `found_rx` must be obtained from the scanner before spawning
+/// `scan_block_range`, so this server never contends for the scanner mutex.
 pub async fn run(
-    scanner: Arc<Mutex<Scanner>>,
-    scan_start_height: u64,
+    index: Arc<Mutex<WalletElectrumIndex>>,
+    mut found_rx: broadcast::Receiver<usize>,
     addr: &str,
     p2p_peer: SocketAddr,
     network: Network,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Clone the Arc to the Electrum index — no scanner lock needed at runtime.
-    let index = {
-        let s = scanner.lock().await;
-        let index = s.electrum_index();
-        {
-            let mut idx = index.lock().await;
-            idx.sp_start_height = scan_start_height;
-        }
-        index
-    };
-
     let (push_tx, _) = broadcast::channel::<String>(256);
 
     let state = Arc::new(ElectrumServerState {
@@ -135,14 +123,13 @@ pub async fn run(
 
     // Background push task: receives a signal whenever the scanner updates the
     // index and broadcasts pre-serialised JSON notifications to all clients.
-    // Crucially, this never locks the Scanner — it reads only from `index`.
     {
         let state = state.clone();
-        let mut found_rx = {
-            let s = scanner.lock().await;
-            s.subscribe_to_found_utxos()
-        };
         tokio::spawn(async move {
+            // Push current index state immediately so clients don't wait for the
+            // first wallet match before seeing scan progress / tip height.
+            push_notifications(&state).await;
+
             loop {
                 match found_rx.recv().await {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
