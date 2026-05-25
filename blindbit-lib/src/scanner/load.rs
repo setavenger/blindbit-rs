@@ -1,5 +1,6 @@
 use super::config::ScannerConfig;
 use super::scanner::Scanner;
+use super::ScannerError;
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 
@@ -10,7 +11,7 @@ use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 ///
 /// Requires the `serde` feature to be enabled for state persistence.
 #[cfg(feature = "serde")]
-pub async fn load_scanner(config: &ScannerConfig) -> Result<Scanner, Box<dyn std::error::Error>> {
+pub async fn load_scanner(config: &ScannerConfig) -> Result<Scanner, ScannerError> {
     // Validate configuration
     config.validate()?;
 
@@ -58,7 +59,7 @@ pub async fn load_scanner(config: &ScannerConfig) -> Result<Scanner, Box<dyn std
 
 /// Create a new scanner from configuration
 #[cfg(feature = "serde")]
-async fn create_new_scanner(config: &ScannerConfig) -> Result<Scanner, Box<dyn std::error::Error>> {
+async fn create_new_scanner(config: &ScannerConfig) -> Result<Scanner, ScannerError> {
     // Connect to oracle service
     let client = OracleServiceClient::connect(config.oracle_url.clone()).await?;
 

@@ -12,10 +12,12 @@ use crate::oracle_grpc::{
     BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
 };
 
+use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
 use super::p2p;
 use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
+use super::ScannerError;
 
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
@@ -23,7 +25,7 @@ impl Scanner {
         &mut self,
         start: u64,
         end: u64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), ScannerError> {
         // TODO: Implement sync check if needed
 
         let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
@@ -38,6 +40,13 @@ impl Scanner {
             .await
             .unwrap()
             .into_inner();
+
+        // Stamp sp_start_height into the index so the Electrum server's
+        // SP subscription response always uses the correct scan start key.
+        {
+            let mut idx = self.electrum_index.lock().await;
+            idx.sp_start_height = start;
+        }
 
         let genesis_hash = BlockHash::from_byte_array(
             indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
@@ -188,6 +197,92 @@ impl Scanner {
                         balance.trusted_pending,
                         balance.untrusted_pending
                     );
+
+                    // --- Electrum index update ---
+                    // Update the wallet-scoped Electrum index while the full block is in hand.
+                    // The block is already fetched from P2P so this costs nothing extra.
+                    {
+                        let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
+                            .internal_indexer
+                            .index()
+                            .by_shared_secret
+                            .keys()
+                            .cloned()
+                            .collect();
+
+                        let header_hex = hex::encode(
+                            bitcoin::consensus::encode::serialize(&block.header),
+                        );
+
+                        let mut idx = self.electrum_index.lock().await;
+                        idx.headers.insert(block_height_u32, header_hex.clone());
+                        idx.tip = Some((block_height_u32, header_hex));
+
+                        for tx in &block.txdata {
+                            let txid = tx.compute_txid();
+                            let mut is_ours = false;
+                            for (vout, output) in tx.output.iter().enumerate() {
+                                let outpoint = bitcoin::OutPoint {
+                                    txid,
+                                    vout: vout as u32,
+                                };
+                                if owned_outpoints.contains(&outpoint) {
+                                    is_ours = true;
+                                    let scripthash =
+                                        electrum_scripthash(&output.script_pubkey);
+                                    let entry = ScriptHashEntry {
+                                        tx_hash: txid.to_string(),
+                                        height: block_height_u32,
+                                        fee: 0,
+                                    };
+                                    let history = idx
+                                        .scripthash_history
+                                        .entry(scripthash)
+                                        .or_default();
+                                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                                        history.push(entry);
+                                        history.sort_by_key(|e| e.height);
+                                    }
+                                }
+                            }
+                            if is_ours {
+                                let raw = bitcoin::consensus::encode::serialize(tx);
+                                idx.txs.insert(txid.to_string(), raw);
+                            }
+                        }
+
+                        // SP history — use confirmed txid_to_partial_secret
+                        // (populated by apply_block_relevant for this block's matches).
+                        for tx in &block.txdata {
+                            let txid = tx.compute_txid();
+                            if let Some(secret) = self
+                                .internal_indexer
+                                .index()
+                                .txid_to_partial_secret
+                                .get(&txid)
+                            {
+                                let entry = SpHistoryEntry {
+                                    tx_hash: txid.to_string(),
+                                    height: block_height_u32,
+                                    tweak_hex: secret.to_string(),
+                                };
+                                if !idx.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                                    idx.sp_history.push(entry);
+                                    idx.sp_history.sort_by_key(|e| e.height);
+                                }
+                            }
+                        }
+
+                        // Track progress for incremental SP notifications.
+                        // start/end are block_scan_data range params — available in scope.
+                        let scanned = block_identifier.block_height.saturating_sub(start) + 1;
+                        let total = end.saturating_sub(start) + 1;
+                        idx.scan_progress = (scanned as f32 / total as f32).min(1.0);
+                    }
+
+                    // Signal the Electrum push task that the index has new data.
+                    let utxo_count = self.internal_indexer.index().by_shared_secret.len();
+                    let _ = self.notify_found_utxos.send(utxo_count);
                 }
                 Err(e) => {
                     println!("Error scanning short block data: {e:?}");
@@ -233,7 +328,7 @@ impl Scanner {
     /// watch the chain for new utxos and spent outpoints
     /// this is a long running task that will watch the chain for new utxos and spent outpoints
     /// and notify the user via the notifiers
-    pub async fn watch_chain(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         todo!()
     }
 
@@ -241,7 +336,7 @@ impl Scanner {
     fn scan_short_block_data(
         &mut self,
         block_data: BlockScanDataShortResponse,
-    ) -> Result<Option<ProbableMatch>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<ProbableMatch>, ScannerError> {
         // todo: first append to list then push notifications.
         //  We need to check for the actual match and not just a probablistic match.
 
@@ -330,7 +425,7 @@ impl Scanner {
     fn probabilistic_match(
         &mut self,
         item: &ComputeIndexTxItem,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, ScannerError> {
         let tweak_len = item.tweak.len();
         let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
             std::io::Error::new(
@@ -360,7 +455,7 @@ impl Scanner {
         &self,
         tweak: &PublicKey,
         short_pubkeys: &[u8],
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, ScannerError> {
         let ecdh_shared_secret: PublicKey =
             bdk_sp::compute_shared_secret(self.internal_indexer.scan_sk(), tweak);
 
@@ -392,7 +487,7 @@ impl Scanner {
     pub fn scan_transaction_full(
         &mut self,
         item: &FullTxItem,
-    ) -> Result<Vec<SpOut>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<SpOut>, ScannerError> {
         let tweak =
             PublicKey::from_slice(&item.tweak).expect("tweak must be a valid secp256k1 public key");
 

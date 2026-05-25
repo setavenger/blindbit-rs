@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bitcoin::BlockHash;
 use bitcoin::Network as BTCNetwork;
@@ -13,7 +14,7 @@ use bitcoin_rev::Network;
 use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use tonic::transport::Channel;
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
@@ -21,6 +22,8 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::ChangeSet;
 use super::config::ScannerConfig;
+use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
+use super::ScannerError;
 
 /// Main scanner struct for scanning the blockchain for Silent Payments outputs
 pub struct Scanner {
@@ -71,6 +74,11 @@ pub struct Scanner {
 
     /// highest number m used for a lable, uses continuous gapless labels
     pub(crate) max_label_num: u32,
+
+    /// Wallet-scoped Electrum index for single-server friglet mode.
+    /// Shared with the Electrum TCP server via Arc so it can serve requests
+    /// without waiting on the scanner lock.
+    pub(crate) electrum_index: Arc<Mutex<WalletElectrumIndex>>,
 }
 
 impl Scanner {
@@ -121,6 +129,10 @@ impl Scanner {
             stage.indexer.merge(indexer.add_label(i));
         }
 
+        let sp_address = indexer
+            .get_address(convert_network(network))
+            .to_string();
+
         Self {
             client,
             p2p_peer: p2p_socket_addr,
@@ -136,6 +148,12 @@ impl Scanner {
             state_file,
             network,
             max_label_num,
+            electrum_index: Arc::new(Mutex::new({
+                let mut idx = WalletElectrumIndex::new();
+                idx.sp_address = sp_address;
+                idx.sp_labels = (0..=max_label_num).collect();
+                idx
+            })),
         }
     }
 
@@ -143,7 +161,7 @@ impl Scanner {
     ///
     /// This is a convenience constructor that takes a ScannerConfig instead of
     /// individual parameters. The Oracle client will be created automatically.
-    pub async fn from_config(config: &ScannerConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn from_config(config: &ScannerConfig) -> Result<Self, ScannerError> {
         // Validate configuration
         config.validate()?;
 
@@ -221,6 +239,115 @@ impl Scanner {
     //     outputs
     // }
 
+    /// Returns a cloned Arc to the wallet-scoped Electrum index.
+    /// The Electrum TCP server holds this Arc and serves requests without
+    /// locking the scanner itself.
+    pub fn electrum_index(&self) -> Arc<Mutex<WalletElectrumIndex>> {
+        self.electrum_index.clone()
+    }
+
+    /// Returns the P2P peer address. Used by the Electrum server to broadcast txs.
+    pub fn p2p_peer(&self) -> SocketAddr {
+        self.p2p_peer
+    }
+
+    /// Returns the network. Used by the Electrum server for P2P broadcast.
+    pub fn network(&self) -> Network {
+        self.network
+    }
+
+    /// Rebuild the Electrum index from the persisted graph after loading from state.
+    ///
+    /// Raw tx bytes are recovered from the BDK graph (transactions are stored
+    /// in the graph changeset and survive restarts). Call this once after
+    /// `from_changeset` / `load_scanner` and before starting the Electrum server.
+    ///
+    /// `scan_start_height` should match the configured scan start so that
+    /// Sparrow's subscription key matches across restarts.
+    pub async fn rebuild_electrum_index_from_graph(&self, scan_start_height: u64) {
+        let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
+            .internal_indexer
+            .index()
+            .by_shared_secret
+            .keys()
+            .cloned()
+            .collect();
+
+        let mut index = self.electrum_index.lock().await;
+        index.sp_start_height = scan_start_height;
+
+        for inner_tx in self.internal_indexer.graph().full_txs() {
+            let Some(anchor) = inner_tx.anchors.first() else {
+                continue;
+            };
+            let height = anchor.block_id.height;
+            let txid = inner_tx.txid;
+
+            // inner_tx.tx is Arc<bitcoin::Transaction> in bdk-chain TxNode.
+            // If this field name differs in setavenger/bdk-sp, adjust here.
+            let raw = bitcoin::consensus::encode::serialize(inner_tx.tx.as_ref());
+
+            let mut is_ours = false;
+            for (vout, output) in inner_tx.tx.output.iter().enumerate() {
+                let outpoint = bitcoin::OutPoint {
+                    txid,
+                    vout: vout as u32,
+                };
+                if owned_outpoints.contains(&outpoint) {
+                    is_ours = true;
+                    let scripthash = electrum_scripthash(&output.script_pubkey);
+                    let entry = ScriptHashEntry {
+                        tx_hash: txid.to_string(),
+                        height,
+                        fee: 0,
+                    };
+                    let history = index.scripthash_history.entry(scripthash).or_default();
+                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                        history.push(entry);
+                    }
+                }
+            }
+
+            if is_ours {
+                index.txs.insert(txid.to_string(), raw);
+            }
+
+            // SP history from txid_to_partial_secret
+            if let Some(secret) = self
+                .internal_indexer
+                .index()
+                .txid_to_partial_secret
+                .get(&txid)
+            {
+                let entry = SpHistoryEntry {
+                    tx_hash: txid.to_string(),
+                    height,
+                    tweak_hex: secret.to_string(),
+                };
+                if !index.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                    index.sp_history.push(entry);
+                }
+            }
+        }
+
+        // Sort all histories by height ascending (Electrum spec order).
+        for history in index.scripthash_history.values_mut() {
+            history.sort_by_key(|e| e.height);
+        }
+        index.sp_history.sort_by_key(|e| e.height);
+
+        // Restore tip height from last_scanned_block_height.
+        // Header hex is not recoverable without re-fetching; Sparrow's BlockHeaderTip
+        // handles an empty hex gracefully.
+        if self.last_scanned_block_height > 0 {
+            let h = self.last_scanned_block_height as u32;
+            let hex = index.headers.get(&h).cloned().unwrap_or_default();
+            index.tip = Some((h, hex));
+        }
+
+        index.scan_progress = 1.0;
+    }
+
     /// subscribe to notifications when a new utxo is found
     pub fn subscribe_to_found_utxos(&self) -> broadcast::Receiver<usize> {
         self.notify_found_utxos.subscribe()
@@ -295,7 +422,7 @@ impl Scanner {
     ///
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
-    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ScannerError> {
         // TODO:Create directory if it does not exist?
 
         // Ensure we have the keys in the changeset for reconstruction
@@ -332,7 +459,7 @@ impl Scanner {
     #[cfg(feature = "serde")]
     pub fn load_from_file<P: AsRef<Path>>(
         path: P,
-    ) -> Result<ChangeSet, Box<dyn std::error::Error>> {
+    ) -> Result<ChangeSet, ScannerError> {
         let json = std::fs::read_to_string(path)?;
         let mut json_value: serde_json::Value =
             serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))?;
@@ -374,7 +501,7 @@ impl Scanner {
         mut changeset: ChangeSet,
         state_file: PathBuf,
         network: Network,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, ScannerError> {
         // Extract keys from changeset
         let secret_scan_hex = changeset
             .secret_scan_hex
@@ -416,6 +543,10 @@ impl Scanner {
         changeset.secret_scan_hex = Some(secret_scan_hex);
         changeset.public_spend_hex = Some(public_spend_hex);
 
+        let sp_address = indexer
+            .get_address(convert_network(network))
+            .to_string();
+
         Ok(Self {
             client,
             p2p_peer: p2p_socket_addr,
@@ -431,6 +562,12 @@ impl Scanner {
             state_file: state_file,
             network: network,
             max_label_num,
+            electrum_index: Arc::new(Mutex::new({
+                let mut idx = WalletElectrumIndex::new();
+                idx.sp_address = sp_address;
+                idx.sp_labels = (0..=max_label_num).collect();
+                idx
+            })),
         })
     }
 }

@@ -16,12 +16,45 @@ use bitcoin_rev::Network;
 use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
 use bitcoin_rev::consensus::encode;
 
+use super::ScannerError;
+
+/// Broadcast a raw transaction to a P2P peer.
+///
+/// Sends a `tx` message directly. Most nodes accept unsolicited tx messages.
+/// Returns the txid hex string on success.
+pub fn broadcast_tx(
+    p2p_peer: SocketAddr,
+    network: Network,
+    raw_tx_hex: &str,
+) -> Result<String, ScannerError> {
+    let tx_bytes = hex::decode(raw_tx_hex)?;
+
+    // Parse with the standard bitcoin crate to compute the txid.
+    let bitcoin_tx: bitcoin::Transaction =
+        bitcoin::consensus::encode::deserialize(&tx_bytes)?;
+    let txid = bitcoin_tx.compute_txid().to_string();
+
+    // Re-parse with bitcoin_rev (the commit that bitcoin-p2p expects).
+    // bitcoin_rev is a re-export of rust-bitcoin at a specific commit; Transaction
+    // lives at the crate root just like in the standard bitcoin crate.
+    let prim_tx: bitcoin_rev::Transaction = encode::deserialize(&tx_bytes)?;
+
+    let connection_config = ConnectionConfig::new().change_network(network);
+    let (writer, _reader, _metadata) =
+        connection_config.open_connection(p2p_peer, TimeoutParams::default())?;
+
+    writer.send_message(NetworkMessage::Tx(prim_tx))?;
+
+    println!("Broadcast tx: {txid}");
+    Ok(txid)
+}
+
 /// Pull a block from a P2P peer by block hash
 pub fn pull_block_from_p2p_by_blockhash(
     p2p_peer: SocketAddr,
     block_hash: BlockHash,
     network: Network,
-) -> Result<Block, Box<dyn std::error::Error>> {
+) -> Result<Block, ScannerError> {
     println!("Connecting to peer: {}", p2p_peer);
     println!("Requesting block: {block_hash}");
 

@@ -72,7 +72,7 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -113,6 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let loaded_scanner = scanner::load_scanner(&config).await?;
+
+            // Pre-populate the Electrum index from the persisted BDK graph so that
+            // Sparrow can immediately fetch wallet history after a restart.
+            loaded_scanner.rebuild_electrum_index_from_graph(start_height).await;
+
             let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
             // launch the scanner in the background
@@ -148,9 +153,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let electrum_scanner = bg_scanner.clone();
             let electrum_start_height = start_height;
+            let electrum_p2p_addr = p2p_socket_addr;
+            let electrum_network = network;
             let electrum_server = async move {
-                if let Err(e) =
-                    electrum::run(electrum_scanner, electrum_start_height, &electrum_addr).await
+                if let Err(e) = electrum::run(
+                    electrum_scanner,
+                    electrum_start_height,
+                    &electrum_addr,
+                    electrum_p2p_addr,
+                    electrum_network,
+                )
+                .await
                 {
                     eprintln!("Electrum server error: {}", e);
                 }
