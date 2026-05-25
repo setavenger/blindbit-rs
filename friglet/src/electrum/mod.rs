@@ -165,6 +165,20 @@ async fn handle_request(
                 .await?;
         }
 
+        "server.banner" => {
+            let resp = JsonRpcResponse::success(
+                request.id.clone(),
+                Value::String(
+                    "Friglet personal silent payment scanner\n\
+                     Silent payments only — use a regular Electrum server for wallet sync."
+                        .to_string(),
+                ),
+            );
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
+
         "server.features" => {
             let resp = JsonRpcResponse::success(
                 request.id.clone(),
@@ -209,6 +223,43 @@ async fn handle_request(
                 request.id.clone(),
                 Value::String(s.get_scanner_sp_address()),
             );
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
+
+        // Minimal Electrum handshake stubs so Sparrow can complete its connection
+        // test. Friglet is not a full Electrum server — use alongside electrs/Fulcrum.
+        "blockchain.headers.subscribe" => {
+            let s = state.scanner.lock().await;
+            let resp = JsonRpcResponse::success(
+                request.id.clone(),
+                json!({
+                    "height": s.get_last_scanned_block_height(),
+                    "hex": null
+                }),
+            );
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
+
+        "blockchain.estimatefee" => {
+            let resp = JsonRpcResponse::success(request.id.clone(), json!(0.0001));
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
+
+        "blockchain.relayfee" => {
+            let resp = JsonRpcResponse::success(request.id.clone(), json!(0.00001));
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
+
+        "mempool.get_fee_histogram" => {
+            let resp = JsonRpcResponse::success(request.id.clone(), json!([]));
             writer
                 .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
                 .await?;
