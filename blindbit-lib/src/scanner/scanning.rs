@@ -215,6 +215,20 @@ impl Scanner {
                             .cloned()
                             .collect();
 
+                        // Build outpoint → script map from the graph so we can derive the
+                        // scripthash of a spent output without re-fetching anything.
+                        let mut outpoint_scripts: HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
+                            HashMap::new();
+                        for node in self.internal_indexer.graph().full_txs() {
+                            let node_txid = node.txid;
+                            for (vout, out) in node.tx.output.iter().enumerate() {
+                                let op = bitcoin::OutPoint { txid: node_txid, vout: vout as u32 };
+                                if owned_outpoints.contains(&op) {
+                                    outpoint_scripts.insert(op, out.script_pubkey.clone());
+                                }
+                            }
+                        }
+
                         let header_hex = hex::encode(
                             bitcoin::consensus::encode::serialize(&block.header),
                         );
@@ -226,6 +240,8 @@ impl Scanner {
                         for tx in &block.txdata {
                             let txid = tx.compute_txid();
                             let mut is_ours = false;
+
+                            // Receiving side: outputs belonging to the wallet.
                             for (vout, output) in tx.output.iter().enumerate() {
                                 let outpoint = bitcoin::OutPoint {
                                     txid,
@@ -250,6 +266,32 @@ impl Scanner {
                                     }
                                 }
                             }
+
+                            // Spending side: inputs that consume one of our outputs.
+                            // Sparrow expects the spending tx to also appear in
+                            // blockchain.scripthash.get_history for the spent scripthash.
+                            for input in &tx.input {
+                                if let Some(script) =
+                                    outpoint_scripts.get(&input.previous_output)
+                                {
+                                    is_ours = true;
+                                    let scripthash = electrum_scripthash(script);
+                                    let entry = ScriptHashEntry {
+                                        tx_hash: txid.to_string(),
+                                        height: block_height_u32,
+                                        fee: 0,
+                                    };
+                                    let history = idx
+                                        .scripthash_history
+                                        .entry(scripthash)
+                                        .or_default();
+                                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                                        history.push(entry);
+                                        history.sort_by_key(|e| e.height);
+                                    }
+                                }
+                            }
+
                             if is_ours {
                                 let raw = bitcoin::consensus::encode::serialize(tx);
                                 idx.txs.insert(txid.to_string(), raw);

@@ -273,6 +273,20 @@ impl Scanner {
             .cloned()
             .collect();
 
+        // Build outpoint → script map once so spend detection can look up the
+        // scripthash of a consumed output without re-iterating the graph.
+        let mut outpoint_scripts: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
+            std::collections::HashMap::new();
+        for node in self.internal_indexer.graph().full_txs() {
+            let txid = node.txid;
+            for (vout, out) in node.tx.output.iter().enumerate() {
+                let op = bitcoin::OutPoint { txid, vout: vout as u32 };
+                if owned_outpoints.contains(&op) {
+                    outpoint_scripts.insert(op, out.script_pubkey.clone());
+                }
+            }
+        }
+
         let mut index = self.electrum_index.lock().await;
         index.sp_start_height = scan_start_height;
 
@@ -283,11 +297,11 @@ impl Scanner {
             let height = anchor.block_id.height;
             let txid = inner_tx.txid;
 
-            // inner_tx.tx is Arc<bitcoin::Transaction> in bdk-chain TxNode.
-            // If this field name differs in setavenger/bdk-sp, adjust here.
             let raw = bitcoin::consensus::encode::serialize(inner_tx.tx.as_ref());
 
             let mut is_ours = false;
+
+            // Receiving side: outputs belonging to the wallet.
             for (vout, output) in inner_tx.tx.output.iter().enumerate() {
                 let outpoint = bitcoin::OutPoint {
                     txid,
@@ -296,6 +310,23 @@ impl Scanner {
                 if owned_outpoints.contains(&outpoint) {
                     is_ours = true;
                     let scripthash = electrum_scripthash(&output.script_pubkey);
+                    let entry = ScriptHashEntry {
+                        tx_hash: txid.to_string(),
+                        height,
+                        fee: 0,
+                    };
+                    let history = index.scripthash_history.entry(scripthash).or_default();
+                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
+                        history.push(entry);
+                    }
+                }
+            }
+
+            // Spending side: inputs that consume one of our outputs.
+            for input in inner_tx.tx.input.iter() {
+                if let Some(script) = outpoint_scripts.get(&input.previous_output) {
+                    is_ours = true;
+                    let scripthash = electrum_scripthash(script);
                     let entry = ScriptHashEntry {
                         tx_hash: txid.to_string(),
                         height,
