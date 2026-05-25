@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use blindbit_lib::scanner::Scanner;
 
-use crate::types::{FrigateHistory, FrigateResponse};
+use crate::types::FrigateResponse;
 
 /// Electrum JSON-RPC request
 #[derive(Debug, Deserialize)]
@@ -67,28 +67,22 @@ impl JsonRpcResponse {
     }
 }
 
-/// Build FrigateResponse from scanner state (same logic as HTTP endpoint)
-fn build_frigate_response(scanner: &Scanner) -> FrigateResponse {
-    let relevant_txs = scanner.get_relevant_txs();
-    let history: Vec<FrigateHistory> = relevant_txs
-        .iter()
-        .map(|tx_data| FrigateHistory::from_relevant_tx_data(tx_data))
-        .collect();
-
-    FrigateResponse::new(
-        scanner.get_scanner_sp_address(),
-        scanner.get_last_scanned_block_height(),
-        (0..=scanner.get_max_label_num()).collect(),
-        1.0,
-        history,
-    )
+struct ElectrumServerState {
+    scanner: Arc<Mutex<Scanner>>,
+    scan_start_height: u64,
 }
 
 /// Run the Electrum TCP server
 pub async fn run(
     scanner: Arc<Mutex<Scanner>>,
+    scan_start_height: u64,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let state = Arc::new(ElectrumServerState {
+        scanner,
+        scan_start_height,
+    });
+
     let listener = TcpListener::bind(addr).await?;
     println!("Electrum server listening on {}", addr);
 
@@ -96,10 +90,10 @@ pub async fn run(
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 println!("Electrum client connected: {}", peer_addr);
-                let scanner = scanner.clone();
+                let state = state.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, scanner).await {
+                    if let Err(e) = handle_client(stream, state).await {
                         eprintln!("Client error {}: {}", peer_addr, e);
                     }
                     println!("Electrum client disconnected: {}", peer_addr);
@@ -113,7 +107,7 @@ pub async fn run(
 /// Handle a single client connection
 async fn handle_client(
     stream: TcpStream,
-    scanner: Arc<Mutex<Scanner>>,
+    state: Arc<ElectrumServerState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -144,7 +138,7 @@ async fn handle_client(
         };
 
         // Handle the request
-        handle_request(&request, &scanner, &mut writer).await?;
+        handle_request(&request, &state, &mut writer).await?;
     }
 
     Ok(())
@@ -153,7 +147,7 @@ async fn handle_client(
 /// Handle a JSON-RPC request
 async fn handle_request(
     request: &JsonRpcRequest,
-    scanner: &Arc<Mutex<Scanner>>,
+    state: &ElectrumServerState,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match request.method.as_str() {
@@ -171,23 +165,37 @@ async fn handle_request(
                 .await?;
         }
 
-        "blockchain.silentpayments.subscribe" => {
-            // TODO: send back start height which is provided in the rpc call
-            let s = scanner.lock().await;
-            let sp_address = s.get_scanner_sp_address();
+        "server.features" => {
+            let resp = JsonRpcResponse::success(
+                request.id.clone(),
+                json!({ "silent_payments": [0] }),
+            );
+            writer
+                .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
+                .await?;
+        }
 
-            // 1. Send initial response with SP address
-            let resp = JsonRpcResponse::success(request.id.clone(), Value::String(sp_address));
+        "blockchain.silentpayments.subscribe" => {
+            let s = state.scanner.lock().await;
+            let frigate_response =
+                FrigateResponse::from_scanner(&s, state.scan_start_height);
+
+            // 1. Send initial response with subscription metadata (Sparrow expects an object)
+            let subscription = serde_json::to_value(&frigate_response.subscription)?;
+            let resp = JsonRpcResponse::success(request.id.clone(), subscription);
             writer
                 .write_all((serde_json::to_string(&resp)? + "\n").as_bytes())
                 .await?;
 
-            // 2. Send notification with full history (same data as HTTP endpoint)
-            let frigate_response = build_frigate_response(&s);
+            // 2. Send notification with positional params: [subscription, progress, history]
             let notification = json!({
                 "jsonrpc": "2.0",
                 "method": "blockchain.silentpayments.subscribe",
-                "params": frigate_response
+                "params": [
+                    frigate_response.subscription,
+                    frigate_response.progress,
+                    frigate_response.history
+                ]
             });
             writer
                 .write_all((serde_json::to_string(&notification)? + "\n").as_bytes())
@@ -196,7 +204,7 @@ async fn handle_request(
 
         "blockchain.silentpayments.unsubscribe" => {
             // No-op internally, but return the SP address as expected
-            let s = scanner.lock().await;
+            let s = state.scanner.lock().await;
             let resp = JsonRpcResponse::success(
                 request.id.clone(),
                 Value::String(s.get_scanner_sp_address()),

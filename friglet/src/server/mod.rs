@@ -1,9 +1,12 @@
-use crate::scanner;
-use crate::types::{FrigateHistory, FrigateResponse};
+use crate::types::FrigateResponse;
 use axum::{Extension, Json};
+use blindbit_lib::scanner::Scanner;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+#[derive(Clone, Copy)]
+pub struct ScanStartHeight(pub u64);
 
 #[derive(Serialize)]
 pub struct HeightResponse {
@@ -11,7 +14,7 @@ pub struct HeightResponse {
 }
 
 pub async fn get_height(
-    Extension(sp_scanner): Extension<Arc<Mutex<scanner::Scanner>>>,
+    Extension(sp_scanner): Extension<Arc<Mutex<Scanner>>>,
 ) -> Json<HeightResponse> {
     let s = sp_scanner.lock().await;
     Json(HeightResponse {
@@ -20,22 +23,9 @@ pub async fn get_height(
 }
 
 pub async fn subscribe(
-    Extension(sp_scanner): Extension<Arc<Mutex<scanner::Scanner>>>,
+    Extension(sp_scanner): Extension<Arc<Mutex<Scanner>>>,
+    Extension(ScanStartHeight(scan_start_height)): Extension<ScanStartHeight>,
 ) -> Json<FrigateResponse> {
     let s = sp_scanner.lock().await;
-
-    let outputs = s.get_relevant_txs();
-
-    let history: Vec<FrigateHistory> = outputs
-        .iter()
-        .map(|out| FrigateHistory::from_relevant_tx_data(out))
-        .collect();
-
-    Json(FrigateResponse::new(
-        s.get_scanner_sp_address(),
-        s.get_last_scanned_block_height(),
-        (0..=s.get_max_label_num()).collect(),
-        1.0,
-        history,
-    ))
+    Json(FrigateResponse::from_scanner(&s, scan_start_height))
 }

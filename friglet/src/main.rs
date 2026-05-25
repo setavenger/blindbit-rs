@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // .route("/utxos", get(get_utxos))
                 .route("/height", get(server::get_height))
                 .route("/subscribe", get(server::subscribe))
+                .layer(Extension(server::ScanStartHeight(start_height)))
                 .layer(Extension(bg_scanner.clone()));
 
             // 5. Start both HTTP and Electrum servers in parallel
@@ -146,8 +147,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let electrum_scanner = bg_scanner.clone();
+            let electrum_start_height = start_height;
             let electrum_server = async move {
-                if let Err(e) = electrum::run(electrum_scanner, &electrum_addr).await {
+                if let Err(e) =
+                    electrum::run(electrum_scanner, electrum_start_height, &electrum_addr).await
+                {
                     eprintln!("Electrum server error: {}", e);
                 }
             };
