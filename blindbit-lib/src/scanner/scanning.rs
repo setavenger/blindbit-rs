@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use bdk_sp::receive::SpOut;
 use bitcoin::hashes::Hash;
+use tokio::time;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use indexer::bdk_chain::bdk_core::Merge;
@@ -43,9 +44,13 @@ impl Scanner {
 
         // Stamp sp_start_height into the index so the Electrum server's
         // SP subscription response always uses the correct scan start key.
+        // Only set it on the first call; watch_chain increments start each
+        // iteration, so we must not overwrite the original wallet birthday.
         {
             let mut idx = self.electrum_index.lock().await;
-            idx.sp_start_height = start;
+            if idx.sp_start_height == 0 {
+                idx.sp_start_height = start;
+            }
         }
 
         let genesis_hash = BlockHash::from_byte_array(
@@ -85,6 +90,21 @@ impl Scanner {
                         }
                         Some(probable_match) => probable_match,
                     };
+                    // Guard: if block_hash is malformed (already warned in
+                    // scan_short_block_data) we cannot pull the full block
+                    // via P2P.  Advance progress and move on.
+                    if block_identifier.block_hash.len() != 32 {
+                        self.notify_electrum_scan_progress(
+                            block_identifier.block_height,
+                            start,
+                            end,
+                        )
+                        .await;
+                        self.last_scanned_block_height = block_identifier.block_height;
+                        self.stage.last_scanned_block_height = block_identifier.block_height;
+                        continue;
+                    }
+
                     // pull the full block data
 
                     // Ensure we have exactly 32 bytes
@@ -92,7 +112,7 @@ impl Scanner {
                     reversed_block_hash_slice.reverse();
                     let block_hash_arr: [u8; 32] = reversed_block_hash_slice
                         .try_into()
-                        .expect("this should always work");
+                        .expect("block_hash length already verified to be 32");
 
                     let block_hash = BlockHash::from_byte_array(block_hash_arr);
 
@@ -397,11 +417,32 @@ impl Scanner {
         let _ = self.notify_found_utxos.send(utxo_count);
     }
 
-    /// watch the chain for new utxos and spent outpoints
-    /// this is a long running task that will watch the chain for new utxos and spent outpoints
-    /// and notify the user via the notifiers
+    /// Watch the chain for new blocks indefinitely.
+    ///
+    /// Polls the oracle every 10 seconds via `GetInfo`.  Whenever the oracle
+    /// height advances past `last_scanned_block_height`, the missing range is
+    /// scanned with `scan_block_range`.  This mirrors `blindbit-desktop`'s
+    /// `Watch()` loop and means callers never need to supply an `end_height`.
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
-        todo!()
+        loop {
+            let oracle_tip = self
+                .client
+                .get_info(tonic::Request::new(()))
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                })?
+                .into_inner()
+                .height;
+
+            if oracle_tip > self.last_scanned_block_height {
+                let from = self.last_scanned_block_height + 1;
+                println!("New blocks available: scanning {from} → {oracle_tip}");
+                self.scan_block_range(from, oracle_tip).await?;
+            }
+
+            time::sleep(time::Duration::from_secs(10)).await;
+        }
     }
 
     /// scan short block data for new utxos and spent outpoints
@@ -420,20 +461,25 @@ impl Scanner {
             .into());
         };
 
-        if block_id.block_hash.len() != 32 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "block hash is not 32 bytes",
+        // If block_hash is missing or malformed, we can still run the probabilistic
+        // tx filter but must skip spent-output notifications (which need the hash).
+        let block_hash_opt: Option<[u8; 32]> = if block_id.block_hash.len() == 32 {
+            Some(
+                block_id
+                    .block_hash
+                    .clone()
+                    .try_into()
+                    .expect("length already checked to be 32"),
             )
-            .into());
-        }
-
-        let block_hash: [u8; 32] = block_id.block_hash.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "block hash is not 32 bytes",
-            )
-        })?;
+        } else {
+            eprintln!(
+                "Warning: block {} has malformed block_hash ({} bytes, expected 32); \
+                 spent-output notifications for this block will be skipped",
+                block_id.block_height,
+                block_id.block_hash.len()
+            );
+            None
+        };
 
         let mut probable_match = ProbableMatch::new(vec![], false);
 
@@ -442,7 +488,6 @@ impl Scanner {
                 Ok(true) => {
                     println!("TxId of interest: {:?}", hex::encode(&item.txid));
                     let txid_len = item.txid.len();
-                    // todo: clean this up
                     let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
                         std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -461,27 +506,28 @@ impl Scanner {
                     if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
                         println!("Error probabilistic match notification: {e:?}");
                     }
-                    // continue;
                 }
                 Ok(false) => continue,
                 Err(e) => return Err(e),
             }
         }
 
-        // make spent pubkey check
-        let spent_outputs_count = block_data.spent_outputs.len() / 8;
-        for i in 0..spent_outputs_count {
-            let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
-            for pubkey in &self.owned_outputs {
-                if pubkey[..8] == *spent_output {
-                    probable_match.spent = true;
+        // Spent-output check — only when we have a valid block_hash to report.
+        if let Some(block_hash) = block_hash_opt {
+            let spent_outputs_count = block_data.spent_outputs.len() / 8;
+            for i in 0..spent_outputs_count {
+                let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
+                for pubkey in &self.owned_outputs {
+                    if pubkey[..8] == *spent_output {
+                        probable_match.spent = true;
 
-                    println!("Spent output: {:?}", hex::encode(pubkey));
-                    if self.notify_spent_outpoints.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                        println!("Error spent output notification: {e:?}");
+                        println!("Spent output: {:?}", hex::encode(pubkey));
+                        if self.notify_spent_outpoints.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
+                            println!("Error spent output notification: {e:?}");
+                        }
                     }
                 }
             }

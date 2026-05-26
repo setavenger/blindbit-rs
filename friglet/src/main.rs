@@ -25,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scan a range of blocks for silent payments
+    /// Scan from start_height to chain tip, then keep watching for new blocks
     Scan {
         /// The scan secret key (32 bytes hex string)
         #[arg(long)]
@@ -35,13 +35,9 @@ enum Commands {
         #[arg(long)]
         spend_pubkey: String,
 
-        /// Start block height
+        /// Start block height (wallet birthday)
         #[arg(long)]
         start_height: u64,
-
-        /// End block height
-        #[arg(long)]
-        end_height: u64,
 
         #[arg(long)]
         p2p_node_addr: String,
@@ -80,7 +76,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             scan_secret,
             spend_pubkey,
             start_height,
-            end_height,
             p2p_node_addr,
             max_label_num,
             oracle_url,
@@ -131,14 +126,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 (index, s.subscribe_to_found_utxos())
             };
 
-            // launch the scanner in the background
+            // Ensure watch_chain starts from start_height on a fresh wallet
+            // (last_scanned_block_height is 0 when there is no saved state).
+            {
+                let mut s = scanner_instance.lock().await;
+                if s.get_last_scanned_block_height() < start_height {
+                    s.update_last_scanned_block_height(start_height.saturating_sub(1));
+                }
+            }
+
+            // Launch the scanner in the background.  watch_chain polls the
+            // oracle for new blocks and runs indefinitely — no end_height needed.
             let bg_scanner_clone = scanner_instance.clone();
-            let start = start_height;
-            let end = end_height;
             tokio::spawn(async move {
                 let mut s = bg_scanner_clone.lock().await;
-                if let Err(e) = s.scan_block_range(start, end).await {
-                    eprintln!("Scan error: {e}");
+                if let Err(e) = s.watch_chain().await {
+                    eprintln!("Watch error: {e}");
                 }
             });
 
