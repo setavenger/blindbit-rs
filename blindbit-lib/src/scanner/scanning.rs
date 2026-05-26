@@ -86,6 +86,13 @@ impl Scanner {
                             .await;
                             self.last_scanned_block_height = block_identifier.block_height;
                             self.stage.last_scanned_block_height = block_identifier.block_height;
+                            // Periodically checkpoint progress so a crash/restart during a
+                            // long initial catch-up scan doesn't lose everything.
+                            if block_identifier.block_height % 1000 == 0 {
+                                if let Err(e) = self.save_to_file(&self.state_file) {
+                                    eprintln!("Warning: Failed to save periodic checkpoint: {e}");
+                                }
+                            }
                             continue;
                         }
                         Some(probable_match) => probable_match,
@@ -390,6 +397,13 @@ impl Scanner {
             balance.trusted_pending,
             balance.untrusted_pending
         );
+
+        // Always persist progress at the end of a scan range so watch_chain
+        // resumes from the correct height after a restart, even when no
+        // wallet-relevant transactions were found in this range.
+        if let Err(e) = self.save_to_file(&self.state_file) {
+            eprintln!("Warning: Failed to save state after scan: {e}");
+        }
 
         Ok(())
     }

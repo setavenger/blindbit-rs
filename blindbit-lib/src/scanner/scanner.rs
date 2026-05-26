@@ -454,7 +454,12 @@ impl Scanner {
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ScannerError> {
-        // TODO:Create directory if it does not exist?
+        // Create parent directory if it does not exist yet.
+        if let Some(parent) = path.as_ref().parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
 
         // Ensure we have the keys in the changeset for reconstruction
         let mut changeset = self.stage.clone();
