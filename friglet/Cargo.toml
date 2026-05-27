@@ -20,3 +20,6 @@ bitcoin = "0.32.7"
 
 # due to bitcoin-p2p using a different version
 bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598", package = "bitcoin" }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

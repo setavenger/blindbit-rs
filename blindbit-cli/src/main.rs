@@ -50,11 +50,15 @@ enum Commands {
 
         #[arg(long, default_value = "bitcoin")]
         network: Network,
+
+        /// Log level: trace, debug, info, warn, error (overridden by RUST_LOG env var)
+        #[arg(long, default_value = "info")]
+        log_level: String,
     },
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -68,7 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             oracle_url,
             state_file,
             network,
+            log_level,
         } => {
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
                 .map_err(|e| format!("Invalid scan_secret: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"))?;
@@ -83,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Create scanner configuration
             let config = ScannerConfig::new(
-                oracle_url,
+                oracle_url.clone(),
                 p2p_socket_addr,
                 secret_scan,
                 public_spend,
@@ -92,28 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 network,
             );
 
-            // Load scanner using the new config-based approach
-            println!("Connecting to oracle service at {}...", config.oracle_url);
+            tracing::info!(oracle_url = %oracle_url, "connecting to oracle service");
             let mut sp_scanner = scanner::load_scanner(&config).await?;
 
-            // Scan the block range
-            println!("Scanning blocks from {start_height} to {end_height}...");
-
-            // Use a result to capture any errors during scanning
+            tracing::info!(start = start_height, end = end_height, "scanning blocks");
             let scan_result = sp_scanner.scan_block_range(start_height, end_height).await;
 
-            // Always try to save state, even if scanning failed
-            println!("Saving scanner state to {}...", state_file.display());
+            tracing::info!(path = %state_file.display(), "saving scanner state");
             if let Err(save_err) = sp_scanner.save_to_file(&state_file) {
-                eprintln!("Warning: Failed to save state: {save_err}");
+                tracing::warn!(error = %save_err, "failed to save state");
             } else {
-                println!("State saved successfully!");
+                tracing::info!("state saved");
             }
 
-            // Return the scan result (will propagate any errors)
             scan_result?;
 
-            println!("Scan completed successfully!");
+            tracing::info!("scan completed successfully");
         }
     }
 

@@ -5,6 +5,7 @@
 
 use bitcoin::Txid;
 use bitcoin::secp256k1::PublicKey;
+use blindbit_lib::scanner::Scanner;
 use serde::{Deserialize, Serialize};
 
 /// Frigate response containing subscription info, progress, and transaction history
@@ -60,5 +61,26 @@ impl FrigateResponse {
             progress,
             history,
         }
+    }
+
+    /// Build a Frigate response from scanner state.
+    ///
+    /// `scan_start_height` is the configured scan range start (not last scanned height).
+    /// Sparrow uses this value as the canonical subscription key and rejects notifications
+    /// where `subscription.start_height` differs.
+    pub fn from_scanner(scanner: &Scanner, scan_start_height: u64) -> Self {
+        let history: Vec<FrigateHistory> = scanner
+            .get_relevant_txs()
+            .iter()
+            .map(FrigateHistory::from_relevant_tx_data)
+            .collect();
+
+        Self::new(
+            scanner.get_scanner_sp_address(),
+            scan_start_height,
+            (0..=scanner.get_max_label_num()).collect(),
+            1.0,
+            history,
+        )
     }
 }
