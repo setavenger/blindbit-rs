@@ -4,7 +4,6 @@ mod types;
 
 use bitcoin_rev::Network;
 use clap::{Parser, Subcommand};
-// use server::{FrigateHistory, FrigateResponse, FrigateSubscription};
 use std::sync::Arc;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 use tokio::sync::Mutex;
@@ -64,6 +63,10 @@ enum Commands {
         /// Electrum TCP server address
         #[arg(long, default_value = "127.0.0.1:50001")]
         electrum_addr: String,
+
+        /// Log level: trace, debug, info, warn, error (overridden by RUST_LOG env var)
+        #[arg(long, default_value = "info")]
+        log_level: String,
     },
 }
 
@@ -83,7 +86,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             network,
             http_addr,
             electrum_addr,
+            log_level,
         } => {
+            // Initialise structured logging.  RUST_LOG takes precedence; the
+            // --log-level flag sets the default when RUST_LOG is not set.
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+
             // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
                 .map_err(|e| format!("Invalid scan_secret: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"))?;
@@ -95,6 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Parse the P2P socket address
             let p2p_socket_addr = SocketAddr::from_str(&p2p_node_addr)
                 .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
+
+            tracing::info!(
+                oracle_url = %oracle_url,
+                p2p_peer = %p2p_socket_addr,
+                network = %network,
+                start_height,
+                "starting friglet"
+            );
 
             // Create scanner configuration
             let config = scanner::ScannerConfig::new(
@@ -141,7 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::spawn(async move {
                 let mut s = bg_scanner_clone.lock().await;
                 if let Err(e) = s.watch_chain().await {
-                    eprintln!("Watch error: {e}");
+                    tracing::error!(error = %e, "watch_chain terminated with error");
                 }
             });
 
@@ -149,7 +170,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // 4. Create HTTP server
             let app = Router::new()
-                // .route("/utxos", get(get_utxos))
                 .route("/height", get(server::get_height))
                 .route("/subscribe", get(server::subscribe))
                 .layer(Extension(server::ScanStartHeight(start_height)))
@@ -161,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let listener = tokio::net::TcpListener::bind(&http_addr_clone)
                     .await
                     .expect("Failed to bind HTTP server");
-                println!("HTTP server listening on {}", http_addr_clone);
+                tracing::info!(addr = %http_addr_clone, "HTTP server listening");
                 axum::serve(listener, app)
                     .await
                     .expect("HTTP server failed");
@@ -179,17 +199,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 )
                 .await
                 {
-                    eprintln!("Electrum server error: {}", e);
+                    tracing::error!(error = %e, "Electrum server terminated with error");
                 }
             };
 
             // Run both servers concurrently
             tokio::select! {
                 _ = http_server => {
-                    println!("HTTP server stopped");
+                    tracing::info!("HTTP server stopped");
                 }
                 _ = electrum_server => {
-                    println!("Electrum server stopped");
+                    tracing::info!("Electrum server stopped");
                 }
             }
 

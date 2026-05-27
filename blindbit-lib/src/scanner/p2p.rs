@@ -20,8 +20,14 @@ use super::ScannerError;
 
 /// Broadcast a raw transaction to a P2P peer.
 ///
-/// Sends a `tx` message directly. Most nodes accept unsolicited tx messages.
-/// Returns the txid hex string on success.
+/// Opens a fresh P2P connection, completes the handshake, sends the raw `tx`
+/// message, then reads back up to `MAX_READBACK` messages before closing.
+/// Reading back is important: it keeps the connection open long enough for the
+/// peer to fully process the payload, and surfaces any `reject` or other
+/// diagnostic messages that would otherwise be silently discarded.
+///
+/// Returns the txid hex string on success.  Returns an error if the peer sends
+/// a `reject`-equivalent response or if any I/O step fails.
 pub fn broadcast_tx(
     p2p_peer: SocketAddr,
     network: Network,
@@ -35,17 +41,55 @@ pub fn broadcast_tx(
     let txid = bitcoin_tx.compute_txid().to_string();
 
     // Re-parse with bitcoin_rev (the commit that bitcoin-p2p expects).
-    // bitcoin_rev is a re-export of rust-bitcoin at a specific commit; Transaction
-    // lives at the crate root just like in the standard bitcoin crate.
     let prim_tx: bitcoin_rev::Transaction = encode::deserialize(&tx_bytes)?;
 
+    tracing::debug!(peer = %p2p_peer, "connecting to P2P peer for broadcast");
+
     let connection_config = ConnectionConfig::new().change_network(network);
-    let (writer, _reader, _metadata) =
+    let (writer, mut reader, metadata) =
         connection_config.open_connection(p2p_peer, TimeoutParams::default())?;
 
-    writer.send_message(NetworkMessage::Tx(prim_tx))?;
+    tracing::debug!(
+        peer_height = metadata.feeler_data().reported_height,
+        services = %metadata.feeler_data().services,
+        "P2P handshake complete"
+    );
 
-    println!("Broadcast tx: {txid}");
+    writer.send_message(NetworkMessage::Tx(prim_tx))?;
+    tracing::info!(txid = %txid, peer = %p2p_peer, "transaction sent to P2P peer");
+
+    // Drain the immediate post-handshake messages the peer sends right after
+    // the connection is established (sendcmpct / sendheaders / feefilter /
+    // ping).  Reading these:
+    //   1. Keeps the TCP socket open long enough for the peer to receive the Tx
+    //   2. Surfaces any immediate rejection the peer might send
+    //
+    // We stop after a small fixed count because after those 3-4 quick setup
+    // messages the peer only sends keepalive pings every ~30 s — waiting for
+    // them would block the caller for minutes.  Any rejection arrives within
+    // the first few messages (BIP-61 reject, if enabled, follows the tx almost
+    // immediately).
+    const MAX_READBACK: usize = 3;
+    let mut n = 0;
+    loop {
+        match reader.read_message() {
+            Ok(Some(msg)) => {
+                let cmd = msg.command();
+                tracing::debug!(command = %cmd, "received P2P message after broadcast");
+                n += 1;
+                if n >= MAX_READBACK {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(error = %e, "P2P read ended after broadcast (expected)");
+                break;
+            }
+        }
+    }
+
+    tracing::info!(txid = %txid, "broadcast complete");
     Ok(txid)
 }
 
@@ -55,8 +99,7 @@ pub fn pull_block_from_p2p_by_blockhash(
     block_hash: BlockHash,
     network: Network,
 ) -> Result<Block, ScannerError> {
-    println!("Connecting to peer: {}", p2p_peer);
-    println!("Requesting block: {block_hash}");
+    tracing::debug!(peer = %p2p_peer, block_hash = %block_hash, "connecting to peer for block fetch");
 
     let connection_config = ConnectionConfig::new();
     let connection_config = connection_config.change_network(network);
@@ -65,10 +108,10 @@ pub fn pull_block_from_p2p_by_blockhash(
     let (writer, mut reader, metadata) =
         connection_config.open_connection(p2p_peer, TimeoutParams::default())?;
 
-    println!(
-        "Connected! Peer height: {}, services: {}",
-        metadata.feeler_data().reported_height,
-        metadata.feeler_data().services
+    tracing::debug!(
+        peer_height = metadata.feeler_data().reported_height,
+        services = %metadata.feeler_data().services,
+        "P2P handshake complete, requesting block"
     );
 
     // Request the block
@@ -79,7 +122,7 @@ pub fn pull_block_from_p2p_by_blockhash(
     let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
 
     writer.send_message(net_msg)?;
-    println!("Sent GetData request, waiting for block...");
+    tracing::debug!("sent GetData for block, waiting for response");
 
     // Read messages until we receive the block
     let mut message_count = 0;
@@ -90,18 +133,16 @@ pub fn pull_block_from_p2p_by_blockhash(
                 let block_bytes = encode::serialize(&block);
 
                 let block: Block = bitcoin::consensus::encode::deserialize(&block_bytes)?;
-                println!("\n✓ Received block!");
-                println!("  Block hash: {}", block.block_hash());
-                println!("  Transactions: {:?}", block.txdata.len());
+                tracing::info!(
+                    block_hash = %block.block_hash(),
+                    tx_count = block.txdata.len(),
+                    "received block from peer"
+                );
                 return Ok(block);
             }
             Some(msg) => {
                 message_count += 1;
-                if message_count <= 5 {
-                    println!("  Received: {:?} (waiting for block...)", msg.command());
-                } else if message_count == 6 {
-                    println!("  ... (continuing to wait for block)");
-                }
+                tracing::trace!(command = %msg.command(), count = message_count, "received message while waiting for block");
             }
             None => continue,
         }

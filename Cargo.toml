@@ -5,6 +5,10 @@ members = ["blindbit-cli", "blindbit-lib", "friglet"]
 [workspace.package]
 authors = ["Setor"]
 
+[workspace.dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # [profile.release]
 # debug = "line-tables-only"
 

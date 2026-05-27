@@ -16,10 +16,7 @@ pub async fn load_scanner(config: &ScannerConfig) -> Result<Scanner, ScannerErro
     config.validate()?;
 
     let sp_scanner = if config.state_file.exists() {
-        println!(
-            "Loading scanner state from {}...",
-            config.state_file.display()
-        );
+        tracing::info!(path = %config.state_file.display(), "loading scanner state");
         match Scanner::load_from_file(&config.state_file) {
             Ok(changeset) => {
                 // Connect to oracle service for restoring from changeset
@@ -33,24 +30,22 @@ pub async fn load_scanner(config: &ScannerConfig) -> Result<Scanner, ScannerErro
                 ) {
                     Ok(scanner) => {
                         let last_height = scanner.get_last_scanned_block_height();
-                        println!("Loaded state. Last scanned height: {}", last_height);
+                        tracing::info!(last_scanned_height = last_height, "scanner state loaded");
                         scanner
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to restore from state file: {e}");
-                        eprintln!("Creating new scanner...");
+                        tracing::warn!(error = %e, "failed to restore from state file, creating new scanner");
                         create_new_scanner(config).await?
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Failed to load state file: {e}");
-                eprintln!("Creating new scanner...");
+                tracing::warn!(error = %e, "failed to load state file, creating new scanner");
                 create_new_scanner(config).await?
             }
         }
     } else {
-        println!("No existing state file found. Creating new scanner...");
+        tracing::info!("no existing state file, creating new scanner");
         create_new_scanner(config).await?
     };
 

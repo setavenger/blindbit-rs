@@ -20,9 +20,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast};
+use tokio::time::{Duration, Instant, timeout_at};
 
 use bitcoin_rev::Network;
-use blindbit_lib::scanner::{WalletElectrumIndex, electrum_status};
+use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
+use blindbit_lib::scanner::{ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
 use blindbit_lib::scanner::broadcast_tx;
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,12 @@ pub async fn run(
 
     // Background push task: receives a signal whenever the scanner updates the
     // index and broadcasts pre-serialised JSON notifications to all clients.
+    //
+    // During initial scan the scanner fires a signal for every block, which
+    // could be hundreds of thousands of signals.  Without debouncing this
+    // floods Sparrow with notifications faster than it can process them,
+    // causing UI freezes.  We drain all signals that arrive within a 1-second
+    // window and issue a single push for the whole batch.
     {
         let state = state.clone();
         tokio::spawn(async move {
@@ -130,9 +138,24 @@ pub async fn run(
             // first wallet match before seeing scan progress / tip height.
             push_notifications(&state).await;
 
+            const DEBOUNCE: Duration = Duration::from_millis(1000);
+
             loop {
                 match found_rx.recv().await {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Drain any additional signals that arrive within the
+                        // debounce window so fast scanning collapses into one push.
+                        let deadline = Instant::now() + DEBOUNCE;
+                        loop {
+                            match timeout_at(deadline, found_rx.recv()).await {
+                                Ok(Ok(_))
+                                | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                                    // more signals in the window — keep draining
+                                }
+                                Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                                Err(_elapsed) => break, // window expired
+                            }
+                        }
                         push_notifications(&state).await;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -142,21 +165,21 @@ pub async fn run(
     }
 
     let listener = TcpListener::bind(addr).await?;
-    println!("Electrum server listening on {}", addr);
+    tracing::info!(addr = %addr, "Electrum server listening");
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                println!("Electrum client connected: {}", peer_addr);
+                tracing::info!(peer = %peer_addr, "Electrum client connected");
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, state).await {
-                        eprintln!("Client error {}: {}", peer_addr, e);
+                        tracing::error!(peer = %peer_addr, error = %e, "Electrum client error");
                     }
-                    println!("Electrum client disconnected: {}", peer_addr);
+                    tracing::info!(peer = %peer_addr, "Electrum client disconnected");
                 });
             }
-            Err(e) => eprintln!("Accept error: {}", e),
+            Err(e) => tracing::error!(error = %e, "Electrum accept error"),
         }
     }
 }
@@ -184,17 +207,26 @@ async fn push_notifications(state: &ElectrumServerState) {
             .send(serde_json::to_string(&notification).unwrap() + "\n");
     }
 
-    // blockchain.scripthash.subscribe — one per known scripthash
-    for (scripthash, history) in &index.scripthash_history {
-        let status = electrum_status(history);
-        let notification = json!({
-            "jsonrpc": "2.0",
-            "method": "blockchain.scripthash.subscribe",
-            "params": [scripthash, status]
-        });
-        let _ = state
-            .push_tx
-            .send(serde_json::to_string(&notification).unwrap() + "\n");
+    // blockchain.scripthash.subscribe — one per known scripthash.
+    //
+    // Skip during an active scan (progress < 1.0): there is nothing useful
+    // Sparrow can do with a scripthash notification while the scan is still
+    // running, and broadcasting N notifications per block would flood Sparrow
+    // with events faster than it can service them.  A final push is issued
+    // when scan_progress reaches 1.0, at which point Sparrow performs its
+    // normal one-time history refresh.
+    if index.scan_progress >= 1.0 {
+        for (scripthash, history) in &index.scripthash_history {
+            let status = electrum_status(history);
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scripthash.subscribe",
+                "params": [scripthash, status]
+            });
+            let _ = state
+                .push_tx
+                .send(serde_json::to_string(&notification).unwrap() + "\n");
+        }
     }
 
     // blockchain.silentpayments.subscribe
@@ -292,6 +324,88 @@ async fn handle_client(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unconfirmed-tx indexing
+// ---------------------------------------------------------------------------
+
+/// After a successful P2P broadcast, add the tx to the Electrum index at
+/// height 0 so that Sparrow's `TransactionMempoolService` immediately finds
+/// it via `blockchain.scripthash.get_history` without waiting for the next
+/// confirmed block.
+///
+/// Strategy:
+/// - For each **input**, look up the previous tx in `idx.txs` and resolve the
+///   spent output's script → scripthash.  This is the scripthash Sparrow polls
+///   (the address of the UTXO being spent).
+/// - For each **output** whose scripthash is already tracked in the index
+///   (e.g. change going back to a known SP address), add the tx there too.
+/// - The raw tx bytes are stored in `idx.txs` so `blockchain.transaction.get`
+///   can serve the tx before it confirms.
+async fn index_unconfirmed_tx(
+    index: &Arc<Mutex<WalletElectrumIndex>>,
+    raw_hex: &str,
+    txid: &str,
+) {
+    let tx_bytes = match hex::decode(raw_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to decode broadcast tx for mempool indexing");
+            return;
+        }
+    };
+    let tx: bitcoin::Transaction = match bitcoin_deserialize(&tx_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to parse broadcast tx for mempool indexing");
+            return;
+        }
+    };
+
+    let mut idx = index.lock().await;
+
+    // Resolve input scripthashes first (immutable borrow of idx.txs).
+    let mut affected_scripthashes: Vec<String> = Vec::new();
+    for input in &tx.input {
+        let prev_txid = input.previous_output.txid.to_string();
+        if let Some(raw_prev) = idx.txs.get(&prev_txid) {
+            if let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev) {
+                if let Some(out) = prev_tx.output.get(input.previous_output.vout as usize) {
+                    affected_scripthashes.push(electrum_scripthash(&out.script_pubkey));
+                }
+            }
+        }
+    }
+
+    // Outputs — only add scripthashes already tracked (avoids polluting the
+    // index with recipient addresses we don't own).
+    for out in &tx.output {
+        let sh = electrum_scripthash(&out.script_pubkey);
+        if idx.scripthash_history.contains_key(&sh) {
+            affected_scripthashes.push(sh);
+        }
+    }
+
+    // Store raw bytes so blockchain.transaction.get can serve the unconfirmed tx.
+    idx.txs.insert(txid.to_string(), tx_bytes);
+
+    // Add height-0 entries.
+    for sh in affected_scripthashes {
+        let history = idx.scripthash_history.entry(sh).or_default();
+        // Replace an existing unconfirmed entry or add a new one.
+        // (A confirmed entry with height > 0 takes precedence and is left alone.)
+        match history.iter().position(|e| e.tx_hash == txid) {
+            Some(pos) if history[pos].height == 0 => {} // already unconfirmed, no-op
+            Some(_) => {}                                // already confirmed, leave it
+            None => {
+                history.push(ScriptHashEntry { tx_hash: txid.to_string(), height: 0, fee: 0 });
+                history.sort_by_key(|e| e.height);
+            }
+        }
+    }
+
+    tracing::debug!(txid = %txid, "indexed broadcast tx as unconfirmed (height 0)");
 }
 
 // ---------------------------------------------------------------------------
@@ -455,14 +569,42 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 return JsonRpcResponse::error(req.id.clone(), -32602, "raw tx must be string")
                     .into_line();
             };
-            match broadcast_tx(state.p2p_peer, state.network, raw_hex) {
-                Ok(txid) => {
+            // broadcast_tx opens a synchronous TCP connection and reads back
+            // several messages.  Run it on the blocking-thread pool so the
+            // async runtime (and this client's read loop) are not stalled
+            // while Sparrow waits for the JSON-RPC response.
+            let raw_hex_owned = raw_hex.to_string();
+            let raw_hex_for_index = raw_hex_owned.clone();
+            let p2p_peer = state.p2p_peer;
+            let network = state.network;
+            match tokio::task::spawn_blocking(move || {
+                broadcast_tx(p2p_peer, network, &raw_hex_owned)
+            })
+            .await
+            {
+                Ok(Ok(txid)) => {
+                    // Index the tx as unconfirmed (height 0) immediately so that
+                    // Sparrow's TransactionMempoolService poll finds it in
+                    // blockchain.scripthash.get_history without waiting for the
+                    // next confirmed block.
+                    index_unconfirmed_tx(&state.index, &raw_hex_for_index, &txid).await;
+                    // Push updated scripthash status to all connected clients.
+                    push_notifications(state).await;
                     JsonRpcResponse::success(req.id.clone(), Value::String(txid)).into_line()
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "P2P broadcast failed");
+                    JsonRpcResponse::error(
+                        req.id.clone(),
+                        -32603,
+                        format!("broadcast failed: {e}"),
+                    )
+                    .into_line()
                 }
                 Err(e) => JsonRpcResponse::error(
                     req.id.clone(),
                     -32603,
-                    format!("broadcast failed: {e}"),
+                    format!("broadcast task panicked: {e}"),
                 )
                 .into_line(),
             }

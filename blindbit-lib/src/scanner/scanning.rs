@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use bdk_sp::receive::SpOut;
 use bitcoin::hashes::Hash;
-use tokio::time;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::bdk_chain::local_chain::LocalChain;
 use indexer::bdk_chain::{BlockId, CanonicalizationParams};
+use tokio::time;
 
 use crate::oracle_grpc::{
     BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
@@ -19,6 +19,27 @@ use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
 use super::ScannerError;
+
+/// Insert or upgrade a scripthash history entry.
+///
+/// If the tx is already present with a confirmed height (> 0), it is left
+/// untouched.  If it is present at height 0 (unconfirmed, added by the
+/// broadcast handler), the entry is upgraded to the confirmed height.
+/// Otherwise the entry is appended and the list is re-sorted.
+fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEntry) {
+    match history.iter().position(|e| e.tx_hash == entry.tx_hash) {
+        Some(pos) if history[pos].height == 0 && entry.height > 0 => {
+            // Promote unconfirmed → confirmed.
+            history[pos].height = entry.height;
+            history.sort_by_key(|e| e.height);
+        }
+        Some(_) => {} // already confirmed (or same height), leave it
+        None => {
+            history.push(entry);
+            history.sort_by_key(|e| e.height);
+        }
+    }
+}
 
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
@@ -71,7 +92,7 @@ impl Scanner {
                 .into());
             };
             let block_id = BlockIdentifierDisplay(&block_identifier);
-            println!("received: {}", block_id.0.block_height);
+            tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
 
             match self.scan_short_block_data(block_scan_data) {
                 Ok(probable_match_opt) => {
@@ -89,9 +110,9 @@ impl Scanner {
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
                             if block_identifier.block_height % 1000 == 0 {
-                                if let Err(e) = self.save_to_file(&self.state_file) {
-                                    eprintln!("Warning: Failed to save periodic checkpoint: {e}");
-                                }
+                        if let Err(e) = self.save_to_file(&self.state_file) {
+                            tracing::warn!(error = %e, "failed to save periodic checkpoint");
+                        }
                             }
                             continue;
                         }
@@ -123,7 +144,7 @@ impl Scanner {
 
                     let block_hash = BlockHash::from_byte_array(block_hash_arr);
 
-                    println!("block_hash: {block_hash}");
+                    tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
 
                     // Make multiple parallel requests and wait for the first successful one
                     let block = match p2p::pull_block_from_p2p_by_blockhash(
@@ -133,7 +154,7 @@ impl Scanner {
                     ) {
                         Ok(full_block) => full_block,
                         Err(err) => {
-                            println!("{err}");
+                            tracing::error!(error = %err, "failed to pull block via P2P");
                             return Err(err);
                         }
                     };
@@ -186,9 +207,9 @@ impl Scanner {
                         .block_checkpoints
                         .insert(block_height_u32, block_hash);
 
-                    println!("Printing for height: {}", block_identifier.block_height);
+                    tracing::debug!(height = block_identifier.block_height, "indexer graph transactions after block");
                     for inner_tx in self.internal_indexer.graph().full_txs() {
-                        println!("txid: {}", inner_tx.txid);
+                        tracing::debug!(txid = %inner_tx.txid, "tracked transaction in graph");
                     }
 
                     // Print balance from the graph
@@ -218,16 +239,16 @@ impl Scanner {
                     );
 
                     if let Err(save_err) = self.save_to_file(&self.state_file) {
-                        eprintln!("Warning: Failed to save state: {save_err}");
+                        tracing::warn!(error = %save_err, "failed to save state");
                     } else {
-                        println!("State saved successfully!");
+                        tracing::debug!("state saved");
                     }
-                    println!(
-                        "Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
-                        balance.total(),
-                        balance.confirmed,
-                        balance.trusted_pending,
-                        balance.untrusted_pending
+                    tracing::info!(
+                        total = %balance.total(),
+                        confirmed = %balance.confirmed,
+                        trusted_pending = %balance.trusted_pending,
+                        untrusted_pending = %balance.untrusted_pending,
+                        "balance"
                     );
 
                     // --- Electrum index update ---
@@ -287,10 +308,7 @@ impl Scanner {
                                         .scripthash_history
                                         .entry(scripthash)
                                         .or_default();
-                                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                                        history.push(entry);
-                                        history.sort_by_key(|e| e.height);
-                                    }
+                                    upsert_history_entry(history, entry);
                                 }
                             }
 
@@ -312,10 +330,7 @@ impl Scanner {
                                         .scripthash_history
                                         .entry(scripthash)
                                         .or_default();
-                                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                                        history.push(entry);
-                                        history.sort_by_key(|e| e.height);
-                                    }
+                                    upsert_history_entry(history, entry);
                                 }
                             }
 
@@ -361,7 +376,7 @@ impl Scanner {
                     .await;
                 }
                 Err(e) => {
-                    println!("Error scanning short block data: {e:?}");
+                    tracing::error!(error = ?e, "error scanning short block data");
                     return Err(e);
                 }
             }
@@ -390,19 +405,19 @@ impl Scanner {
             outpoints.iter().copied(), // confirmed outpoints from our index
             |_txout_index, _script| true, // include all pending outputs
         );
-        println!(
-            "Balance - Total: {} sats, Confirmed: {} sats, Trusted Pending: {} sats, Untrusted Pending: {} sats",
-            balance.total(),
-            balance.confirmed,
-            balance.trusted_pending,
-            balance.untrusted_pending
+        tracing::info!(
+            total = %balance.total(),
+            confirmed = %balance.confirmed,
+            trusted_pending = %balance.trusted_pending,
+            untrusted_pending = %balance.untrusted_pending,
+            "balance after scan"
         );
 
         // Always persist progress at the end of a scan range so watch_chain
         // resumes from the correct height after a restart, even when no
         // wallet-relevant transactions were found in this range.
         if let Err(e) = self.save_to_file(&self.state_file) {
-            eprintln!("Warning: Failed to save state after scan: {e}");
+            tracing::warn!(error = %e, "failed to save state after scan");
         }
 
         Ok(())
@@ -451,7 +466,7 @@ impl Scanner {
 
             if oracle_tip > self.last_scanned_block_height {
                 let from = self.last_scanned_block_height + 1;
-                println!("New blocks available: scanning {from} → {oracle_tip}");
+                tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
                 self.scan_block_range(from, oracle_tip).await?;
             }
 
@@ -486,11 +501,10 @@ impl Scanner {
                     .expect("length already checked to be 32"),
             )
         } else {
-            eprintln!(
-                "Warning: block {} has malformed block_hash ({} bytes, expected 32); \
-                 spent-output notifications for this block will be skipped",
-                block_id.block_height,
-                block_id.block_hash.len()
+            tracing::warn!(
+                height = block_id.block_height,
+                got_bytes = block_id.block_hash.len(),
+                "block has malformed block_hash; spent-output notifications will be skipped"
             );
             None
         };
@@ -500,7 +514,7 @@ impl Scanner {
         for item in block_data.comp_index {
             match self.probabilistic_match(&item) {
                 Ok(true) => {
-                    println!("TxId of interest: {:?}", hex::encode(&item.txid));
+                    tracing::info!(txid = %hex::encode(&item.txid), "probable match found");
                     let txid_len = item.txid.len();
                     let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
                         std::io::Error::new(
@@ -518,7 +532,7 @@ impl Scanner {
                         continue;
                     }
                     if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
-                        println!("Error probabilistic match notification: {e:?}");
+                        tracing::warn!(error = ?e, "failed to send probabilistic match notification");
                     }
                 }
                 Ok(false) => continue,
@@ -535,12 +549,12 @@ impl Scanner {
                     if pubkey[..8] == *spent_output {
                         probable_match.spent = true;
 
-                        println!("Spent output: {:?}", hex::encode(pubkey));
+                        tracing::info!(pubkey = %hex::encode(pubkey), "spent output detected");
                         if self.notify_spent_outpoints.is_empty() {
                             continue;
                         }
                         if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                            println!("Error spent output notification: {e:?}");
+                            tracing::warn!(error = ?e, "failed to send spent output notification");
                         }
                     }
                 }
