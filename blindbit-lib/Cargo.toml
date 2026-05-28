@@ -32,6 +32,7 @@ tonic-prost = "0.14.2"
 hex = "0.4.3"
 base64 = { version = "0.22", optional = true }
 tracing = { workspace = true }
+rayon = "1"
 bitcoin = "0.32.7"
 # due to bitcoin-p2p using a different version
 bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598", package = "bitcoin" }

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use bdk_sp::receive::SpOut;
 use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::secp256k1::{PublicKey, SecretKey};
+use rayon::prelude::*;
 use bitcoin::{BlockHash, OutPoint, Txid};
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::bdk_chain::local_chain::LocalChain;
@@ -10,7 +11,7 @@ use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 use tokio::time;
 
 use crate::oracle_grpc::{
-    BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
+    BlockScanDataShortResponse, FullTxItem, RangedBlockHeightRequestFiltered,
 };
 
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
@@ -38,6 +39,99 @@ fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEnt
             history.push(entry);
             history.sort_by_key(|e| e.height);
         }
+    }
+}
+
+/// Pure ECC filter for a single block's short scan data.
+///
+/// Runs the probabilistic match check (ECDH + point addition per tx) using a
+/// snapshot of the wallet's cryptographic material.  Takes no `&mut self` and
+/// performs no I/O, so it is safe to call concurrently from multiple rayon
+/// threads for different blocks.
+fn filter_block_ecc(
+    scan_sk: &SecretKey,
+    spend_pk: &PublicKey,
+    label_pks: &[PublicKey],
+    owned_outputs: &[[u8; 32]],
+    block_data: &BlockScanDataShortResponse,
+) -> Result<Option<ProbableMatch>, ScannerError> {
+    let Some(block_id) = &block_data.block_identifier else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "block identifier is missing",
+        )
+        .into());
+    };
+
+    let block_hash_valid = block_id.block_hash.len() == 32;
+    if !block_hash_valid && !block_data.spent_outputs.is_empty() {
+        tracing::warn!(
+            height = block_id.block_height,
+            got_bytes = block_id.block_hash.len(),
+            "block has malformed block_hash; spent-output detection will be skipped"
+        );
+    }
+
+    let mut matched_txs: Vec<([u8; 32], PublicKey)> = Vec::new();
+    for item in &block_data.comp_index {
+        let tweak_len = item.tweak.len();
+        let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tweak must be exactly 33 bytes, got {tweak_len} bytes"),
+            )
+        })?;
+        let tweak = PublicKey::from_slice(&tweak_data).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tweak must be a valid secp256k1 public key: {e:?}"),
+            )
+        })?;
+
+        let ecdh_shared_secret = bdk_sp::compute_shared_secret(scan_sk, &tweak);
+        let p_n =
+            bdk_sp::receive::get_silentpayment_pubkey(spend_pk, &ecdh_shared_secret, 0, None);
+
+        let is_match = match_short_pubkey(&p_n.x_only_public_key().0, &item.outputs_short)
+            || label_pks.iter().any(|label_pk| {
+                let p_n_label = p_n
+                    .combine(label_pk)
+                    .expect("computationally unreachable: can only fail if label = -spend_sk");
+                match_short_pubkey(&p_n_label.x_only_public_key().0, &item.outputs_short)
+            });
+
+        if is_match {
+            tracing::info!(txid = %hex::encode(&item.txid), "probable match found");
+            let txid_len = item.txid.len();
+            let txid_array: [u8; 32] = item.txid.clone().try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("txid must be exactly 32 bytes, got {txid_len} bytes"),
+                )
+            })?;
+            matched_txs.push((txid_array, tweak));
+        }
+    }
+
+    // Spent-output check — only when block_hash is valid (matches original behaviour).
+    let mut spent = false;
+    if block_hash_valid {
+        let spent_count = block_data.spent_outputs.len() / 8;
+        for i in 0..spent_count {
+            let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
+            for pubkey in owned_outputs {
+                if pubkey[..8] == *spent_output {
+                    tracing::info!(pubkey = %hex::encode(pubkey), "spent output detected");
+                    spent = true;
+                }
+            }
+        }
+    }
+
+    if matched_txs.is_empty() && !spent {
+        Ok(None)
+    } else {
+        Ok(Some(ProbableMatch::new(matched_txs, spent)))
     }
 }
 
@@ -83,45 +177,129 @@ impl Scanner {
             hash: genesis_hash,
         };
 
-        while let Some(block_scan_data) = stream.message().await.unwrap() {
-            let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "block identifier is missing",
-                )
-                .into());
-            };
-            let block_id = BlockIdentifierDisplay(&block_identifier);
-            tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
+        // ── Parallel ECC scan setup ──────────────────────────────────────────────
+        //
+        // Snapshot the wallet's cryptographic material once.  These values are
+        // immutable for the duration of the scan range, so they can be shared
+        // across rayon threads without any locking.
+        let scan_sk = *self.internal_indexer.scan_sk();
+        let spend_pk = *self.internal_indexer.spend_pk();
+        let label_pks: Vec<PublicKey> = self
+            .internal_indexer
+            .index()
+            .label_lookup
+            .keys()
+            .cloned()
+            .collect();
+        let owned_outputs_snapshot: Vec<[u8; 32]> = self.owned_outputs.clone();
 
-            match self.scan_short_block_data(block_scan_data) {
-                Ok(probable_match_opt) => {
-                    let probable_match = match probable_match_opt {
-                        None => {
-                            // No match — still advance tip/progress so Sparrow sees sync moving.
-                            self.notify_electrum_scan_progress(
-                                block_identifier.block_height,
-                                start,
-                                end,
-                            )
-                            .await;
-                            self.last_scanned_block_height = block_identifier.block_height;
-                            self.stage.last_scanned_block_height = block_identifier.block_height;
-                            // Periodically checkpoint progress so a crash/restart during a
-                            // long initial catch-up scan doesn't lose everything.
-                            if block_identifier.block_height % 1000 == 0 {
-                        if let Err(e) = self.save_to_file(&self.state_file) {
-                            tracing::warn!(error = %e, "failed to save periodic checkpoint");
-                        }
+        // BATCH_SIZE: how many oracle blocks are buffered before the parallel
+        // ECC pass fires.  Larger = better throughput (more work per rayon
+        // dispatch, more cores used); smaller = lower latency for progress
+        // notifications.  64 is a good trade-off for a full initial sync; the
+        // watch_chain batches will naturally be tiny (1–2 blocks).
+        const BATCH_SIZE: usize = 64;
+
+        let mut batch: Vec<BlockScanDataShortResponse> = Vec::with_capacity(BATCH_SIZE);
+        let mut stream_ended = false;
+
+        loop {
+            // ── Stage 1: fill the batch from the oracle stream (sequential I/O) ──
+            while !stream_ended && batch.len() < BATCH_SIZE {
+                match stream.message().await.unwrap() {
+                    Some(data) => batch.push(data),
+                    None => stream_ended = true,
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+
+            // ── Stage 2: parallel ECC filter (CPU-bound, all cores) ──────────────
+            //
+            // Each block is processed independently: ECDH + point addition per
+            // tx, no shared mutable state.  Rayon distributes blocks across the
+            // thread pool; `collect` preserves the original insertion order so
+            // Stage 3 always commits in block-height order.
+            let filter_results: Vec<Result<Option<ProbableMatch>, ScannerError>> = batch
+                .par_iter()
+                .map(|block_data| {
+                    filter_block_ecc(
+                        &scan_sk,
+                        &spend_pk,
+                        &label_pks,
+                        &owned_outputs_snapshot,
+                        block_data,
+                    )
+                })
+                .collect();
+
+            // ── Stage 3: sequential commit — order is mandatory ───────────────────
+            //
+            // apply_block_relevant and the electrum index spend detection both
+            // read from the BDK graph, so each block must be fully committed
+            // before the next one is processed.
+            for (block_data, filter_result) in batch.drain(..).zip(filter_results) {
+                let Some(block_identifier) = block_data.block_identifier.clone() else {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "block identifier is missing",
+                    )
+                    .into());
+                };
+                let block_id = BlockIdentifierDisplay(&block_identifier);
+                tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
+
+                if block_identifier.block_height % 100 == 0 {
+                    let scanned = block_identifier.block_height.saturating_sub(start) + 1;
+                    let total = end.saturating_sub(start) + 1;
+                    let pct = (scanned * 100 / total).min(100);
+                    tracing::info!(
+                        height = block_identifier.block_height,
+                        scanned,
+                        total,
+                        pct,
+                        "scan progress"
+                    );
+                }
+
+                let probable_match_opt = filter_result?;
+
+                // Fire deferred notifications — these need &mut self so they
+                // cannot run inside the parallel ECC phase.
+                if let Some(ref pm) = probable_match_opt {
+                    for (txid_array, _) in &pm.matched_txs {
+                        if !self.notify_probabilistic_matches.is_empty() {
+                            if let Err(e) =
+                                self.notify_probabilistic_matches.send(*txid_array)
+                            {
+                                tracing::warn!(
+                                    error = ?e,
+                                    "failed to send probabilistic match notification"
+                                );
                             }
-                            continue;
                         }
-                        Some(probable_match) => probable_match,
-                    };
-                    // Guard: if block_hash is malformed (already warned in
-                    // scan_short_block_data) we cannot pull the full block
-                    // via P2P.  Advance progress and move on.
-                    if block_identifier.block_hash.len() != 32 {
+                    }
+                    if pm.spent && block_identifier.block_hash.len() == 32 {
+                        let block_hash_arr: [u8; 32] = block_identifier
+                            .block_hash
+                            .clone()
+                            .try_into()
+                            .expect("length already checked");
+                        if !self.notify_spent_outpoints.is_empty() {
+                            if let Err(e) = self.notify_spent_outpoints.send(block_hash_arr) {
+                                tracing::warn!(
+                                    error = ?e,
+                                    "failed to send spent output notification"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                match probable_match_opt {
+                    None => {
+                        // No match — still advance tip/progress so Sparrow sees sync moving.
                         self.notify_electrum_scan_progress(
                             block_identifier.block_height,
                             start,
@@ -130,291 +308,361 @@ impl Scanner {
                         .await;
                         self.last_scanned_block_height = block_identifier.block_height;
                         self.stage.last_scanned_block_height = block_identifier.block_height;
+                        // Periodically checkpoint progress so a crash/restart during a
+                        // long initial catch-up scan doesn't lose everything.
+                        if block_identifier.block_height % 1000 == 0 {
+                            if let Err(e) = self.save_to_file(&self.state_file) {
+                                tracing::warn!(error = %e, "failed to save periodic checkpoint");
+                            }
+                        }
                         continue;
                     }
-
-                    // pull the full block data
-
-                    // Ensure we have exactly 32 bytes
-                    let mut reversed_block_hash_slice = block_identifier.block_hash.clone();
-                    reversed_block_hash_slice.reverse();
-                    let block_hash_arr: [u8; 32] = reversed_block_hash_slice
-                        .try_into()
-                        .expect("block_hash length already verified to be 32");
-
-                    let block_hash = BlockHash::from_byte_array(block_hash_arr);
-
-                    tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
-
-                    // Make multiple parallel requests and wait for the first successful one
-                    let block = match p2p::pull_block_from_p2p_by_blockhash(
-                        self.p2p_peer,
-                        block_hash,
-                        self.network,
-                    ) {
-                        Ok(full_block) => full_block,
-                        Err(err) => {
-                            tracing::error!(error = %err, "failed to pull block via P2P");
-                            return Err(err);
-                        }
-                    };
-
-                    // build partial secret hashmap, only populate with txids and secrets where we
-                    // suspect matches, skip the rest
-                    let mut partial_secrets =
-                        HashMap::with_capacity(probable_match.matched_txs.len());
-
-                    for tx in &block.txdata {
-                        if probable_match.spent {
-                            // todo: we will need to look at all spent outpoints in this
-                            // block and find the relevant txids for spent
+                    Some(probable_match) => {
+                        // Guard: if block_hash is malformed (already warned in
+                        // filter_block_ecc) we cannot pull the full block via P2P.
+                        // Advance progress and move on.
+                        if block_identifier.block_hash.len() != 32 {
+                            self.notify_electrum_scan_progress(
+                                block_identifier.block_height,
+                                start,
+                                end,
+                            )
+                            .await;
+                            self.last_scanned_block_height = block_identifier.block_height;
+                            self.stage.last_scanned_block_height =
+                                block_identifier.block_height;
+                            continue;
                         }
 
-                        for (txid_arr, tweak) in &probable_match.matched_txs {
-                            // this check should be optimised to a map lookup on all items
-                            let mut item_txid = *txid_arr;
-                            item_txid.reverse();
+                        // pull the full block data
 
-                            if Txid::from_byte_array(item_txid) != tx.compute_txid() {
-                                continue;
+                        // Ensure we have exactly 32 bytes
+                        let mut reversed_block_hash_slice = block_identifier.block_hash.clone();
+                        reversed_block_hash_slice.reverse();
+                        let block_hash_arr: [u8; 32] = reversed_block_hash_slice
+                            .try_into()
+                            .expect("block_hash length already verified to be 32");
+
+                        let block_hash = BlockHash::from_byte_array(block_hash_arr);
+
+                        tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
+
+                        const MAX_P2P_RETRIES: u32 = 5;
+                        let mut block_opt = None;
+                        let mut last_p2p_err: Option<ScannerError> = None;
+                        for attempt in 0..MAX_P2P_RETRIES {
+                            if attempt > 0 {
+                                let delay = time::Duration::from_secs(2u64.pow(attempt - 1));
+                                tracing::warn!(
+                                    attempt,
+                                    block_hash = %block_hash,
+                                    delay_secs = delay.as_secs(),
+                                    "retrying P2P block fetch"
+                                );
+                                time::sleep(delay).await;
+                            }
+                            match p2p::pull_block_from_p2p_by_blockhash(
+                                self.p2p_peer,
+                                block_hash,
+                                self.network,
+                            ) {
+                                Ok(full_block) => {
+                                    block_opt = Some(full_block);
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        attempt,
+                                        error = %err,
+                                        "P2P block fetch attempt failed"
+                                    );
+                                    last_p2p_err = Some(err);
+                                }
+                            }
+                        }
+                        let block = match block_opt {
+                            Some(b) => b,
+                            None => {
+                                let err = last_p2p_err.unwrap();
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to pull block via P2P after {MAX_P2P_RETRIES} attempts"
+                                );
+                                return Err(err);
+                            }
+                        };
+
+                        // build partial secret hashmap, only populate with txids and secrets where we
+                        // suspect matches, skip the rest
+                        let mut partial_secrets =
+                            HashMap::with_capacity(probable_match.matched_txs.len());
+
+                        for tx in &block.txdata {
+                            if probable_match.spent {
+                                // todo: we will need to look at all spent outpoints in this
+                                // block and find the relevant txids for spent
                             }
 
-                            let txid = byte_array_to_txid(txid_arr);
+                            for (txid_arr, tweak) in &probable_match.matched_txs {
+                                // this check should be optimised to a map lookup on all items
+                                let mut item_txid = *txid_arr;
+                                item_txid.reverse();
 
-                            partial_secrets.insert(txid, *tweak);
+                                if Txid::from_byte_array(item_txid) != tx.compute_txid() {
+                                    continue;
+                                }
+
+                                let txid = byte_array_to_txid(txid_arr);
+
+                                partial_secrets.insert(txid, *tweak);
+                            }
                         }
-                    }
-                    // Apply block to indexer and stage the changes
-                    let indexer_changes = self.internal_indexer.apply_block_relevant(
-                        &block,
-                        partial_secrets,
-                        block_identifier.block_height as u32,
-                    );
-                    self.stage.indexer.merge(indexer_changes);
+                        // Apply block to indexer and stage the changes
+                        let indexer_changes = self.internal_indexer.apply_block_relevant(
+                            &block,
+                            partial_secrets,
+                            block_identifier.block_height as u32,
+                        );
+                        self.stage.indexer.merge(indexer_changes);
 
-                    // Update block checkpoints: only store blocks where we found something
-                    let block_height_u32 = block_identifier.block_height as u32;
-                    let block_hash = block.block_hash();
-                    let block_id = BlockId {
-                        height: block_height_u32,
-                        hash: block_hash,
-                    };
-                    last_block_id = block_id;
+                        // Update block checkpoints: only store blocks where we found something
+                        let block_height_u32 = block_identifier.block_height as u32;
+                        let block_hash = block.block_hash();
+                        let block_id = BlockId {
+                            height: block_height_u32,
+                            hash: block_hash,
+                        };
+                        last_block_id = block_id;
 
-                    // Add this block as a checkpoint since we found something in it
-                    self.block_checkpoints.insert(block_height_u32, block_hash);
-                    self.stage
-                        .block_checkpoints
-                        .insert(block_height_u32, block_hash);
+                        // Add this block as a checkpoint since we found something in it
+                        self.block_checkpoints.insert(block_height_u32, block_hash);
+                        self.stage
+                            .block_checkpoints
+                            .insert(block_height_u32, block_hash);
 
-                    tracing::debug!(height = block_identifier.block_height, "indexer graph transactions after block");
-                    for inner_tx in self.internal_indexer.graph().full_txs() {
-                        tracing::debug!(txid = %inner_tx.txid, "tracked transaction in graph");
-                    }
+                        tracing::debug!(height = block_identifier.block_height, "indexer graph transactions after block");
+                        for inner_tx in self.internal_indexer.graph().full_txs() {
+                            tracing::debug!(txid = %inner_tx.txid, "tracked transaction in graph");
+                        }
 
-                    // Print balance from the graph
-                    // Following the bdk-sp pattern: get outpoints from index and pass to balance
-                    let graph = self.internal_indexer.graph();
-                    // Get all outpoints from by_shared_secret - these are our UTXOs
-                    // The balance method expects (u32, OutPoint) where u32 is txout_index
-                    // We'll use the vout from the OutPoint as the txout_index
-                    let outpoints: Vec<(u32, OutPoint)> = self
-                        .internal_indexer
-                        .index()
-                        .by_shared_secret
-                        .keys()
-                        .map(|outpoint| (outpoint.vout, *outpoint))
-                        .collect();
-
-                    // Create LocalChain from sparse checkpoints for balance calculation
-                    let local_chain = LocalChain::from_blocks(self.block_checkpoints.clone())
-                        .expect("Failed to create LocalChain from checkpoints");
-
-                    let balance = graph.balance(
-                        &local_chain,
-                        block_id,
-                        CanonicalizationParams::default(),
-                        outpoints.iter().copied(), // confirmed outpoints from our index
-                        |_txout_index, _script| true, // include all pending outputs
-                    );
-
-                    if let Err(save_err) = self.save_to_file(&self.state_file) {
-                        tracing::warn!(error = %save_err, "failed to save state");
-                    } else {
-                        tracing::debug!("state saved");
-                    }
-                    tracing::info!(
-                        total = %balance.total(),
-                        confirmed = %balance.confirmed,
-                        trusted_pending = %balance.trusted_pending,
-                        untrusted_pending = %balance.untrusted_pending,
-                        "balance"
-                    );
-
-                    // --- Electrum index update ---
-                    // Update the wallet-scoped Electrum index while the full block is in hand.
-                    // The block is already fetched from P2P so this costs nothing extra.
-                    {
-                        let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
+                        // Print balance from the graph
+                        // Following the bdk-sp pattern: get outpoints from index and pass to balance
+                        let graph = self.internal_indexer.graph();
+                        // Get all outpoints from by_shared_secret - these are our UTXOs
+                        // The balance method expects (u32, OutPoint) where u32 is txout_index
+                        // We'll use the vout from the OutPoint as the txout_index
+                        let outpoints: Vec<(u32, OutPoint)> = self
                             .internal_indexer
                             .index()
                             .by_shared_secret
                             .keys()
-                            .cloned()
+                            .map(|outpoint| (outpoint.vout, *outpoint))
                             .collect();
 
-                        // Build outpoint → script map from the graph so we can derive the
-                        // scripthash of a spent output without re-fetching anything.
-                        let mut outpoint_scripts: HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
-                            HashMap::new();
-                        for node in self.internal_indexer.graph().full_txs() {
-                            let node_txid = node.txid;
-                            for (vout, out) in node.tx.output.iter().enumerate() {
-                                let op = bitcoin::OutPoint { txid: node_txid, vout: vout as u32 };
-                                if owned_outpoints.contains(&op) {
-                                    outpoint_scripts.insert(op, out.script_pubkey.clone());
-                                }
-                            }
-                        }
+                        // Create LocalChain from sparse checkpoints for balance calculation
+                        let local_chain =
+                            LocalChain::from_blocks(self.block_checkpoints.clone())
+                                .expect("Failed to create LocalChain from checkpoints");
 
-                        let header_hex = hex::encode(
-                            bitcoin::consensus::encode::serialize(&block.header),
+                        let balance = graph.balance(
+                            &local_chain,
+                            block_id,
+                            CanonicalizationParams::default(),
+                            outpoints.iter().copied(),
+                            |_txout_index, _script| true,
                         );
 
-                        let mut idx = self.electrum_index.lock().await;
-                        idx.headers.insert(block_height_u32, header_hex.clone());
-                        idx.tip = Some((block_height_u32, header_hex));
-
-                        for tx in &block.txdata {
-                            let txid = tx.compute_txid();
-                            let mut is_ours = false;
-
-                            // Receiving side: outputs belonging to the wallet.
-                            for (vout, output) in tx.output.iter().enumerate() {
-                                let outpoint = bitcoin::OutPoint {
-                                    txid,
-                                    vout: vout as u32,
-                                };
-                                if owned_outpoints.contains(&outpoint) {
-                                    is_ours = true;
-                                    let scripthash =
-                                        electrum_scripthash(&output.script_pubkey);
-                                    let entry = ScriptHashEntry {
-                                        tx_hash: txid.to_string(),
-                                        height: block_height_u32,
-                                        fee: 0,
-                                    };
-                                    let history = idx
-                                        .scripthash_history
-                                        .entry(scripthash)
-                                        .or_default();
-                                    upsert_history_entry(history, entry);
-                                }
-                            }
-
-                            // Spending side: inputs that consume one of our outputs.
-                            // Sparrow expects the spending tx to also appear in
-                            // blockchain.scripthash.get_history for the spent scripthash.
-                            for input in &tx.input {
-                                if let Some(script) =
-                                    outpoint_scripts.get(&input.previous_output)
-                                {
-                                    is_ours = true;
-                                    let scripthash = electrum_scripthash(script);
-                                    let entry = ScriptHashEntry {
-                                        tx_hash: txid.to_string(),
-                                        height: block_height_u32,
-                                        fee: 0,
-                                    };
-                                    let history = idx
-                                        .scripthash_history
-                                        .entry(scripthash)
-                                        .or_default();
-                                    upsert_history_entry(history, entry);
-                                }
-                            }
-
-                            if is_ours {
-                                let raw = bitcoin::consensus::encode::serialize(tx);
-                                idx.txs.insert(txid.to_string(), raw);
-                            }
+                        if let Err(save_err) = self.save_to_file(&self.state_file) {
+                            tracing::warn!(error = %save_err, "failed to save state");
+                        } else {
+                            tracing::debug!("state saved");
                         }
+                        tracing::info!(
+                            total = %balance.total(),
+                            confirmed = %balance.confirmed,
+                            trusted_pending = %balance.trusted_pending,
+                            untrusted_pending = %balance.untrusted_pending,
+                            "balance"
+                        );
 
-                        // SP history — use confirmed txid_to_partial_secret
-                        // (populated by apply_block_relevant for this block's matches).
-                        for tx in &block.txdata {
-                            let txid = tx.compute_txid();
-                            if let Some(secret) = self
-                                .internal_indexer
-                                .index()
-                                .txid_to_partial_secret
-                                .get(&txid)
-                            {
-                                let entry = SpHistoryEntry {
-                                    tx_hash: txid.to_string(),
-                                    height: block_height_u32,
-                                    tweak_hex: secret.to_string(),
-                                };
-                                if !idx.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                                    idx.sp_history.push(entry);
-                                    idx.sp_history.sort_by_key(|e| e.height);
-                                }
-                            }
-                        }
+                        // --- Electrum index update ---
+                        // Update the wallet-scoped Electrum index while the full block is in hand.
+                        // The block is already fetched from P2P so this costs nothing extra.
+                        {
+                            let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> =
+                                self.internal_indexer
+                                    .index()
+                                    .by_shared_secret
+                                    .keys()
+                                    .cloned()
+                                    .collect();
 
-                        // Promote any pending (unconfirmed) height-0 entries for txs
-                        // that appear in this block.  This handles outputs that the SP
-                        // scanner does not own (e.g. regular taproot change, recipient
-                        // outputs) which were added at height 0 by the broadcast handler
-                        // and must now be updated to the confirmed block height.
-                        for tx in &block.txdata {
-                            let txid_str = tx.compute_txid().to_string();
-                            if let Some(pending_shs) = idx.pending_scripthashes.remove(&txid_str) {
-                                for sh in &pending_shs {
-                                    if let Some(history) = idx.scripthash_history.get_mut(sh) {
-                                        let mut updated = false;
-                                        for entry in history.iter_mut() {
-                                            if entry.tx_hash == txid_str && entry.height == 0 {
-                                                entry.height = block_height_u32;
-                                                updated = true;
-                                            }
-                                        }
-                                        if updated {
-                                            history.sort_by_key(|e| e.height);
-                                        }
+                            // Build outpoint → script map from the graph so we can derive the
+                            // scripthash of a spent output without re-fetching anything.
+                            let mut outpoint_scripts: HashMap<
+                                bitcoin::OutPoint,
+                                bitcoin::ScriptBuf,
+                            > = HashMap::new();
+                            for node in self.internal_indexer.graph().full_txs() {
+                                let node_txid = node.txid;
+                                for (vout, out) in node.tx.output.iter().enumerate() {
+                                    let op = bitcoin::OutPoint {
+                                        txid: node_txid,
+                                        vout: vout as u32,
+                                    };
+                                    if owned_outpoints.contains(&op) {
+                                        outpoint_scripts.insert(op, out.script_pubkey.clone());
                                     }
                                 }
-                                tracing::debug!(
-                                    txid = %txid_str,
-                                    height = block_height_u32,
-                                    scripthashes = pending_shs.len(),
-                                    "promoted pending tx to confirmed height"
-                                );
                             }
+
+                            let header_hex = hex::encode(
+                                bitcoin::consensus::encode::serialize(&block.header),
+                            );
+
+                            let mut idx = self.electrum_index.lock().await;
+                            idx.headers.insert(block_height_u32, header_hex.clone());
+                            idx.tip = Some((block_height_u32, header_hex));
+
+                            for tx in &block.txdata {
+                                let txid = tx.compute_txid();
+                                let mut is_ours = false;
+
+                                // Receiving side: outputs belonging to the wallet.
+                                for (vout, output) in tx.output.iter().enumerate() {
+                                    let outpoint = bitcoin::OutPoint {
+                                        txid,
+                                        vout: vout as u32,
+                                    };
+                                    if owned_outpoints.contains(&outpoint) {
+                                        is_ours = true;
+                                        let scripthash =
+                                            electrum_scripthash(&output.script_pubkey);
+                                        let entry = ScriptHashEntry {
+                                            tx_hash: txid.to_string(),
+                                            height: block_height_u32,
+                                            fee: 0,
+                                        };
+                                        let history = idx
+                                            .scripthash_history
+                                            .entry(scripthash)
+                                            .or_default();
+                                        upsert_history_entry(history, entry);
+                                    }
+                                }
+
+                                // Spending side: inputs that consume one of our outputs.
+                                // Sparrow expects the spending tx to also appear in
+                                // blockchain.scripthash.get_history for the spent scripthash.
+                                for input in &tx.input {
+                                    if let Some(script) =
+                                        outpoint_scripts.get(&input.previous_output)
+                                    {
+                                        is_ours = true;
+                                        let scripthash = electrum_scripthash(script);
+                                        let entry = ScriptHashEntry {
+                                            tx_hash: txid.to_string(),
+                                            height: block_height_u32,
+                                            fee: 0,
+                                        };
+                                        let history = idx
+                                            .scripthash_history
+                                            .entry(scripthash)
+                                            .or_default();
+                                        upsert_history_entry(history, entry);
+                                    }
+                                }
+
+                                if is_ours {
+                                    let raw = bitcoin::consensus::encode::serialize(tx);
+                                    idx.txs.insert(txid.to_string(), raw);
+                                }
+                            }
+
+                            // SP history — use confirmed txid_to_partial_secret
+                            // (populated by apply_block_relevant for this block's matches).
+                            for tx in &block.txdata {
+                                let txid = tx.compute_txid();
+                                if let Some(secret) = self
+                                    .internal_indexer
+                                    .index()
+                                    .txid_to_partial_secret
+                                    .get(&txid)
+                                {
+                                    let entry = SpHistoryEntry {
+                                        tx_hash: txid.to_string(),
+                                        height: block_height_u32,
+                                        tweak_hex: secret.to_string(),
+                                    };
+                                    if !idx.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash)
+                                    {
+                                        idx.sp_history.push(entry);
+                                        idx.sp_history.sort_by_key(|e| e.height);
+                                    }
+                                }
+                            }
+
+                            // Promote any pending (unconfirmed) height-0 entries for txs
+                            // that appear in this block.  This handles outputs that the SP
+                            // scanner does not own (e.g. regular taproot change, recipient
+                            // outputs) which were added at height 0 by the broadcast handler
+                            // and must now be updated to the confirmed block height.
+                            for tx in &block.txdata {
+                                let txid_str = tx.compute_txid().to_string();
+                                if let Some(pending_shs) =
+                                    idx.pending_scripthashes.remove(&txid_str)
+                                {
+                                    for sh in &pending_shs {
+                                        if let Some(history) =
+                                            idx.scripthash_history.get_mut(sh)
+                                        {
+                                            let mut updated = false;
+                                            for entry in history.iter_mut() {
+                                                if entry.tx_hash == txid_str
+                                                    && entry.height == 0
+                                                {
+                                                    entry.height = block_height_u32;
+                                                    updated = true;
+                                                }
+                                            }
+                                            if updated {
+                                                history.sort_by_key(|e| e.height);
+                                            }
+                                        }
+                                    }
+                                    tracing::debug!(
+                                        txid = %txid_str,
+                                        height = block_height_u32,
+                                        scripthashes = pending_shs.len(),
+                                        "promoted pending tx to confirmed height"
+                                    );
+                                }
+                            }
+
+                            // Track progress for incremental SP notifications.
+                            let scanned =
+                                block_identifier.block_height.saturating_sub(start) + 1;
+                            let total = end.saturating_sub(start) + 1;
+                            idx.scan_progress = (scanned as f32 / total as f32).min(1.0);
                         }
 
-                        // Track progress for incremental SP notifications.
-                        let scanned = block_identifier.block_height.saturating_sub(start) + 1;
-                        let total = end.saturating_sub(start) + 1;
-                        idx.scan_progress = (scanned as f32 / total as f32).min(1.0);
+                        self.notify_electrum_scan_progress(
+                            block_identifier.block_height,
+                            start,
+                            end,
+                        )
+                        .await;
                     }
+                }
 
-                    self.notify_electrum_scan_progress(
-                        block_identifier.block_height,
-                        start,
-                        end,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, "error scanning short block data");
-                    return Err(e);
-                }
+                // Update last scanned block height and stage it
+                self.last_scanned_block_height = block_identifier.block_height;
+                self.stage.last_scanned_block_height = block_identifier.block_height;
             }
 
-            // Update last scanned block height and stage it
-            self.last_scanned_block_height = block_identifier.block_height;
-            self.stage.last_scanned_block_height = block_identifier.block_height;
+            if stream_ended {
+                break;
+            }
         }
 
         let outpoints: Vec<(u32, OutPoint)> = self
@@ -485,143 +733,28 @@ impl Scanner {
     /// `Watch()` loop and means callers never need to supply an `end_height`.
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         loop {
-            let oracle_tip = self
+            let oracle_tip = match self
                 .client
                 .get_info(tonic::Request::new(()))
                 .await
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?
-                .into_inner()
-                .height;
+            {
+                Ok(resp) => resp.into_inner().height,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to reach oracle, will retry");
+                    time::sleep(time::Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
 
             if oracle_tip > self.last_scanned_block_height {
                 let from = self.last_scanned_block_height + 1;
                 tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
-                self.scan_block_range(from, oracle_tip).await?;
+                if let Err(e) = self.scan_block_range(from, oracle_tip).await {
+                    tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
+                }
             }
 
             time::sleep(time::Duration::from_secs(10)).await;
-        }
-    }
-
-    /// scan short block data for new utxos and spent outpoints
-    fn scan_short_block_data(
-        &mut self,
-        block_data: BlockScanDataShortResponse,
-    ) -> Result<Option<ProbableMatch>, ScannerError> {
-        // todo: first append to list then push notifications.
-        //  We need to check for the actual match and not just a probablistic match.
-
-        let Some(block_id) = block_data.block_identifier else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "block identifier is missing",
-            )
-            .into());
-        };
-
-        // If block_hash is missing or malformed, we can still run the probabilistic
-        // tx filter but must skip spent-output notifications (which need the hash).
-        let block_hash_opt: Option<[u8; 32]> = if block_id.block_hash.len() == 32 {
-            Some(
-                block_id
-                    .block_hash
-                    .clone()
-                    .try_into()
-                    .expect("length already checked to be 32"),
-            )
-        } else {
-            tracing::warn!(
-                height = block_id.block_height,
-                got_bytes = block_id.block_hash.len(),
-                "block has malformed block_hash; spent-output notifications will be skipped"
-            );
-            None
-        };
-
-        let mut probable_match = ProbableMatch::new(vec![], false);
-
-        for item in block_data.comp_index {
-            match self.probabilistic_match(&item) {
-                Ok(true) => {
-                    tracing::info!(txid = %hex::encode(&item.txid), "probable match found");
-                    let txid_len = item.txid.len();
-                    let txid_array: [u8; 32] = item.txid.try_into().map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("txid must be exactly 32 bytes, got {txid_len} bytes"),
-                        )
-                    })?;
-
-                    let tweak = PublicKey::from_slice(&item.tweak)
-                        .expect("tweak must be a valid secp256k1 public key");
-
-                    probable_match.matched_txs.push((txid_array, tweak));
-
-                    if self.notify_probabilistic_matches.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
-                        tracing::warn!(error = ?e, "failed to send probabilistic match notification");
-                    }
-                }
-                Ok(false) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-
-        // Spent-output check — only when we have a valid block_hash to report.
-        if let Some(block_hash) = block_hash_opt {
-            let spent_outputs_count = block_data.spent_outputs.len() / 8;
-            for i in 0..spent_outputs_count {
-                let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
-                for pubkey in &self.owned_outputs {
-                    if pubkey[..8] == *spent_output {
-                        probable_match.spent = true;
-
-                        tracing::info!(pubkey = %hex::encode(pubkey), "spent output detected");
-                        if self.notify_spent_outpoints.is_empty() {
-                            continue;
-                        }
-                        if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                            tracing::warn!(error = ?e, "failed to send spent output notification");
-                        }
-                    }
-                }
-            }
-        }
-
-        if !probable_match.spent && probable_match.matched_txs.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(probable_match))
-        }
-    }
-
-    fn probabilistic_match(
-        &mut self,
-        item: &ComputeIndexTxItem,
-    ) -> Result<bool, ScannerError> {
-        let tweak_len = item.tweak.len();
-        let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("tweak must be exactly 33 bytes, got {tweak_len} bytes"),
-            )
-        })?;
-        let tweak = PublicKey::from_slice(&tweak_data).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("tweak must be a valid secp256k1 public key: {e:?}"),
-            )
-        })?;
-
-        // Call once and match on the result
-        match self.scan_transaction_short(&tweak, &item.outputs_short) {
-            Ok(true) => Ok(true),
-            Ok(false) => Ok(false),
-            Err(e) => Err(e),
         }
     }
 
