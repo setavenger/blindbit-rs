@@ -22,6 +22,16 @@ pub struct WalletElectrumIndex {
     /// One entry per wallet output (confirmed SP receive / spend output).
     pub scripthash_history: HashMap<String, Vec<ScriptHashEntry>>,
 
+    /// txid hex → set of scripthashes that have a `height: 0` entry for this tx.
+    ///
+    /// Populated by `index_unconfirmed_tx` (the broadcast handler) for every
+    /// output and resolved input of a just-broadcast transaction.  When the
+    /// block that includes the tx is later scanned, all those `height: 0`
+    /// entries are promoted to the confirmed block height — including regular
+    /// non-SP outputs (change to a taproot address, recipient, etc.) that the
+    /// SP scanner would otherwise never update.
+    pub pending_scripthashes: HashMap<String, Vec<String>>,
+
     /// Current best block tip seen by the scanner (height, header hex).
     /// Used for blockchain.headers.subscribe RPC response and push notifications.
     pub tip: Option<(u32, String)>,

@@ -362,6 +362,37 @@ impl Scanner {
                             }
                         }
 
+                        // Promote any pending (unconfirmed) height-0 entries for txs
+                        // that appear in this block.  This handles outputs that the SP
+                        // scanner does not own (e.g. regular taproot change, recipient
+                        // outputs) which were added at height 0 by the broadcast handler
+                        // and must now be updated to the confirmed block height.
+                        for tx in &block.txdata {
+                            let txid_str = tx.compute_txid().to_string();
+                            if let Some(pending_shs) = idx.pending_scripthashes.remove(&txid_str) {
+                                for sh in &pending_shs {
+                                    if let Some(history) = idx.scripthash_history.get_mut(sh) {
+                                        let mut updated = false;
+                                        for entry in history.iter_mut() {
+                                            if entry.tx_hash == txid_str && entry.height == 0 {
+                                                entry.height = block_height_u32;
+                                                updated = true;
+                                            }
+                                        }
+                                        if updated {
+                                            history.sort_by_key(|e| e.height);
+                                        }
+                                    }
+                                }
+                                tracing::debug!(
+                                    txid = %txid_str,
+                                    height = block_height_u32,
+                                    scripthashes = pending_shs.len(),
+                                    "promoted pending tx to confirmed height"
+                                );
+                            }
+                        }
+
                         // Track progress for incremental SP notifications.
                         let scanned = block_identifier.block_height.saturating_sub(start) + 1;
                         let total = end.saturating_sub(start) + 1;

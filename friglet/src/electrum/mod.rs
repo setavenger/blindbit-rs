@@ -330,19 +330,23 @@ async fn handle_client(
 // Unconfirmed-tx indexing
 // ---------------------------------------------------------------------------
 
-/// After a successful P2P broadcast, add the tx to the Electrum index at
-/// height 0 so that Sparrow's `TransactionMempoolService` immediately finds
-/// it via `blockchain.scripthash.get_history` without waiting for the next
-/// confirmed block.
+/// After a successful P2P broadcast, index the tx as unconfirmed (`height: 0`)
+/// so that Sparrow's `TransactionMempoolService` immediately finds it via
+/// `blockchain.scripthash.get_history`.
 ///
-/// Strategy:
-/// - For each **input**, look up the previous tx in `idx.txs` and resolve the
-///   spent output's script → scripthash.  This is the scripthash Sparrow polls
-///   (the address of the UTXO being spent).
-/// - For each **output** whose scripthash is already tracked in the index
-///   (e.g. change going back to a known SP address), add the tx there too.
-/// - The raw tx bytes are stored in `idx.txs` so `blockchain.transaction.get`
-///   can serve the tx before it confirms.
+/// Sparrow's poll queries **every wallet node** involved in the tx — both the
+/// spent inputs AND any recognized change/receive outputs.  We must therefore
+/// index the tx against **all** output scripthashes (not just already-tracked
+/// ones), since Sparrow may be polling the change output's scripthash before
+/// friglet's SP scanner has seen that output in a confirmed block.
+///
+/// Input scripthashes are resolved by looking up the previous tx in `idx.txs`.
+/// A fallback searches `scripthash_history` for the prev txid in case the raw
+/// bytes are not yet cached.
+///
+/// The set of affected scripthashes is stored in `pending_scripthashes` so
+/// that when the block is later confirmed, `scan_block_range` can promote all
+/// `height: 0` entries (including non-SP change outputs) to the real height.
 async fn index_unconfirmed_tx(
     index: &Arc<Mutex<WalletElectrumIndex>>,
     raw_hex: &str,
@@ -365,47 +369,88 @@ async fn index_unconfirmed_tx(
 
     let mut idx = index.lock().await;
 
-    // Resolve input scripthashes first (immutable borrow of idx.txs).
-    let mut affected_scripthashes: Vec<String> = Vec::new();
+    let mut affected: Vec<String> = Vec::new();
+
+    // --- Inputs: resolve the scripthash of each spent output ---
     for input in &tx.input {
         let prev_txid = input.previous_output.txid.to_string();
+        let vout = input.previous_output.vout as usize;
+
+        // Primary: decode from raw bytes cached in idx.txs.
         if let Some(raw_prev) = idx.txs.get(&prev_txid) {
             if let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev) {
-                if let Some(out) = prev_tx.output.get(input.previous_output.vout as usize) {
-                    affected_scripthashes.push(electrum_scripthash(&out.script_pubkey));
+                if let Some(out) = prev_tx.output.get(vout) {
+                    affected.push(electrum_scripthash(&out.script_pubkey));
+                    continue;
                 }
             }
         }
-    }
 
-    // Outputs — only add scripthashes already tracked (avoids polluting the
-    // index with recipient addresses we don't own).
-    for out in &tx.output {
-        let sh = electrum_scripthash(&out.script_pubkey);
-        if idx.scripthash_history.contains_key(&sh) {
-            affected_scripthashes.push(sh);
+        // Fallback: the receive tx's scripthash is already in scripthash_history.
+        // Find the first scripthash whose history contains the prev txid.
+        let mut found = false;
+        for (sh, entries) in &idx.scripthash_history {
+            if entries.iter().any(|e| e.tx_hash == prev_txid) {
+                tracing::debug!(
+                    prev_txid = %prev_txid,
+                    sh = %sh,
+                    "resolved input scripthash via history fallback"
+                );
+                affected.push(sh.clone());
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            tracing::debug!(prev_txid = %prev_txid, "could not resolve input scripthash (prev tx not cached)");
         }
     }
 
-    // Store raw bytes so blockchain.transaction.get can serve the unconfirmed tx.
+    // --- Outputs: add ALL output scripthashes unconditionally ---
+    //
+    // Sparrow calls blockchain.scripthash.get_history for every wallet node
+    // involved in the tx (inputs + recognized change/receive outputs).  We
+    // must therefore index the tx against the change output's scripthash even
+    // if friglet has never seen that script before.  Since Sparrow only queries
+    // its own wallet scripthashes, external recipient entries are harmless.
+    for out in &tx.output {
+        affected.push(electrum_scripthash(&out.script_pubkey));
+    }
+
+    // Deduplicate (a self-transfer can produce the same scripthash for input
+    // and output if we send back to the same address).
+    affected.sort_unstable();
+    affected.dedup();
+
+    // Store raw bytes so blockchain.transaction.get can serve the tx.
     idx.txs.insert(txid.to_string(), tx_bytes);
 
-    // Add height-0 entries.
-    for sh in affected_scripthashes {
-        let history = idx.scripthash_history.entry(sh).or_default();
-        // Replace an existing unconfirmed entry or add a new one.
-        // (A confirmed entry with height > 0 takes precedence and is left alone.)
+    // Add height-0 entries to every affected scripthash.
+    let entry = ScriptHashEntry { tx_hash: txid.to_string(), height: 0, fee: 0 };
+    let mut added = 0usize;
+    for sh in &affected {
+        let history = idx.scripthash_history.entry(sh.clone()).or_default();
         match history.iter().position(|e| e.tx_hash == txid) {
             Some(pos) if history[pos].height == 0 => {} // already unconfirmed, no-op
             Some(_) => {}                                // already confirmed, leave it
             None => {
-                history.push(ScriptHashEntry { tx_hash: txid.to_string(), height: 0, fee: 0 });
+                history.push(entry.clone());
                 history.sort_by_key(|e| e.height);
+                added += 1;
             }
         }
     }
 
-    tracing::debug!(txid = %txid, "indexed broadcast tx as unconfirmed (height 0)");
+    // Record affected scripthashes so scan_block_range can promote height-0
+    // entries to the confirmed block height when the tx lands in a block.
+    idx.pending_scripthashes.insert(txid.to_string(), affected.clone());
+
+    tracing::info!(
+        txid = %txid,
+        new_history_entries = added,
+        total_affected_scripthashes = affected.len(),
+        "indexed broadcast tx as unconfirmed (height 0)"
+    );
 }
 
 // ---------------------------------------------------------------------------
