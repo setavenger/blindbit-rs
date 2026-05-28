@@ -83,6 +83,8 @@ impl Scanner {
             hash: genesis_hash,
         };
 
+        let mut p2p_conn: Option<p2p::P2pConnection> = None;
+
         while let Some(block_scan_data) = stream.message().await.unwrap() {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
@@ -110,9 +112,9 @@ impl Scanner {
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
                             if block_identifier.block_height % 1000 == 0 {
-                        if let Err(e) = self.save_to_file(&self.state_file) {
-                            tracing::warn!(error = %e, "failed to save periodic checkpoint");
-                        }
+                                if let Err(e) = self.save_to_file(&self.state_file) {
+                                    tracing::warn!(error = %e, "failed to save periodic checkpoint");
+                                }
                             }
                             continue;
                         }
@@ -146,16 +148,22 @@ impl Scanner {
 
                     tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
 
-                    // Make multiple parallel requests and wait for the first successful one
-                    let block = match p2p::pull_block_from_p2p_by_blockhash(
-                        self.p2p_peer,
-                        block_hash,
-                        self.network,
-                    ) {
-                        Ok(full_block) => full_block,
+                    if p2p_conn.is_none() {
+                        p2p_conn = Some(p2p::P2pConnection::connect(
+                            self.p2p_peer,
+                            self.network,
+                        )?);
+                    }
+
+                    let block = match p2p_conn.as_mut().unwrap().fetch_block(block_hash) {
+                        Ok(b) => b,
                         Err(err) => {
-                            tracing::error!(error = %err, "failed to pull block via P2P");
-                            return Err(err);
+                            tracing::warn!(error = %err, "block fetch failed on existing connection, reconnecting");
+                            p2p_conn = Some(p2p::P2pConnection::connect(
+                                self.p2p_peer,
+                                self.network,
+                            )?);
+                            p2p_conn.as_mut().unwrap().fetch_block(block_hash)?
                         }
                     };
 
