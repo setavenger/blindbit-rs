@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 
 use axum::{Extension, Router, routing::get};
 use blindbit_lib::scanner;
+use rayon;
 use tokio;
 
 use bitcoin::secp256k1::{PublicKey, SecretKey};
@@ -67,6 +68,10 @@ enum Commands {
         /// Log level: trace, debug, info, warn, error (overridden by RUST_LOG env var)
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Number of threads used for parallel ECC scanning (0 = all logical CPUs)
+        #[arg(long, default_value = "1")]
+        scan_threads: usize,
     },
 }
 
@@ -87,7 +92,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             http_addr,
             electrum_addr,
             log_level,
+            scan_threads,
         } => {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(scan_threads)
+                .build_global()
+                .map_err(|e| format!("failed to configure rayon thread pool: {e}"))?;
+
             // Initialise structured logging.  RUST_LOG takes precedence; the
             // --log-level flag sets the default when RUST_LOG is not set.
             let filter = tracing_subscriber::EnvFilter::try_from_default_env()
