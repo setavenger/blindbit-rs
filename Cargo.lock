@@ -646,6 +646,7 @@ dependencies = [
  "blindbit-lib",
  "clap",
  "hex",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",
