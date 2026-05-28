@@ -202,6 +202,7 @@ impl Scanner {
 
         let mut batch: Vec<BlockScanDataShortResponse> = Vec::with_capacity(BATCH_SIZE);
         let mut stream_ended = false;
+        let mut p2p_conn: Option<p2p::P2pConnection> = None;
 
         loop {
             // ── Stage 1: fill the batch from the oracle stream (sequential I/O) ──
@@ -347,48 +348,22 @@ impl Scanner {
 
                         tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
 
-                        const MAX_P2P_RETRIES: u32 = 5;
-                        let mut block_opt = None;
-                        let mut last_p2p_err: Option<ScannerError> = None;
-                        for attempt in 0..MAX_P2P_RETRIES {
-                            if attempt > 0 {
-                                let delay = time::Duration::from_secs(2u64.pow(attempt - 1));
-                                tracing::warn!(
-                                    attempt,
-                                    block_hash = %block_hash,
-                                    delay_secs = delay.as_secs(),
-                                    "retrying P2P block fetch"
-                                );
-                                time::sleep(delay).await;
-                            }
-                            match p2p::pull_block_from_p2p_by_blockhash(
+                        if p2p_conn.is_none() {
+                            p2p_conn = Some(p2p::P2pConnection::connect(
                                 self.p2p_peer,
-                                block_hash,
                                 self.network,
-                            ) {
-                                Ok(full_block) => {
-                                    block_opt = Some(full_block);
-                                    break;
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        attempt,
-                                        error = %err,
-                                        "P2P block fetch attempt failed"
-                                    );
-                                    last_p2p_err = Some(err);
-                                }
-                            }
+                            )?);
                         }
-                        let block = match block_opt {
-                            Some(b) => b,
-                            None => {
-                                let err = last_p2p_err.unwrap();
-                                tracing::error!(
-                                    error = %err,
-                                    "failed to pull block via P2P after {MAX_P2P_RETRIES} attempts"
-                                );
-                                return Err(err);
+
+                        let block = match p2p_conn.as_mut().unwrap().fetch_block(block_hash) {
+                            Ok(b) => b,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "block fetch failed on existing connection, reconnecting");
+                                p2p_conn = Some(p2p::P2pConnection::connect(
+                                    self.p2p_peer,
+                                    self.network,
+                                )?);
+                                p2p_conn.as_mut().unwrap().fetch_block(block_hash)?
                             }
                         };
 
