@@ -1,11 +1,12 @@
+use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::Block;
 use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
 
-use bitcoin_p2p::net::{ConnectionReader, ConnectionWriter};
+use bitcoin_p2p::net::{ConnectionReader, ConnectionWriter, Error as P2pNetError};
 use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
 use bitcoin_p2p::p2p_message_types::{message::NetworkMessage, message_blockdata::Inventory};
 use bitcoin_p2p::{
@@ -95,17 +96,40 @@ pub fn broadcast_tx(
     Ok(txid)
 }
 
+/// How long the peer may stay silent before we give up on a single read.
+///
+/// This is a per-syscall socket timeout, NOT a per-message budget.  It needs to
+/// be generous: after we send `getdata`, the peer may take a moment to load a
+/// large block off disk, and during a multi-megabyte transfer there can be
+/// short gaps between TCP segments.  A too-short value (the previous code used
+/// 1 second) risks firing in the *middle* of a block payload, which makes the
+/// library's `read_exact` abort after partially consuming the message and
+/// permanently desyncs the stream.  30 s is far longer than any healthy gap but
+/// still bounds a dead connection.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall wall-clock budget for receiving one block, across any number of
+/// tolerated per-syscall read timeouts.
+const BLOCK_FETCH_DEADLINE: Duration = Duration::from_secs(90);
+
 /// Persistent P2P connection for fetching multiple blocks without reconnecting.
 ///
-/// `pull_block_from_p2p_by_blockhash` opens a fresh TCP connection + full P2P
-/// handshake for every single block.  When `scan_block_range` finds probable
-/// matches in consecutive blocks, the rapid-fire connect/disconnect cycle
-/// causes the peer to drop connections ("failed to fill whole buffer").
+/// Opening a fresh TCP connection + handshake per block caused rapid-fire
+/// connect/disconnect churn against the peer, so this keeps one connection
+/// alive across an entire scan range.
 ///
-/// This struct keeps one connection alive across an entire scan range.
+/// Note: the previous "post-handshake drain" has been removed.  It existed on
+/// the false premise that the post-`verack` message flood (`sendcmpct`,
+/// `feefilter`, `wtxidrelay`, `sendaddrv2`, …) would corrupt later reads.  In
+/// fact unrecognised messages decode to `NetworkMessage::Unknown` and every
+/// message is read as an exact, checksummed frame, so the stream never desyncs.
+/// `fetch_block` simply skips any non-block message while it waits, which makes
+/// the drain redundant (and it was the cause of multi-minute startup stalls,
+/// since it blocked reading the peer's 30 s keepalive pongs).
 pub struct P2pConnection {
     writer: ConnectionWriter,
     reader: ConnectionReader,
+    peer: SocketAddr,
 }
 
 impl P2pConnection {
@@ -116,10 +140,18 @@ impl P2pConnection {
         tracing::debug!(peer = %p2p_peer, "opening persistent P2P connection for block fetches");
         let connection_config = ConnectionConfig::new().change_network(network);
         let mut timeout_params = TimeoutParams::new();
-        timeout_params.read_timeout(Duration::from_secs(300));
-        let (writer, reader, _metadata) =
+        timeout_params.read_timeout(READ_TIMEOUT);
+        let (writer, reader, metadata) =
             connection_config.open_connection(p2p_peer, timeout_params)?;
-        Ok(Self { writer, reader })
+
+        tracing::debug!(
+            peer = %p2p_peer,
+            peer_height = metadata.feeler_data().reported_height,
+            services = %metadata.feeler_data().services,
+            "P2P handshake complete"
+        );
+
+        Ok(Self { writer, reader, peer: p2p_peer })
     }
 
     pub fn fetch_block(&mut self, block_hash: BlockHash) -> Result<Block, ScannerError> {
@@ -131,25 +163,121 @@ impl P2pConnection {
         self.writer
             .send_message(net_msg)
             .map_err(|e| -> ScannerError { format!("P2P send failed: {e}").into() })?;
-        tracing::debug!(block_hash = %block_hash, "sent GetData for block");
+        tracing::debug!(peer = %self.peer, block_hash = %block_hash, "sent getdata for block");
+
+        let started = Instant::now();
+        let mut last_idle_log = 0u64;
 
         loop {
-            match self.reader.read_message()? {
-                Some(NetworkMessage::Block(block)) => {
+            if started.elapsed() > BLOCK_FETCH_DEADLINE {
+                return Err(format!(
+                    "gave up waiting for block {block_hash} from {} after {:?}",
+                    self.peer,
+                    started.elapsed()
+                )
+                .into());
+            }
+
+            match self.reader.read_message() {
+                Ok(Some(NetworkMessage::Block(block))) => {
                     let block_bytes = encode::serialize(&block);
                     let block: Block = bitcoin::consensus::encode::deserialize(&block_bytes)?;
                     tracing::info!(
+                        peer = %self.peer,
                         block_hash = %block.block_hash(),
                         tx_count = block.txdata.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
                         "received block from peer"
                     );
                     return Ok(block);
                 }
-                Some(msg) => {
-                    tracing::trace!(command = %msg.command(), "skipping message while waiting for block");
+                Ok(Some(NetworkMessage::Ping(nonce))) => {
+                    // Pong inline so the peer doesn't drop us for inactivity
+                    // while it's still preparing/streaming the block.
+                    let _ = self.writer.send_message(NetworkMessage::Pong(nonce));
                 }
-                None => continue,
+                // The peer explicitly told us it does not have/serve this block.
+                // Spinning would loop forever; surface a clear, distinct error.
+                Ok(Some(NetworkMessage::NotFound(inv))) => {
+                    return Err(format!(
+                        "peer {} replied notfound for block {block_hash} ({} inv item(s)) \
+                         — peer may be pruned or not serving this block",
+                        self.peer,
+                        inv.0.len()
+                    )
+                    .into());
+                }
+                Ok(Some(NetworkMessage::Reject(reject))) => {
+                    return Err(format!(
+                        "peer {} rejected getdata for block {block_hash}: {reject:?}",
+                        self.peer
+                    )
+                    .into());
+                }
+                Ok(Some(msg)) => {
+                    tracing::trace!(
+                        peer = %self.peer,
+                        command = %msg.command(),
+                        "skipping message while waiting for block"
+                    );
+                }
+                Ok(None) => {} // no message this round; keep waiting
+                Err(e) => {
+                    if is_read_timeout(&e) {
+                        // Per-syscall timeout: the peer just hasn't sent the next
+                        // chunk yet. Keep waiting until BLOCK_FETCH_DEADLINE.
+                        let waited = started.elapsed().as_secs();
+                        if waited >= last_idle_log + READ_TIMEOUT.as_secs() {
+                            last_idle_log = waited;
+                            tracing::warn!(
+                                peer = %self.peer,
+                                block_hash = %block_hash,
+                                waited_s = waited,
+                                "no data from peer yet, still waiting for block"
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Anything else means the connection is unusable: EOF means
+                    // the peer closed on us ("failed to fill whole buffer"); a
+                    // deserialize error means the framed stream is corrupt.
+                    let reason = if is_eof(&e) {
+                        "peer closed the connection"
+                    } else {
+                        "unrecoverable read error"
+                    };
+                    return Err(format!(
+                        "block fetch from {} failed ({reason}) while waiting for {block_hash}: {e}",
+                        self.peer
+                    )
+                    .into());
+                }
             }
         }
     }
+}
+
+/// A per-syscall read timeout (the peer is momentarily quiet), not a fatal error.
+fn is_read_timeout(e: &P2pNetError) -> bool {
+    matches!(
+        e,
+        P2pNetError::Io(io_err)
+            if matches!(io_err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    )
+}
+
+/// The peer closed the connection mid-read — surfaces as "failed to fill whole buffer".
+fn is_eof(e: &P2pNetError) -> bool {
+    matches!(
+        e,
+        P2pNetError::Io(io_err)
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            )
+    )
 }
