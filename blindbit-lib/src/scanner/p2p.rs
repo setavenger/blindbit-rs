@@ -168,6 +168,14 @@ impl P2pConnection {
         let started = Instant::now();
         let mut last_idle_log = 0u64;
 
+        // Per-fetch protocol timeline. Records every message received (with the
+        // time since `getdata` was sent) so we can correlate an early EOF with
+        // what the peer did right before closing — and cross-reference against
+        // the node's debug.log. Gated behind `p2p-trace` to stay zero-cost in
+        // release builds.
+        #[cfg(feature = "p2p-trace")]
+        let mut msg_count: u64 = 0;
+
         loop {
             if started.elapsed() > BLOCK_FETCH_DEADLINE {
                 return Err(format!(
@@ -192,6 +200,19 @@ impl P2pConnection {
                     return Ok(block);
                 }
                 Ok(Some(NetworkMessage::Ping(nonce))) => {
+                    #[cfg(feature = "p2p-trace")]
+                    {
+                        msg_count += 1;
+                        tracing::info!(
+                            target: "p2p_trace",
+                            peer = %self.peer,
+                            block_hash = %block_hash,
+                            seq = msg_count,
+                            t_ms = started.elapsed().as_millis() as u64,
+                            command = "ping",
+                            "recv message during block fetch"
+                        );
+                    }
                     // Pong inline so the peer doesn't drop us for inactivity
                     // while it's still preparing/streaming the block.
                     let _ = self.writer.send_message(NetworkMessage::Pong(nonce));
@@ -215,6 +236,19 @@ impl P2pConnection {
                     .into());
                 }
                 Ok(Some(msg)) => {
+                    #[cfg(feature = "p2p-trace")]
+                    {
+                        msg_count += 1;
+                        tracing::info!(
+                            target: "p2p_trace",
+                            peer = %self.peer,
+                            block_hash = %block_hash,
+                            seq = msg_count,
+                            t_ms = started.elapsed().as_millis() as u64,
+                            command = %msg.command(),
+                            "recv message during block fetch"
+                        );
+                    }
                     tracing::trace!(
                         peer = %self.peer,
                         command = %msg.command(),
@@ -247,6 +281,27 @@ impl P2pConnection {
                     } else {
                         "unrecoverable read error"
                     };
+                    #[cfg(feature = "p2p-trace")]
+                    {
+                        let io_kind = match &e {
+                            P2pNetError::Io(io_err) => Some(io_err.kind()),
+                            _ => None,
+                        };
+                        tracing::warn!(
+                            target: "p2p_trace",
+                            peer = %self.peer,
+                            block_hash = %block_hash,
+                            // How many protocol messages arrived before the close.
+                            // 0 ⇒ peer dropped us before sending anything (rejects
+                            // the connection itself); >0 ⇒ dropped mid/after stream.
+                            msgs_before_close = msg_count,
+                            t_ms = started.elapsed().as_millis() as u64,
+                            reason,
+                            ?io_kind,
+                            error = %e,
+                            "connection closed during block fetch"
+                        );
+                    }
                     return Err(format!(
                         "block fetch from {} failed ({reason}) while waiting for {block_hash}: {e}",
                         self.peer
