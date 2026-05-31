@@ -496,7 +496,14 @@ impl Scanner {
             }
 
             match p2p_conn.as_mut().unwrap().fetch_block(block_hash) {
-                Ok(block) => return Ok(block),
+                Ok(block) => {
+                    // The peer may close the connection after serving a block (connection
+                    // limits, rate limiting, etc.).  Proactively discard the connection
+                    // so the next fetch starts a fresh handshake rather than discovering
+                    // the dead socket mid-read on the next attempt.
+                    *p2p_conn = None;
+                    return Ok(block);
+                }
                 Err(e) => {
                     tracing::warn!(
                         peer = %self.p2p_peer,
