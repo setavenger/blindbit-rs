@@ -6,6 +6,10 @@ edition = "2024"
 [features]
 default = []
 serde = ["dep:serde", "dep:serde_json", "dep:base64"]
+# Emit a per-message protocol timeline (target "p2p_trace") for every block
+# fetch, including how many messages arrived before a connection close. Use to
+# diagnose P2P instability and correlate with the node's debug.log.
+p2p-trace = []
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

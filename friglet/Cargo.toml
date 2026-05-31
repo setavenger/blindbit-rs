@@ -7,6 +7,8 @@ authors.workspace = true
 [features]
 default = []
 # serde = ["serde"]
+# Forward to blindbit-lib's P2P protocol timeline tracing.
+p2p-trace = ["blindbit-lib/p2p-trace"]
 
 [dependencies]
 blindbit-lib = { path = "../blindbit-lib", features = ["serde"] }
