@@ -83,6 +83,8 @@ impl Scanner {
             hash: genesis_hash,
         };
 
+        let mut p2p_conn: Option<p2p::P2pConnection> = None;
+
         while let Some(block_scan_data) = stream.message().await.unwrap() {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
@@ -93,6 +95,19 @@ impl Scanner {
             };
             let block_id = BlockIdentifierDisplay(&block_identifier);
             tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
+
+            if block_identifier.block_height % 100 == 0 {
+                let scanned = block_identifier.block_height.saturating_sub(start) + 1;
+                let total = end.saturating_sub(start) + 1;
+                let pct = (scanned * 100 / total).min(100);
+                tracing::info!(
+                    height = block_identifier.block_height,
+                    scanned,
+                    total,
+                    pct,
+                    "scan progress"
+                );
+            }
 
             match self.scan_short_block_data(block_scan_data) {
                 Ok(probable_match_opt) => {
@@ -110,9 +125,9 @@ impl Scanner {
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
                             if block_identifier.block_height % 1000 == 0 {
-                        if let Err(e) = self.save_to_file(&self.state_file) {
-                            tracing::warn!(error = %e, "failed to save periodic checkpoint");
-                        }
+                                if let Err(e) = self.save_to_file(&self.state_file) {
+                                    tracing::warn!(error = %e, "failed to save periodic checkpoint");
+                                }
                             }
                             continue;
                         }
@@ -146,18 +161,9 @@ impl Scanner {
 
                     tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
 
-                    // Make multiple parallel requests and wait for the first successful one
-                    let block = match p2p::pull_block_from_p2p_by_blockhash(
-                        self.p2p_peer,
-                        block_hash,
-                        self.network,
-                    ) {
-                        Ok(full_block) => full_block,
-                        Err(err) => {
-                            tracing::error!(error = %err, "failed to pull block via P2P");
-                            return Err(err);
-                        }
-                    };
+                    let block = self
+                        .fetch_block_with_retry(&mut p2p_conn, block_hash, block_identifier.block_height)
+                        .await?;
 
                     // build partial secret hashmap, only populate with txids and secrets where we
                     // suspect matches, skip the rest
@@ -454,6 +460,77 @@ impl Scanner {
         Ok(())
     }
 
+    /// Fetch a full block over P2P, transparently (re)connecting on failure.
+    ///
+    /// The P2P fetch is blocking I/O, so it runs on a fresh connection that is
+    /// reused across calls via `p2p_conn`.  If a fetch fails (the peer closed
+    /// the connection, timed out, or replied notfound), we drop the dead
+    /// connection and retry on a brand-new one with linear backoff.  Only after
+    /// all attempts are exhausted does the error propagate, at which point
+    /// `watch_chain` will retry the whole range on the next poll.
+    async fn fetch_block_with_retry(
+        &self,
+        p2p_conn: &mut Option<p2p::P2pConnection>,
+        block_hash: BlockHash,
+        height: u64,
+    ) -> Result<bitcoin::Block, ScannerError> {
+        const MAX_ATTEMPTS: u32 = 4;
+
+        let mut last_err: Option<ScannerError> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            if p2p_conn.is_none() {
+                match p2p::P2pConnection::connect(self.p2p_peer, self.network) {
+                    Ok(conn) => *p2p_conn = Some(conn),
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = %self.p2p_peer,
+                            attempt,
+                            error = %e,
+                            "failed to open P2P connection"
+                        );
+                        last_err = Some(e);
+                        time::sleep(time::Duration::from_secs(attempt as u64)).await;
+                        continue;
+                    }
+                }
+            }
+
+            match p2p_conn.as_mut().unwrap().fetch_block(block_hash) {
+                Ok(block) => {
+                    // The peer may close the connection after serving a block (connection
+                    // limits, rate limiting, etc.).  Proactively discard the connection
+                    // so the next fetch starts a fresh handshake rather than discovering
+                    // the dead socket mid-read on the next attempt.
+                    *p2p_conn = None;
+                    return Ok(block);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer = %self.p2p_peer,
+                        height,
+                        block_hash = %block_hash,
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        "block fetch failed; dropping connection and retrying"
+                    );
+                    // Drop the (likely dead) connection so the next attempt
+                    // starts a fresh handshake.
+                    *p2p_conn = None;
+                    last_err = Some(e);
+                    if attempt < MAX_ATTEMPTS {
+                        time::sleep(time::Duration::from_secs(attempt as u64)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            format!("failed to fetch block {block_hash} from {} after {MAX_ATTEMPTS} attempts", self.p2p_peer)
+                .into()
+        }))
+    }
+
     /// Update Electrum tip height and scan progress after each scanned block.
     /// Fires a push notification even when no wallet outputs were found.
     async fn notify_electrum_scan_progress(&self, block_height: u64, start: u64, end: u64) {
@@ -485,20 +562,25 @@ impl Scanner {
     /// `Watch()` loop and means callers never need to supply an `end_height`.
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         loop {
-            let oracle_tip = self
+            let oracle_tip = match self
                 .client
                 .get_info(tonic::Request::new(()))
                 .await
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                })?
-                .into_inner()
-                .height;
+            {
+                Ok(resp) => resp.into_inner().height,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to reach oracle, will retry");
+                    time::sleep(time::Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
 
             if oracle_tip > self.last_scanned_block_height {
                 let from = self.last_scanned_block_height + 1;
                 tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
-                self.scan_block_range(from, oracle_tip).await?;
+                if let Err(e) = self.scan_block_range(from, oracle_tip).await {
+                    tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
+                }
             }
 
             time::sleep(time::Duration::from_secs(10)).await;
