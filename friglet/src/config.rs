@@ -107,7 +107,10 @@ pub fn default_key_file() -> Option<PathBuf> {
 }
 
 /// Merge all configuration layers for the given CLI args.
-pub fn load(args: &ScanArgs) -> Result<DaemonConfig, String> {
+///
+/// Also returns the config file that was used (if any) so the daemon knows
+/// where `SetConfig` should persist changes.
+pub fn load(args: &ScanArgs) -> Result<(DaemonConfig, Option<PathBuf>), String> {
     let file = match &args.config {
         Some(path) => {
             if !path.exists() {
@@ -117,7 +120,8 @@ pub fn load(args: &ScanArgs) -> Result<DaemonConfig, String> {
         }
         None => default_config_path().filter(|p| p.exists()),
     };
-    merge_layers(file.as_deref(), args)
+    let merged = merge_layers(file.as_deref(), args)?;
+    Ok((merged, file))
 }
 
 fn merge_layers(file: Option<&Path>, args: &ScanArgs) -> Result<DaemonConfig, String> {
@@ -208,6 +212,52 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
     })
 }
 
+/// Full validation for a config arriving via `SetConfig`: everything
+/// [`resolve`] checks (network, p2p address, start height, spend pubkey)
+/// plus checks that would otherwise only surface at startup — mirroring
+/// blindbit-lib's `ScannerConfig::validate` (oracle URL scheme) and the
+/// HTTP/Electrum bind addresses parsing.
+pub fn validate_daemon_config(cfg: &DaemonConfig) -> Result<ResolvedConfig, String> {
+    let resolved = resolve(cfg.clone())?;
+
+    if resolved.oracle_url.is_empty() {
+        return Err("oracle_url cannot be empty".to_string());
+    }
+    if !resolved.oracle_url.starts_with("http://") && !resolved.oracle_url.starts_with("https://") {
+        return Err(format!(
+            "invalid oracle_url `{}`: must start with http:// or https://",
+            resolved.oracle_url
+        ));
+    }
+    if resolved.start_height == 0 {
+        return Err("invalid start_height 0: must be at least 1".to_string());
+    }
+    SocketAddr::from_str(&resolved.http_addr)
+        .map_err(|e| format!("invalid http_addr `{}`: {e}", resolved.http_addr))?;
+    SocketAddr::from_str(&resolved.electrum_addr)
+        .map_err(|e| format!("invalid electrum_addr `{}`: {e}", resolved.electrum_addr))?;
+    if resolved.state_file.as_os_str().is_empty() {
+        return Err("state_file cannot be empty".to_string());
+    }
+
+    Ok(resolved)
+}
+
+/// Persist `cfg` as pretty TOML to `path` (atomically: temp file + rename),
+/// creating parent directories as needed.
+pub fn write_config_file(path: &Path, cfg: &DaemonConfig) -> Result<(), String> {
+    let describe = |e: String| format!("cannot write config file {}: {e}", path.display());
+    let toml = toml::to_string_pretty(cfg).map_err(|e| describe(e.to_string()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| describe(e.to_string()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| describe(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| describe(e.to_string()))
+}
+
 /// Resolve the scan secret. Precedence: `--scan-secret` flag, then
 /// `FRIGLET_SCAN_SECRET` env, then the key file. When the secret arrives via
 /// flag or env and the key file does not exist yet, it is written there
@@ -251,7 +301,24 @@ pub fn resolve_scan_secret(cli_secret: Option<&str>, key_file: &Path) -> Result<
     Ok(secret)
 }
 
+/// Validate `hex` as a 32-byte secp256k1 secret key and write/replace the
+/// key file at `path` (0600 on Unix). Backs the `SetScanKey` control verb.
+pub fn replace_scan_key(path: &Path, hex: &str) -> Result<SecretKey, String> {
+    let hex = hex.trim();
+    let secret = SecretKey::from_str(hex).map_err(|e| {
+        format!(
+            "invalid scan key: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"
+        )
+    })?;
+    write_key_file_impl(path, hex, true)?;
+    Ok(secret)
+}
+
 fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
+    write_key_file_impl(path, secret_hex, false)
+}
+
+fn write_key_file_impl(path: &Path, secret_hex: &str, overwrite: bool) -> Result<(), String> {
     let describe = |e: std::io::Error| format!("cannot write key file {}: {e}", path.display());
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -260,7 +327,12 @@ fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
     }
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -269,6 +341,14 @@ fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
     // On Windows the file inherits the profile directory's default ACL, which
     // restricts access to the owning user — no tighter per-file ceiling is set.
     let mut file = options.open(path).map_err(describe)?;
+    // `mode(0o600)` only applies on creation; enforce it when replacing a
+    // pre-existing key file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(describe)?;
+    }
     file.write_all(secret_hex.as_bytes()).map_err(describe)?;
     file.write_all(b"\n").map_err(describe)?;
     Ok(())

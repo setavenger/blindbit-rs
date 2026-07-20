@@ -31,3 +31,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+# Lazy (no-network) oracle channel for control-socket tests; version pinned
+# to blindbit-lib's tonic.
+tonic = "0.14.2"

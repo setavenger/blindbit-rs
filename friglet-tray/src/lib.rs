@@ -8,7 +8,7 @@ pub mod lifecycle;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use friglet_ipc::{Client, Request, Response, StatusInfo};
+use friglet_ipc::{Client, DaemonConfig, Request, Response, StatusInfo};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -70,8 +70,53 @@ async fn stop_scanning(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     send_simple(&state.socket_path, Request::Stop).await
 }
 
+/// Fetch the daemon's effective configuration (never contains the scan
+/// secret). Errors when the daemon is unreachable so the settings form can
+/// disable itself.
+#[tauri::command]
+async fn get_config(state: State<'_, Arc<AppState>>) -> Result<DaemonConfig, String> {
+    let mut client = Client::connect(&state.socket_path)
+        .await
+        .map_err(|e| format!("daemon unreachable: {e}"))?;
+    match client
+        .request(&Request::GetConfig)
+        .await
+        .map_err(|e| format!("request failed: {e}"))?
+    {
+        Response::Config(cfg) => Ok(cfg),
+        Response::Error(e) => Err(e),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
+}
+
+/// Send the full configuration to the daemon (validate → persist → apply).
+/// `Ok(None)` on plain success; `Ok(Some(note))` when the daemon reports a
+/// note (e.g. bind-address changes needing a daemon restart).
+#[tauri::command]
+async fn set_config(
+    state: State<'_, Arc<AppState>>,
+    config: DaemonConfig,
+) -> Result<Option<String>, String> {
+    send_with_note(&state.socket_path, Request::SetConfig(Box::new(config))).await
+}
+
+/// Replace the scan secret (hex 32 bytes); the daemon writes its key file.
+#[tauri::command]
+async fn set_scan_key(
+    state: State<'_, Arc<AppState>>,
+    key: String,
+) -> Result<Option<String>, String> {
+    send_with_note(&state.socket_path, Request::SetScanKey(key)).await
+}
+
 /// Send a request that is expected to answer `Ok`.
 async fn send_simple(socket_path: &str, req: Request) -> Result<(), String> {
+    send_with_note(socket_path, req).await.map(|_| ())
+}
+
+/// Send a request answering `Ok` or `OkWithNote`; the note is passed through
+/// so the UI can surface it.
+async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String>, String> {
     let mut client = Client::connect(socket_path)
         .await
         .map_err(|e| format!("daemon unreachable: {e}"))?;
@@ -80,7 +125,8 @@ async fn send_simple(socket_path: &str, req: Request) -> Result<(), String> {
         .await
         .map_err(|e| format!("request failed: {e}"))?
     {
-        Response::Ok => Ok(()),
+        Response::Ok => Ok(None),
+        Response::OkWithNote(note) => Ok(Some(note)),
         Response::Error(e) => Err(e),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -302,7 +348,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             start_scanning,
-            stop_scanning
+            stop_scanning,
+            get_config,
+            set_config,
+            set_scan_key
         ])
         .on_window_event(|window, event| {
             // Tray-only app: closing the status window hides it.

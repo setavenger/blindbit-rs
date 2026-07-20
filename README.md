@@ -111,6 +111,16 @@ address, errors) in the tray menu and in a status window (hidden by default,
 opened via the tray menu; closing it hides it again). The tray menu also
 offers Start/Stop scanning and Quit.
 
+The window's **Settings** tab lets you view and edit all daemon settings —
+network, oracle URL, P2P node address, start height, scan key, spend pubkey,
+max labels, HTTP/Electrum bind addresses, state and key file paths. Saving
+sends the config to the daemon, which validates it, persists it to its config
+file (and the scan key to the 0600 key file) and applies it: scan settings
+restart the scan task immediately, while bind-address changes take effect on
+the next daemon restart (the UI surfaces the daemon's note about this). The
+scan key is write-only — it is never displayed and only sent when you type a
+new one.
+
 ```bash
 # build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
 # libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)

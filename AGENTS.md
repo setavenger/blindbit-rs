@@ -17,6 +17,8 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
 
 - `cargo run -p friglet-tray` — no npm/frontend build step; the UI is plain
   static HTML/CSS/JS in `friglet-tray/ui/` (tauri.conf.json `frontendDist`).
+  The status window has a Settings tab (GetConfig/SetConfig/SetScanKey over
+  the control socket); the fake daemon answers all of these in memory.
 - Fake daemon for manual testing (speaks the `friglet-ipc` protocol on the
   default control socket): `cargo run -p friglet-tray --example fake-daemon`.
 - Useful env vars: `FRIGLET_CONTROL_SOCKET` (socket path override),
@@ -42,6 +44,28 @@ Verified in this repo's cloud VM (Xvfb available, no desktop environment):
   therefore cannot be exercised with xdotool in this environment; rely on the
   `friglet-tray/tests/` integration tests and unit tests for the lifecycle
   and IPC logic instead.
+
+## SetConfig / SetScanKey semantics (v1)
+
+- The daemon validates a `SetConfig` payload fully before touching anything;
+  invalid input → `Response::Error`, nothing persisted. Valid configs are
+  written as TOML to the config file the daemon loaded (or the default path)
+  and applied: scanner-affecting fields rebuild + restart the scan task;
+  `http_addr`/`electrum_addr`/`control_socket`/`log_level` need a daemon
+  restart (reported via `Response::OkWithNote` — no live rebinding).
+- Known v1 limitation: the Electrum server keeps the index/notification
+  channel of the scanner it was started with, so after a scanner-affecting
+  `SetConfig` it serves the pre-change wallet view until the daemon restarts
+  (the `OkWithNote` message says so). Same for the HTTP `/subscribe` start
+  height.
+- `SetScanKey` writes the key file (0600) but blindbit-lib restores the
+  secret embedded in the state file, so a stale state file pins the old key —
+  the daemon detects this and answers `OkWithNote` telling the user to move
+  the state file.
+- Control-socket integration tests live in `friglet/src/control/mod.rs`
+  (friglet is a bin crate, so no `tests/` dir); they build offline `Scanner`s
+  via a lazy tonic channel (`tonic` is a friglet dev-dependency pinned to
+  blindbit-lib's version) and inject a no-network `scanner_builder`.
 
 ## Rules
 

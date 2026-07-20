@@ -30,7 +30,8 @@ pub use interprocess::local_socket::tokio::Listener;
 /// `FRIGLET_*` environment variable suffixes.
 ///
 /// The scan secret is deliberately not part of this struct: it lives in the
-/// key file (see the daemon docs) and never crosses the control socket.
+/// key file (see the daemon docs) and is never *returned* over the control
+/// socket. Replacing it is a separate write-only verb ([`Request::SetScanKey`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
@@ -88,8 +89,19 @@ pub enum Request {
     Start,
     /// Stop the scan task (no-op if not running).
     Stop,
+    /// Current effective configuration (never contains the scan secret).
     GetConfig,
+    /// Replace the daemon configuration: the daemon validates it, persists
+    /// it to its config file (TOML) and applies it. Scanner-affecting fields
+    /// restart the scan task; bind addresses (`http_addr`, `electrum_addr`)
+    /// only take effect after a daemon restart (reported via
+    /// [`Response::OkWithNote`]).
     SetConfig(Box<DaemonConfig>),
+    /// Replace the scan secret: a hex-encoded 32-byte secp256k1 secret key.
+    /// The daemon validates it and writes it to its key file (0600 on Unix).
+    /// The secret is deliberately not part of [`DaemonConfig`], so this is a
+    /// separate verb; `GetConfig` never returns it.
+    SetScanKey(String),
     /// Gracefully shut down the whole daemon process.
     Shutdown,
 }
@@ -99,6 +111,9 @@ pub enum Request {
 pub enum Response {
     Status(StatusInfo),
     Ok,
+    /// Success, plus a human-readable note the client should surface (e.g.
+    /// which changed settings need a daemon restart to take effect).
+    OkWithNote(String),
     Config(DaemonConfig),
     Error(String),
 }
@@ -283,6 +298,17 @@ mod tests {
         }));
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+    }
+
+    #[test]
+    fn set_scan_key_roundtrip() {
+        let req = Request::SetScanKey("aa".repeat(32));
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+
+        let resp = Response::OkWithNote("restart required".to_string());
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
     }
 
     #[test]

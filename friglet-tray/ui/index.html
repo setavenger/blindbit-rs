@@ -13,57 +13,139 @@
       <span id="reachable" class="pill pill-bad">unreachable</span>
     </header>
 
-    <section class="card">
-      <div class="row">
-        <span class="label">Scanning</span>
-        <span id="scanning" class="value">–</span>
-      </div>
-      <div class="row">
-        <span class="label">Height</span>
-        <span class="value"><span id="scanned-height">–</span> / <span id="tip-height">–</span></span>
-      </div>
-      <div class="progress"><div id="progress-bar"></div></div>
-      <div class="row">
-        <span class="label">Progress</span>
-        <span id="progress-text" class="value">–</span>
-      </div>
-    </section>
+    <nav class="tabs">
+      <button id="tab-status" class="tab active">Status</button>
+      <button id="tab-settings" class="tab">Settings</button>
+    </nav>
 
-    <section class="card">
-      <div class="row">
-        <span class="label">Network</span>
-        <span id="network" class="value">–</span>
-      </div>
-      <div class="row">
-        <span class="label">Electrum clients</span>
-        <span id="electrum-clients" class="value">–</span>
-      </div>
-      <div class="row">
-        <span class="label">Oracle / P2P</span>
-        <span id="oracle" class="value">–</span>
-      </div>
-      <div class="row">
-        <span class="label">Daemon version</span>
-        <span id="version" class="value">–</span>
-      </div>
-    </section>
+    <div id="view-status">
+      <section class="card">
+        <div class="row">
+          <span class="label">Scanning</span>
+          <span id="scanning" class="value">–</span>
+        </div>
+        <div class="row">
+          <span class="label">Height</span>
+          <span class="value"><span id="scanned-height">–</span> / <span id="tip-height">–</span></span>
+        </div>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <div class="row">
+          <span class="label">Progress</span>
+          <span id="progress-text" class="value">–</span>
+        </div>
+      </section>
 
-    <section class="card">
-      <div class="col">
-        <span class="label">SP address</span>
-        <code id="sp-address">–</code>
-      </div>
-      <div class="col" id="error-block" hidden>
-        <span class="label">Last error</span>
-        <code id="last-error" class="error"></code>
-      </div>
-    </section>
+      <section class="card">
+        <div class="row">
+          <span class="label">Network</span>
+          <span id="network" class="value">–</span>
+        </div>
+        <div class="row">
+          <span class="label">Electrum clients</span>
+          <span id="electrum-clients" class="value">–</span>
+        </div>
+        <div class="row">
+          <span class="label">Oracle / P2P</span>
+          <span id="oracle" class="value">–</span>
+        </div>
+        <div class="row">
+          <span class="label">Daemon version</span>
+          <span id="version" class="value">–</span>
+        </div>
+      </section>
 
-    <div class="actions">
-      <button id="start-btn">Start scanning</button>
-      <button id="stop-btn" class="secondary">Stop scanning</button>
+      <section class="card">
+        <div class="col">
+          <span class="label">SP address</span>
+          <code id="sp-address">–</code>
+        </div>
+        <div class="col" id="error-block" hidden>
+          <span class="label">Last error</span>
+          <code id="last-error" class="error"></code>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button id="start-btn">Start scanning</button>
+        <button id="stop-btn" class="secondary">Stop scanning</button>
+      </div>
+      <p id="action-error" class="error small"></p>
     </div>
-    <p id="action-error" class="error small"></p>
+
+    <div id="view-settings" hidden>
+      <p id="settings-unreachable" class="error small" hidden>
+        Daemon unreachable — settings cannot be loaded or changed.
+      </p>
+      <form id="settings-form">
+        <fieldset id="settings-fields" disabled>
+          <section class="card">
+            <div class="field">
+              <label for="cfg-network">Network</label>
+              <select id="cfg-network">
+                <option value="bitcoin">bitcoin</option>
+                <option value="signet">signet</option>
+                <option value="testnet">testnet</option>
+                <option value="testnet4">testnet4</option>
+                <option value="regtest">regtest</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="cfg-oracle-url">Oracle URL</label>
+              <input id="cfg-oracle-url" type="text" placeholder="https://oracle.setor.dev" />
+            </div>
+            <div class="field">
+              <label for="cfg-p2p-addr">P2P node address (host:port)</label>
+              <input id="cfg-p2p-addr" type="text" placeholder="127.0.0.1:8333" />
+            </div>
+            <div class="field">
+              <label for="cfg-start-height">Start height (wallet birthday)</label>
+              <input id="cfg-start-height" type="number" min="1" step="1" />
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="field">
+              <label for="cfg-scan-key">Scan key (32-byte hex, write-only)</label>
+              <input id="cfg-scan-key" type="password" autocomplete="off"
+                     placeholder="unchanged — enter to replace" />
+            </div>
+            <div class="field">
+              <label for="cfg-spend-pubkey">Spend public key (33-byte hex)</label>
+              <input id="cfg-spend-pubkey" type="text" class="mono" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="cfg-max-labels">Max label number</label>
+              <input id="cfg-max-labels" type="number" min="0" step="1" />
+            </div>
+            <div class="field">
+              <label for="cfg-key-file">Key file path</label>
+              <input id="cfg-key-file" type="text" class="mono" spellcheck="false" />
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="field">
+              <label for="cfg-http-addr">HTTP bind address</label>
+              <input id="cfg-http-addr" type="text" placeholder="127.0.0.1:8080" />
+            </div>
+            <div class="field">
+              <label for="cfg-electrum-addr">Electrum bind address</label>
+              <input id="cfg-electrum-addr" type="text" placeholder="127.0.0.1:50001" />
+            </div>
+            <div class="field">
+              <label for="cfg-state-file">State file path</label>
+              <input id="cfg-state-file" type="text" class="mono" spellcheck="false" />
+            </div>
+          </section>
+
+          <div class="actions">
+            <button type="submit" id="save-btn">Save</button>
+            <button type="button" id="reload-btn" class="secondary">Reload</button>
+          </div>
+        </fieldset>
+      </form>
+      <p id="settings-msg" class="small"></p>
+    </div>
   </main>
 
   <script src="main.js"></script>

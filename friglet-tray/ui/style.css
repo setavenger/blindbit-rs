@@ -19,6 +19,8 @@ body {
 }
 
 main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+#view-status, #view-settings { display: flex; flex-direction: column; gap: 12px; }
+#view-status[hidden], #view-settings[hidden] { display: none; }
 
 header { display: flex; align-items: center; justify-content: space-between; }
 h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
@@ -69,6 +71,40 @@ code {
 }
 .error { color: var(--bad); }
 .small { font-size: 12px; min-height: 18px; }
+
+.tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); }
+.tab {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  padding: 6px 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab.active { color: var(--text); border-bottom-color: var(--accent); }
+.tab:hover { color: var(--text); }
+
+input, select { user-select: text; }
+fieldset { border: none; display: flex; flex-direction: column; gap: 12px; }
+fieldset:disabled { opacity: 0.5; }
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field label { color: var(--muted); font-size: 12px; }
+.field input, .field select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 9px;
+}
+.field input.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+.ok { color: var(--good); }
 
 .actions { display: flex; gap: 8px; }
 button {

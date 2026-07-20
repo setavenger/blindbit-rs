@@ -47,7 +47,10 @@ async fn main() {
 }
 
 async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let merged = config::load(&args)?;
+    let (merged, config_file) = config::load(&args)?;
+    // Where SetConfig persists changes: the file we loaded, or the default
+    // location when the daemon started without one.
+    let config_path = config_file.or_else(config::default_config_path);
 
     if args.print_config {
         print!("{}", toml::to_string_pretty(&merged)?);
@@ -139,11 +142,14 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let control_ctx = Arc::new(control::ControlCtx {
         supervisor: supervisor.clone(),
         scanner: scanner_instance.clone(),
-        electrum_index: electrum_index.clone(),
+        electrum_index: std::sync::Mutex::new(electrum_index.clone()),
         electrum_clients: electrum_clients.clone(),
-        config: cfg.raw.clone(),
-        network: cfg.raw.network.clone(),
-        state_file: cfg.state_file.clone(),
+        settings: std::sync::Mutex::new(cfg.raw.clone()),
+        config_path,
+        apply_lock: Mutex::new(()),
+        scanner_builder: Box::new(|cfg| {
+            Box::pin(async move { scanner::load_scanner(&cfg).await.map_err(|e| e.to_string()) })
+        }),
         shutdown: shutdown_token.clone(),
     });
     let control_server = control::run(cfg.control_socket.clone(), {
