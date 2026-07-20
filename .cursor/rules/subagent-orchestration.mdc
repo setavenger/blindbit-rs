@@ -1,0 +1,17 @@
+---
+description: Delegate context-heavy work to subagents; keep main session lean
+alwaysApply: true
+---
+
+# Subagent orchestration
+
+Default for all work: **orchestrate in main thread, execute in subagents.**
+
+Delegate to subagents (Task tool) for anything context-heavy — codebase exploration, research, isolated implementation chunks, shell/git ops, and review. Subagents return summaries; main context keeps plan, decisions, and synthesis.
+
+- **Research / exploration:** `explore` or `generalPurpose` subagent with `composer-2.5-fast` when available.
+- **Parallelize** independent subagents in one turn.
+- **Main thread:** short targeted reads only; avoid broad file/grep spirals.
+- **Reserve slow/deep models** for subagents that truly need them.
+
+Read and follow `.cursor/skills/subagent-orchestration/SKILL.md` for full delegation patterns.
