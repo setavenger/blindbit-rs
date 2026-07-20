@@ -25,13 +25,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["deb", "appimage", "dmg"],
+    "category": "Utility",
+    "shortDescription": "System tray companion for the friglet Silent Payments daemon",
+    "longDescription": "Friglet Tray supervises and monitors the friglet BIP-352 Silent Payments scanning daemon: it shows live scan status in the system tray, offers start/stop controls and a settings window, and spawns the bundled friglet daemon when none is running.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
+      }
+    }
   }
 }

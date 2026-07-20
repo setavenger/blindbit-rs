@@ -45,6 +45,48 @@ Verified in this repo's cloud VM (Xvfb available, no desktop environment):
   `friglet-tray/tests/` integration tests and unit tests for the lifecycle
   and IPC logic instead.
 
+## Packaging (M4)
+
+- Desktop bundles: `scripts/prepare-sidecar.sh` (stages
+  `target/release/friglet` as `friglet-tray/binaries/friglet-<triple>`,
+  gitignored), then from `friglet-tray/`:
+  `npx @tauri-apps/cli build --bundles deb,appimage --config
+  tauri.sidecar.conf.json` (Linux) or `--bundles dmg --config
+  tauri.sidecar.conf.json` (macOS host only — dmg cannot be cross-built
+  from Linux). Artifacts: `target/release/bundle/{deb,appimage,dmg}/`.
+- The daemon is a Tauri sidecar (`bundle.externalBin`), but it lives in the
+  `tauri.sidecar.conf.json` overlay, NOT the base `tauri.conf.json`:
+  tauri-build errors at compile time when an externalBin file is missing,
+  which would break plain `cargo build/test --workspace` on fresh clones.
+  The sidecar file needs the target-triple suffix or the build fails with
+  "resource path ... doesn't exist". Both deb and AppImage place `friglet`
+  next to `friglet-tray` in `usr/bin/`, which the existing lifecycle search
+  order (env → exe dir → PATH) already covers — no lifecycle changes were
+  needed.
+- Verified in this repo's cloud VM: the installed `.deb`'s tray, run under
+  `xvfb-run -a dbus-run-session`, attaches to a fake daemon AND spawns the
+  bundled `/usr/bin/friglet` sidecar (which scanned signet blocks live).
+  Same attach smoke test passes for the AppImage with
+  `--appimage-extract-and-run` (plain AppImage mount needs FUSE).
+- AppImage bundling downloads linuxdeploy/appimagetool at build time —
+  needs network; the deb target has no such dependency.
+- Docker: root `Dockerfile` (multi-stage; builder needs `protobuf-compiler`
+  AND `libprotobuf-dev` — the latter provides the `google/protobuf/*.proto`
+  well-known types blindbit-lib's protos import) + `docs/docker.md`. All
+  state under a `/data` volume; image presets
+  `FRIGLET_HTTP_ADDR`/`FRIGLET_ELECTRUM_ADDR` to `0.0.0.0` binds (env beats
+  config file, loses to flags). Verified in this VM (dockerd with
+  `--storage-driver=vfs`; overlayfs fails in the nested container): image
+  builds (~91 MB), container scans signet, control socket works. Note a
+  pre-existing daemon behavior: the scan task holds the scanner mutex, so
+  HTTP `/height`/`/subscribe` block while a scan is actively running.
+- Windows status: `cargo check -p friglet-ipc -p friglet -p friglet-tray
+  --target x86_64-pc-windows-gnu` passes cleanly (mingw-w64 installed).
+  The `x86_64-pc-windows-msvc` target cannot be checked from Linux — the
+  `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
+  an environment limitation, not a code problem. No real Windows
+  build/run has been exercised; linking + runtime remain unverified.
+
 ## SetConfig / SetScanKey semantics (v1)
 
 - The daemon validates a `SetConfig` payload fully before touching anything;

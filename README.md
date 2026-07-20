@@ -149,6 +149,70 @@ the control protocol: `cargo run -p friglet-tray --example fake-daemon`.
 
 ---
 
+## Packaging
+
+### Desktop bundles (friglet-tray + bundled daemon)
+
+The tray app ships as a Tauri bundle — `.deb` and `.AppImage` on Linux,
+`.dmg` on macOS — with the `friglet` daemon included as a sidecar binary
+(Tauri `bundle.externalBin`), so the installed tray always finds a daemon
+right next to its own executable.
+
+```bash
+# 1. stage the daemon sidecar (builds friglet --release and copies it to
+#    friglet-tray/binaries/friglet-<target-triple>)
+scripts/prepare-sidecar.sh
+
+# 2. build the bundles (tauri-cli via npx; `cargo install tauri-cli --locked`
+#    works too — then use `cargo tauri build ...`)
+cd friglet-tray
+npx @tauri-apps/cli build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
+npx @tauri-apps/cli build --bundles dmg --config tauri.sidecar.conf.json           # macOS
+```
+
+The `--config tauri.sidecar.conf.json` overlay adds the daemon sidecar
+(`bundle.externalBin`). It is kept out of the base `tauri.conf.json` so that
+plain `cargo build`/`cargo test` on the workspace never require the staged
+sidecar binary.
+
+Artifacts land under `target/release/bundle/`:
+
+- `deb/friglet-tray_<version>_amd64.deb` — installs `friglet-tray` **and**
+  `friglet` into `/usr/bin/`; declares `libwebkit2gtk-4.1-0` and
+  `libayatana-appindicator3-1` as dependencies.
+- `appimage/friglet-tray_<version>_amd64.AppImage` — self-contained; both
+  binaries in the embedded `usr/bin/`.
+- `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
+  Run `scripts/prepare-sidecar.sh` there first; it picks up the host triple
+  (e.g. `aarch64-apple-darwin`) automatically.
+
+### Standalone daemon
+
+```bash
+cargo build --release -p friglet   # -> target/release/friglet
+```
+
+Copy `target/release/friglet` wherever you like; it is self-contained. Run
+it with a config file (see [Configuration](#configuration)):
+`friglet scan --config /path/to/config.toml`, or just `friglet` to use
+`~/.config/friglet/config.toml`.
+
+### Docker (headless daemon)
+
+A multi-stage `Dockerfile` at the repo root builds a slim headless daemon
+image. Config, key file, scanner state, and the control socket all live in a
+`/data` volume:
+
+```bash
+docker build -t friglet .
+docker run -d -p 8080:8080 -p 50001:50001 -v "$PWD/friglet-data:/data" friglet
+curl http://127.0.0.1:8080/height
+```
+
+See [docs/docker.md](docs/docker.md) for the config layout and details.
+
+---
+
 ### blindbit-cli
 
 The `blindbit-cli` provides a minimal command-line interface for scanning blocks without a server:

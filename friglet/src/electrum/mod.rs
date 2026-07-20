@@ -144,25 +144,20 @@ pub async fn run(
 
             const DEBOUNCE: Duration = Duration::from_millis(1000);
 
-            loop {
-                match found_rx.recv().await {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Drain any additional signals that arrive within the
-                        // debounce window so fast scanning collapses into one push.
-                        let deadline = Instant::now() + DEBOUNCE;
-                        loop {
-                            match timeout_at(deadline, found_rx.recv()).await {
-                                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                                    // more signals in the window — keep draining
-                                }
-                                Ok(Err(broadcast::error::RecvError::Closed)) => return,
-                                Err(_elapsed) => break, // window expired
-                            }
+            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = found_rx.recv().await {
+                // Drain any additional signals that arrive within the
+                // debounce window so fast scanning collapses into one push.
+                let deadline = Instant::now() + DEBOUNCE;
+                loop {
+                    match timeout_at(deadline, found_rx.recv()).await {
+                        Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                            // more signals in the window — keep draining
                         }
-                        push_notifications(&state).await;
+                        Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                        Err(_elapsed) => break, // window expired
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
+                push_notifications(&state).await;
             }
         });
     }
@@ -378,13 +373,12 @@ async fn index_unconfirmed_tx(index: &Arc<Mutex<WalletElectrumIndex>>, raw_hex: 
         let vout = input.previous_output.vout as usize;
 
         // Primary: decode from raw bytes cached in idx.txs.
-        if let Some(raw_prev) = idx.txs.get(&prev_txid) {
-            if let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev) {
-                if let Some(out) = prev_tx.output.get(vout) {
-                    affected.push(electrum_scripthash(&out.script_pubkey));
-                    continue;
-                }
-            }
+        if let Some(raw_prev) = idx.txs.get(&prev_txid)
+            && let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev)
+            && let Some(out) = prev_tx.output.get(vout)
+        {
+            affected.push(electrum_scripthash(&out.script_pubkey));
+            continue;
         }
 
         // Fallback: the receive tx's scripthash is already in scripthash_history.
