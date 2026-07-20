@@ -175,7 +175,15 @@ where
              killing it and starting over"
         );
         if let Some(mut child) = lc.child.take() {
-            let _ = child.kill().await;
+            // tokio's `Child::kill` is `start_kill` + `wait`: it resolves
+            // only after the child has fully exited and been reaped, so the
+            // attach-or-spawn below can never run concurrently with the old
+            // daemon (they share config/key/state paths).
+            if child.kill().await.is_err() {
+                // `start_kill` fails when the child exited in the meantime;
+                // reap it so the exit is still complete before proceeding.
+                let _ = child.wait().await;
+            }
         }
         lc.spawned_by_tray = false;
     }
@@ -527,8 +535,18 @@ mod tests {
         assert!(process_alive(pid));
 
         // Locator finds nothing, so the re-run ends Unreachable — the point
-        // here is that the wedged child is killed and cleared first.
-        attach_and_record_with(&state, || None).await;
+        // here is that the wedged child is killed and cleared first. The
+        // locator runs right before a new daemon would be spawned, so the
+        // old child must already be fully exited by then (no overlap on
+        // shared config/key/state paths).
+        attach_and_record_with(&state, move || {
+            assert!(
+                !process_alive(pid),
+                "old daemon must be fully exited before a new spawn attempt"
+            );
+            None
+        })
+        .await;
 
         let lc = state.lifecycle.lock().await;
         assert!(lc.child.is_none(), "wedged child must be cleared");

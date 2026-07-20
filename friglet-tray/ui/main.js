@@ -143,28 +143,44 @@ async function saveConfig(event) {
   settingsMessage("Saving…", false);
 
   const notes = [];
+  // Config first: if the user changed key_file in the same save, the scan
+  // key below must land in the NEW path. A set_config failure aborts the
+  // save before the key is sent anywhere, keeping the form edits intact.
   try {
-    // Config first: if the user changed key_file in the same save, the scan
-    // key below must land in the NEW path. A set_config failure aborts the
-    // save before the key is sent anywhere.
     const note = await invoke("set_config", { config: formConfig() });
     if (note) notes.push(note);
-    // Write-only scan key: only sent when the user typed one.
-    const key = $("cfg-scan-key").value.trim();
-    if (key !== "") {
-      const keyNote = await invoke("set_scan_key", { key });
-      if (keyNote) notes.push(keyNote);
-    }
   } catch (e) {
     settingsMessage(String(e), true);
     $("save-btn").disabled = false;
     return;
   }
 
-  settingsMessage(notes.length ? `Saved. ${notes.join(". ")}` : "Saved.", false);
-  $("save-btn").disabled = false;
+  // The config is persisted daemon-side from here on. Write-only scan key:
+  // only sent when the user typed one; a failure must not skip the reload
+  // below, or the form keeps merging stale hidden fields into later saves.
+  let keyError = null;
+  const key = $("cfg-scan-key").value.trim();
+  if (key !== "") {
+    try {
+      const keyNote = await invoke("set_scan_key", { key });
+      if (keyNote) notes.push(keyNote);
+    } catch (e) {
+      keyError = String(e);
+    }
+  }
+
+  // Reload so loadedConfig matches what the daemon persisted (loadConfig
+  // clears the message, so report the outcome afterwards).
   await loadConfig();
   await refresh();
+  if (keyError) {
+    settingsMessage(`Config saved, but updating the scan key failed: ${keyError}`, true);
+    // fillForm cleared the key input; restore it so the user can retry.
+    $("cfg-scan-key").value = key;
+  } else {
+    settingsMessage(notes.length ? `Saved. ${notes.join(". ")}` : "Saved.", false);
+  }
+  $("save-btn").disabled = false;
 }
 
 $("settings-form").addEventListener("submit", saveConfig);
