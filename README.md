@@ -57,6 +57,34 @@ cargo run --release --package friglet scan \
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
 
+#### Configuration
+
+Every flag above can also come from a TOML config file or environment
+variables. Precedence: **CLI flags > `FRIGLET_*` env vars > config file >
+defaults**. With a complete config file, `friglet` (or `friglet scan`) starts
+with no flags at all.
+
+- Config file: `~/.config/friglet/config.toml` (Linux),
+  `~/Library/Application Support/friglet/config.toml` (macOS), or `--config <path>`.
+  Keys match the flag names (`oracle_url`, `p2p_node_addr`, `start_height`, ...).
+- Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
+  `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
+- `--print-config` prints the merged configuration as TOML and exits.
+
+The scan secret is kept out of the config file. It is read from, in order:
+`--scan-secret` (deprecated), `FRIGLET_SCAN_SECRET`, or the key file at
+`<config dir>/friglet/scan.key` (override with `key_file` / `--key-file`).
+When the secret is supplied via flag or env and no key file exists yet, it is
+written there with `0600` permissions so subsequent runs need no secret on
+the command line. Note: the scanner state file also contains the secret
+(required for restore); friglet keeps it at `0600`.
+
+While running, the daemon serves a control socket (newline-delimited JSON,
+see the `friglet-ipc` crate) for status, start/stop scanning, and shutdown.
+Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux),
+`~/Library/Application Support/friglet/friglet.sock` (macOS),
+`\\.\pipe\friglet` (Windows); override with `FRIGLET_CONTROL_SOCKET`.
+
 #### HTTP API
 
 Once running, `friglet` exposes the following endpoints on `--http-addr`:

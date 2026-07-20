@@ -17,15 +17,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant, timeout_at};
 
-use bitcoin_rev::Network;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
-use blindbit_lib::scanner::{ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
+use bitcoin_rev::Network;
 use blindbit_lib::scanner::broadcast_tx;
+use blindbit_lib::scanner::{
+    ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status,
+};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
@@ -113,6 +116,7 @@ pub async fn run(
     addr: &str,
     p2p_peer: SocketAddr,
     network: Network,
+    client_count: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (push_tx, _) = broadcast::channel::<String>(256);
 
@@ -148,8 +152,7 @@ pub async fn run(
                         let deadline = Instant::now() + DEBOUNCE;
                         loop {
                             match timeout_at(deadline, found_rx.recv()).await {
-                                Ok(Ok(_))
-                                | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
                                     // more signals in the window — keep draining
                                 }
                                 Ok(Err(broadcast::error::RecvError::Closed)) => return,
@@ -172,10 +175,13 @@ pub async fn run(
             Ok((stream, peer_addr)) => {
                 tracing::info!(peer = %peer_addr, "Electrum client connected");
                 let state = state.clone();
+                let client_count = client_count.clone();
+                client_count.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, state).await {
                         tracing::error!(peer = %peer_addr, error = %e, "Electrum client error");
                     }
+                    client_count.fetch_sub(1, Ordering::Relaxed);
                     tracing::info!(peer = %peer_addr, "Electrum client disconnected");
                 });
             }
@@ -312,8 +318,7 @@ async fn handle_client(
         let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                let resp =
-                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
+                let resp = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
                 tx.send(resp.into_line()).await?;
                 continue;
             }
@@ -347,11 +352,7 @@ async fn handle_client(
 /// The set of affected scripthashes is stored in `pending_scripthashes` so
 /// that when the block is later confirmed, `scan_block_range` can promote all
 /// `height: 0` entries (including non-SP change outputs) to the real height.
-async fn index_unconfirmed_tx(
-    index: &Arc<Mutex<WalletElectrumIndex>>,
-    raw_hex: &str,
-    txid: &str,
-) {
+async fn index_unconfirmed_tx(index: &Arc<Mutex<WalletElectrumIndex>>, raw_hex: &str, txid: &str) {
     let tx_bytes = match hex::decode(raw_hex) {
         Ok(b) => b,
         Err(e) => {
@@ -426,13 +427,17 @@ async fn index_unconfirmed_tx(
     idx.txs.insert(txid.to_string(), tx_bytes);
 
     // Add height-0 entries to every affected scripthash.
-    let entry = ScriptHashEntry { tx_hash: txid.to_string(), height: 0, fee: 0 };
+    let entry = ScriptHashEntry {
+        tx_hash: txid.to_string(),
+        height: 0,
+        fee: 0,
+    };
     let mut added = 0usize;
     for sh in &affected {
         let history = idx.scripthash_history.entry(sh.clone()).or_default();
         match history.iter().position(|e| e.tx_hash == txid) {
             Some(pos) if history[pos].height == 0 => {} // already unconfirmed, no-op
-            Some(_) => {}                                // already confirmed, leave it
+            Some(_) => {}                               // already confirmed, leave it
             None => {
                 history.push(entry.clone());
                 history.sort_by_key(|e| e.height);
@@ -443,7 +448,8 @@ async fn index_unconfirmed_tx(
 
     // Record affected scripthashes so scan_block_range can promote height-0
     // entries to the confirmed block height when the tx lands in a block.
-    idx.pending_scripthashes.insert(txid.to_string(), affected.clone());
+    idx.pending_scripthashes
+        .insert(txid.to_string(), affected.clone());
 
     tracing::info!(
         txid = %txid,
@@ -471,11 +477,9 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
             ),
         )
         .into_line(),
-        "server.features" => JsonRpcResponse::success(
-            req.id.clone(),
-            json!({ "silent_payments": [0] }),
-        )
-        .into_line(),
+        "server.features" => {
+            JsonRpcResponse::success(req.id.clone(), json!({ "silent_payments": [0] })).into_line()
+        }
 
         // ---- Block headers -----------------------------------------------
         "blockchain.headers.subscribe" => {
@@ -496,18 +500,13 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(height) = height_val.as_u64().map(|h| h as u32) else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "height must be integer",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "height must be integer")
+                    .into_line();
             };
             let index = state.index.lock().await;
             match index.headers.get(&height) {
                 Some(hex) => {
-                    JsonRpcResponse::success(req.id.clone(), Value::String(hex.clone()))
-                        .into_line()
+                    JsonRpcResponse::success(req.id.clone(), Value::String(hex.clone())).into_line()
                 }
                 None => JsonRpcResponse::error(
                     req.id.clone(),
@@ -525,12 +524,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "scripthash must be string",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
+                    .into_line();
             };
             let index = state.index.lock().await;
             let status = index
@@ -553,12 +548,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "scripthash must be string",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
+                    .into_line();
             };
             let index = state.index.lock().await;
             let history: Vec<Value> = index
@@ -567,9 +558,7 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 .map(|entries| {
                     entries
                         .iter()
-                        .map(|e| {
-                            json!({ "tx_hash": e.tx_hash, "height": e.height, "fee": e.fee })
-                        })
+                        .map(|e| json!({ "tx_hash": e.tx_hash, "height": e.height, "fee": e.fee }))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -591,11 +580,10 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
             };
             let index = state.index.lock().await;
             match index.txs.get(txid) {
-                Some(raw) => JsonRpcResponse::success(
-                    req.id.clone(),
-                    Value::String(hex::encode(raw)),
-                )
-                .into_line(),
+                Some(raw) => {
+                    JsonRpcResponse::success(req.id.clone(), Value::String(hex::encode(raw)))
+                        .into_line()
+                }
                 None => JsonRpcResponse::error(
                     req.id.clone(),
                     -32603,
@@ -639,12 +627,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "P2P broadcast failed");
-                    JsonRpcResponse::error(
-                        req.id.clone(),
-                        -32603,
-                        format!("broadcast failed: {e}"),
-                    )
-                    .into_line()
+                    JsonRpcResponse::error(req.id.clone(), -32603, format!("broadcast failed: {e}"))
+                        .into_line()
                 }
                 Err(e) => JsonRpcResponse::error(
                     req.id.clone(),
@@ -699,11 +683,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
 
         "blockchain.silentpayments.unsubscribe" => {
             let index = state.index.lock().await;
-            JsonRpcResponse::success(
-                req.id.clone(),
-                Value::String(index.sp_address.clone()),
-            )
-            .into_line()
+            JsonRpcResponse::success(req.id.clone(), Value::String(index.sp_address.clone()))
+                .into_line()
         }
 
         // ---- Fee stubs (Sparrow has fallbacks) ---------------------------
