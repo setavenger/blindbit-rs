@@ -144,14 +144,17 @@ async function saveConfig(event) {
 
   const notes = [];
   try {
+    // Config first: if the user changed key_file in the same save, the scan
+    // key below must land in the NEW path. A set_config failure aborts the
+    // save before the key is sent anywhere.
+    const note = await invoke("set_config", { config: formConfig() });
+    if (note) notes.push(note);
     // Write-only scan key: only sent when the user typed one.
     const key = $("cfg-scan-key").value.trim();
     if (key !== "") {
-      const note = await invoke("set_scan_key", { key });
-      if (note) notes.push(note);
+      const keyNote = await invoke("set_scan_key", { key });
+      if (keyNote) notes.push(keyNote);
     }
-    const note = await invoke("set_config", { config: formConfig() });
-    if (note) notes.push(note);
   } catch (e) {
     settingsMessage(String(e), true);
     $("save-btn").disabled = false;

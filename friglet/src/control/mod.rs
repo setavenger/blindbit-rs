@@ -59,8 +59,9 @@ pub struct ControlCtx {
     /// Where `SetConfig` persists the config; `None` when no location could
     /// be determined (no config dir on this platform).
     pub config_path: Option<PathBuf>,
-    /// Serializes `SetConfig` / `SetScanKey` so concurrent requests cannot
-    /// interleave persist + scanner rebuild.
+    /// Serializes `SetConfig` / `SetScanKey` / `Start` / `Stop` so lifecycle
+    /// verbs cannot interleave with persist + scanner rebuild (e.g. starting
+    /// the outgoing scanner in the middle of a swap).
     pub apply_lock: Mutex<()>,
     /// How to construct a scanner when new settings are applied.
     pub scanner_builder: ScannerBuilder,
@@ -72,12 +73,16 @@ impl ControlCtx {
         match req {
             Request::GetStatus => Response::Status(self.status().await),
             Request::Start => {
+                // Serialize with SetConfig/SetScanKey so the old scanner
+                // cannot be started in the middle of a rebuild + swap.
+                let _guard = self.apply_lock.lock().await;
                 if self.supervisor.start() {
                     tracing::info!("scan task started via control socket");
                 }
                 Response::Ok
             }
             Request::Stop => {
+                let _guard = self.apply_lock.lock().await;
                 if self.supervisor.stop().await {
                     tracing::info!("scan task stopped via control socket");
                     self.save_state().await;
@@ -171,6 +176,10 @@ impl ControlCtx {
             return Response::Error(e);
         }
         tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
+        // Update the effective settings as soon as the file is written so
+        // `GetConfig` matches the on-disk config even when applying fails
+        // below (the error tells the client it was saved but not applied).
+        *self.settings.lock().unwrap() = new_cfg.clone();
 
         let mut notes: Vec<String> = Vec::new();
         let restart_only: Vec<&str> = [
@@ -196,7 +205,7 @@ impl ControlCtx {
         }
 
         if scanner_settings_changed(&old_cfg, &new_cfg) {
-            if let Err(e) = self.rebuild_scanner(&resolved).await {
+            if let Err(e) = self.rebuild_scanner(&resolved, None).await {
                 return Response::Error(format!(
                     "config saved to {}, but applying it failed: {e}; \
                      a daemon restart may be required",
@@ -209,8 +218,6 @@ impl ControlCtx {
                     .to_string(),
             );
         }
-
-        *self.settings.lock().unwrap() = new_cfg;
 
         if notes.is_empty() {
             Response::Ok
@@ -248,8 +255,14 @@ impl ControlCtx {
             ));
         }
 
-        match self.rebuild_scanner(&resolved).await {
-            Ok(()) => Response::Ok,
+        // Rebuild with the just-written key explicitly: `resolve_scan_secret`
+        // prefers FRIGLET_SCAN_SECRET over the key file, which would silently
+        // ignore the rotation while that env var is set.
+        match self.rebuild_scanner(&resolved, Some(secret)).await {
+            Ok(()) => match scan_secret_env_shadows(&secret) {
+                Some(note) => Response::OkWithNote(note),
+                None => Response::Ok,
+            },
             Err(e) => Response::Error(format!(
                 "scan key file updated, but restarting the scanner failed: {e}; \
                  a daemon restart may be required"
@@ -260,13 +273,24 @@ impl ControlCtx {
     /// Stop the scan task, save state, build a fresh scanner from `resolved`
     /// and swap it into the shared `Arc`, then restart the scan task if it
     /// was running.
-    async fn rebuild_scanner(&self, resolved: &ResolvedConfig) -> Result<(), String> {
+    ///
+    /// `secret` overrides the usual secret resolution (env var, then key
+    /// file); `SetScanKey` passes the key it just wrote so a lingering
+    /// `FRIGLET_SCAN_SECRET` cannot undo the rotation.
+    async fn rebuild_scanner(
+        &self,
+        resolved: &ResolvedConfig,
+        secret: Option<bitcoin::secp256k1::SecretKey>,
+    ) -> Result<(), String> {
         let was_running = self.supervisor.is_running();
         self.supervisor.stop().await;
         // Persist the outgoing scanner's progress to the *old* state file.
         self.save_state().await;
 
-        let secret = config::resolve_scan_secret(None, &resolved.key_file)?;
+        let secret = match secret {
+            Some(s) => s,
+            None => config::resolve_scan_secret(None, &resolved.key_file)?,
+        };
         let scanner_config = scanner::ScannerConfig::new(
             resolved.oracle_url.clone(),
             resolved.p2p_addr,
@@ -301,6 +325,28 @@ impl ControlCtx {
         }
         Ok(())
     }
+}
+
+/// A warning note when `FRIGLET_SCAN_SECRET` is set to a key other than
+/// `new_secret`: the running scanner uses the new key, but
+/// [`config::resolve_scan_secret`] prefers the env var over the key file, so
+/// the next daemon restart would revert to the env key.
+fn scan_secret_env_shadows(new_secret: &bitcoin::secp256k1::SecretKey) -> Option<String> {
+    use std::str::FromStr;
+    let env = std::env::var("FRIGLET_SCAN_SECRET").ok()?;
+    let env = env.trim();
+    if env.is_empty() {
+        return None;
+    }
+    if bitcoin::secp256k1::SecretKey::from_str(env).is_ok_and(|k| k == *new_secret) {
+        return None;
+    }
+    Some(
+        "scan key applied, but FRIGLET_SCAN_SECRET is set in the daemon's environment and \
+         overrides the key file: the old key comes back on the next daemon restart unless \
+         the variable is unset"
+            .to_string(),
+    )
 }
 
 /// Whether any field that is baked into the scanner differs.
@@ -396,6 +442,20 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000002";
     const SPEND_PK: &str = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
 
+    /// Serializes the test that sets `FRIGLET_SCAN_SECRET` (process-global)
+    /// with tests whose assertions depend on it being unset.
+    static SCAN_SECRET_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Removes an env var on drop, so a panicking test cannot leak it.
+    struct EnvVarGuard(&'static str);
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: only used under SCAN_SECRET_ENV_LOCK; no other thread
+            // mutates the environment concurrently.
+            unsafe { std::env::remove_var(self.0) };
+        }
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("friglet-control-test-{}-{tag}", std::process::id()));
@@ -443,6 +503,15 @@ mod tests {
     /// A full `ControlCtx` wired against a temp dir, with an offline scanner
     /// and a scanner builder that needs no network.
     fn test_ctx(dir: &Path) -> Arc<ControlCtx> {
+        test_ctx_with_builder(
+            dir,
+            Box::new(|cfg| Box::pin(async move { Ok(offline_scanner(&cfg)) })),
+        )
+    }
+
+    /// [`test_ctx`] with a custom scanner builder (failure injection,
+    /// recording the config the rebuild uses, ...).
+    fn test_ctx_with_builder(dir: &Path, scanner_builder: ScannerBuilder) -> Arc<ControlCtx> {
         let cfg = test_config(dir);
         config::replace_scan_key(&dir.join("scan.key"), SECRET_HEX).unwrap();
         let config_path = dir.join("config.toml");
@@ -478,7 +547,7 @@ mod tests {
             settings: std::sync::Mutex::new(cfg),
             config_path: Some(config_path),
             apply_lock: Mutex::new(()),
-            scanner_builder: Box::new(|cfg| Box::pin(async move { Ok(offline_scanner(&cfg)) })),
+            scanner_builder,
             shutdown: CancellationToken::new(),
         })
     }
@@ -709,6 +778,9 @@ mod tests {
 
     #[tokio::test]
     async fn set_scan_key_writes_0600_key_file() {
+        // `Response::Ok` (note-less) requires FRIGLET_SCAN_SECRET to be
+        // unset, so exclude the test that sets it.
+        let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
         let dir = temp_dir("setkey-ok");
         let ctx = test_ctx(&dir);
         let mut client = serve_ctx("setkey-ok", ctx).await;
@@ -785,6 +857,116 @@ mod tests {
                 .trim(),
             OTHER_SECRET_HEX
         );
+    }
+
+    #[tokio::test]
+    async fn set_scan_key_rebuilds_with_new_key_despite_env_override() {
+        use std::str::FromStr;
+
+        let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
+        // SAFETY: guarded by SCAN_SECRET_ENV_LOCK; the value equals the key
+        // file content every test ctx starts with, so concurrent tests that
+        // resolve the secret via the env var see no difference.
+        unsafe { std::env::set_var("FRIGLET_SCAN_SECRET", SECRET_HEX) };
+        let _env_guard = EnvVarGuard("FRIGLET_SCAN_SECRET");
+
+        let dir = temp_dir("setkey-env");
+        let seen_secret = Arc::new(std::sync::Mutex::new(None));
+        let recorder = seen_secret.clone();
+        let ctx = test_ctx_with_builder(
+            &dir,
+            Box::new(move |cfg| {
+                *recorder.lock().unwrap() = Some(cfg.secret_scan);
+                Box::pin(async move { Ok(offline_scanner(&cfg)) })
+            }),
+        );
+        let mut client = serve_ctx("setkey-env", ctx).await;
+
+        let resp = client
+            .request(&Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
+            .await
+            .unwrap();
+        // Rotation succeeds but warns that the env var wins after a restart.
+        match &resp {
+            Response::OkWithNote(note) => {
+                assert!(note.contains("FRIGLET_SCAN_SECRET"), "note: {note}")
+            }
+            other => panic!("expected OkWithNote, got {other:?}"),
+        }
+        // The rebuilt scanner uses the just-written key, not the env secret.
+        assert_eq!(
+            *seen_secret.lock().unwrap(),
+            Some(bitcoin::secp256k1::SecretKey::from_str(OTHER_SECRET_HEX).unwrap()),
+            "rebuild must use the rotated key, not FRIGLET_SCAN_SECRET"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scan.key"))
+                .unwrap()
+                .trim(),
+            OTHER_SECRET_HEX
+        );
+    }
+
+    #[tokio::test]
+    async fn start_and_stop_wait_for_the_apply_lock() {
+        let dir = temp_dir("start-lock");
+        let ctx = test_ctx(&dir);
+
+        // Simulate a config apply in progress.
+        let guard = ctx.apply_lock.lock().await;
+        let ctx2 = ctx.clone();
+        let start = tokio::spawn(async move { ctx2.handle(Request::Start).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !ctx.supervisor.is_running(),
+            "Start must block while the apply lock is held"
+        );
+        drop(guard);
+        assert_eq!(start.await.unwrap(), Response::Ok);
+        assert!(ctx.supervisor.is_running());
+
+        let guard = ctx.apply_lock.lock().await;
+        let ctx2 = ctx.clone();
+        let stop = tokio::spawn(async move { ctx2.handle(Request::Stop).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            ctx.supervisor.is_running(),
+            "Stop must block while the apply lock is held"
+        );
+        drop(guard);
+        assert_eq!(stop.await.unwrap(), Response::Ok);
+        assert!(!ctx.supervisor.is_running());
+    }
+
+    #[tokio::test]
+    async fn failed_apply_keeps_get_config_matching_disk() {
+        let dir = temp_dir("setconfig-applyfail");
+        let ctx = test_ctx_with_builder(
+            &dir,
+            Box::new(|_cfg| Box::pin(async { Err("injected scanner build failure".to_string()) })),
+        );
+        let mut client = serve_ctx("setconfig-applyfail", ctx).await;
+
+        let new_cfg = DaemonConfig {
+            start_height: Some(777),
+            ..test_config(&dir)
+        };
+        let resp = client
+            .request(&Request::SetConfig(Box::new(new_cfg.clone())))
+            .await
+            .unwrap();
+        match &resp {
+            Response::Error(msg) => {
+                assert!(msg.contains("config saved"), "error: {msg}");
+                assert!(msg.contains("applying it failed"), "error: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // Disk has the new config and GetConfig agrees with it.
+        assert_eq!(read_config_file(&dir), new_cfg);
+        let resp = client.request(&Request::GetConfig).await.unwrap();
+        assert_eq!(resp, Response::Config(new_cfg));
     }
 
     #[tokio::test]

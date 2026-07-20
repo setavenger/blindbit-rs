@@ -138,6 +138,15 @@ async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String
 /// Holds the lifecycle lock for the whole attempt so concurrent retriggers
 /// queue up instead of spawning multiple daemons.
 async fn attach_and_record(state: &AppState) {
+    attach_and_record_with(state, lifecycle::locate_daemon_binary_from_env).await
+}
+
+/// [`attach_and_record`] with an injectable daemon-binary locator (tests
+/// pass a stub so no real binary search happens).
+async fn attach_and_record_with<F>(state: &AppState, locate: F)
+where
+    F: FnOnce() -> Option<std::path::PathBuf>,
+{
     let mut lc = state.lifecycle.lock().await;
 
     // Reap a previously spawned child that has exited.
@@ -149,13 +158,29 @@ async fn attach_and_record(state: &AppState) {
         lc.spawned_by_tray = false;
     }
 
+    // Our own daemon is still alive: verify it answers on the socket rather
+    // than returning early, so a retry can recover from a wedged daemon.
     if lc.child.is_some() {
-        // Our own daemon is alive (maybe still starting up); never stack a
-        // second spawn on top of it.
-        return;
+        if lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT)
+            .await
+            .is_some()
+        {
+            tracing::debug!("spawned daemon is alive and reachable; nothing to do");
+            return;
+        }
+        // Alive but its control socket is unreachable. The child is
+        // tray-spawned, so killing it and starting over is ours to do.
+        tracing::warn!(
+            "spawned daemon is alive but its control socket is unreachable; \
+             killing it and starting over"
+        );
+        if let Some(mut child) = lc.child.take() {
+            let _ = child.kill().await;
+        }
+        lc.spawned_by_tray = false;
     }
 
-    match lifecycle::attach_or_spawn(&state.socket_path).await {
+    match lifecycle::attach_or_spawn_with(&state.socket_path, locate).await {
         Attachment::Attached => {
             tracing::info!("attached to already-running daemon");
             lc.spawned_by_tray = false;
@@ -384,4 +409,156 @@ pub fn run() {
                 api.prevent_exit();
             }
         });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn test_socket_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "friglet-tray-lib-{}-{tag}.sock",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn test_state(socket_path: String) -> AppState {
+        AppState {
+            socket_path,
+            status: Mutex::new(StatusState::default()),
+            lifecycle: tokio::sync::Mutex::new(LifecycleState::default()),
+        }
+    }
+
+    /// Serve GetStatus on `path`, like a healthy daemon.
+    fn spawn_fake_daemon(path: String) {
+        tokio::spawn(async move {
+            let _ = std::fs::remove_file(&path);
+            let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
+            loop {
+                let Ok(mut conn) = friglet_ipc::accept(&listener).await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    while let Ok(Some(req)) = conn.next_request().await {
+                        let resp = match req {
+                            Request::GetStatus => Response::Status(StatusInfo {
+                                scanning: false,
+                                scanned_height: 1,
+                                tip_height: None,
+                                scan_progress: 0.0,
+                                network: "regtest".to_string(),
+                                electrum_clients: 0,
+                                oracle_connected: false,
+                                last_error: None,
+                                sp_address: None,
+                                version: "test".to_string(),
+                            }),
+                            _ => Response::Ok,
+                        };
+                        if conn.respond(&resp).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    fn spawn_sleeper() -> Child {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_child_when_socket_reachable() {
+        let path = test_socket_path("retry-reachable");
+        spawn_fake_daemon(path.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let state = test_state(path.clone());
+        {
+            let mut lc = state.lifecycle.lock().await;
+            lc.child = Some(spawn_sleeper());
+            lc.spawned_by_tray = true;
+        }
+
+        attach_and_record_with(&state, || {
+            panic!("must not look for a binary when the spawned daemon answers")
+        })
+        .await;
+
+        let mut lc = state.lifecycle.lock().await;
+        assert!(lc.spawned_by_tray, "ownership must be kept");
+        let mut child = lc.child.take().expect("child must be kept");
+        let _ = child.kill().await;
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn retry_replaces_alive_child_when_socket_unreachable() {
+        // No listener at this path: the spawned daemon is "alive but wedged".
+        let path = test_socket_path("retry-wedged");
+        let _ = std::fs::remove_file(&path);
+
+        let state = test_state(path);
+        let pid = {
+            let mut lc = state.lifecycle.lock().await;
+            let child = spawn_sleeper();
+            let pid = child.id().expect("child pid");
+            lc.child = Some(child);
+            lc.spawned_by_tray = true;
+            pid
+        };
+        assert!(process_alive(pid));
+
+        // Locator finds nothing, so the re-run ends Unreachable — the point
+        // here is that the wedged child is killed and cleared first.
+        attach_and_record_with(&state, || None).await;
+
+        let lc = state.lifecycle.lock().await;
+        assert!(lc.child.is_none(), "wedged child must be cleared");
+        assert!(!lc.spawned_by_tray);
+        assert!(!process_alive(pid), "wedged child must be killed");
+    }
+
+    #[tokio::test]
+    async fn retry_reattaches_after_child_exited() {
+        let path = test_socket_path("retry-exited");
+        spawn_fake_daemon(path.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let state = test_state(path.clone());
+        {
+            let mut lc = state.lifecycle.lock().await;
+            let mut child = tokio::process::Command::new("true").spawn().expect("spawn");
+            let _ = child.wait().await;
+            lc.child = Some(child);
+            lc.spawned_by_tray = true;
+        }
+
+        attach_and_record_with(&state, || None).await;
+
+        let lc = state.lifecycle.lock().await;
+        assert!(lc.child.is_none(), "exited child must be reaped");
+        assert!(
+            !lc.spawned_by_tray,
+            "re-attach to the reachable daemon must drop ownership"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
