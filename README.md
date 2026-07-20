@@ -18,10 +18,12 @@ BlindBit is a comprehensive software suite for Bitcoin BIP-352 Silent Payments. 
 
 ## Workspace Structure
 
-This is a Cargo workspace containing three main crates:
+This is a Cargo workspace containing the following crates:
 
 - **blindbit-lib**: Core library containing the scanning logic and gRPC client
 - **friglet**: Lightweight scanner compatible with Frigate's Silent Payments endpoints, with built-in Electrum and HTTP servers
+- **friglet-ipc**: Shared IPC protocol (control socket) between the friglet daemon and its clients
+- **friglet-tray**: System tray companion app for the friglet daemon (Tauri v2)
 - **blindbit-cli**: Minimal command-line interface for scanning (no server functionality)
 
 ## Usage
@@ -97,6 +99,43 @@ Once running, `friglet` exposes the following endpoints on `--http-addr`:
 #### Electrum Server
 
 The built-in Electrum server (bound to `--electrum-addr`) allows wallets such as Sparrow to connect directly and query Silent Payment UTXOs without any additional infrastructure.
+
+---
+
+### Tray app (friglet-tray)
+
+`friglet-tray` is a small Tauri v2 system tray app that supervises and
+monitors the `friglet` daemon over its control socket. It shows live status
+(scan height, progress, network, Electrum clients, oracle connectivity, SP
+address, errors) in the tray menu and in a status window (hidden by default,
+opened via the tray menu; closing it hides it again). The tray menu also
+offers Start/Stop scanning and Quit.
+
+```bash
+# build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
+# libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)
+cargo build --release -p friglet-tray
+
+# run
+./target/release/friglet-tray
+```
+
+Lifecycle behavior:
+
+- **Attach or spawn**: on startup the tray probes the control socket. If a
+  daemon answers, the tray attaches to it. Otherwise it spawns the `friglet`
+  binary (search order: `FRIGLET_DAEMON_BIN` env var, then `friglet` next to
+  the tray executable, then `friglet` on `PATH`) and retries the socket for a
+  few seconds. If nothing comes up the tray keeps running, shows
+  "Daemon: unreachable", and a "Retry / Start daemon" menu item retriggers the
+  attach-or-spawn logic.
+- **Quit rule**: if the tray spawned the daemon, Quit sends `Shutdown` over
+  the control socket (killing the child as a fallback) before exiting. If the
+  tray merely attached to an externally started daemon, Quit leaves the daemon
+  running.
+
+For manual testing without a real daemon there is a fake daemon that speaks
+the control protocol: `cargo run -p friglet-tray --example fake-daemon`.
 
 ---
 

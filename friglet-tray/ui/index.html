@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Friglet Status</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Friglet</h1>
+      <span id="reachable" class="pill pill-bad">unreachable</span>
+    </header>
+
+    <section class="card">
+      <div class="row">
+        <span class="label">Scanning</span>
+        <span id="scanning" class="value">–</span>
+      </div>
+      <div class="row">
+        <span class="label">Height</span>
+        <span class="value"><span id="scanned-height">–</span> / <span id="tip-height">–</span></span>
+      </div>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div class="row">
+        <span class="label">Progress</span>
+        <span id="progress-text" class="value">–</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row">
+        <span class="label">Network</span>
+        <span id="network" class="value">–</span>
+      </div>
+      <div class="row">
+        <span class="label">Electrum clients</span>
+        <span id="electrum-clients" class="value">–</span>
+      </div>
+      <div class="row">
+        <span class="label">Oracle / P2P</span>
+        <span id="oracle" class="value">–</span>
+      </div>
+      <div class="row">
+        <span class="label">Daemon version</span>
+        <span id="version" class="value">–</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="col">
+        <span class="label">SP address</span>
+        <code id="sp-address">–</code>
+      </div>
+      <div class="col" id="error-block" hidden>
+        <span class="label">Last error</span>
+        <code id="last-error" class="error"></code>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="start-btn">Start scanning</button>
+      <button id="stop-btn" class="secondary">Stop scanning</button>
+    </div>
+    <p id="action-error" class="error small"></p>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>
