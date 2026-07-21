@@ -28,8 +28,9 @@ bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16c
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Oracle tip polling in GetStatus (and lazy no-network channels in tests);
+# version pinned to blindbit-lib's tonic.
+tonic = "0.14.2"
+
 [dev-dependencies]
 figment = { version = "0.10", features = ["toml", "env", "test"] }
-# Lazy (no-network) oracle channel for control-socket tests; version pinned
-# to blindbit-lib's tonic.
-tonic = "0.14.2"

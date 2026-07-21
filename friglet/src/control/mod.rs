@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use blindbit_lib::scanner::{self, Scanner, WalletElectrumIndex};
 use friglet_ipc::{DaemonConfig, Listener, Request, Response, StatusInfo};
@@ -33,6 +34,11 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{self, ResolvedConfig};
 use crate::supervisor::ScanSupervisor;
 
+/// How long a cached oracle tip is considered fresh.
+const ORACLE_TIP_TTL: Duration = Duration::from_secs(10);
+/// Cap how long `GetStatus` waits on a slow/unreachable oracle.
+const ORACLE_TIP_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Builds a fresh [`Scanner`] for a new configuration. In the daemon this is
 /// `blindbit_lib::scanner::load_scanner` (which connects to the oracle);
 /// tests inject a builder that needs no network.
@@ -41,6 +47,25 @@ pub type ScannerBuilder = Box<
         + Send
         + Sync,
 >;
+
+/// Cached BlindBit oracle chain tip for [`ControlCtx::status`].
+#[derive(Debug, Default, Clone)]
+pub struct OracleTipCache {
+    tip: Option<u64>,
+    fetched_at: Option<Instant>,
+}
+
+impl OracleTipCache {
+    fn is_fresh(&self) -> bool {
+        self.fetched_at
+            .is_some_and(|at| at.elapsed() < ORACLE_TIP_TTL)
+    }
+}
+
+/// Prefer the oracle tip when known; else the last scanned (electrum) tip.
+fn pick_tip(oracle: Option<u64>, electrum: Option<u64>) -> Option<u64> {
+    oracle.or(electrum)
+}
 
 /// Everything the request handler needs from the daemon.
 pub struct ControlCtx {
@@ -65,6 +90,9 @@ pub struct ControlCtx {
     pub apply_lock: Mutex<()>,
     /// How to construct a scanner when new settings are applied.
     pub scanner_builder: ScannerBuilder,
+    /// Cached oracle chain tip so `GetStatus` does not hit the network every
+    /// poll (TTL ≈ 10s).
+    pub oracle_tip_cache: std::sync::Mutex<OracleTipCache>,
     pub shutdown: CancellationToken,
 }
 
@@ -106,9 +134,40 @@ impl ControlCtx {
         }
     }
 
+    /// Poll the BlindBit oracle for the real chain tip, with a short TTL
+    /// cache. Failures return the stale cache (if any) and never break
+    /// `GetStatus`.
+    async fn fetch_oracle_tip(&self) -> Option<u64> {
+        {
+            let cache = self.oracle_tip_cache.lock().unwrap();
+            if cache.is_fresh() {
+                return cache.tip;
+            }
+        }
+
+        let url = self.settings.lock().unwrap().oracle_url.clone();
+        let stale = self.oracle_tip_cache.lock().unwrap().tip;
+
+        let fetch = async {
+            let mut client = blindbit_lib::OracleServiceClient::connect(url).await.ok()?;
+            let resp = client.get_info(tonic::Request::new(())).await.ok()?;
+            Some(resp.into_inner().height)
+        };
+
+        match tokio::time::timeout(ORACLE_TIP_FETCH_TIMEOUT, fetch).await {
+            Ok(Some(height)) => {
+                let mut cache = self.oracle_tip_cache.lock().unwrap();
+                cache.tip = Some(height);
+                cache.fetched_at = Some(Instant::now());
+                Some(height)
+            }
+            _ => stale,
+        }
+    }
+
     async fn status(&self) -> StatusInfo {
         let index = self.electrum_index.lock().unwrap().clone();
-        let (tip_height, scan_progress, sp_address) = {
+        let (electrum_tip, scan_progress, sp_address) = {
             let idx = index.lock().await;
             let tip = idx.tip.as_ref().map(|(h, _)| u64::from(*h));
             let addr = (!idx.sp_address.is_empty()).then(|| idx.sp_address.clone());
@@ -120,12 +179,16 @@ impl ControlCtx {
         // block) when the lock is unavailable.
         let scanned_height = match self.scanner.try_lock() {
             Ok(s) => s.get_last_scanned_block_height(),
-            Err(_) => tip_height.unwrap_or(0),
+            Err(_) => electrum_tip.unwrap_or(0),
         };
+
+        let oracle_tip = self.fetch_oracle_tip().await;
+        let tip_height = pick_tip(oracle_tip, electrum_tip);
 
         let scanning = self.supervisor.is_running();
         let last_error = self.supervisor.last_error();
         let network = self.settings.lock().unwrap().network.clone();
+        let oracle_connected = self.oracle_tip_cache.lock().unwrap().is_fresh();
 
         StatusInfo {
             scanning,
@@ -134,7 +197,7 @@ impl ControlCtx {
             scan_progress,
             network,
             electrum_clients: self.electrum_clients.load(Ordering::Relaxed),
-            oracle_connected: scanning && last_error.is_none(),
+            oracle_connected,
             last_error,
             sp_address,
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -442,6 +505,13 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000002";
     const SPEND_PK: &str = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
 
+    #[test]
+    fn pick_tip_prefers_oracle_then_electrum() {
+        assert_eq!(pick_tip(Some(300), Some(200)), Some(300));
+        assert_eq!(pick_tip(None, Some(200)), Some(200));
+        assert_eq!(pick_tip(None, None), None);
+    }
+
     /// Serializes the test that sets `FRIGLET_SCAN_SECRET` (process-global)
     /// with tests whose assertions depend on it being unset.
     static SCAN_SECRET_ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -548,6 +618,7 @@ mod tests {
             config_path: Some(config_path),
             apply_lock: Mutex::new(()),
             scanner_builder,
+            oracle_tip_cache: std::sync::Mutex::new(OracleTipCache::default()),
             shutdown: CancellationToken::new(),
         })
     }

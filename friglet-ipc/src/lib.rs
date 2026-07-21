@@ -52,7 +52,9 @@ pub struct DaemonConfig {
     pub http_addr: String,
     /// Electrum TCP server bind address.
     pub electrum_addr: String,
-    /// Path for scanner state persistence.
+    /// Path for scanner state persistence. Defaults to
+    /// [`default_state_file`] (`<platform config dir>/friglet/scanner_state.json`)
+    /// when a config dir exists, else the relative `scanner_state.json`.
     pub state_file: PathBuf,
     /// Default log level when RUST_LOG is not set.
     pub log_level: String,
@@ -74,7 +76,7 @@ impl Default for DaemonConfig {
             max_label_num: 0,
             http_addr: "127.0.0.1:8080".to_string(),
             electrum_addr: "127.0.0.1:50001".to_string(),
-            state_file: PathBuf::from("scanner_state.json"),
+            state_file: default_state_file().unwrap_or_else(|| PathBuf::from("scanner_state.json")),
             log_level: "info".to_string(),
             key_file: None,
             control_socket: None,
@@ -126,14 +128,14 @@ pub struct StatusInfo {
     pub scanning: bool,
     /// Height of the last block processed by the scanner.
     pub scanned_height: u64,
-    /// Best chain tip height known to the scanner, if any.
+    /// Oracle chain tip when known, else last scanned (Electrum index tip).
     pub tip_height: Option<u64>,
     /// Scan progress in the current catch-up range, 0.0–1.0.
     pub scan_progress: f32,
     pub network: String,
     /// Number of currently connected Electrum clients.
     pub electrum_clients: u64,
-    /// Best effort: scan task alive and no recorded error.
+    /// True when an oracle tip was fetched successfully within the cache TTL.
     pub oracle_connected: bool,
     pub last_error: Option<String>,
     /// Silent Payments address of the wallet, once known.
@@ -190,6 +192,13 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// `<platform config dir>/friglet/scan.key`.
 pub fn default_key_file() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("friglet").join("scan.key"))
+}
+
+/// Default scanner state file path:
+/// `<platform config dir>/friglet/scanner_state.json` (same directory as
+/// `config.toml` / `scan.key`).
+pub fn default_state_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("friglet").join("scanner_state.json"))
 }
 
 /// Read and parse a TOML config file into a [`DaemonConfig`]. Missing keys
@@ -367,6 +376,22 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_state_file_is_under_config_dir() {
+        let cfg = DaemonConfig::default();
+        if let Some(expected) = default_state_file() {
+            assert_eq!(cfg.state_file, expected);
+            assert!(cfg.state_file.is_absolute());
+            assert!(
+                cfg.state_file
+                    .file_name()
+                    .is_some_and(|n| n == "scanner_state.json")
+            );
+        } else {
+            assert_eq!(cfg.state_file, PathBuf::from("scanner_state.json"));
+        }
+    }
 
     #[test]
     fn request_roundtrip() {
