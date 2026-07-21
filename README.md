@@ -135,15 +135,28 @@ cargo build --release -p friglet-tray
 FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
 ```
 
+**First run** — no manual config file needed: launch the tray, and if no
+daemon is running and none is configured yet (no `config.toml`, no
+`FRIGLET_*` env), the window opens automatically on the Settings tab with a
+first-time-setup banner. Fill in the required fields (P2P node address,
+start height, spend pubkey, scan key) and hit Save: the tray validates the
+form, writes the config file (atomic TOML at the platform default path,
+e.g. `~/.config/friglet/config.toml` on Linux or
+`~/Library/Application Support/friglet/config.toml` on macOS) and the scan
+key file (0600), then starts the daemon with it.
+
 Lifecycle behavior:
 
-- **Attach or spawn**: on startup the tray probes the control socket. If a
-  daemon answers, the tray attaches to it. Otherwise it spawns the `friglet`
-  binary (search order: `FRIGLET_DAEMON_BIN` env var, then `friglet` next to
-  the tray executable, then `friglet` on `PATH`) and retries the socket for a
-  few seconds. If nothing comes up the tray keeps running, shows
-  "Daemon: unreachable", and a "Retry / Start daemon" menu item retriggers the
-  attach-or-spawn logic.
+- **Attach, spawn, or set up**: on startup the tray probes the control
+  socket. If a daemon answers, the tray attaches to it. If not, and the
+  daemon is not plausibly configured (required settings missing from the
+  config file / `FRIGLET_*` env, or no scan key), it enters the first-run
+  setup mode described above instead of spawn-failing. Otherwise it spawns
+  the `friglet` binary (search order: `FRIGLET_DAEMON_BIN` env var, then
+  `friglet` next to the tray executable, then `friglet` on `PATH`) and
+  retries the socket for a few seconds. If nothing comes up the tray keeps
+  running, shows "Daemon: unreachable" (or "Setup required — open window"),
+  and a "Retry / Start daemon" menu item retriggers the whole logic.
 - **Quit rule**: if the tray spawned the daemon, Quit sends `Shutdown` over
   the control socket (killing the child as a fallback) before exiting. If the
   tray merely attached to an externally started daemon, Quit leaves the daemon

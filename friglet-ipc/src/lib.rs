@@ -16,7 +16,8 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf, Stream};
@@ -178,6 +179,83 @@ pub fn default_socket_path() -> String {
     }
 }
 
+/// Default daemon config file path:
+/// `<platform config dir>/friglet/config.toml`. Shared by the daemon (which
+/// loads it) and the tray (which writes it during first-run setup).
+pub fn default_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("friglet").join("config.toml"))
+}
+
+/// Default scan-secret key file path:
+/// `<platform config dir>/friglet/scan.key`.
+pub fn default_key_file() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("friglet").join("scan.key"))
+}
+
+/// Read and parse a TOML config file into a [`DaemonConfig`]. Missing keys
+/// take their defaults (the struct is `#[serde(default)]`).
+pub fn read_config_toml(path: &Path) -> Result<DaemonConfig, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config file {}: {e}", path.display()))?;
+    toml::from_str(&text).map_err(|e| format!("invalid config file {}: {e}", path.display()))
+}
+
+/// Persist `cfg` as pretty TOML to `path` (atomically: temp file + rename),
+/// creating parent directories as needed. Shared by the daemon's `SetConfig`
+/// handler and the tray's first-run setup.
+pub fn write_config_toml(path: &Path, cfg: &DaemonConfig) -> Result<(), String> {
+    let describe = |e: String| format!("cannot write config file {}: {e}", path.display());
+    let toml = toml::to_string_pretty(cfg).map_err(|e| describe(e.to_string()))?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| describe(e.to_string()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, toml).map_err(|e| describe(e.to_string()))?;
+    std::fs::rename(&tmp, path).map_err(|e| describe(e.to_string()))
+}
+
+/// Write the scan-secret key file at `path` (0600 on Unix), creating parent
+/// directories as needed. With `overwrite = false` the call fails if the
+/// file already exists. Performs no validation of `secret_hex` itself —
+/// callers validate the key material.
+pub fn write_key_file(path: &Path, secret_hex: &str, overwrite: bool) -> Result<(), String> {
+    let describe = |e: std::io::Error| format!("cannot write key file {}: {e}", path.display());
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(describe)?;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // On Windows the file inherits the profile directory's default ACL, which
+    // restricts access to the owning user — no tighter per-file ceiling is set.
+    let mut file = options.open(path).map_err(describe)?;
+    // `mode(0o600)` only applies on creation; enforce it when replacing a
+    // pre-existing key file too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(describe)?;
+    }
+    file.write_all(secret_hex.as_bytes()).map_err(describe)?;
+    file.write_all(b"\n").map_err(describe)?;
+    Ok(())
+}
+
 fn socket_name(path: &str) -> io::Result<Name<'_>> {
     #[cfg(windows)]
     {
@@ -316,5 +394,50 @@ mod tests {
         let cfg: DaemonConfig = serde_json::from_str(r#"{"oracle_url":"http://x"}"#).unwrap();
         assert_eq!(cfg.oracle_url, "http://x");
         assert_eq!(cfg.network, "bitcoin");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("friglet-ipc-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_toml_roundtrip_is_atomic() {
+        let dir = temp_dir("config-toml");
+        let path = dir.join("sub").join("config.toml");
+        let cfg = DaemonConfig {
+            p2p_node_addr: Some("127.0.0.1:38333".to_string()),
+            start_height: Some(1234),
+            spend_pubkey: Some("02".repeat(33)),
+            ..DaemonConfig::default()
+        };
+        write_config_toml(&path, &cfg).unwrap();
+        assert_eq!(read_config_toml(&path).unwrap(), cfg);
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "temp file must be renamed away"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_file_written_0600_and_overwrite_flag_respected() {
+        let dir = temp_dir("key-file");
+        let path = dir.join("sub").join("scan.key");
+        write_key_file(&path, "aa", false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "aa\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // create_new fails on an existing file; overwrite replaces it.
+        assert!(write_key_file(&path, "bb", false).is_err());
+        write_key_file(&path, "bb", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bb\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

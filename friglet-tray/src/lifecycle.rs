@@ -45,6 +45,10 @@ pub enum Attachment {
     Attached,
     /// No daemon was reachable; we spawned one and it came up.
     Spawned(Child),
+    /// No daemon was reachable and it is not configured yet: spawning would
+    /// only fail with `missing required setting ...`, so first-run setup is
+    /// needed instead (see `setup::is_configured`).
+    SetupRequired,
     /// No daemon was reachable and we could not bring one up.
     Unreachable { reason: String },
 }
@@ -210,8 +214,30 @@ pub async fn attach_or_spawn_with<F>(socket_path: &str, locate: F) -> Attachment
 where
     F: FnOnce() -> Option<PathBuf>,
 {
+    attach_spawn_or_setup_with(socket_path, locate, || false).await
+}
+
+/// [`attach_or_spawn_with`] plus a first-run gate: when the daemon is
+/// unreachable AND `needs_setup()` says it is not plausibly configured,
+/// return [`Attachment::SetupRequired`] without any spawn attempt (a spawn
+/// could only fail with `missing required setting ...`). The check runs
+/// only after the probe fails, so an externally configured, reachable
+/// daemon attaches exactly as before.
+pub async fn attach_spawn_or_setup_with<F, C>(
+    socket_path: &str,
+    locate: F,
+    needs_setup: C,
+) -> Attachment
+where
+    F: FnOnce() -> Option<PathBuf>,
+    C: FnOnce() -> bool,
+{
     if probe(socket_path, PROBE_TIMEOUT).await.is_some() {
         return Attachment::Attached;
+    }
+
+    if needs_setup() {
+        return Attachment::SetupRequired;
     }
 
     let Some(bin) = locate() else {

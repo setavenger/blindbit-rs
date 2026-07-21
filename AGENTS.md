@@ -59,6 +59,43 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   `1`/`true`/`yes`/`on`/`status` → Status tab;
   `settings` → Settings tab after the UI loads — useful for headless /
   screenshot testing; synthetic X11 clicks do not reach WebKitGTK reliably).
+
+### First-run setup mode (no config file yet)
+
+- On startup (and on "Retry / Start daemon") the tray probes the socket;
+  when unreachable it checks whether the daemon is plausibly configured
+  BEFORE spawning (`friglet-tray/src/setup.rs::is_configured`): the default
+  config file (`friglet_ipc::default_config_path()`, i.e.
+  `<config dir>/friglet/config.toml`) must supply `p2p_node_addr`,
+  `start_height` and `spend_pubkey` (each satisfiable via
+  `FRIGLET_P2P_NODE_ADDR`/`FRIGLET_START_HEIGHT`/`FRIGLET_SPEND_PUBKEY`
+  env instead), and a scan secret must exist (key file from the config's
+  `key_file` or `<config dir>/friglet/scan.key`, or `FRIGLET_SCAN_SECRET`).
+  A config file that exists but fails to parse counts as configured, so the
+  spawn attempt surfaces the daemon's own parse error instead of setup mode
+  silently overwriting a hand-written file.
+- Not configured → NO spawn (it could only fail with `missing required
+  setting ...`); the tray enters setup mode instead: tray label "Setup
+  required — open window", the main window auto-opens on the Settings tab
+  with a first-time-setup banner and the form ENABLED in local mode
+  (prefilled from defaults + any partial config file via `get_setup_state`).
+- Save in setup mode goes through the `save_local_config` tauri command:
+  tray-side validation (mirrors the daemon's rules; scan key REQUIRED
+  here), then the tray writes the key file (0600) first and the config file
+  (atomic TOML) second — shared helpers in `friglet-ipc`
+  (`default_config_path`/`default_key_file`/`read_config_toml`/
+  `write_config_toml`/`write_key_file`, which `friglet/src/config.rs` also
+  delegates to) — then reruns attach-or-spawn, which now starts the daemon
+  and flips the UI to the normal daemon-backed mode.
+- Headless test: run the tray under the Xvfb recipe below but with a fresh
+  `HOME` (and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_RUNTIME_DIR` unset)
+  and no `FRIGLET_*` env — no fake daemon, no
+  `FRIGLET_TRAY_SHOW_ON_START`. The window must appear by itself on the
+  Settings tab with the banner (verified in this VM; window screenshot via
+  `import -window "$(xdotool search --name "Friglet Status" | head -1)"`).
+  Unit/e2e coverage: `friglet-tray/src/setup.rs` tests, the
+  `setup_required_*` cases in `friglet-tray/tests/lifecycle_e2e.rs`, and
+  the setup-mode tests in `friglet-tray/src/lib.rs`.
 - Tray icons are generated placeholders; regenerate with
   `python3 friglet-tray/icons/generate.py` (stdlib only).
 

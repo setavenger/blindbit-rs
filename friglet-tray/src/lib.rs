@@ -4,7 +4,9 @@
 //! window, and manages the daemon lifecycle (attach or spawn, quit rule).
 
 pub mod lifecycle;
+pub mod setup;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,6 +44,9 @@ struct AppState {
     socket_path: String,
     status: Mutex<StatusState>,
     lifecycle: tokio::sync::Mutex<LifecycleState>,
+    /// First-run setup mode: the daemon is unreachable and not plausibly
+    /// configured, so spawning is pointless until the user saves a config.
+    setup_needed: AtomicBool,
 }
 
 /// Payload for the `get_status` command.
@@ -109,6 +114,68 @@ async fn set_scan_key(
     send_with_note(&state.socket_path, Request::SetScanKey(key)).await
 }
 
+/// Payload for the `get_setup_state` command.
+#[derive(Serialize)]
+struct SetupStatePayload {
+    /// Whether first-run setup mode is active (daemon unreachable and not
+    /// plausibly configured).
+    active: bool,
+    /// Where the config file will be written, for display.
+    config_path: Option<String>,
+    /// Where the scan key file will be written, for display.
+    key_file: Option<String>,
+    /// Prefill for the settings form: a partially written config file (if
+    /// any) merged over the built-in defaults.
+    config: DaemonConfig,
+}
+
+/// Report whether first-run setup mode is active, plus the default paths
+/// and a config prefill so the UI can enable the form without a daemon.
+#[tauri::command]
+async fn get_setup_state(state: State<'_, Arc<AppState>>) -> Result<SetupStatePayload, String> {
+    let config_path = friglet_ipc::default_config_path();
+    let config = config_path
+        .as_deref()
+        .filter(|p| p.exists())
+        .and_then(|p| friglet_ipc::read_config_toml(p).ok())
+        .unwrap_or_default();
+    let key_file = config
+        .key_file
+        .clone()
+        .or_else(friglet_ipc::default_key_file);
+    Ok(SetupStatePayload {
+        active: state.setup_needed.load(Ordering::SeqCst),
+        config_path: config_path.map(|p| p.display().to_string()),
+        key_file: key_file.map(|p| p.display().to_string()),
+        config,
+    })
+}
+
+/// First-run setup save: validate tray-side, write the scan key file (0600)
+/// and the config file (atomic TOML) locally, then run the normal
+/// attach-or-spawn flow — which now finds a configured daemon to start.
+///
+/// `Ok(None)`: saved and the daemon came up. `Ok(Some(reason))`: files were
+/// saved but the daemon still failed to start (the reason is the spawn
+/// diagnostic). `Err(msg)`: validation or write failed, nothing spawned.
+#[tauri::command]
+async fn save_local_config(
+    state: State<'_, Arc<AppState>>,
+    config: DaemonConfig,
+    scan_key: String,
+) -> Result<Option<String>, String> {
+    setup::validate_setup(&config, &scan_key)?;
+    let config_path = friglet_ipc::default_config_path()
+        .ok_or("cannot determine the platform config directory")?;
+    let key_file = setup::write_local_config(&config_path, &config, &scan_key)?;
+    tracing::info!(
+        config = %config_path.display(),
+        key_file = %key_file.display(),
+        "first-run setup: wrote local config and key file"
+    );
+    Ok(attach_and_record(&state).await)
+}
+
 /// Send a request that is expected to answer `Ok`.
 async fn send_simple(socket_path: &str, req: Request) -> Result<(), String> {
     send_with_note(socket_path, req).await.map(|_| ())
@@ -132,20 +199,27 @@ async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String
     }
 }
 
-/// Probe-or-spawn, recording the outcome in [`LifecycleState`].
+/// Probe-spawn-or-setup, recording the outcome in [`LifecycleState`] and the
+/// `setup_needed` flag. Returns the failure reason when the daemon stayed
+/// unreachable despite being configured (spawn failed / socket never came up).
 ///
-/// Runs at startup and again from the "Retry / Start daemon" menu item.
-/// Holds the lifecycle lock for the whole attempt so concurrent retriggers
-/// queue up instead of spawning multiple daemons.
-async fn attach_and_record(state: &AppState) {
-    attach_and_record_with(state, lifecycle::locate_daemon_binary_from_env).await
+/// Runs at startup, from the "Retry / Start daemon" menu item and after a
+/// first-run setup save. Holds the lifecycle lock for the whole attempt so
+/// concurrent retriggers queue up instead of spawning multiple daemons.
+async fn attach_and_record(state: &AppState) -> Option<String> {
+    attach_and_record_with(state, lifecycle::locate_daemon_binary_from_env, || {
+        !setup::is_configured_from_env()
+    })
+    .await
 }
 
-/// [`attach_and_record`] with an injectable daemon-binary locator (tests
-/// pass a stub so no real binary search happens).
-async fn attach_and_record_with<F>(state: &AppState, locate: F)
+/// [`attach_and_record`] with an injectable daemon-binary locator and
+/// setup-needed check (tests pass stubs so no real binary search or config
+/// file inspection happens).
+async fn attach_and_record_with<F, C>(state: &AppState, locate: F, needs_setup: C) -> Option<String>
 where
     F: FnOnce() -> Option<std::path::PathBuf>,
+    C: FnOnce() -> bool,
 {
     let mut lc = state.lifecycle.lock().await;
 
@@ -166,7 +240,7 @@ where
             .is_some()
         {
             tracing::debug!("spawned daemon is alive and reachable; nothing to do");
-            return;
+            return None;
         }
         // Alive but its control socket is unreachable. The child is
         // tray-spawned, so killing it and starting over is ours to do.
@@ -188,18 +262,29 @@ where
         lc.spawned_by_tray = false;
     }
 
-    match lifecycle::attach_or_spawn_with(&state.socket_path, locate).await {
+    match lifecycle::attach_spawn_or_setup_with(&state.socket_path, locate, needs_setup).await {
         Attachment::Attached => {
             tracing::info!("attached to already-running daemon");
             lc.spawned_by_tray = false;
+            state.setup_needed.store(false, Ordering::SeqCst);
+            None
         }
         Attachment::Spawned(child) => {
             tracing::info!("spawned daemon and connected");
             lc.spawned_by_tray = true;
             lc.child = Some(child);
+            state.setup_needed.store(false, Ordering::SeqCst);
+            None
+        }
+        Attachment::SetupRequired => {
+            tracing::info!("daemon not configured yet; entering first-run setup mode");
+            state.setup_needed.store(true, Ordering::SeqCst);
+            None
         }
         Attachment::Unreachable { reason } => {
             tracing::warn!(%reason, "daemon unreachable");
+            state.setup_needed.store(false, Ordering::SeqCst);
+            Some(reason)
         }
     }
 }
@@ -225,6 +310,22 @@ fn show_status_window(app: &AppHandle) {
     }
 }
 
+/// Show the main window and switch it to the Settings tab once the UI has
+/// had a chance to load. Used for `FRIGLET_TRAY_SHOW_ON_START=settings` and
+/// for first-run setup mode. (Synthetic X11 clicks do not reach WebKitGTK
+/// reliably under Xvfb, so this eval is the supported headless path to the
+/// Settings form.)
+fn show_settings_window(app: &AppHandle) {
+    show_status_window(app);
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Some(w) = handle.get_webview_window("main") {
+            let _ = w.eval("document.getElementById('tab-settings')?.click()");
+        }
+    });
+}
+
 /// Parse `FRIGLET_TRAY_SHOW_ON_START`:
 /// - unset / falsy → hide window (default)
 /// - `1` / `true` / `yes` / `on` / `status` → show status window
@@ -240,14 +341,15 @@ fn show_on_start_env() -> Option<&'static str> {
     }
 }
 
-fn tray_label(status: Option<&StatusInfo>) -> String {
+fn tray_label(status: Option<&StatusInfo>, setup_needed: bool) -> String {
     match status {
         Some(s) => format!("Daemon: reachable (height {})", s.scanned_height),
+        None if setup_needed => "Setup required — open window".to_string(),
         None => "Daemon: unreachable".to_string(),
     }
 }
 
-fn tray_tooltip(status: Option<&StatusInfo>) -> String {
+fn tray_tooltip(status: Option<&StatusInfo>, setup_needed: bool) -> String {
     match status {
         Some(s) => {
             let tip = s
@@ -257,6 +359,7 @@ fn tray_tooltip(status: Option<&StatusInfo>) -> String {
             let activity = if s.scanning { "scanning" } else { "idle" };
             format!("Friglet: {activity}, height {}/{tip}", s.scanned_height)
         }
+        None if setup_needed => "Friglet: first-time setup required".to_string(),
         None => "Friglet: daemon unreachable".to_string(),
     }
 }
@@ -267,7 +370,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(
         handle,
         "status-label",
-        tray_label(None),
+        tray_label(None, false),
         false,
         None::<&str>,
     )?;
@@ -330,7 +433,15 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
             "retry-daemon" => {
                 let state = app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::spawn(async move { attach_and_record(&state).await });
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = attach_and_record(&state).await;
+                    // Retry with an unconfigured daemon lands in setup mode
+                    // instead of a spawn-fail loop; take the user there.
+                    if state.setup_needed.load(Ordering::SeqCst) {
+                        show_settings_window(&app);
+                    }
+                });
             }
             "quit" => quit(app),
             _ => {}
@@ -352,12 +463,17 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     s.last = info.clone();
                 }
             }
+            // A reachable daemon ends setup mode, whoever configured it.
+            if info.is_some() {
+                state.setup_needed.store(false, Ordering::SeqCst);
+            }
+            let setup_needed = state.setup_needed.load(Ordering::SeqCst);
 
-            let label = tray_label(info.as_ref());
+            let label = tray_label(info.as_ref(), setup_needed);
             if label != last_label {
                 tracing::info!(%label, "tray status label updated");
                 let _ = status_item.set_text(&label);
-                let _ = tray.set_tooltip(Some(tray_tooltip(info.as_ref())));
+                let _ = tray.set_tooltip(Some(tray_tooltip(info.as_ref(), setup_needed)));
                 last_label = label;
             }
 
@@ -389,6 +505,7 @@ pub fn run() {
         socket_path: friglet_ipc::default_socket_path(),
         status: Mutex::new(StatusState::default()),
         lifecycle: tokio::sync::Mutex::new(LifecycleState::default()),
+        setup_needed: AtomicBool::new(false),
     });
 
     tauri::Builder::default()
@@ -399,7 +516,9 @@ pub fn run() {
             stop_scanning,
             get_config,
             set_config,
-            set_scan_key
+            set_scan_key,
+            get_setup_state,
+            save_local_config
         ])
         .on_window_event(|window, event| {
             // Tray-only app: closing the status window hides it.
@@ -415,26 +534,26 @@ pub fn run() {
             setup_tray(app)?;
 
             if let Some(tab) = show_on_start_env() {
-                show_status_window(app.handle());
                 if tab == "settings" {
-                    // Webview may not have finished loading at setup time;
-                    // delay the tab switch. (Synthetic X11 clicks do not reach
-                    // WebKitGTK reliably under Xvfb, so this is the supported
-                    // headless path to the Settings form.)
-                    let handle = app.handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(800)).await;
-                        if let Some(w) = handle.get_webview_window("main") {
-                            let _ = w.eval("document.getElementById('tab-settings')?.click()");
-                        }
-                    });
+                    show_settings_window(app.handle());
+                } else {
+                    show_status_window(app.handle());
                 }
             }
 
-            // Attach to a running daemon or spawn one, in the background so
-            // the tray appears immediately.
+            // Attach to a running daemon, spawn one, or detect that
+            // first-run setup is needed — in the background so the tray
+            // appears immediately. When setup is needed, bring the window
+            // up on the Settings tab so the user isn't stuck staring at an
+            // inert tray icon.
             let state = app.state::<Arc<AppState>>().inner().clone();
-            tauri::async_runtime::spawn(async move { attach_and_record(&state).await });
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = attach_and_record(&state).await;
+                if state.setup_needed.load(Ordering::SeqCst) {
+                    show_settings_window(&handle);
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -470,6 +589,7 @@ mod tests {
             socket_path,
             status: Mutex::new(StatusState::default()),
             lifecycle: tokio::sync::Mutex::new(LifecycleState::default()),
+            setup_needed: AtomicBool::new(false),
         }
     }
 
@@ -570,9 +690,11 @@ mod tests {
             lc.spawned_by_tray = true;
         }
 
-        attach_and_record_with(&state, || {
-            panic!("must not look for a binary when the spawned daemon answers")
-        })
+        attach_and_record_with(
+            &state,
+            || panic!("must not look for a binary when the spawned daemon answers"),
+            || false,
+        )
         .await;
 
         let mut lc = state.lifecycle.lock().await;
@@ -604,13 +726,17 @@ mod tests {
         // locator runs right before a new daemon would be spawned, so the
         // old child must already be fully exited by then (no overlap on
         // shared config/key/state paths).
-        attach_and_record_with(&state, move || {
-            assert!(
-                !process_alive(pid),
-                "old daemon must be fully exited before a new spawn attempt"
-            );
-            None
-        })
+        attach_and_record_with(
+            &state,
+            move || {
+                assert!(
+                    !process_alive(pid),
+                    "old daemon must be fully exited before a new spawn attempt"
+                );
+                None
+            },
+            || false,
+        )
         .await;
 
         let lc = state.lifecycle.lock().await;
@@ -634,7 +760,7 @@ mod tests {
             lc.spawned_by_tray = true;
         }
 
-        attach_and_record_with(&state, || None).await;
+        attach_and_record_with(&state, || None, || false).await;
 
         let lc = state.lifecycle.lock().await;
         assert!(lc.child.is_none(), "exited child must be reaped");
@@ -643,5 +769,39 @@ mod tests {
             "re-attach to the reachable daemon must drop ownership"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn unreachable_and_unconfigured_sets_setup_mode_without_spawn() {
+        // No listener at this path and setup needed: the locator must never
+        // run (no spawn attempt) and the setup flag must be raised.
+        let path = test_socket_path("setup-mode");
+        let _ = std::fs::remove_file(&path);
+
+        let state = test_state(path);
+        let reason = attach_and_record_with(
+            &state,
+            || panic!("must not look for a binary when setup is needed"),
+            || true,
+        )
+        .await;
+        assert_eq!(reason, None, "setup mode is not a spawn failure");
+        assert!(state.setup_needed.load(Ordering::SeqCst));
+
+        // Once configured (files written), the same flow proceeds to the
+        // normal locate/spawn path and clears the flag on failure.
+        let reason = attach_and_record_with(&state, || None, || false).await;
+        assert!(
+            reason.is_some_and(|r| r.contains("not found")),
+            "expected the binary-not-found reason"
+        );
+        assert!(!state.setup_needed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn tray_labels_reflect_setup_mode() {
+        assert_eq!(tray_label(None, false), "Daemon: unreachable");
+        assert_eq!(tray_label(None, true), "Setup required — open window");
+        assert!(tray_tooltip(None, true).contains("setup required"));
     }
 }

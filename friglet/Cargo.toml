@@ -20,7 +20,6 @@ serde = { version = "1.0.228", features = ["derive"]}
 serde_json = "1.0"
 bitcoin = "0.32.7"
 figment = { version = "0.10", features = ["toml", "env"] }
-dirs = "6.0"
 toml = "0.8"
 
 # due to bitcoin-p2p using a different version

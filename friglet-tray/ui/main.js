@@ -47,7 +47,14 @@ function render({ reachable, status }) {
 
 async function refresh() {
   try {
-    render(await invoke("get_status"));
+    const status = await invoke("get_status");
+    // First-run setup mode only matters while the daemon is unreachable.
+    if (!status.reachable) {
+      await refreshSetupState();
+    } else if (setupMode) {
+      exitSetupMode();
+    }
+    render(status);
   } catch (e) {
     console.error("get_status failed", e);
   }
@@ -76,9 +83,49 @@ let loadedConfig = null;
 
 let configLoadInFlight = false;
 
+// First-run setup mode: no reachable daemon AND no usable local config.
+// The form is enabled in local mode and Save writes the config + key files
+// via the tray itself (save_local_config) instead of the daemon socket.
+let setupMode = false;
+// Prefill baseline while in setup mode (partial config file over defaults).
+let setupConfig = null;
+
 function updateSettingsAvailability() {
-  $("settings-unreachable").hidden = daemonReachable;
-  $("settings-fields").disabled = !daemonReachable || loadedConfig === null;
+  $("setup-banner").hidden = !setupMode;
+  $("settings-unreachable").hidden = daemonReachable || setupMode;
+  $("settings-fields").disabled = setupMode
+    ? false
+    : !daemonReachable || loadedConfig === null;
+  $("cfg-scan-key").placeholder = setupMode
+    ? "required (32-byte hex)"
+    : "unchanged — enter to replace";
+}
+
+async function refreshSetupState() {
+  try {
+    const s = await invoke("get_setup_state");
+    if (s.active && !setupMode) enterSetupMode(s);
+    else if (!s.active && setupMode) exitSetupMode();
+  } catch (e) {
+    console.error("get_setup_state failed", e);
+  }
+}
+
+function enterSetupMode(s) {
+  setupMode = true;
+  setupConfig = s.config;
+  const paths = [s.config_path, s.key_file].filter(Boolean);
+  $("setup-config-path").textContent = paths.length ? `Writes: ${paths.join(", ")}` : "";
+  // A pre-setup loadConfig attempt may have left an "unreachable" error.
+  settingsMessage("", false);
+  if (loadedConfig === null) fillForm(setupConfig);
+  updateSettingsAvailability();
+}
+
+function exitSetupMode() {
+  setupMode = false;
+  setupConfig = null;
+  updateSettingsAvailability();
 }
 
 function fillForm(cfg) {
@@ -101,7 +148,7 @@ function formConfig() {
   const text = (id) => $(id).value.trim();
   const optional = (id) => text(id) || null;
   return {
-    ...loadedConfig,
+    ...(loadedConfig ?? setupConfig),
     network: $("cfg-network").value,
     oracle_url: text("cfg-oracle-url"),
     p2p_node_addr: optional("cfg-p2p-addr"),
@@ -136,8 +183,37 @@ async function loadConfig() {
   updateSettingsAvailability();
 }
 
+// Setup-mode save: the tray validates and writes the config + key files
+// locally, then starts the daemon. On success the UI flips back to the
+// normal daemon-backed mode.
+async function saveSetupConfig() {
+  $("save-btn").disabled = true;
+  settingsMessage("Saving…", false);
+  const key = $("cfg-scan-key").value;
+  try {
+    const spawnError = await invoke("save_local_config", {
+      config: formConfig(),
+      scanKey: key,
+    });
+    if (spawnError) {
+      // Files were written; only starting the daemon failed. The next polls
+      // leave setup mode (the config is complete now) and disable the form.
+      settingsMessage(`Saved, but the daemon failed to start: ${spawnError}`, true);
+    } else {
+      exitSetupMode();
+      await loadConfig();
+      await refresh();
+      settingsMessage("Saved — daemon started.", false);
+    }
+  } catch (e) {
+    settingsMessage(String(e), true);
+  }
+  $("save-btn").disabled = false;
+}
+
 async function saveConfig(event) {
   event.preventDefault();
+  if (setupMode) return saveSetupConfig();
   if (loadedConfig === null) return;
   $("save-btn").disabled = true;
   settingsMessage("Saving…", false);
@@ -195,7 +271,8 @@ function showTab(name) {
   $("view-settings").hidden = name !== "settings";
   $("tab-status").classList.toggle("active", name === "status");
   $("tab-settings").classList.toggle("active", name === "settings");
-  if (name === "settings" && loadedConfig === null && !configLoadInFlight) loadConfig();
+  if (name === "settings" && !setupMode && loadedConfig === null && !configLoadInFlight)
+    loadConfig();
 }
 
 $("tab-status").addEventListener("click", () => showTab("status"));

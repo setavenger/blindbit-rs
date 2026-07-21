@@ -5,7 +5,6 @@
 //! UI can reuse it). The scan secret is handled separately — see
 //! [`resolve_scan_secret`].
 
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -99,11 +98,11 @@ pub struct ScanArgs {
 }
 
 pub fn default_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("friglet").join("config.toml"))
+    friglet_ipc::default_config_path()
 }
 
 pub fn default_key_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("friglet").join("scan.key"))
+    friglet_ipc::default_key_file()
 }
 
 /// Merge all configuration layers for the given CLI args.
@@ -244,18 +243,10 @@ pub fn validate_daemon_config(cfg: &DaemonConfig) -> Result<ResolvedConfig, Stri
 }
 
 /// Persist `cfg` as pretty TOML to `path` (atomically: temp file + rename),
-/// creating parent directories as needed.
+/// creating parent directories as needed. Delegates to the shared helper in
+/// `friglet-ipc` so the tray's first-run setup writes the same format.
 pub fn write_config_file(path: &Path, cfg: &DaemonConfig) -> Result<(), String> {
-    let describe = |e: String| format!("cannot write config file {}: {e}", path.display());
-    let toml = toml::to_string_pretty(cfg).map_err(|e| describe(e.to_string()))?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(|e| describe(e.to_string()))?;
-    }
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, toml).map_err(|e| describe(e.to_string()))?;
-    std::fs::rename(&tmp, path).map_err(|e| describe(e.to_string()))
+    friglet_ipc::write_config_toml(path, cfg)
 }
 
 /// Resolve the scan secret. Precedence: `--scan-secret` flag, then
@@ -310,48 +301,12 @@ pub fn replace_scan_key(path: &Path, hex: &str) -> Result<SecretKey, String> {
             "invalid scan key: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"
         )
     })?;
-    write_key_file_impl(path, hex, true)?;
+    friglet_ipc::write_key_file(path, hex, true)?;
     Ok(secret)
 }
 
 fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
-    write_key_file_impl(path, secret_hex, false)
-}
-
-fn write_key_file_impl(path: &Path, secret_hex: &str, overwrite: bool) -> Result<(), String> {
-    let describe = |e: std::io::Error| format!("cannot write key file {}: {e}", path.display());
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent).map_err(describe)?;
-    }
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    // On Windows the file inherits the profile directory's default ACL, which
-    // restricts access to the owning user — no tighter per-file ceiling is set.
-    let mut file = options.open(path).map_err(describe)?;
-    // `mode(0o600)` only applies on creation; enforce it when replacing a
-    // pre-existing key file too.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(describe)?;
-    }
-    file.write_all(secret_hex.as_bytes()).map_err(describe)?;
-    file.write_all(b"\n").map_err(describe)?;
-    Ok(())
+    friglet_ipc::write_key_file(path, secret_hex, false)
 }
 
 /// Restrict the state file to owner read/write.

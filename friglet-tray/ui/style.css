@@ -72,6 +72,22 @@ code {
 .error { color: var(--bad); }
 .small { font-size: 12px; min-height: 18px; }
 
+.banner {
+  background: rgba(247, 147, 26, 0.12);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.banner strong { color: var(--accent); }
+.banner-path {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font: 11px/1.4 ui-monospace, "Cascadia Mono", monospace;
+  word-break: break-all;
+}
+
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); }
 .tab {
   background: none;

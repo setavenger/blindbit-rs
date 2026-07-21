@@ -101,6 +101,41 @@ async fn unreachable_when_no_daemon_and_no_binary() {
     }
 }
 
+/// First-run: daemon unreachable AND not configured → no spawn attempt at
+/// all (the locator must never run), outcome says setup is needed.
+#[tokio::test]
+async fn setup_required_instead_of_spawn_when_unconfigured() {
+    let path = test_socket_path("setup");
+    let att = lifecycle::attach_spawn_or_setup_with(
+        &path,
+        || panic!("must not look for a daemon binary when setup is needed"),
+        || true,
+    )
+    .await;
+    assert!(matches!(att, Attachment::SetupRequired), "got {att:?}");
+}
+
+/// A reachable daemon always wins: neither the setup check nor the binary
+/// locator run when attaching succeeds (a daemon configured via flags/env
+/// may be running without any config file).
+#[tokio::test]
+async fn attach_beats_setup_check_when_daemon_reachable() {
+    let path = test_socket_path("setup-attach");
+    spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let att = lifecycle::attach_spawn_or_setup_with(
+        &path,
+        || panic!("should not look for a binary when attach succeeds"),
+        || panic!("should not check configuration when attach succeeds"),
+    )
+    .await;
+    assert!(matches!(att, Attachment::Attached), "got {att:?}");
+
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Spawn path: the "daemon binary" is an inert script; the socket is brought
 /// up by an in-test listener shortly after, simulating daemon startup time.
 #[cfg(unix)]
