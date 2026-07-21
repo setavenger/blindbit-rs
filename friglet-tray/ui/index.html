@@ -16,6 +16,7 @@
     <nav class="tabs">
       <button id="tab-status" class="tab active">Status</button>
       <button id="tab-settings" class="tab">Settings</button>
+      <button id="tab-wallet" class="tab">Wallet</button>
     </nav>
 
     <div id="view-status">
@@ -70,6 +71,44 @@
         <button id="stop-btn" class="secondary">Stop scanning</button>
       </div>
       <p id="action-error" class="error small"></p>
+    </div>
+
+    <div id="view-wallet" hidden>
+      <p id="wallet-unavailable" class="wallet-placeholder small">
+        Connect to the daemon to load wallet activity.
+      </p>
+
+      <div id="wallet-content" class="wallet-content" aria-disabled="true">
+        <section class="card wallet-stats">
+          <div class="row">
+            <span class="label">Transactions found</span>
+            <strong id="wallet-tx-count" class="stat-value">–</strong>
+          </div>
+          <div class="row">
+            <span class="label">Outputs found</span>
+            <strong id="wallet-output-count" class="stat-value">–</strong>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="address-heading">
+            <span class="label">Base address</span>
+          </div>
+          <div class="address-row">
+            <code id="wallet-base-address" class="address-value" title="">–</code>
+            <button type="button" id="copy-base-address" class="copy-btn" disabled>Copy</button>
+            <span id="copied-base-address" class="copied" aria-live="polite">Copied!</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="address-heading">
+            <span class="label">Label addresses</span>
+          </div>
+          <div id="label-addresses" class="address-list"></div>
+          <p id="no-label-addresses" class="wallet-empty small">No label addresses configured.</p>
+        </section>
+      </div>
     </div>
 
     <div id="view-settings" hidden>

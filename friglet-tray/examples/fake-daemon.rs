@@ -7,7 +7,7 @@
 //!
 //! Usage: `cargo run -p friglet-tray --example fake-daemon`
 
-use friglet_ipc::{DaemonConfig, Request, Response, StatusInfo};
+use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, StatusInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -61,7 +61,26 @@ async fn main() -> std::io::Result<()> {
                         electrum_clients: 1,
                         oracle_connected: scanning.load(Ordering::Relaxed),
                         last_error: None,
-                        sp_address: Some("sp1qfake...".to_string()),
+                        sp_address: Some(
+                            "tsp1qz90l7rkv30c0f35l5mk4l90n5q9yq0q6p8s8v7h2e9l4j2n0c4x8f6t7w"
+                                .to_string(),
+                        ),
+                        tx_count: 7,
+                        outputs_found: 11,
+                        label_addresses: vec![
+                            LabelAddress {
+                                label: 0,
+                                address:
+                                    "tsp1q8u4ph4sx3m7v2k9d5n6r0c1g8w3j7l5f9y2e6t4q0a8s1d3h5k7m9n2p4"
+                                        .to_string(),
+                            },
+                            LabelAddress {
+                                label: 1,
+                                address:
+                                    "tsp1q5m2k8v4c9x7n3l6s0d1f8g2h5j9q4w7e3r6t0y1u8i2o5p9a4z7x3c6v"
+                                        .to_string(),
+                            },
+                        ],
                         version: "fake-0.0.0".to_string(),
                     }),
                     Request::Start => {

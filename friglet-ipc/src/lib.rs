@@ -140,8 +140,24 @@ pub struct StatusInfo {
     pub last_error: Option<String>,
     /// Silent Payments address of the wallet, once known.
     pub sp_address: Option<String>,
+    /// Number of confirmed Silent Payments receive transactions found.
+    #[serde(default)]
+    pub tx_count: u64,
+    /// Number of wallet-owned outputs found, including persisted results.
+    #[serde(default)]
+    pub outputs_found: u64,
+    /// Silent Payments addresses for every configured label.
+    #[serde(default)]
+    pub label_addresses: Vec<LabelAddress>,
     /// Daemon crate version.
     pub version: String,
+}
+
+/// A configured Silent Payments label and its receive address.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LabelAddress {
+    pub label: u32,
+    pub address: String,
 }
 
 /// Default control socket path for the current platform.
@@ -412,6 +428,50 @@ mod tests {
         let resp = Response::OkWithNote("restart required".to_string());
         let json = serde_json::to_string(&resp).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), resp);
+    }
+
+    #[test]
+    fn status_roundtrip_includes_wallet_fields() {
+        let status = StatusInfo {
+            scanning: true,
+            scanned_height: 100,
+            tip_height: Some(101),
+            scan_progress: 0.5,
+            network: "signet".to_string(),
+            electrum_clients: 1,
+            oracle_connected: true,
+            last_error: None,
+            sp_address: Some("sp1qbase".to_string()),
+            tx_count: 2,
+            outputs_found: 3,
+            label_addresses: vec![LabelAddress {
+                label: 0,
+                address: "tsp1qlabel".to_string(),
+            }],
+            version: "test".to_string(),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
+    }
+
+    #[test]
+    fn status_old_json_defaults_wallet_fields() {
+        let json = r#"{
+            "scanning": false,
+            "scanned_height": 42,
+            "tip_height": null,
+            "scan_progress": 0.0,
+            "network": "regtest",
+            "electrum_clients": 0,
+            "oracle_connected": false,
+            "last_error": null,
+            "sp_address": null,
+            "version": "old"
+        }"#;
+        let status: StatusInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(status.tx_count, 0);
+        assert_eq!(status.outputs_found, 0);
+        assert!(status.label_addresses.is_empty());
     }
 
     #[test]

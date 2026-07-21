@@ -1,4 +1,4 @@
-use friglet_ipc::{Client, Request, Response, StatusInfo, accept, listen};
+use friglet_ipc::{Client, LabelAddress, Request, Response, StatusInfo, accept, listen};
 
 fn temp_socket_path() -> String {
     #[cfg(windows)]
@@ -29,6 +29,12 @@ async fn get_status_roundtrip() {
         oracle_connected: true,
         last_error: None,
         sp_address: Some("sp1q...".to_string()),
+        tx_count: 2,
+        outputs_found: 3,
+        label_addresses: vec![LabelAddress {
+            label: 0,
+            address: "sp1qlabel...".to_string(),
+        }],
         version: "0.1.0".to_string(),
     };
     let expected = status.clone();

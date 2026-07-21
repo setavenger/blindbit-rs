@@ -1,4 +1,5 @@
 const invoke = window.__TAURI__.core.invoke;
+const writeText = window.__TAURI__.clipboardManager.writeText;
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,6 +23,7 @@ function render({ reachable, status }) {
   // (retried at poll cadence while loading fails).
   if (reachable && loadedConfig === null && !configLoadInFlight) loadConfig();
 
+  renderWallet(reachable ? status : null);
   if (!status) return; // nothing known yet; keep placeholders
 
   setText("scanning", status.scanning ? "running" : "stopped");
@@ -72,6 +74,93 @@ async function action(command) {
 
 $("start-btn").addEventListener("click", () => action("start_scanning"));
 $("stop-btn").addEventListener("click", () => action("stop_scanning"));
+
+// ---------------------------------------------------------------------------
+// Wallet view
+// ---------------------------------------------------------------------------
+
+let walletLabelsKey = null;
+
+function truncateMiddle(value) {
+  if (!value || value.length <= 38) return value || "–";
+  return `${value.slice(0, 20)}…${value.slice(-14)}`;
+}
+
+async function copyAddress(address, confirmation) {
+  if (!address) return;
+  try {
+    await writeText(address);
+    confirmation.textContent = "Copied!";
+    confirmation.classList.add("visible");
+    setTimeout(() => confirmation.classList.remove("visible"), 1400);
+  } catch (e) {
+    console.error("copy failed", e);
+    confirmation.textContent = "Copy failed";
+    confirmation.classList.add("visible", "error");
+    setTimeout(() => confirmation.classList.remove("visible", "error"), 1800);
+  }
+}
+
+function renderLabelAddresses(labels) {
+  const key = JSON.stringify(labels);
+  if (key === walletLabelsKey) return;
+  walletLabelsKey = key;
+
+  const list = $("label-addresses");
+  list.replaceChildren();
+  $("no-label-addresses").hidden = labels.length > 0;
+  for (const item of labels) {
+    const row = document.createElement("div");
+    row.className = "label-address-row";
+
+    const meta = document.createElement("span");
+    meta.className = "label-number";
+    meta.textContent = `Label ${item.label}`;
+
+    const address = document.createElement("code");
+    address.className = "address-value";
+    address.textContent = truncateMiddle(item.address);
+    address.title = item.address;
+
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "copy-btn";
+    copy.textContent = "Copy";
+
+    const confirmation = document.createElement("span");
+    confirmation.className = "copied";
+    confirmation.setAttribute("aria-live", "polite");
+    confirmation.textContent = "Copied!";
+    copy.addEventListener("click", () => copyAddress(item.address, confirmation));
+
+    row.append(meta, address, copy, confirmation);
+    list.append(row);
+  }
+}
+
+function renderWallet(status) {
+  const available = status != null;
+  $("wallet-unavailable").hidden = available;
+  $("wallet-unavailable").textContent = setupMode
+    ? "Finish setup to load wallet activity."
+    : "Connect to the daemon to load wallet activity.";
+  $("wallet-content").classList.toggle("unavailable", !available);
+  $("wallet-content").setAttribute("aria-disabled", String(!available));
+
+  setText("wallet-tx-count", available ? status.tx_count.toLocaleString() : "–");
+  setText("wallet-output-count", available ? status.outputs_found.toLocaleString() : "–");
+
+  const base = available ? status.sp_address : null;
+  setText("wallet-base-address", truncateMiddle(base));
+  $("wallet-base-address").title = base ?? "";
+  $("copy-base-address").disabled = !base;
+  $("copy-base-address").dataset.address = base ?? "";
+  renderLabelAddresses(available ? status.label_addresses : []);
+}
+
+$("copy-base-address").addEventListener("click", () =>
+  copyAddress($("copy-base-address").dataset.address, $("copied-base-address"))
+);
 
 // ---------------------------------------------------------------------------
 // Settings view
@@ -269,14 +358,17 @@ $("reload-btn").addEventListener("click", loadConfig);
 function showTab(name) {
   $("view-status").hidden = name !== "status";
   $("view-settings").hidden = name !== "settings";
+  $("view-wallet").hidden = name !== "wallet";
   $("tab-status").classList.toggle("active", name === "status");
   $("tab-settings").classList.toggle("active", name === "settings");
+  $("tab-wallet").classList.toggle("active", name === "wallet");
   if (name === "settings" && !setupMode && loadedConfig === null && !configLoadInFlight)
     loadConfig();
 }
 
 $("tab-status").addEventListener("click", () => showTab("status"));
 $("tab-settings").addEventListener("click", () => showTab("settings"));
+$("tab-wallet").addEventListener("click", () => showTab("wallet"));
 
 refresh();
 setInterval(refresh, 1000);

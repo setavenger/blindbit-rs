@@ -26,8 +26,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bdk_sp::encoding::SilentPaymentCode;
+use bitcoin::Network as BitcoinNetwork;
+use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use blindbit_lib::scanner::{self, Scanner, WalletElectrumIndex};
-use friglet_ipc::{DaemonConfig, Listener, Request, Response, StatusInfo};
+use friglet_ipc::{DaemonConfig, LabelAddress, Listener, Request, Response, StatusInfo};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +70,54 @@ fn pick_tip(oracle: Option<u64>, electrum: Option<u64>) -> Option<u64> {
     oracle.or(electrum)
 }
 
+/// Count persisted wallet-owned outputs without making daemon startup depend
+/// on the state file being present or valid.
+pub(crate) fn owned_outputs_count(state_file: &std::path::Path) -> u64 {
+    std::fs::read(state_file)
+        .ok()
+        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok())
+        .and_then(|value| {
+            value
+                .get("owned_outputs")?
+                .as_array()
+                .map(|a| a.len() as u64)
+        })
+        .unwrap_or(0)
+}
+
+/// Derive every configured label address. Label 0 is included because the
+/// scanner indexes the inclusive range `0..=max_label_num`.
+pub(crate) fn derive_label_addresses(
+    scan_secret: SecretKey,
+    spend_pubkey: PublicKey,
+    network: BitcoinNetwork,
+    max_label_num: u32,
+) -> Vec<LabelAddress> {
+    let scan_pubkey = PublicKey::from_secret_key(&Secp256k1::new(), &scan_secret);
+    let base = SilentPaymentCode::new_v0(scan_pubkey, spend_pubkey, network);
+    (0..=max_label_num)
+        .map(|label| {
+            let tweak = SilentPaymentCode::get_label(scan_secret, label);
+            let address = base
+                .add_label(tweak)
+                .expect("hash-derived label tweak is a valid curve scalar")
+                .to_string();
+            LabelAddress { label, address }
+        })
+        .collect()
+}
+
+pub(crate) fn wallet_network(network: bitcoin_rev::Network) -> BitcoinNetwork {
+    use bitcoin_rev::network::TestnetVersion;
+    match network {
+        bitcoin_rev::Network::Bitcoin => BitcoinNetwork::Bitcoin,
+        bitcoin_rev::Network::Signet => BitcoinNetwork::Signet,
+        bitcoin_rev::Network::Regtest => BitcoinNetwork::Regtest,
+        bitcoin_rev::Network::Testnet(TestnetVersion::V4) => BitcoinNetwork::Testnet4,
+        bitcoin_rev::Network::Testnet(_) => BitcoinNetwork::Testnet,
+    }
+}
+
 /// Everything the request handler needs from the daemon.
 pub struct ControlCtx {
     pub supervisor: Arc<ScanSupervisor>,
@@ -79,6 +130,12 @@ pub struct ControlCtx {
     /// the startup index and is not rewired (see module docs).
     pub electrum_index: std::sync::Mutex<Arc<Mutex<WalletElectrumIndex>>>,
     pub electrum_clients: Arc<AtomicU64>,
+    /// Cumulative wallet-owned output count, seeded from persisted state and
+    /// updated from scanner notifications.
+    pub outputs_found: Arc<AtomicU64>,
+    /// Label addresses derived from the scan secret. Never sent separately
+    /// from the status snapshot and replaced whenever the scanner is rebuilt.
+    pub label_addresses: std::sync::Mutex<Vec<LabelAddress>>,
     /// Current effective configuration, updated by `SetConfig`.
     pub settings: std::sync::Mutex<DaemonConfig>,
     /// Where `SetConfig` persists the config; `None` when no location could
@@ -167,11 +224,11 @@ impl ControlCtx {
 
     async fn status(&self) -> StatusInfo {
         let index = self.electrum_index.lock().unwrap().clone();
-        let (electrum_tip, scan_progress, sp_address) = {
+        let (electrum_tip, scan_progress, sp_address, tx_count) = {
             let idx = index.lock().await;
             let tip = idx.tip.as_ref().map(|(h, _)| u64::from(*h));
             let addr = (!idx.sp_address.is_empty()).then(|| idx.sp_address.clone());
-            (tip, idx.scan_progress, addr)
+            (tip, idx.scan_progress, addr, idx.sp_history.len() as u64)
         };
 
         // While the scan task runs it holds the scanner mutex, so fall back
@@ -200,6 +257,9 @@ impl ControlCtx {
             oracle_connected,
             last_error,
             sp_address,
+            tx_count,
+            outputs_found: self.outputs_found.load(Ordering::Relaxed),
+            label_addresses: self.label_addresses.lock().unwrap().clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -377,10 +437,26 @@ impl ControlCtx {
         if new_scanner.get_last_scanned_block_height() < resolved.start_height {
             new_scanner.update_last_scanned_block_height(resolved.start_height.saturating_sub(1));
         }
+        let label_addresses = derive_label_addresses(
+            secret,
+            resolved.spend_pubkey,
+            wallet_network(resolved.network),
+            resolved.max_label_num,
+        );
+        self.outputs_found
+            .store(owned_outputs_count(&resolved.state_file), Ordering::Relaxed);
+        let mut outputs_rx = new_scanner.subscribe_to_found_utxos();
+        let outputs_found = self.outputs_found.clone();
+        tokio::spawn(async move {
+            while let Ok(count) = outputs_rx.recv().await {
+                outputs_found.store(count as u64, Ordering::Relaxed);
+            }
+        });
         config::tighten_state_file_perms(&resolved.state_file);
 
         *self.scanner.lock().await = new_scanner;
         *self.electrum_index.lock().unwrap() = new_index;
+        *self.label_addresses.lock().unwrap() = label_addresses;
 
         if was_running {
             self.supervisor.start();
@@ -512,6 +588,35 @@ mod tests {
         assert_eq!(pick_tip(None, None), None);
     }
 
+    #[test]
+    fn owned_outputs_count_tolerates_state_file_variants() {
+        let dir = temp_dir("owned-outputs");
+        let path = dir.join("state.json");
+
+        assert_eq!(owned_outputs_count(&path), 0);
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(owned_outputs_count(&path), 0);
+        std::fs::write(&path, br#"{"other":[]}"#).unwrap();
+        assert_eq!(owned_outputs_count(&path), 0);
+        std::fs::write(&path, br#"{"owned_outputs":["02aa","02bb"]}"#).unwrap();
+        assert_eq!(owned_outputs_count(&path), 2);
+    }
+
+    #[test]
+    fn label_address_derivation_is_deterministic_and_unique() {
+        use std::str::FromStr;
+
+        let scan_secret = SecretKey::from_str(SECRET_HEX).unwrap();
+        let spend_pubkey = PublicKey::from_str(SPEND_PK).unwrap();
+        let first = derive_label_addresses(scan_secret, spend_pubkey, BitcoinNetwork::Signet, 2);
+        let second = derive_label_addresses(scan_secret, spend_pubkey, BitcoinNetwork::Signet, 2);
+
+        assert_eq!(first, second);
+        assert_eq!(first.iter().map(|a| a.label).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_ne!(first[0].address, first[1].address);
+        assert_ne!(first[1].address, first[2].address);
+    }
+
     /// Serializes the test that sets `FRIGLET_SCAN_SECRET` (process-global)
     /// with tests whose assertions depend on it being unset.
     static SCAN_SECRET_ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -614,6 +719,13 @@ mod tests {
             scanner: scanner_arc,
             electrum_index: std::sync::Mutex::new(electrum_index),
             electrum_clients: Arc::new(AtomicU64::new(0)),
+            outputs_found: Arc::new(AtomicU64::new(0)),
+            label_addresses: std::sync::Mutex::new(derive_label_addresses(
+                secret,
+                resolved.spend_pubkey,
+                wallet_network(resolved.network),
+                resolved.max_label_num,
+            )),
             settings: std::sync::Mutex::new(cfg),
             config_path: Some(config_path),
             apply_lock: Mutex::new(()),
@@ -644,8 +756,36 @@ mod tests {
             oracle_connected: false,
             last_error: None,
             sp_address: None,
+            tx_count: 0,
+            outputs_found: 0,
+            label_addresses: Vec::new(),
             version: "test".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn status_reports_silent_payment_transaction_count() {
+        let dir = temp_dir("status-tx-count");
+        let ctx = test_ctx(&dir);
+        let index = ctx.electrum_index.lock().unwrap().clone();
+        index.lock().await.sp_history.extend([
+            blindbit_lib::scanner::SpHistoryEntry {
+                tx_hash: "11".repeat(32),
+                height: 1,
+                tweak_hex: "02".repeat(33),
+            },
+            blindbit_lib::scanner::SpHistoryEntry {
+                tx_hash: "22".repeat(32),
+                height: 2,
+                tweak_hex: "03".repeat(33),
+            },
+        ]);
+        {
+            let mut cache = ctx.oracle_tip_cache.lock().unwrap();
+            cache.fetched_at = Some(Instant::now());
+        }
+
+        assert_eq!(ctx.status().await.tx_count, 2);
     }
 
     #[tokio::test]

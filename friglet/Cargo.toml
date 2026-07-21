@@ -31,6 +31,7 @@ tracing-subscriber = { workspace = true }
 # Oracle tip polling in GetStatus (and lazy no-network channels in tests);
 # version pinned to blindbit-lib's tonic.
 tonic = "0.14.2"
+bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0", package = "bdk_sp" }
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["toml", "env", "test"] }

@@ -71,6 +71,15 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     let cfg = config::resolve(merged)?;
     let secret_scan = config::resolve_scan_secret(args.scan_secret.as_deref(), &cfg.key_file)?;
+    let label_addresses = control::derive_label_addresses(
+        secret_scan,
+        cfg.spend_pubkey,
+        control::wallet_network(cfg.network),
+        cfg.max_label_num,
+    );
+    let outputs_found = Arc::new(AtomicU64::new(control::owned_outputs_count(
+        &cfg.state_file,
+    )));
 
     // blindbit-lib persists the scan secret inside the state JSON (see
     // config::tighten_state_file_perms), so keep the file owner-only.
@@ -105,15 +114,27 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
     // Grab Electrum index + push receiver before the scan task locks the scanner.
-    let (electrum_index, found_utxos_rx) = {
+    let (electrum_index, found_utxos_rx, mut outputs_found_rx) = {
         let s = scanner_instance.lock().await;
         let index = s.electrum_index();
         {
             let mut idx = index.lock().await;
             idx.sp_start_height = cfg.start_height;
         }
-        (index, s.subscribe_to_found_utxos())
+        (
+            index,
+            s.subscribe_to_found_utxos(),
+            s.subscribe_to_found_utxos(),
+        )
     };
+    {
+        let outputs_found = outputs_found.clone();
+        tokio::spawn(async move {
+            while let Ok(count) = outputs_found_rx.recv().await {
+                outputs_found.store(count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
 
     // Ensure watch_chain starts from start_height on a fresh wallet
     // (last_scanned_block_height is 0 when there is no saved state).
@@ -147,6 +168,8 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         scanner: scanner_instance.clone(),
         electrum_index: std::sync::Mutex::new(electrum_index.clone()),
         electrum_clients: electrum_clients.clone(),
+        outputs_found,
+        label_addresses: std::sync::Mutex::new(label_addresses),
         settings: std::sync::Mutex::new(cfg.raw.clone()),
         config_path,
         apply_lock: Mutex::new(()),

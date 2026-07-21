@@ -57,7 +57,7 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   `FRIGLET_DAEMON_BIN` (daemon binary the tray spawns when none is running),
   `FRIGLET_TRAY_SHOW_ON_START` (show the status window on startup:
   `1`/`true`/`yes`/`on`/`status` → Status tab;
-  `settings` → Settings tab after the UI loads — useful for headless /
+  `settings` → Settings tab, `wallet` → Wallet tab after the UI loads — useful for headless /
   screenshot testing; synthetic X11 clicks do not reach WebKitGTK reliably).
 
 ### First-run setup mode (no config file yet)
@@ -217,6 +217,19 @@ dbus-run-session -- bash -c '
   `GetStatus` also uses tonic to poll the oracle tip (cached ~10s) for
   `tip_height`; tests use unreachable `oracle_url`s and fall back to the
   electrum tip within a 2s connect timeout.
+
+## Wallet status fields
+
+- `StatusInfo` includes restart-safe `tx_count`, `outputs_found`, and
+  `label_addresses`; the tray's Wallet tab also uses the existing
+  `sp_address`. New fields use serde defaults for older daemon payloads.
+- `tx_count` comes from the rebuilt Electrum index's `sp_history`.
+  `outputs_found` is seeded from the persisted state JSON's `owned_outputs`
+  array and then updated from an independent scanner broadcast receiver.
+- Label addresses are derived in `friglet` from the scan secret with the
+  `bdk_sp` encoding crate pinned to the same git revision already locked for
+  `blindbit-lib`. Labels are the scanner's inclusive `0..=max_label_num`
+  range and are recomputed whenever the scanner is rebuilt.
 
 ## Daemon spawn diagnostics (tray lifecycle)
 

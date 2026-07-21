@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Status window: core APIs + app commands via invoke",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "clipboard-manager:allow-write-text"]
 }

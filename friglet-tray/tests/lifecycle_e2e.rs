@@ -37,6 +37,9 @@ fn dummy_status() -> StatusInfo {
         oracle_connected: false,
         last_error: None,
         sp_address: None,
+        tx_count: 0,
+        outputs_found: 0,
+        label_addresses: Vec::new(),
         version: "test".to_string(),
     }
 }

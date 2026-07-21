@@ -19,8 +19,8 @@ body {
 }
 
 main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-#view-status, #view-settings { display: flex; flex-direction: column; gap: 12px; }
-#view-status[hidden], #view-settings[hidden] { display: none; }
+#view-status, #view-settings, #view-wallet { display: flex; flex-direction: column; gap: 12px; }
+#view-status[hidden], #view-settings[hidden], #view-wallet[hidden] { display: none; }
 
 header { display: flex; align-items: center; justify-content: space-between; }
 h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
@@ -48,6 +48,7 @@ h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
 .col { display: flex; flex-direction: column; gap: 4px; }
 .label { color: var(--muted); font-size: 12px; }
 .value { font-variant-numeric: tabular-nums; }
+.stat-value { color: var(--text); font-size: 20px; font-variant-numeric: tabular-nums; }
 
 .progress {
   height: 6px;
@@ -122,6 +123,55 @@ fieldset:disabled { opacity: 0.5; }
 .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
 .ok { color: var(--good); }
 
+.wallet-placeholder, .wallet-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 6px;
+}
+.wallet-content { display: flex; flex-direction: column; gap: 12px; transition: opacity 0.2s ease; }
+.wallet-content.unavailable { opacity: 0.45; }
+.wallet-stats { gap: 12px; }
+.address-heading { display: flex; justify-content: space-between; align-items: center; }
+.address-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.address-list { display: flex; flex-direction: column; gap: 10px; }
+.label-address-row {
+  display: grid;
+  grid-template-columns: 50px minmax(0, 1fr) auto auto;
+  gap: 7px;
+  align-items: center;
+}
+.label-number { color: var(--muted); font-size: 11px; }
+.address-value {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  word-break: normal;
+  user-select: text;
+}
+button.copy-btn {
+  flex: none;
+  min-width: 48px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 11px;
+}
+.copied {
+  width: 48px;
+  color: var(--good);
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+.copied.visible { opacity: 1; }
+.copied.error { color: var(--bad); }
+
 .actions { display: flex; gap: 8px; }
 button {
   flex: 1;
@@ -137,3 +187,7 @@ button {
 button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
 button:disabled { opacity: 0.4; cursor: default; }
 button:not(:disabled):hover { filter: brightness(1.1); }
+
+@media (prefers-reduced-motion: reduce) {
+  #progress-bar, .wallet-content, .copied { transition: none; }
+}

@@ -121,6 +121,10 @@ the next daemon restart (the UI surfaces the daemon's note about this). The
 scan key is write-only — it is never displayed and only sent when you type a
 new one.
 
+The **Wallet** tab is a read-only convenience view, not a spending wallet. It
+shows found transaction/output counts plus copyable base and per-label Silent
+Payments addresses.
+
 ```bash
 # build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
 # libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)
@@ -131,7 +135,8 @@ cargo build --release -p friglet-tray
 
 # optional: show the status window immediately (normally hidden until
 # opened from the tray menu — useful for headless / screenshot testing).
-# Values: 1/true/yes/on/status → Status tab; settings → Settings tab.
+# Values: 1/true/yes/on/status → Status tab; settings → Settings tab;
+# wallet → Wallet tab.
 FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
 ```
 

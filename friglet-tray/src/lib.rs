@@ -333,15 +333,29 @@ fn show_settings_window(app: &AppHandle) {
     });
 }
 
+/// Show the main window on the Wallet tab for screenshot testing.
+fn show_wallet_window(app: &AppHandle) {
+    show_status_window(app);
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Some(w) = handle.get_webview_window("main") {
+            let _ = w.eval("document.getElementById('tab-wallet')?.click()");
+        }
+    });
+}
+
 /// Parse `FRIGLET_TRAY_SHOW_ON_START`:
 /// - unset / falsy → hide window (default)
 /// - `1` / `true` / `yes` / `on` / `status` → show status window
 /// - `settings` → show window and switch to the Settings tab (after the UI loads)
+/// - `wallet` → show window and switch to the Wallet tab (after the UI loads)
 fn show_on_start_env() -> Option<&'static str> {
     match std::env::var("FRIGLET_TRAY_SHOW_ON_START") {
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" | "status" => Some("status"),
             "settings" => Some("settings"),
+            "wallet" => Some("wallet"),
             _ => None,
         },
         Err(_) => None,
@@ -516,6 +530,7 @@ pub fn run() {
     });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -541,10 +556,10 @@ pub fn run() {
             setup_tray(app)?;
 
             if let Some(tab) = show_on_start_env() {
-                if tab == "settings" {
-                    show_settings_window(app.handle());
-                } else {
-                    show_status_window(app.handle());
+                match tab {
+                    "settings" => show_settings_window(app.handle()),
+                    "wallet" => show_wallet_window(app.handle()),
+                    _ => show_status_window(app.handle()),
                 }
             }
 
@@ -622,6 +637,9 @@ mod tests {
                                 oracle_connected: false,
                                 last_error: None,
                                 sp_address: None,
+                                tx_count: 0,
+                                outputs_found: 0,
+                                label_addresses: Vec::new(),
                                 version: "test".to_string(),
                             }),
                             _ => Response::Ok,
@@ -673,6 +691,10 @@ mod tests {
             std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", "settings");
         }
         assert_eq!(show_on_start_env(), Some("settings"));
+        unsafe {
+            std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", "wallet");
+        }
+        assert_eq!(show_on_start_env(), Some("wallet"));
         for v in ["0", "false", "no", "off", "", "maybe"] {
             unsafe {
                 std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", v);
