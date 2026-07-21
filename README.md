@@ -55,7 +55,7 @@ cargo run --release --package friglet scan \
 | `--oracle-url` | BlindBit Oracle URL | `https://oracle.setor.dev` |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
-| `--state-file` | Path to persist scanner state | `scanner_state.json` |
+| `--state-file` | Path to persist scanner state | `<config dir>/friglet/scanner_state.json` |
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
 
@@ -252,7 +252,7 @@ cargo run --release --package blindbit-cli scan \
 - `--start-height`: Block height to begin scanning from (wallet birthday)
 - `--p2p-node-addr`: Bitcoin P2P node address (`host:port`)
 - `--oracle-url`: Oracle service URL (default: `https://oracle.setor.dev`)
-- `--state-file`: Path for scanner state persistence (default: `scanner_state.json`)
+- `--state-file`: Path for scanner state persistence (default: `<config dir>/friglet/scanner_state.json`)
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)
 - `--max-label-num`: Maximum label number (default: `0`)
 
