@@ -134,11 +134,18 @@ struct SetupStatePayload {
 #[tauri::command]
 async fn get_setup_state(state: State<'_, Arc<AppState>>) -> Result<SetupStatePayload, String> {
     let config_path = friglet_ipc::default_config_path();
-    let config = config_path
+    let mut config = config_path
         .as_deref()
         .filter(|p| p.exists())
         .and_then(|p| friglet_ipc::read_config_toml(p).ok())
         .unwrap_or_default();
+    // Show the absolute platform default in the first-run form when the
+    // loaded/default config still has a relative state_file.
+    if !config.state_file.is_absolute()
+        && let Some(absolute) = friglet_ipc::default_state_file()
+    {
+        config.state_file = absolute;
+    }
     let key_file = config
         .key_file
         .clone()

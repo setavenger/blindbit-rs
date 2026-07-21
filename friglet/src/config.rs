@@ -56,7 +56,7 @@ pub struct ScanArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle_url: Option<String>,
 
-    /// Path to save/load scanner state [default: scanner_state.json]
+    /// Path to save/load scanner state [default: `<config dir>/friglet/scanner_state.json`]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_file: Option<PathBuf>,
@@ -194,6 +194,16 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
         .control_socket
         .clone()
         .unwrap_or_else(friglet_ipc::default_socket_path);
+
+    // Belt-and-suspenders: old configs / CWD-relative defaults land state
+    // next to the tray binary's CWD. Rewrite the bare default name to the
+    // platform config-dir path when available.
+    let mut raw = raw;
+    if raw.state_file.as_os_str() == "scanner_state.json"
+        && let Some(absolute) = friglet_ipc::default_state_file()
+    {
+        raw.state_file = absolute;
+    }
 
     Ok(ResolvedConfig {
         network,
