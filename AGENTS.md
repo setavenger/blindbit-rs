@@ -7,6 +7,18 @@ Rust Cargo workspace (edition 2024) for BlindBit BIP-352 Silent Payments. Three 
 ### Toolchain / build
 - Needs Rust **stable >= 1.85** (edition 2024). Default toolchain is set to `stable`; the preinstalled `1.83.0` is too old and fails to compile.
 - `protoc` is a hard build requirement: `blindbit-lib/build.rs` compiles `blindbit-lib/proto/*.proto` via `tonic-prost-build`. Build fails with no protoc on PATH.
+
+### System dependencies (baked into the VM snapshot)
+This env needs heavy system setup beyond the current tree because the repo also has a **Tauri v2 tray app** (on branch `cursor/friglet-tray-ui-a38a`) that requires GTK/WebKit/appindicator to build, plus Windows cross-compile + headless-GUI test tooling. These are already installed in the VM snapshot from a setup session, so future agents should NOT need to reinstall them; if a fresh env is missing them, install via apt (needs `sudo`):
+
+- Tauri build: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev libssl-dev pkg-config patchelf`
+- Proto codegen: `protobuf-compiler libprotobuf-dev`
+- Headless GUI test / automation: `xvfb xdotool libxdo-dev`
+- Windows cross-compile: `mingw-w64` + `rustup target add x86_64-pc-windows-gnu`
+- Containers: `docker.io`
+- Rust components: `clippy` + `rustfmt`
+
+If a future env keeps losing these, regenerate the environment config via the env setup agent at `cursor.com/onboard` rather than relying on the startup update script (which is kept minimal to `cargo fetch`).
 - Standard commands from repo root: `cargo build --workspace`, `cargo clippy --workspace`, `cargo fmt --all -- --check`, `cargo test --workspace`.
 - There are **no in-repo tests** (`cargo test` reports 0 tests) and **no committed clippy/rustfmt config**. Clippy emits warnings only (e.g. `collapsible_if`) and `cargo fmt --check` reports pre-existing diffs — neither is an error; do not "fix" pre-existing style unless asked.
 
