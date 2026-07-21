@@ -1,3 +1,4 @@
+mod blockheader;
 mod config;
 mod control;
 mod electrum;
@@ -111,6 +112,21 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         .rebuild_electrum_index_from_graph(cfg.start_height)
         .await;
 
+    // Snapshot sparse wallet checkpoints before watch_chain takes the scanner
+    // lock for its full run. Header misses use this map, then the oracle.
+    let block_checkpoints = loaded_scanner
+        .staged()
+        .map(|stage| {
+            stage
+                .block_checkpoints
+                .iter()
+                .map(|(height, hash)| (*height, *hash))
+                .collect()
+        })
+        .unwrap_or_default();
+    let header_sidecar = blockheader::sidecar_path(&cfg.state_file);
+    let persisted_headers = blockheader::load_headers(&header_sidecar);
+
     let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
     // Grab Electrum index + push receiver before the scan task locks the scanner.
@@ -120,6 +136,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         {
             let mut idx = index.lock().await;
             idx.sp_start_height = cfg.start_height;
+            idx.headers.extend(persisted_headers);
         }
         (
             index,
@@ -209,6 +226,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         let electrum_clients = electrum_clients.clone();
         let p2p_addr = cfg.p2p_addr;
         let network = cfg.network;
+        let oracle_url = cfg.oracle_url.clone();
         async move {
             if let Err(e) = electrum::run(
                 electrum_index,
@@ -216,6 +234,9 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
                 &electrum_addr,
                 p2p_addr,
                 network,
+                oracle_url,
+                block_checkpoints,
+                header_sidecar,
                 electrum_clients,
             )
             .await

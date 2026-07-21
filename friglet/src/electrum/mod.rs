@@ -15,7 +15,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -23,12 +25,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant, timeout_at};
 
+use bitcoin::BlockHash;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
 use bitcoin_rev::Network;
 use blindbit_lib::scanner::broadcast_tx;
 use blindbit_lib::scanner::{
     ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status,
 };
+use blindbit_lib::{BlockHeightRequest, OracleServiceClient};
+
+use crate::blockheader;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
@@ -97,6 +103,10 @@ struct ElectrumServerState {
     index: Arc<Mutex<WalletElectrumIndex>>,
     p2p_peer: SocketAddr,
     network: Network,
+    oracle_url: String,
+    block_checkpoints: HashMap<u32, BlockHash>,
+    header_sidecar: PathBuf,
+    header_fetch_lock: Mutex<()>,
     /// Broadcast channel: pre-serialised JSON notification lines sent to every
     /// connected client.
     push_tx: broadcast::Sender<String>,
@@ -110,12 +120,16 @@ struct ElectrumServerState {
 ///
 /// `index` and `found_rx` must be obtained from the scanner before spawning
 /// `scan_block_range`, so this server never contends for the scanner mutex.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     index: Arc<Mutex<WalletElectrumIndex>>,
     mut found_rx: broadcast::Receiver<usize>,
     addr: &str,
     p2p_peer: SocketAddr,
     network: Network,
+    oracle_url: String,
+    block_checkpoints: HashMap<u32, BlockHash>,
+    header_sidecar: PathBuf,
     client_count: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (push_tx, _) = broadcast::channel::<String>(256);
@@ -124,6 +138,10 @@ pub async fn run(
         index,
         p2p_peer,
         network,
+        oracle_url,
+        block_checkpoints,
+        header_sidecar,
+        header_fetch_lock: Mutex::new(()),
         push_tx: push_tx.clone(),
     });
 
@@ -257,6 +275,89 @@ async fn push_notifications(state: &ElectrumServerState) {
     let _ = state
         .push_tx
         .send(serde_json::to_string(&notification).unwrap() + "\n");
+}
+
+async fn resolve_block_hash(state: &ElectrumServerState, height: u32) -> Result<BlockHash, String> {
+    if let Some(hash) = state.block_checkpoints.get(&height) {
+        return Ok(*hash);
+    }
+
+    let oracle_url = state.oracle_url.clone();
+    let resolve = async move {
+        let mut client = OracleServiceClient::connect(oracle_url)
+            .await
+            .map_err(|error| format!("oracle connection failed: {error}"))?;
+        let response = client
+            .get_block_hash_by_height(tonic::Request::new(BlockHeightRequest {
+                block_height: u64::from(height),
+            }))
+            .await
+            .map_err(|error| format!("oracle hash lookup failed: {error}"))?
+            .into_inner();
+        blockheader::block_hash_from_oracle(response.block_hash).map_err(|error| error.to_string())
+    };
+
+    tokio::time::timeout(Duration::from_secs(15), resolve)
+        .await
+        .map_err(|_| "oracle hash lookup timed out after 15 seconds".to_string())?
+}
+
+async fn backfill_header(state: &ElectrumServerState, height: u32) -> Result<String, String> {
+    // A single lock is adequate for this personal server and prevents duplicate
+    // getdata requests when Sparrow asks for the same missing height at once.
+    let _fetch_guard = state.header_fetch_lock.lock().await;
+
+    if let Some(hex) = state.index.lock().await.headers.get(&height).cloned() {
+        return Ok(hex);
+    }
+
+    let expected_hash = resolve_block_hash(state, height).await?;
+    let peer = state.p2p_peer;
+    let network = state.network;
+    let header = tokio::task::spawn_blocking(move || {
+        blockheader::fetch_header(peer, network, expected_hash)
+    })
+    .await
+    .map_err(|error| format!("P2P header task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    // fetch_header already validates this before returning. Keep the check here
+    // at the trust boundary so a future fetch implementation cannot serve the
+    // wrong block under the requested height.
+    let actual_hash = header.block_hash();
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "fetched header hash {actual_hash} does not match expected {expected_hash}"
+        ));
+    }
+
+    let header_hex = blockheader::header_hex(&header);
+    let headers = {
+        let mut index = state.index.lock().await;
+        index.headers.insert(height, header_hex.clone());
+        index.headers.clone()
+    };
+
+    let sidecar = state.header_sidecar.clone();
+    match tokio::task::spawn_blocking(move || blockheader::save_headers(&sidecar, &headers)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                path = %state.header_sidecar.display(),
+                error = %error,
+                "failed to persist block-header sidecar"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %state.header_sidecar.display(),
+                error = %error,
+                "block-header sidecar write task failed"
+            );
+        }
+    }
+
+    Ok(header_hex)
 }
 
 // ---------------------------------------------------------------------------
@@ -497,17 +598,25 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 return JsonRpcResponse::error(req.id.clone(), -32602, "height must be integer")
                     .into_line();
             };
-            let index = state.index.lock().await;
-            match index.headers.get(&height) {
-                Some(hex) => {
-                    JsonRpcResponse::success(req.id.clone(), Value::String(hex.clone())).into_line()
+            if let Some(hex) = state.index.lock().await.headers.get(&height).cloned() {
+                return JsonRpcResponse::success(req.id.clone(), Value::String(hex)).into_line();
+            }
+
+            match backfill_header(state, height).await {
+                Ok(hex) => JsonRpcResponse::success(req.id.clone(), Value::String(hex)).into_line(),
+                Err(error) => {
+                    tracing::error!(
+                        height,
+                        error = %error,
+                        "failed to backfill requested block header"
+                    );
+                    JsonRpcResponse::error(
+                        req.id.clone(),
+                        -32603,
+                        format!("unknown block at height {height}: {error}"),
+                    )
+                    .into_line()
                 }
-                None => JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32603,
-                    format!("unknown block at height {height}"),
-                )
-                .into_line(),
             }
         }
 
