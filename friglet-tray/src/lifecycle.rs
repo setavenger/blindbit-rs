@@ -157,6 +157,15 @@ fn spawn_daemon(bin: &Path) -> io::Result<(Child, Arc<StdMutex<VecDeque<String>>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false);
+    // Do not inherit the tray's RUST_LOG (often `trace` during debugging) —
+    // that floods the pipe with h2/tonic TRACE noise. Prefer
+    // FRIGLET_DAEMON_RUST_LOG when set; otherwise clear RUST_LOG so the
+    // daemon falls back to its config `log_level` (info by default).
+    if let Ok(level) = std::env::var("FRIGLET_DAEMON_RUST_LOG") {
+        cmd.env("RUST_LOG", level);
+    } else {
+        cmd.env_remove("RUST_LOG");
+    }
     // Own process group so terminal signals aimed at the tray don't take the
     // daemon down with it.
     #[cfg(unix)]
@@ -173,6 +182,27 @@ fn spawn_daemon(bin: &Path) -> io::Result<(Child, Arc<StdMutex<VecDeque<String>>
     Ok((child, recent_output))
 }
 
+/// Strip ANSI CSI sequences (`ESC [ ... letter`) so piped daemon logs stay
+/// readable when re-logged or stored for spawn-failure diagnostics.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn drain_lines<R>(reader: R, recent_output: Arc<StdMutex<VecDeque<String>>>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -180,12 +210,13 @@ where
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            tracing::debug!(target: "friglet-daemon", "{line}");
+            let stripped = strip_ansi(&line);
+            tracing::debug!(target: "friglet-daemon", "{stripped}");
             let mut buf = recent_output.lock().unwrap();
             if buf.len() >= RECENT_OUTPUT_LINES {
                 buf.pop_front();
             }
-            buf.push_back(line);
+            buf.push_back(stripped);
         }
     });
 }
@@ -404,5 +435,13 @@ mod tests {
             locate_daemon_binary(None, Some(&empty), Some(&path_var)),
             None
         );
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[32minfo\x1b[0m: hello"), "info: hello");
+        assert_eq!(strip_ansi("\x1b[1;31mERROR\x1b[0m boom"), "ERROR boom");
+        assert_eq!(strip_ansi("a\x1b[2Kb"), "ab");
     }
 }

@@ -59,11 +59,14 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     // Initialise structured logging.  RUST_LOG takes precedence; the
     // configured log_level sets the default when RUST_LOG is not set.
+    // Only colour when stderr is a TTY so a tray-piped daemon never emits
+    // ANSI into the capture pipe.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&merged.log_level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     let cfg = config::resolve(merged)?;
@@ -150,6 +153,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         scanner_builder: Box::new(|cfg| {
             Box::pin(async move { scanner::load_scanner(&cfg).await.map_err(|e| e.to_string()) })
         }),
+        oracle_tip_cache: std::sync::Mutex::new(control::OracleTipCache::default()),
         shutdown: shutdown_token.clone(),
     });
     let control_server = control::run(cfg.control_socket.clone(), {

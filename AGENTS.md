@@ -212,8 +212,11 @@ dbus-run-session -- bash -c '
   the state file.
 - Control-socket integration tests live in `friglet/src/control/mod.rs`
   (friglet is a bin crate, so no `tests/` dir); they build offline `Scanner`s
-  via a lazy tonic channel (`tonic` is a friglet dev-dependency pinned to
+  via a lazy tonic channel (`tonic` is a friglet dependency pinned to
   blindbit-lib's version) and inject a no-network `scanner_builder`.
+  `GetStatus` also uses tonic to poll the oracle tip (cached ~10s) for
+  `tip_height`; tests use unreachable `oracle_url`s and fall back to the
+  electrum tip within a 2s connect timeout.
 
 ## Daemon spawn diagnostics (tray lifecycle)
 
@@ -224,17 +227,33 @@ it logs enough to fill an unread pipe buffer, and so that a daemon that
 exits immediately after spawning (stale binary predating the current CLI,
 missing config/key file, bad address, ...) surfaces its actual error message
 in the "Daemon: unreachable" reason instead of a bare, undiagnosable exit
-code. If you see `spawned daemon exited immediately (exit status: 2)` with
-no further detail, you're looking at a build that predates this fix, or a
-release binary with stdio still swallowed — rebuild `friglet-tray` and check
-the captured reason text (also logged at `debug` level, target
-`friglet-daemon`) before guessing at the cause. Exit code 2 from a Rust CLI
-built with `clap` almost always means clap itself rejected the arguments
-(rare here, since the daemon runs with zero args) or — far more likely in
-practice — a stale `target/release/friglet` predating this branch's
-optional-subcommand/config-file support; run `cargo build --release
---workspace` (or at least `-p friglet`) after pulling changes that touch the
-daemon's CLI.
+code. Captured lines are ANSI-stripped before logging (`friglet-daemon`
+target) and before inclusion in spawn-failure reasons. The tray does **not**
+inherit its own `RUST_LOG` into the child: set `FRIGLET_DAEMON_RUST_LOG` to
+control daemon verbosity when spawned by the tray; otherwise `RUST_LOG` is
+cleared so the daemon uses its config `log_level` (info by default). The
+daemon itself only emits ANSI when stderr is a TTY. If you see
+`spawned daemon exited immediately (exit status: 2)` with no further detail,
+you're looking at a build that predates this fix, or a release binary with
+stdio still swallowed — rebuild `friglet-tray` and check the captured reason
+text (also logged at `debug` level, target `friglet-daemon`) before guessing
+at the cause. Exit code 2 from a Rust CLI built with `clap` almost always
+means clap itself rejected the arguments (rare here, since the daemon runs
+with zero args) or — far more likely in practice — a stale
+`target/release/friglet` predating this branch's optional-subcommand/config-file
+support; run `cargo build --release --workspace` (or at least `-p friglet`)
+after pulling changes that touch the daemon's CLI.
+
+### Default state file
+
+Scanner state defaults to `<platform config dir>/friglet/scanner_state.json`
+(same directory as `config.toml` / `scan.key`), not a CWD-relative path:
+- Linux: `~/.config/friglet/scanner_state.json` (or `$XDG_CONFIG_HOME/...`)
+- macOS: `~/Library/Application Support/friglet/scanner_state.json`
+- Windows: `%APPDATA%\friglet\scanner_state.json`
+
+Override with `--state-file` / `FRIGLET_STATE_FILE` / `state_file` in the
+config TOML.
 
 ## Rules
 
