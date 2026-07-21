@@ -22,28 +22,65 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
 - Fake daemon for manual testing (speaks the `friglet-ipc` protocol on the
   default control socket): `cargo run -p friglet-tray --example fake-daemon`.
 - Useful env vars: `FRIGLET_CONTROL_SOCKET` (socket path override),
-  `FRIGLET_DAEMON_BIN` (daemon binary the tray spawns when none is running).
+  `FRIGLET_DAEMON_BIN` (daemon binary the tray spawns when none is running),
+  `FRIGLET_TRAY_SHOW_ON_START` (show the status window on startup:
+  `1`/`true`/`yes`/`on`/`status` → Status tab;
+  `settings` → Settings tab after the UI loads — useful for headless /
+  screenshot testing; synthetic X11 clicks do not reach WebKitGTK reliably).
 - Tray icons are generated placeholders; regenerate with
   `python3 friglet-tray/icons/generate.py` (stdlib only).
 
 ## Tray testing under headless / computer-use environments
 
-Verified in this repo's cloud VM (Xvfb available, no desktop environment):
+Verified in this repo's cloud VM (Xvfb + fluxbox + StatusNotifier host):
 
-- `xvfb-run -a dbus-run-session -- ./target/debug/friglet-tray` starts and
-  runs without crashing; logs show the status poller round-trip
-  ("tray status label updated label=Daemon: reachable (height N)") for both
-  the attach path (daemon already running) and the spawn path
-  (`FRIGLET_DAEMON_BIN` pointing at the fake daemon).
+### Screenshot the status/settings window (and tray icon)
+
+```bash
+# deps: fluxbox x11-apps imagemagick xdotool
+#       haskell-gtk-sni-tray-utils (gtk-sni-tray-standalone) for the tray icon
+SOCKET=/tmp/friglet-tray-shot.sock
+rm -f "$SOCKET"
+
+Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset &
+export DISPLAY=:99
+sleep 1
+
+dbus-run-session -- bash -c '
+  fluxbox &
+  sleep 1
+  # StatusNotifierWatcher + tray bar (renders ayatana-appindicator / SNI icons)
+  gtk-sni-tray-standalone --top --end -w -s 28 -c "#222222" &
+  sleep 1
+
+  FRIGLET_CONTROL_SOCKET='"$SOCKET"' ./target/debug/examples/fake-daemon &
+  sleep 1
+
+  # SHOW_ON_START=1 → Status tab; =settings → Settings tab (eval after load)
+  FRIGLET_CONTROL_SOCKET='"$SOCKET"' FRIGLET_TRAY_SHOW_ON_START=1 \
+    ./target/debug/friglet-tray &
+  sleep 4
+
+  import -window root /tmp/shot-desktop.png
+  WID=$(xdotool search --name "Friglet Status" | head -1)
+  import -window "$WID" /tmp/shot-status.png
+'
+# For Settings without relying on xdotool→WebKit clicks, relaunch with
+# FRIGLET_TRAY_SHOW_ON_START=settings instead.
+```
+
+- `FRIGLET_TRAY_SHOW_ON_START` is the supported way to force the status
+  window visible without clicking the tray menu (main window starts with
+  `visible: false` in `tauri.conf.json`).
 - A D-Bus session is required (`dbus-run-session`); without one, GTK/portal
-  init is flaky.
-- The tray ICON itself cannot be verified headless: on Linux it goes through
-  StatusNotifier/ayatana-appindicator, and a bare Xvfb session has no
-  StatusNotifierWatcher host, so nothing renders the icon (no error is
-  raised — there is just nowhere to see or click it). Menu interaction
-  therefore cannot be exercised with xdotool in this environment; rely on the
-  `friglet-tray/tests/` integration tests and unit tests for the lifecycle
-  and IPC logic instead.
+  init is flaky. The tray and `gtk-sni-tray-standalone` must share that bus.
+- Tray icon: bare Xvfb has no StatusNotifierWatcher. With
+  `gtk-sni-tray-standalone -w` (package `haskell-gtk-sni-tray-utils`) under
+  fluxbox the friglet SNI icon renders (ayatana path
+  `/org/ayatana/NotificationItem/tray_icon_tray_app_friglet_tray`).
+  `snixembed` is not in Ubuntu apt; `trayer` alone only hosts legacy XEmbed
+  icons, not StatusNotifierItem. xdotool clicks do not reach WebKitGTK under
+  Xvfb — use `FRIGLET_TRAY_SHOW_ON_START=settings` for the Settings form.
 
 ## Packaging (M4)
 
@@ -115,3 +152,59 @@ Verified in this repo's cloud VM (Xvfb available, no desktop environment):
   in tray-project work; the tray talks to the daemon only via `friglet-ipc`.
 - Workspace-wide `cargo fmt` reformats `blindbit-lib` files that are not
   fmt-clean; run fmt scoped with `-p` to avoid unrelated diffs.
+
+## Linear — no hardcoded links, always update issue status
+
+This repo is public. **Never write a `linear.app` URL into anything that
+ends up in the repo or on GitHub** — commit messages, PR titles/bodies, PR
+comments, code comments, README, this file. Linear's GitHub integration
+auto-detects plain issue identifiers (e.g. `SNB-42`, or `Fixes SNB-42`)
+anywhere in a branch name, commit message, or PR title/body and links them
+up on its own — that's the only mechanism to use. Writing a markdown link
+like `[SNB-42](https://linear.app/...)` or `[Friglet Tray UI
+App](https://linear.app/...)` leaks an internal workspace URL onto a public
+page for no benefit (the plain-text ID already does the linking) and is
+never correct here.
+
+Doing Linear-tracked work is not done until the Linear issues reflect it:
+- When you open a PR that implements one or more issues, move those issues
+  to **"In Review"** (not left in Backlog/Todo) and post a short comment on
+  each with a plain-text mention of the PR (e.g. "Implemented in PR #10
+  (`cursor/friglet-tray-ui-a38a`)") — GitHub PR URLs are fine to put in
+  Linear (it's not public), just never put Linear URLs in GitHub.
+- After the PR merges, move the issues to **"Done"**.
+- If an issue was only partially done, or a review found it doesn't fully
+  meet its acceptance criteria, say so explicitly in the issue comment and
+  leave/return it in **"In Progress"** rather than marking it reviewed.
+- Don't stop at "the code type-checks" — actually reflect real status.
+  Silently leaving every issue in Backlog while the branch/PR claims the
+  project is "done" is exactly the failure mode to avoid.
+
+## Testing is not optional — prove it, don't just build it
+
+"Compiles + unit tests pass" is not the same as "verified it works." For any
+UI-facing or runtime-behavior change (the tray app, the daemon's runtime
+behavior), actually run it and capture evidence:
+- Run the real binary (not just `cargo test`) and observe/log its behavior.
+- For the tray app specifically: take an actual **screenshot** of the
+  running UI (window contents at minimum) and say so explicitly in the PR
+  and in your summary to the user — don't just assert "should work" or
+  silently skip because it's inconvenient in a headless VM.
+- If something genuinely cannot be verified in this environment (e.g. the
+  native tray icon needs a StatusNotifierWatcher host that bare Xvfb
+  doesn't provide), say that explicitly, explain *why*, and record exactly
+  what alternative verification you did instead (e.g. forced the window
+  visible and screenshotted it, or ran a systray host like `snixembed` +
+  `trayer` under a lightweight WM to prove the icon itself renders).
+- Never let a summary go out implying full verification happened when it
+  didn't. Missing/partial verification is fine to report; silently omitting
+  it is not.
+
+## Use varied subagent models for review, not just the implementer's model
+
+When spawning subagents for independent review or verification passes,
+don't default every subagent to the orchestrator's own model. Deliberately
+vary the model (e.g. a different frontier model than the one doing the
+main-thread orchestration) for review/verification subagents — this is
+usually both cheaper and gives a genuinely independent second opinion
+instead of the same model reviewing its own work.

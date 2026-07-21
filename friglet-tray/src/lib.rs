@@ -225,6 +225,21 @@ fn show_status_window(app: &AppHandle) {
     }
 }
 
+/// Parse `FRIGLET_TRAY_SHOW_ON_START`:
+/// - unset / falsy → hide window (default)
+/// - `1` / `true` / `yes` / `on` / `status` → show status window
+/// - `settings` → show window and switch to the Settings tab (after the UI loads)
+fn show_on_start_env() -> Option<&'static str> {
+    match std::env::var("FRIGLET_TRAY_SHOW_ON_START") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" | "status" => Some("status"),
+            "settings" => Some("settings"),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
 fn tray_label(status: Option<&StatusInfo>) -> String {
     match status {
         Some(s) => format!("Daemon: reachable (height {})", s.scanned_height),
@@ -399,6 +414,23 @@ pub fn run() {
 
             setup_tray(app)?;
 
+            if let Some(tab) = show_on_start_env() {
+                show_status_window(app.handle());
+                if tab == "settings" {
+                    // Webview may not have finished loading at setup time;
+                    // delay the tab switch. (Synthetic X11 clicks do not reach
+                    // WebKitGTK reliably under Xvfb, so this is the supported
+                    // headless path to the Settings form.)
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        if let Some(w) = handle.get_webview_window("main") {
+                            let _ = w.eval("document.getElementById('tab-settings')?.click()");
+                        }
+                    });
+                }
+            }
+
             // Attach to a running daemon or spawn one, in the background so
             // the tray appears immediately.
             let state = app.state::<Arc<AppState>>().inner().clone();
@@ -490,6 +522,39 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
+    }
+
+    #[test]
+    fn show_on_start_env_values() {
+        // SAFETY: tests in this module run single-threaded on the env for
+        // this key; we restore afterward.
+        unsafe {
+            std::env::remove_var("FRIGLET_TRAY_SHOW_ON_START");
+        }
+        assert_eq!(show_on_start_env(), None);
+        for v in ["1", "true", "TRUE", "yes", "on", " Yes ", "status"] {
+            unsafe {
+                std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", v);
+            }
+            assert_eq!(
+                show_on_start_env(),
+                Some("status"),
+                "expected status for {v:?}"
+            );
+        }
+        unsafe {
+            std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", "settings");
+        }
+        assert_eq!(show_on_start_env(), Some("settings"));
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            unsafe {
+                std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", v);
+            }
+            assert_eq!(show_on_start_env(), None, "expected unset for {v:?}");
+        }
+        unsafe {
+            std::env::remove_var("FRIGLET_TRAY_SHOW_ON_START");
+        }
     }
 
     #[tokio::test]

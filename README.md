@@ -128,6 +128,11 @@ cargo build --release -p friglet-tray
 
 # run
 ./target/release/friglet-tray
+
+# optional: show the status window immediately (normally hidden until
+# opened from the tray menu — useful for headless / screenshot testing).
+# Values: 1/true/yes/on/status → Status tab; settings → Settings tab.
+FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
 ```
 
 Lifecycle behavior:
