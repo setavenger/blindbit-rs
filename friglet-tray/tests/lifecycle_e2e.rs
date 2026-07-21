@@ -174,6 +174,45 @@ async fn spawn_failure_surfaces_captured_stderr() {
     let _ = std::fs::remove_dir_all(&bin_dir);
 }
 
+/// A stale daemon binary (pre config-file support) rejects the zero-arg
+/// spawn with a clap usage dump and exit 2 — the reason must call out the
+/// outdated binary and how to fix it, not just echo the usage text.
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_binary_usage_output_gets_rebuild_hint() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = test_socket_path("stalebin");
+    let bin_dir =
+        std::env::temp_dir().join(format!("friglet-tray-e2e-stalebin-{}", std::process::id()));
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("stale-friglet.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\nprintf 'A CLI tool\\n\\nUsage: friglet <COMMAND>\\n' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bin_for_locator: PathBuf = bin.clone();
+    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
+    match att {
+        Attachment::Unreachable { reason } => {
+            assert!(
+                reason.contains("outdated build"),
+                "expected stale-binary hint, got: {reason}"
+            );
+            assert!(
+                reason.contains("cargo build --release -p friglet"),
+                "expected rebuild instruction, got: {reason}"
+            );
+        }
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&bin_dir);
+}
+
 #[tokio::test]
 async fn quit_shuts_daemon_down_only_when_spawned_by_tray() {
     let path = test_socket_path("quit");
