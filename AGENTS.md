@@ -178,6 +178,27 @@ dbus-run-session -- bash -c '
   via a lazy tonic channel (`tonic` is a friglet dev-dependency pinned to
   blindbit-lib's version) and inject a no-network `scanner_builder`.
 
+## Daemon spawn diagnostics (tray lifecycle)
+
+`friglet-tray/src/lifecycle.rs`'s `spawn_daemon` pipes (rather than
+`Stdio::null()`s) the spawned `friglet` child's stdout/stderr and drains them
+continuously in a background task — both to avoid the daemon blocking once
+it logs enough to fill an unread pipe buffer, and so that a daemon that
+exits immediately after spawning (stale binary predating the current CLI,
+missing config/key file, bad address, ...) surfaces its actual error message
+in the "Daemon: unreachable" reason instead of a bare, undiagnosable exit
+code. If you see `spawned daemon exited immediately (exit status: 2)` with
+no further detail, you're looking at a build that predates this fix, or a
+release binary with stdio still swallowed — rebuild `friglet-tray` and check
+the captured reason text (also logged at `debug` level, target
+`friglet-daemon`) before guessing at the cause. Exit code 2 from a Rust CLI
+built with `clap` almost always means clap itself rejected the arguments
+(rare here, since the daemon runs with zero args) or — far more likely in
+practice — a stale `target/release/friglet` predating this branch's
+optional-subcommand/config-file support; run `cargo build --release
+--workspace` (or at least `-p friglet`) after pulling changes that touch the
+daemon's CLI.
+
 ## Rules
 
 - Do NOT modify `blindbit-lib` (or `blindbit-cli` / HTTP / Electrum behavior)

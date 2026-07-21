@@ -11,13 +11,20 @@
 //!   socket (fall back to killing the child if the socket is dead); if
 //!   attached, leave the daemon running.
 
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use friglet_ipc::{Client, Request, Response, StatusInfo};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
+
+/// How many of the daemon's most recent stdout/stderr lines to keep around
+/// for diagnostics if it exits unexpectedly right after spawning.
+const RECENT_OUTPUT_LINES: usize = 20;
 
 /// Timeout for a single connect + GetStatus probe.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -130,17 +137,65 @@ pub fn locate_daemon_binary_from_env() -> Option<PathBuf> {
     )
 }
 
-fn spawn_daemon(bin: &Path) -> io::Result<Child> {
+/// Spawn `bin` and continuously drain its stdout/stderr in the background.
+///
+/// Draining (rather than `Stdio::null()`) matters for two reasons: it keeps
+/// the daemon's own log lines visible (at debug level, prefixed
+/// `friglet-daemon`), and — the important part — it prevents the daemon
+/// from blocking on a full pipe buffer once it starts logging heavily during
+/// a long scan. The last [`RECENT_OUTPUT_LINES`] lines are kept so a daemon
+/// that exits immediately after spawning (bad config, missing key file,
+/// stale/incompatible binary, ...) surfaces an actual reason instead of just
+/// an opaque exit code.
+fn spawn_daemon(bin: &Path) -> io::Result<(Child, Arc<StdMutex<VecDeque<String>>>)> {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(false);
     // Own process group so terminal signals aimed at the tray don't take the
     // daemon down with it.
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd.spawn()
+    let mut child = cmd.spawn()?;
+
+    let recent_output = Arc::new(StdMutex::new(VecDeque::with_capacity(RECENT_OUTPUT_LINES)));
+    if let Some(stdout) = child.stdout.take() {
+        drain_lines(stdout, recent_output.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain_lines(stderr, recent_output.clone());
+    }
+    Ok((child, recent_output))
+}
+
+fn drain_lines<R>(reader: R, recent_output: Arc<StdMutex<VecDeque<String>>>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(target: "friglet-daemon", "{line}");
+            let mut buf = recent_output.lock().unwrap();
+            if buf.len() >= RECENT_OUTPUT_LINES {
+                buf.pop_front();
+            }
+            buf.push_back(line);
+        }
+    });
+}
+
+/// Join the captured output into a single diagnostic string, empty if
+/// nothing was captured before the daemon exited.
+fn recent_output_tail(recent_output: &StdMutex<VecDeque<String>>) -> String {
+    recent_output
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Attach to a running daemon, or spawn one and wait for its socket.
@@ -167,8 +222,8 @@ where
         };
     };
 
-    let mut child = match spawn_daemon(&bin) {
-        Ok(child) => child,
+    let (mut child, recent_output) = match spawn_daemon(&bin) {
+        Ok(pair) => pair,
         Err(e) => {
             return Attachment::Unreachable {
                 reason: format!("failed to spawn {}: {e}", bin.display()),
@@ -181,9 +236,13 @@ where
         tokio::time::sleep(SPAWN_CONNECT_INTERVAL).await;
         // Spawned daemon died already (e.g. bad config)? Stop waiting.
         if let Ok(Some(status)) = child.try_wait() {
-            return Attachment::Unreachable {
-                reason: format!("spawned daemon exited immediately ({status})"),
+            let tail = recent_output_tail(&recent_output);
+            let reason = if tail.is_empty() {
+                format!("spawned daemon exited immediately ({status})")
+            } else {
+                format!("spawned daemon exited immediately ({status}): {tail}")
             };
+            return Attachment::Unreachable { reason };
         }
         if probe(socket_path, PROBE_TIMEOUT).await.is_some() {
             return Attachment::Spawned(child);
@@ -193,9 +252,13 @@ where
     // The socket never came up; kill the child so we don't leave an
     // untracked daemon behind.
     let _ = child.kill().await;
-    Attachment::Unreachable {
-        reason: format!("spawned daemon but its control socket never came up at {socket_path}"),
-    }
+    let tail = recent_output_tail(&recent_output);
+    let reason = if tail.is_empty() {
+        format!("spawned daemon but its control socket never came up at {socket_path}")
+    } else {
+        format!("spawned daemon but its control socket never came up at {socket_path}: {tail}")
+    };
+    Attachment::Unreachable { reason }
 }
 
 /// Ask the daemon at `socket_path` to shut down. Returns `true` if the

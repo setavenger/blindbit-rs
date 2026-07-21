@@ -134,6 +134,46 @@ async fn spawns_and_connects_when_socket_comes_up() {
     let _ = std::fs::remove_dir_all(&bin_dir);
 }
 
+/// A daemon binary that fails fast (bad config, missing key, stale/wrong
+/// binary, ...) must surface its own stderr instead of a bare exit code —
+/// this is what actually made a real failure ("exit status: 2") impossible
+/// to diagnose from the tray's `Stdio::null()`-swallowed logs.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawn_failure_surfaces_captured_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = test_socket_path("failfast");
+    let bin_dir =
+        std::env::temp_dir().join(format!("friglet-tray-e2e-failbin-{}", std::process::id()));
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let bin = bin_dir.join("bad-friglet.sh");
+    std::fs::write(
+        &bin,
+        "#!/bin/sh\necho 'Error: missing required setting p2p_node_addr' >&2\nexit 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let bin_for_locator: PathBuf = bin.clone();
+    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
+    match att {
+        Attachment::Unreachable { reason } => {
+            assert!(
+                reason.contains("p2p_node_addr"),
+                "expected captured stderr in reason, got: {reason}"
+            );
+            assert!(
+                reason.contains("exit status: 2") || reason.contains("exit code: 2"),
+                "expected exit status in reason, got: {reason}"
+            );
+        }
+        other => panic!("expected Unreachable, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&bin_dir);
+}
+
 #[tokio::test]
 async fn quit_shuts_daemon_down_only_when_spawned_by_tray() {
     let path = test_socket_path("quit");
