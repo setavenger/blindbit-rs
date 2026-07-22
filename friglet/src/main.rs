@@ -195,6 +195,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         }),
         oracle_tip_cache: std::sync::Mutex::new(control::OracleTipCache::default()),
         shutdown: shutdown_token.clone(),
+        spawned_by_tray: control::ControlCtx::spawned_by_tray_from_env(),
     });
     let control_server = control::run(cfg.control_socket.clone(), {
         let ctx = control_ctx.clone();

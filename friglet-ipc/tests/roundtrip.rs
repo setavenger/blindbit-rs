@@ -36,6 +36,7 @@ async fn get_status_roundtrip() {
             address: "sp1qlabel...".to_string(),
         }],
         version: "0.1.0".to_string(),
+        spawned_by_tray: true,
     };
     let expected = status.clone();
 

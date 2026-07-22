@@ -151,6 +151,10 @@ pub struct ControlCtx {
     /// poll (TTL ≈ 10s).
     pub oracle_tip_cache: std::sync::Mutex<OracleTipCache>,
     pub shutdown: CancellationToken,
+    /// Whether this process was launched by a tray (`FRIGLET_SPAWNED_BY_TRAY`),
+    /// reported back in `GetStatus` so ownership survives a tray restart —
+    /// see [`StatusInfo::spawned_by_tray`].
+    pub spawned_by_tray: bool,
 }
 
 impl ControlCtx {
@@ -261,7 +265,14 @@ impl ControlCtx {
             outputs_found: self.outputs_found.load(Ordering::Relaxed),
             label_addresses: self.label_addresses.lock().unwrap().clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            spawned_by_tray: self.spawned_by_tray,
         }
+    }
+
+    /// Read `FRIGLET_SPAWNED_BY_TRAY` from the process environment (set by
+    /// the tray on the child it spawns).
+    pub fn spawned_by_tray_from_env() -> bool {
+        std::env::var("FRIGLET_SPAWNED_BY_TRAY").is_ok_and(|v| v == "1")
     }
 
     pub async fn save_state(&self) {
@@ -732,6 +743,7 @@ mod tests {
             scanner_builder,
             oracle_tip_cache: std::sync::Mutex::new(OracleTipCache::default()),
             shutdown: CancellationToken::new(),
+            spawned_by_tray: false,
         })
     }
 
@@ -760,6 +772,7 @@ mod tests {
             outputs_found: 0,
             label_addresses: Vec::new(),
             version: "test".to_string(),
+            spawned_by_tray: false,
         }
     }
 

@@ -151,6 +151,14 @@ pub struct StatusInfo {
     pub label_addresses: Vec<LabelAddress>,
     /// Daemon crate version.
     pub version: String,
+    /// Whether this daemon process was spawned by a tray (set from the
+    /// `FRIGLET_SPAWNED_BY_TRAY` env var the spawning tray passes to its
+    /// child). Self-reported by the daemon rather than tracked as tray-side
+    /// state, so ownership survives a tray restart/crash: whichever tray
+    /// later attaches learns the truth straight from the running process
+    /// instead of assuming it did not spawn it.
+    #[serde(default)]
+    pub spawned_by_tray: bool,
 }
 
 /// A configured Silent Payments label and its receive address.
@@ -449,6 +457,7 @@ mod tests {
                 address: "tsp1qlabel".to_string(),
             }],
             version: "test".to_string(),
+            spawned_by_tray: true,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
@@ -472,6 +481,7 @@ mod tests {
         assert_eq!(status.tx_count, 0);
         assert_eq!(status.outputs_found, 0);
         assert!(status.label_addresses.is_empty());
+        assert!(!status.spawned_by_tray);
     }
 
     #[test]

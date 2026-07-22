@@ -82,6 +82,7 @@ async fn main() -> std::io::Result<()> {
                             },
                         ],
                         version: "fake-0.0.0".to_string(),
+                        spawned_by_tray: false,
                     }),
                     Request::Start => {
                         scanning.store(true, Ordering::Relaxed);
