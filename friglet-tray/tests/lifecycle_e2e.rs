@@ -41,12 +41,22 @@ fn dummy_status() -> StatusInfo {
         outputs_found: 0,
         label_addresses: Vec::new(),
         version: "test".to_string(),
+        spawned_by_tray: false,
     }
 }
 
 /// Serve GetStatus/Shutdown on `path`; sets `saw_shutdown` when a Shutdown
 /// request arrives.
 fn spawn_fake_daemon(path: String, saw_shutdown: Arc<AtomicBool>) {
+    spawn_fake_daemon_with(path, saw_shutdown, dummy_status());
+}
+
+/// [`spawn_fake_daemon`] with a caller-supplied `GetStatus` answer.
+fn spawn_fake_daemon_with_status(path: String, status: StatusInfo) {
+    spawn_fake_daemon_with(path, Arc::new(AtomicBool::new(false)), status);
+}
+
+fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: StatusInfo) {
     tokio::spawn(async move {
         #[cfg(unix)]
         let _ = std::fs::remove_file(&path);
@@ -56,10 +66,11 @@ fn spawn_fake_daemon(path: String, saw_shutdown: Arc<AtomicBool>) {
                 break;
             };
             let saw_shutdown = saw_shutdown.clone();
+            let status = status.clone();
             tokio::spawn(async move {
                 while let Ok(Some(req)) = conn.next_request().await {
                     let resp = match req {
-                        Request::GetStatus => Response::Status(dummy_status()),
+                        Request::GetStatus => Response::Status(status.clone()),
                         Request::Shutdown => {
                             saw_shutdown.store(true, Ordering::SeqCst);
                             Response::Ok
@@ -86,7 +97,7 @@ async fn attaches_when_daemon_already_running() {
         panic!("should not look for a binary when attach succeeds")
     })
     .await;
-    assert!(matches!(att, Attachment::Attached), "got {att:?}");
+    assert!(matches!(att, Attachment::Attached(_)), "got {att:?}");
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
@@ -133,7 +144,33 @@ async fn attach_beats_setup_check_when_daemon_reachable() {
         || panic!("should not check configuration when attach succeeds"),
     )
     .await;
-    assert!(matches!(att, Attachment::Attached), "got {att:?}");
+    assert!(matches!(att, Attachment::Attached(_)), "got {att:?}");
+
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A daemon that reports `spawned_by_tray: true` in `GetStatus` (as a
+/// previously tray-spawned daemon would, having kept `FRIGLET_SPAWNED_BY_TRAY`
+/// in its own environment across a tray restart/crash) must have that
+/// carried through to the caller on attach — this is what lets a *new* tray
+/// process learn it owns the daemon without any PID file.
+#[tokio::test]
+async fn attach_carries_daemons_self_reported_ownership() {
+    let path = test_socket_path("ownership-carry");
+    let mut status = dummy_status();
+    status.spawned_by_tray = true;
+    spawn_fake_daemon_with_status(path.clone(), status);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let att = lifecycle::attach_or_spawn_with(&path, || {
+        panic!("should not look for a binary when attach succeeds")
+    })
+    .await;
+    match att {
+        Attachment::Attached(status) => assert!(status.spawned_by_tray),
+        other => panic!("expected Attached, got {other:?}"),
+    }
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);

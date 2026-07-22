@@ -270,9 +270,16 @@ where
     }
 
     match lifecycle::attach_spawn_or_setup_with(&state.socket_path, locate, needs_setup).await {
-        Attachment::Attached => {
-            tracing::info!("attached to already-running daemon");
-            lc.spawned_by_tray = false;
+        Attachment::Attached(status) => {
+            tracing::info!(
+                spawned_by_tray = status.spawned_by_tray,
+                "attached to already-running daemon"
+            );
+            // Trust the daemon's own self-report, not an assumption: a
+            // daemon spawned by a tray that has since crashed/restarted
+            // still answers `spawned_by_tray = true`, so Quit here can
+            // still shut it down instead of orphaning it forever.
+            lc.spawned_by_tray = status.spawned_by_tray;
             state.setup_needed.store(false, Ordering::SeqCst);
             None
         }
@@ -370,6 +377,16 @@ fn tray_label(status: Option<&StatusInfo>, setup_needed: bool) -> String {
     }
 }
 
+/// Label for the Quit menu item, so its consequence (shuts the daemon down
+/// vs. leaves it running) is visible without reading the README.
+fn quit_label(spawned_by_tray: bool) -> &'static str {
+    if spawned_by_tray {
+        "Quit (stops daemon)"
+    } else {
+        "Quit (keeps daemon running)"
+    }
+}
+
 fn tray_tooltip(status: Option<&StatusInfo>, setup_needed: bool) -> String {
     match status {
         Some(s) => {
@@ -411,7 +428,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
-    let quit_item = MenuItem::with_id(handle, "quit", "Quit", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(handle, "quit", quit_label(false), true, None::<&str>)?;
 
     let menu = Menu::with_items(
         handle,
@@ -475,6 +492,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     tauri::async_runtime::spawn(async move {
         let mut last_label = String::new();
         let mut last_enablement: Option<(bool, bool)> = None;
+        let mut last_quit_label: Option<&'static str> = None;
         loop {
             let info = lifecycle::probe(&state.socket_path, POLL_TIMEOUT).await;
             {
@@ -508,6 +526,17 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 last_enablement = Some(enablement);
             }
 
+            // Non-blocking: the lifecycle lock is only briefly held during
+            // attach/spawn/quit, so a lock held elsewhere just skips this
+            // poll tick's Quit-label refresh rather than stalling the poller.
+            if let Ok(lc) = state.lifecycle.try_lock() {
+                let label = quit_label(lc.spawned_by_tray);
+                if last_quit_label != Some(label) {
+                    let _ = quit_item.set_text(label);
+                    last_quit_label = Some(label);
+                }
+            }
+
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -530,6 +559,17 @@ pub fn run() {
     });
 
     tauri::Builder::default()
+        // Must be the first plugin registered (tauri-plugin-single-instance
+        // requirement). Without this, two tray instances can each probe the
+        // socket, find nothing, and both spawn a `friglet` daemon — the
+        // loser's process dies almost immediately (its control socket bind
+        // fails), but if its tray quits before reaping that exit, Quit would
+        // send Shutdown down the *shared* socket path and kill the winner's
+        // daemon out from under the other tray. A second launch here just
+        // surfaces the already-running tray's window instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_status_window(app);
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
@@ -615,8 +655,16 @@ mod tests {
         }
     }
 
-    /// Serve GetStatus on `path`, like a healthy daemon.
+    /// Serve GetStatus on `path`, like a healthy daemon that was not
+    /// tray-spawned.
     fn spawn_fake_daemon(path: String) {
+        spawn_fake_daemon_owned(path, false);
+    }
+
+    /// [`spawn_fake_daemon`] with a caller-chosen `spawned_by_tray` answer,
+    /// so tests can simulate re-attaching to a daemon that self-reports
+    /// having been tray-spawned (e.g. by a now-crashed/restarted tray).
+    fn spawn_fake_daemon_owned(path: String, spawned_by_tray: bool) {
         tokio::spawn(async move {
             let _ = std::fs::remove_file(&path);
             let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
@@ -641,6 +689,7 @@ mod tests {
                                 outputs_found: 0,
                                 label_addresses: Vec::new(),
                                 version: "test".to_string(),
+                                spawned_by_tray,
                             }),
                             _ => Response::Ok,
                         };
@@ -800,6 +849,34 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A fresh tray (no in-memory ownership yet) that attaches to a daemon
+    /// self-reporting `spawned_by_tray: true` — as one spawned by a tray
+    /// that has since crashed or restarted would — must adopt that
+    /// ownership, so its own later Quit can still shut the daemon down
+    /// instead of orphaning it.
+    #[tokio::test]
+    async fn attach_adopts_daemons_self_reported_ownership() {
+        let path = test_socket_path("adopt-ownership");
+        spawn_fake_daemon_owned(path.clone(), true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let state = test_state(path.clone());
+        attach_and_record_with(
+            &state,
+            || panic!("must not spawn when attach succeeds"),
+            || false,
+        )
+        .await;
+
+        let lc = state.lifecycle.lock().await;
+        assert!(
+            lc.spawned_by_tray,
+            "ownership must be adopted from the daemon's self-report"
+        );
+        assert!(lc.child.is_none(), "no child handle for an attached daemon");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn unreachable_and_unconfigured_sets_setup_mode_without_spawn() {
         // No listener at this path and setup needed: the locator must never
@@ -832,5 +909,11 @@ mod tests {
         assert_eq!(tray_label(None, false), "Daemon: unreachable");
         assert_eq!(tray_label(None, true), "Setup required — open window");
         assert!(tray_tooltip(None, true).contains("setup required"));
+    }
+
+    #[test]
+    fn quit_label_reflects_ownership() {
+        assert_eq!(quit_label(true), "Quit (stops daemon)");
+        assert_eq!(quit_label(false), "Quit (keeps daemon running)");
     }
 }

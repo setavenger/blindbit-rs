@@ -5,11 +5,16 @@
 //! tokio tests (see `tests/lifecycle_e2e.rs`).
 //!
 //! Policy is a single boolean, `spawned_by_tray` — no PID files:
-//! - probe succeeds at startup → attach, `spawned_by_tray = false`
-//! - probe fails → spawn the `friglet` binary, `spawned_by_tray = true`
+//! - probe succeeds at startup → attach, `spawned_by_tray` comes from the
+//!   daemon's own `GetStatus` answer (it self-reports whether *it* was
+//!   launched with `FRIGLET_SPAWNED_BY_TRAY=1`), not assumed false — so
+//!   ownership survives a tray crash/restart instead of being forgotten
+//! - probe fails → spawn the `friglet` binary with that env var set,
+//!   `spawned_by_tray = true`
 //! - Quit → if `spawned_by_tray`, ask the daemon to shut down over the
 //!   socket (fall back to killing the child if the socket is dead); if
-//!   attached, leave the daemon running.
+//!   attached to a daemon that reports it was not tray-spawned, leave it
+//!   running.
 
 use std::collections::VecDeque;
 use std::io;
@@ -41,8 +46,10 @@ const DAEMON_EXE: &str = if cfg!(windows) {
 /// Outcome of [`attach_or_spawn`].
 #[derive(Debug)]
 pub enum Attachment {
-    /// A daemon was already listening on the control socket.
-    Attached,
+    /// A daemon was already listening on the control socket; carries its
+    /// `GetStatus` answer so the caller can read `spawned_by_tray` from the
+    /// daemon's own self-report instead of assuming it.
+    Attached(StatusInfo),
     /// No daemon was reachable; we spawned one and it came up.
     Spawned(Child),
     /// No daemon was reachable and it is not configured yet: spawning would
@@ -170,6 +177,10 @@ fn spawn_daemon(bin: &Path) -> io::Result<(Child, Arc<StdMutex<VecDeque<String>>
     // daemon down with it.
     #[cfg(unix)]
     cmd.process_group(0);
+    // The daemon echoes this back in GetStatus so a *future* tray (after
+    // this one crashes/restarts) can learn it was tray-spawned without a
+    // PID file.
+    cmd.env("FRIGLET_SPAWNED_BY_TRAY", "1");
     let mut child = cmd.spawn()?;
 
     let recent_output = Arc::new(StdMutex::new(VecDeque::with_capacity(RECENT_OUTPUT_LINES)));
@@ -263,8 +274,8 @@ where
     F: FnOnce() -> Option<PathBuf>,
     C: FnOnce() -> bool,
 {
-    if probe(socket_path, PROBE_TIMEOUT).await.is_some() {
-        return Attachment::Attached;
+    if let Some(status) = probe(socket_path, PROBE_TIMEOUT).await {
+        return Attachment::Attached(status);
     }
 
     if needs_setup() {

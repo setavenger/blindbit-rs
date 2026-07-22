@@ -164,8 +164,22 @@ Lifecycle behavior:
   and a "Retry / Start daemon" menu item retriggers the whole logic.
 - **Quit rule**: if the tray spawned the daemon, Quit sends `Shutdown` over
   the control socket (killing the child as a fallback) before exiting. If the
-  tray merely attached to an externally started daemon, Quit leaves the daemon
-  running.
+  tray merely attached to a daemon it did not spawn, Quit leaves the daemon
+  running. The Quit menu item's label ("Quit (stops daemon)" vs. "Quit
+  (keeps daemon running)") always reflects which applies. Ownership is
+  self-reported by the daemon (it echoes back whether it was launched with
+  `FRIGLET_SPAWNED_BY_TRAY=1`) rather than tracked only in the tray's own
+  memory, so a tray that crashes or is relaunched still correctly shuts down
+  a daemon it (or an earlier instance of it) spawned, instead of orphaning it.
+- **Single instance**: launching the tray while one is already running just
+  brings the existing status window to front instead of starting a second
+  tray process — this avoids two trays racing to spawn a daemon on a cold
+  start (only one would win the control-socket bind; without this guard the
+  loser could still send `Shutdown` for the other's daemon at Quit).
+- **Scanning start/stop is not sticky across a daemon restart**: `Stop`
+  pauses only the scan task, not the process. If the tray-spawned daemon is
+  later shut down (Quit) and a new one is spawned, the new daemon starts
+  scanning again by default, same as any fresh launch.
 
 For manual testing without a real daemon there is a fake daemon that speaks
 the control protocol: `cargo run -p friglet-tray --example fake-daemon`.
