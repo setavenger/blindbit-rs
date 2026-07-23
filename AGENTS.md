@@ -96,9 +96,9 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   Unit/e2e coverage: `friglet-tray/src/setup.rs` tests, the
   `setup_required_*` cases in `friglet-tray/tests/lifecycle_e2e.rs`, and
   the setup-mode tests in `friglet-tray/src/lib.rs`.
-- Tray icons are a Friglet variation of the BlindBit Desktop suite icon
-  (`source.png`); regenerate sizes with
-  `python3 friglet-tray/icons/generate.py` (needs Pillow).
+- Tray icons are an AI variation of the BlindBit Desktop suite icon
+  (`friglet-tray/icons/source.png` + the Tauri PNG/ICO sizes). No
+  generator script — swap the assets if branding changes.
 
 ## Tray testing under headless / computer-use environments
 
