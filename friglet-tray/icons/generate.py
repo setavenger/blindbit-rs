@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Generate placeholder friglet-tray icons (PNG set + ICO) with no external deps.
+"""Generate friglet-tray icons (PNG set + ICO) with no external deps.
 
-Draws a simple "fridge" glyph on a dark rounded square. Run from the icons/
-directory: python3 generate.py
+Draws a flat silent-payment mark: bitcoin-orange coin with a white crescent
+on a dark rounded square (eclipse / hidden-coin). Run:
+
+    python3 friglet-tray/icons/generate.py
 """
 
 import os
@@ -10,9 +12,8 @@ import struct
 import zlib
 
 BG = (27, 36, 50, 255)  # dark navy
-FRIDGE = (232, 238, 247, 255)  # near-white
-LINE = (27, 36, 50, 255)
-ACCENT = (247, 147, 26, 255)  # bitcoin orange
+COIN = (247, 147, 26, 255)  # bitcoin orange
+MARK = (232, 238, 247, 255)  # near-white
 
 
 def rounded_rect_mask(x, y, x0, y0, x1, y1, r):
@@ -24,30 +25,28 @@ def rounded_rect_mask(x, y, x0, y0, x1, y1, r):
     return 1.0 if (x - cx) ** 2 + (y - cy) ** 2 <= r * r else 0.0
 
 
+def in_circle(x, y, cx, cy, r):
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
 def pixel(x, y, s):
     """RGBA for pixel (x, y) in an s-by-s icon."""
     # Background: rounded square with small transparent margin.
     m = s * 0.02
     if rounded_rect_mask(x, y, m, m, s - m, s - m, s * 0.22) == 0.0:
         return (0, 0, 0, 0)
-    col = BG
-    # Fridge body.
-    fw, fh = s * 0.44, s * 0.60
-    fx0, fy0 = (s - fw) / 2, (s - fh) / 2
-    if rounded_rect_mask(x, y, fx0, fy0, fx0 + fw, fy0 + fh, s * 0.06):
-        col = FRIDGE
-        # Freezer-door split line.
-        split = fy0 + fh * 0.33
-        if abs(y - split) <= max(1.0, s * 0.018):
-            col = LINE
-        # Door handles (short vertical accent marks near the left edge).
-        hx = fx0 + fw * 0.18
-        if abs(x - hx) <= max(1.0, s * 0.02):
-            if fy0 + fh * 0.10 <= y <= fy0 + fh * 0.24:
-                col = ACCENT
-            if split + fh * 0.08 <= y <= split + fh * 0.30:
-                col = ACCENT
-    return col
+
+    cx = cy = s * 0.5
+    r = s * 0.30
+    if not in_circle(x, y, cx, cy, r):
+        return BG
+
+    # White crescent on the right: inside coin, outside a left-shifted disk.
+    crescent_cx = cx - r * 0.34
+    if not in_circle(x, y, crescent_cx, cy, r * 0.92):
+        return MARK
+
+    return COIN
 
 
 def render(s):
