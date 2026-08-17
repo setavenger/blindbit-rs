@@ -15,17 +15,26 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant, timeout_at};
 
-use bitcoin_rev::Network;
+use bitcoin::BlockHash;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
-use blindbit_lib::scanner::{ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
+use bitcoin_rev::Network;
 use blindbit_lib::scanner::broadcast_tx;
+use blindbit_lib::scanner::{
+    ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status,
+};
+use blindbit_lib::{BlockHeightRequest, OracleServiceClient};
+
+use crate::blockheader;
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
@@ -94,6 +103,10 @@ struct ElectrumServerState {
     index: Arc<Mutex<WalletElectrumIndex>>,
     p2p_peer: SocketAddr,
     network: Network,
+    oracle_url: String,
+    block_checkpoints: HashMap<u32, BlockHash>,
+    header_sidecar: PathBuf,
+    header_fetch_lock: Mutex<()>,
     /// Broadcast channel: pre-serialised JSON notification lines sent to every
     /// connected client.
     push_tx: broadcast::Sender<String>,
@@ -107,12 +120,17 @@ struct ElectrumServerState {
 ///
 /// `index` and `found_rx` must be obtained from the scanner before spawning
 /// `scan_block_range`, so this server never contends for the scanner mutex.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     index: Arc<Mutex<WalletElectrumIndex>>,
     mut found_rx: broadcast::Receiver<usize>,
     addr: &str,
     p2p_peer: SocketAddr,
     network: Network,
+    oracle_url: String,
+    block_checkpoints: HashMap<u32, BlockHash>,
+    header_sidecar: PathBuf,
+    client_count: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (push_tx, _) = broadcast::channel::<String>(256);
 
@@ -120,6 +138,10 @@ pub async fn run(
         index,
         p2p_peer,
         network,
+        oracle_url,
+        block_checkpoints,
+        header_sidecar,
+        header_fetch_lock: Mutex::new(()),
         push_tx: push_tx.clone(),
     });
 
@@ -140,26 +162,20 @@ pub async fn run(
 
             const DEBOUNCE: Duration = Duration::from_millis(1000);
 
-            loop {
-                match found_rx.recv().await {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Drain any additional signals that arrive within the
-                        // debounce window so fast scanning collapses into one push.
-                        let deadline = Instant::now() + DEBOUNCE;
-                        loop {
-                            match timeout_at(deadline, found_rx.recv()).await {
-                                Ok(Ok(_))
-                                | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                                    // more signals in the window — keep draining
-                                }
-                                Ok(Err(broadcast::error::RecvError::Closed)) => return,
-                                Err(_elapsed) => break, // window expired
-                            }
+            while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = found_rx.recv().await {
+                // Drain any additional signals that arrive within the
+                // debounce window so fast scanning collapses into one push.
+                let deadline = Instant::now() + DEBOUNCE;
+                loop {
+                    match timeout_at(deadline, found_rx.recv()).await {
+                        Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                            // more signals in the window — keep draining
                         }
-                        push_notifications(&state).await;
+                        Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                        Err(_elapsed) => break, // window expired
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
+                push_notifications(&state).await;
             }
         });
     }
@@ -172,10 +188,13 @@ pub async fn run(
             Ok((stream, peer_addr)) => {
                 tracing::info!(peer = %peer_addr, "Electrum client connected");
                 let state = state.clone();
+                let client_count = client_count.clone();
+                client_count.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     if let Err(e) = handle_client(stream, state).await {
                         tracing::error!(peer = %peer_addr, error = %e, "Electrum client error");
                     }
+                    client_count.fetch_sub(1, Ordering::Relaxed);
                     tracing::info!(peer = %peer_addr, "Electrum client disconnected");
                 });
             }
@@ -258,6 +277,89 @@ async fn push_notifications(state: &ElectrumServerState) {
         .send(serde_json::to_string(&notification).unwrap() + "\n");
 }
 
+async fn resolve_block_hash(state: &ElectrumServerState, height: u32) -> Result<BlockHash, String> {
+    if let Some(hash) = state.block_checkpoints.get(&height) {
+        return Ok(*hash);
+    }
+
+    let oracle_url = state.oracle_url.clone();
+    let resolve = async move {
+        let mut client = OracleServiceClient::connect(oracle_url)
+            .await
+            .map_err(|error| format!("oracle connection failed: {error}"))?;
+        let response = client
+            .get_block_hash_by_height(tonic::Request::new(BlockHeightRequest {
+                block_height: u64::from(height),
+            }))
+            .await
+            .map_err(|error| format!("oracle hash lookup failed: {error}"))?
+            .into_inner();
+        blockheader::block_hash_from_oracle(response.block_hash).map_err(|error| error.to_string())
+    };
+
+    tokio::time::timeout(Duration::from_secs(15), resolve)
+        .await
+        .map_err(|_| "oracle hash lookup timed out after 15 seconds".to_string())?
+}
+
+async fn backfill_header(state: &ElectrumServerState, height: u32) -> Result<String, String> {
+    // A single lock is adequate for this personal server and prevents duplicate
+    // getdata requests when Sparrow asks for the same missing height at once.
+    let _fetch_guard = state.header_fetch_lock.lock().await;
+
+    if let Some(hex) = state.index.lock().await.headers.get(&height).cloned() {
+        return Ok(hex);
+    }
+
+    let expected_hash = resolve_block_hash(state, height).await?;
+    let peer = state.p2p_peer;
+    let network = state.network;
+    let header = tokio::task::spawn_blocking(move || {
+        blockheader::fetch_header(peer, network, expected_hash)
+    })
+    .await
+    .map_err(|error| format!("P2P header task failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    // fetch_header already validates this before returning. Keep the check here
+    // at the trust boundary so a future fetch implementation cannot serve the
+    // wrong block under the requested height.
+    let actual_hash = header.block_hash();
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "fetched header hash {actual_hash} does not match expected {expected_hash}"
+        ));
+    }
+
+    let header_hex = blockheader::header_hex(&header);
+    let headers = {
+        let mut index = state.index.lock().await;
+        index.headers.insert(height, header_hex.clone());
+        index.headers.clone()
+    };
+
+    let sidecar = state.header_sidecar.clone();
+    match tokio::task::spawn_blocking(move || blockheader::save_headers(&sidecar, &headers)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                path = %state.header_sidecar.display(),
+                error = %error,
+                "failed to persist block-header sidecar"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %state.header_sidecar.display(),
+                error = %error,
+                "block-header sidecar write task failed"
+            );
+        }
+    }
+
+    Ok(header_hex)
+}
+
 // ---------------------------------------------------------------------------
 // Per-client handler
 // ---------------------------------------------------------------------------
@@ -312,8 +414,7 @@ async fn handle_client(
         let request: JsonRpcRequest = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                let resp =
-                    JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
+                let resp = JsonRpcResponse::error(Value::Null, -32700, format!("Parse error: {e}"));
                 tx.send(resp.into_line()).await?;
                 continue;
             }
@@ -347,11 +448,7 @@ async fn handle_client(
 /// The set of affected scripthashes is stored in `pending_scripthashes` so
 /// that when the block is later confirmed, `scan_block_range` can promote all
 /// `height: 0` entries (including non-SP change outputs) to the real height.
-async fn index_unconfirmed_tx(
-    index: &Arc<Mutex<WalletElectrumIndex>>,
-    raw_hex: &str,
-    txid: &str,
-) {
+async fn index_unconfirmed_tx(index: &Arc<Mutex<WalletElectrumIndex>>, raw_hex: &str, txid: &str) {
     let tx_bytes = match hex::decode(raw_hex) {
         Ok(b) => b,
         Err(e) => {
@@ -377,13 +474,12 @@ async fn index_unconfirmed_tx(
         let vout = input.previous_output.vout as usize;
 
         // Primary: decode from raw bytes cached in idx.txs.
-        if let Some(raw_prev) = idx.txs.get(&prev_txid) {
-            if let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev) {
-                if let Some(out) = prev_tx.output.get(vout) {
-                    affected.push(electrum_scripthash(&out.script_pubkey));
-                    continue;
-                }
-            }
+        if let Some(raw_prev) = idx.txs.get(&prev_txid)
+            && let Ok(prev_tx) = bitcoin_deserialize::<bitcoin::Transaction>(raw_prev)
+            && let Some(out) = prev_tx.output.get(vout)
+        {
+            affected.push(electrum_scripthash(&out.script_pubkey));
+            continue;
         }
 
         // Fallback: the receive tx's scripthash is already in scripthash_history.
@@ -426,13 +522,17 @@ async fn index_unconfirmed_tx(
     idx.txs.insert(txid.to_string(), tx_bytes);
 
     // Add height-0 entries to every affected scripthash.
-    let entry = ScriptHashEntry { tx_hash: txid.to_string(), height: 0, fee: 0 };
+    let entry = ScriptHashEntry {
+        tx_hash: txid.to_string(),
+        height: 0,
+        fee: 0,
+    };
     let mut added = 0usize;
     for sh in &affected {
         let history = idx.scripthash_history.entry(sh.clone()).or_default();
         match history.iter().position(|e| e.tx_hash == txid) {
             Some(pos) if history[pos].height == 0 => {} // already unconfirmed, no-op
-            Some(_) => {}                                // already confirmed, leave it
+            Some(_) => {}                               // already confirmed, leave it
             None => {
                 history.push(entry.clone());
                 history.sort_by_key(|e| e.height);
@@ -443,7 +543,8 @@ async fn index_unconfirmed_tx(
 
     // Record affected scripthashes so scan_block_range can promote height-0
     // entries to the confirmed block height when the tx lands in a block.
-    idx.pending_scripthashes.insert(txid.to_string(), affected.clone());
+    idx.pending_scripthashes
+        .insert(txid.to_string(), affected.clone());
 
     tracing::info!(
         txid = %txid,
@@ -471,11 +572,9 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
             ),
         )
         .into_line(),
-        "server.features" => JsonRpcResponse::success(
-            req.id.clone(),
-            json!({ "silent_payments": [0] }),
-        )
-        .into_line(),
+        "server.features" => {
+            JsonRpcResponse::success(req.id.clone(), json!({ "silent_payments": [0] })).into_line()
+        }
 
         // ---- Block headers -----------------------------------------------
         "blockchain.headers.subscribe" => {
@@ -496,25 +595,28 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(height) = height_val.as_u64().map(|h| h as u32) else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "height must be integer",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "height must be integer")
+                    .into_line();
             };
-            let index = state.index.lock().await;
-            match index.headers.get(&height) {
-                Some(hex) => {
-                    JsonRpcResponse::success(req.id.clone(), Value::String(hex.clone()))
-                        .into_line()
+            if let Some(hex) = state.index.lock().await.headers.get(&height).cloned() {
+                return JsonRpcResponse::success(req.id.clone(), Value::String(hex)).into_line();
+            }
+
+            match backfill_header(state, height).await {
+                Ok(hex) => JsonRpcResponse::success(req.id.clone(), Value::String(hex)).into_line(),
+                Err(error) => {
+                    tracing::error!(
+                        height,
+                        error = %error,
+                        "failed to backfill requested block header"
+                    );
+                    JsonRpcResponse::error(
+                        req.id.clone(),
+                        -32603,
+                        format!("unknown block at height {height}: {error}"),
+                    )
+                    .into_line()
                 }
-                None => JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32603,
-                    format!("unknown block at height {height}"),
-                )
-                .into_line(),
             }
         }
 
@@ -525,12 +627,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "scripthash must be string",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
+                    .into_line();
             };
             let index = state.index.lock().await;
             let status = index
@@ -553,12 +651,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                     .into_line();
             };
             let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(
-                    req.id.clone(),
-                    -32602,
-                    "scripthash must be string",
-                )
-                .into_line();
+                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
+                    .into_line();
             };
             let index = state.index.lock().await;
             let history: Vec<Value> = index
@@ -567,9 +661,7 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 .map(|entries| {
                     entries
                         .iter()
-                        .map(|e| {
-                            json!({ "tx_hash": e.tx_hash, "height": e.height, "fee": e.fee })
-                        })
+                        .map(|e| json!({ "tx_hash": e.tx_hash, "height": e.height, "fee": e.fee }))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -591,11 +683,10 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
             };
             let index = state.index.lock().await;
             match index.txs.get(txid) {
-                Some(raw) => JsonRpcResponse::success(
-                    req.id.clone(),
-                    Value::String(hex::encode(raw)),
-                )
-                .into_line(),
+                Some(raw) => {
+                    JsonRpcResponse::success(req.id.clone(), Value::String(hex::encode(raw)))
+                        .into_line()
+                }
                 None => JsonRpcResponse::error(
                     req.id.clone(),
                     -32603,
@@ -639,12 +730,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
                 }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "P2P broadcast failed");
-                    JsonRpcResponse::error(
-                        req.id.clone(),
-                        -32603,
-                        format!("broadcast failed: {e}"),
-                    )
-                    .into_line()
+                    JsonRpcResponse::error(req.id.clone(), -32603, format!("broadcast failed: {e}"))
+                        .into_line()
                 }
                 Err(e) => JsonRpcResponse::error(
                     req.id.clone(),
@@ -699,11 +786,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
 
         "blockchain.silentpayments.unsubscribe" => {
             let index = state.index.lock().await;
-            JsonRpcResponse::success(
-                req.id.clone(),
-                Value::String(index.sp_address.clone()),
-            )
-            .into_line()
+            JsonRpcResponse::success(req.id.clone(), Value::String(index.sp_address.clone()))
+                .into_line()
         }
 
         // ---- Fee stubs (Sparrow has fallbacks) ---------------------------

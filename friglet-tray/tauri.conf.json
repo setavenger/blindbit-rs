@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "friglet-tray",
+  "version": "0.1.0",
+  "identifier": "dev.setor.friglet.tray",
+  "build": {
+    "frontendDist": "./ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Friglet Status",
+        "width": 420,
+        "height": 600,
+        "minWidth": 340,
+        "minHeight": 420,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage", "dmg"],
+    "category": "Utility",
+    "shortDescription": "System tray companion for the friglet Silent Payments daemon",
+    "longDescription": "Friglet Tray supervises and monitors the friglet BIP-352 Silent Payments scanning daemon: it shows live scan status in the system tray, offers start/stop controls and a settings window, and spawns the bundled friglet daemon when none is running.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"]
+      }
+    }
+  }
+}

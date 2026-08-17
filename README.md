@@ -18,10 +18,12 @@ BlindBit is a comprehensive software suite for Bitcoin BIP-352 Silent Payments. 
 
 ## Workspace Structure
 
-This is a Cargo workspace containing three main crates:
+This is a Cargo workspace containing the following crates:
 
 - **blindbit-lib**: Core library containing the scanning logic and gRPC client
 - **friglet**: Lightweight scanner compatible with Frigate's Silent Payments endpoints, with built-in Electrum and HTTP servers
+- **friglet-ipc**: Shared IPC protocol (control socket) between the friglet daemon and its clients
+- **friglet-tray**: System tray companion app for the friglet daemon (Tauri v2)
 - **blindbit-cli**: Minimal command-line interface for scanning (no server functionality)
 
 ## Usage
@@ -53,9 +55,37 @@ cargo run --release --package friglet scan \
 | `--oracle-url` | BlindBit Oracle URL | `https://oracle.setor.dev` |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
-| `--state-file` | Path to persist scanner state | `scanner_state.json` |
+| `--state-file` | Path to persist scanner state | `<config dir>/friglet/scanner_state.json` |
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
+
+#### Configuration
+
+Every flag above can also come from a TOML config file or environment
+variables. Precedence: **CLI flags > `FRIGLET_*` env vars > config file >
+defaults**. With a complete config file, `friglet` (or `friglet scan`) starts
+with no flags at all.
+
+- Config file: `~/.config/friglet/config.toml` (Linux),
+  `~/Library/Application Support/friglet/config.toml` (macOS), or `--config <path>`.
+  Keys match the flag names (`oracle_url`, `p2p_node_addr`, `start_height`, ...).
+- Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
+  `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
+- `--print-config` prints the merged configuration as TOML and exits.
+
+The scan secret is kept out of the config file. It is read from, in order:
+`--scan-secret` (deprecated), `FRIGLET_SCAN_SECRET`, or the key file at
+`<config dir>/friglet/scan.key` (override with `key_file` / `--key-file`).
+When the secret is supplied via flag or env and no key file exists yet, it is
+written there with `0600` permissions so subsequent runs need no secret on
+the command line. Note: the scanner state file also contains the secret
+(required for restore); friglet keeps it at `0600`.
+
+While running, the daemon serves a control socket (newline-delimited JSON,
+see the `friglet-ipc` crate) for status, start/stop scanning, and shutdown.
+Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux),
+`~/Library/Application Support/friglet/friglet.sock` (macOS),
+`\\.\pipe\friglet` (Windows); override with `FRIGLET_CONTROL_SOCKET`.
 
 #### HTTP API
 
@@ -69,6 +99,154 @@ Once running, `friglet` exposes the following endpoints on `--http-addr`:
 #### Electrum Server
 
 The built-in Electrum server (bound to `--electrum-addr`) allows wallets such as Sparrow to connect directly and query Silent Payment UTXOs without any additional infrastructure.
+
+---
+
+### Tray app (friglet-tray)
+
+`friglet-tray` is a small Tauri v2 system tray app that supervises and
+monitors the `friglet` daemon over its control socket. It shows live status
+(scan height, progress, network, Electrum clients, oracle connectivity, SP
+address, errors) in the tray menu and in a status window (hidden by default,
+opened via the tray menu; closing it hides it again). The tray menu also
+offers Start/Stop scanning and Quit.
+
+The window's **Settings** tab lets you view and edit all daemon settings —
+network, oracle URL, P2P node address, start height, scan key, spend pubkey,
+max labels, HTTP/Electrum bind addresses, state and key file paths. Saving
+sends the config to the daemon, which validates it, persists it to its config
+file (and the scan key to the 0600 key file) and applies it: scan settings
+restart the scan task immediately, while bind-address changes take effect on
+the next daemon restart (the UI surfaces the daemon's note about this). The
+scan key is write-only — it is never displayed and only sent when you type a
+new one.
+
+The **Wallet** tab is a read-only convenience view, not a spending wallet. It
+shows found transaction/output counts plus copyable base and per-label Silent
+Payments addresses.
+
+```bash
+# build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
+# libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)
+cargo build --release -p friglet-tray
+
+# run
+./target/release/friglet-tray
+
+# optional: show the status window immediately (normally hidden until
+# opened from the tray menu — useful for headless / screenshot testing).
+# Values: 1/true/yes/on/status → Status tab; settings → Settings tab;
+# wallet → Wallet tab.
+FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
+```
+
+**First run** — no manual config file needed: launch the tray, and if no
+daemon is running and none is configured yet (no `config.toml`, no
+`FRIGLET_*` env), the window opens automatically on the Settings tab with a
+first-time-setup banner. Fill in the required fields (P2P node address,
+start height, spend pubkey, scan key) and hit Save: the tray validates the
+form, writes the config file (atomic TOML at the platform default path,
+e.g. `~/.config/friglet/config.toml` on Linux or
+`~/Library/Application Support/friglet/config.toml` on macOS) and the scan
+key file (0600), then starts the daemon with it.
+
+Lifecycle behavior:
+
+- **Attach, spawn, or set up**: on startup the tray probes the control
+  socket. If a daemon answers, the tray attaches to it. If not, and the
+  daemon is not plausibly configured (required settings missing from the
+  config file / `FRIGLET_*` env, or no scan key), it enters the first-run
+  setup mode described above instead of spawn-failing. Otherwise it spawns
+  the `friglet` binary (search order: `FRIGLET_DAEMON_BIN` env var, then
+  `friglet` next to the tray executable, then `friglet` on `PATH`) and
+  retries the socket for a few seconds. If nothing comes up the tray keeps
+  running, shows "Daemon: unreachable" (or "Setup required — open window"),
+  and a "Retry / Start daemon" menu item retriggers the whole logic.
+- **Quit rule**: if the tray spawned the daemon, Quit sends `Shutdown` over
+  the control socket (killing the child as a fallback) before exiting. If the
+  tray merely attached to a daemon it did not spawn, Quit leaves the daemon
+  running. The Quit menu item's label ("Quit (stops daemon)" vs. "Quit
+  (keeps daemon running)") always reflects which applies. Ownership is
+  self-reported by the daemon (it echoes back whether it was launched with
+  `FRIGLET_SPAWNED_BY_TRAY=1`) rather than tracked only in the tray's own
+  memory, so a tray that crashes or is relaunched still correctly shuts down
+  a daemon it (or an earlier instance of it) spawned, instead of orphaning it.
+- **Single instance**: launching the tray while one is already running just
+  brings the existing status window to front instead of starting a second
+  tray process — this avoids two trays racing to spawn a daemon on a cold
+  start (only one would win the control-socket bind; without this guard the
+  loser could still send `Shutdown` for the other's daemon at Quit).
+- **Scanning start/stop is not sticky across a daemon restart**: `Stop`
+  pauses only the scan task, not the process. If the tray-spawned daemon is
+  later shut down (Quit) and a new one is spawned, the new daemon starts
+  scanning again by default, same as any fresh launch.
+
+For manual testing without a real daemon there is a fake daemon that speaks
+the control protocol: `cargo run -p friglet-tray --example fake-daemon`.
+
+---
+
+## Packaging
+
+### Desktop bundles (friglet-tray + bundled daemon)
+
+The tray app ships as a Tauri bundle — `.deb` and `.AppImage` on Linux,
+`.dmg` on macOS — with the `friglet` daemon included as a sidecar binary
+(Tauri `bundle.externalBin`), so the installed tray always finds a daemon
+right next to its own executable.
+
+```bash
+# 1. stage the daemon sidecar (builds friglet --release and copies it to
+#    friglet-tray/binaries/friglet-<target-triple>)
+scripts/prepare-sidecar.sh
+
+# 2. build the bundles (tauri-cli via npx; `cargo install tauri-cli --locked`
+#    works too — then use `cargo tauri build ...`)
+cd friglet-tray
+npx @tauri-apps/cli build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
+npx @tauri-apps/cli build --bundles dmg --config tauri.sidecar.conf.json           # macOS
+```
+
+The `--config tauri.sidecar.conf.json` overlay adds the daemon sidecar
+(`bundle.externalBin`). It is kept out of the base `tauri.conf.json` so that
+plain `cargo build`/`cargo test` on the workspace never require the staged
+sidecar binary.
+
+Artifacts land under `target/release/bundle/`:
+
+- `deb/friglet-tray_<version>_amd64.deb` — installs `friglet-tray` **and**
+  `friglet` into `/usr/bin/`; declares `libwebkit2gtk-4.1-0` and
+  `libayatana-appindicator3-1` as dependencies.
+- `appimage/friglet-tray_<version>_amd64.AppImage` — self-contained; both
+  binaries in the embedded `usr/bin/`.
+- `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
+  Run `scripts/prepare-sidecar.sh` there first; it picks up the host triple
+  (e.g. `aarch64-apple-darwin`) automatically.
+
+### Standalone daemon
+
+```bash
+cargo build --release -p friglet   # -> target/release/friglet
+```
+
+Copy `target/release/friglet` wherever you like; it is self-contained. Run
+it with a config file (see [Configuration](#configuration)):
+`friglet scan --config /path/to/config.toml`, or just `friglet` to use
+`~/.config/friglet/config.toml`.
+
+### Docker (headless daemon)
+
+A multi-stage `Dockerfile` at the repo root builds a slim headless daemon
+image. Config, key file, scanner state, and the control socket all live in a
+`/data` volume:
+
+```bash
+docker build -t friglet .
+docker run -d -p 8080:8080 -p 50001:50001 -v "$PWD/friglet-data:/data" friglet
+curl http://127.0.0.1:8080/height
+```
+
+See [docs/docker.md](docs/docker.md) for the config layout and details.
 
 ---
 
@@ -93,7 +271,7 @@ cargo run --release --package blindbit-cli scan \
 - `--start-height`: Block height to begin scanning from (wallet birthday)
 - `--p2p-node-addr`: Bitcoin P2P node address (`host:port`)
 - `--oracle-url`: Oracle service URL (default: `https://oracle.setor.dev`)
-- `--state-file`: Path for scanner state persistence (default: `scanner_state.json`)
+- `--state-file`: Path for scanner state persistence (default: `<config dir>/friglet/scanner_state.json`)
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)
 - `--max-label-num`: Maximum label number (default: `0`)
 

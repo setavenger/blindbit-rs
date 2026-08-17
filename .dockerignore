@@ -1,0 +1,6 @@
+target/
+.git/
+friglet-tray/binaries/
+friglet-tray/gen/
+Dockerfile
+.dockerignore
