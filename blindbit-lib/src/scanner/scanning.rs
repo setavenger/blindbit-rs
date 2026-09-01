@@ -198,6 +198,17 @@ impl Scanner {
                     );
                     self.stage.indexer.merge(indexer_changes);
 
+                    // Register found outputs as owned so spent detection sees them
+                    let xonlys: Vec<[u8; 32]> = self
+                        .internal_indexer
+                        .index()
+                        .by_xonly()
+                        .map(|(xonly, _)| xonly.serialize())
+                        .collect();
+                    for pk in xonlys {
+                        self.add_owned_output(pk);
+                    }
+
                     // Update block checkpoints: only store blocks where we found something
                     let block_height_u32 = block_identifier.block_height as u32;
                     let block_hash = block.block_hash();

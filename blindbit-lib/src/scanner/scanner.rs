@@ -583,6 +583,15 @@ impl Scanner {
             .get_address(convert_network(network))
             .to_string();
 
+        // Merge outputs from the reconstructed index; heals older state files
+        let mut owned_outputs = changeset.owned_outputs.clone();
+        for (xonly, _) in indexer.index().by_xonly() {
+            let pk = xonly.serialize();
+            if !owned_outputs.contains(&pk) {
+                owned_outputs.push(pk);
+            }
+        }
+
         Ok(Self {
             client,
             p2p_peer: p2p_socket_addr,
@@ -593,7 +602,7 @@ impl Scanner {
             notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: changeset.last_scanned_block_height,
             last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
-            owned_outputs: changeset.owned_outputs.clone(),
+            owned_outputs,
             stage: changeset,
             state_file: state_file,
             network: network,
