@@ -3,7 +3,7 @@ use blindbit_lib::oracle_grpc::oracle_service_client::OracleServiceClient;
 
 static ORACLE_URL: &str = "https://oracle.setor.dev";
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to oracle service at {ORACLE_URL}...");
     let mut client = OracleServiceClient::connect(ORACLE_URL).await?;
