@@ -20,6 +20,13 @@ use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
 use super::ScannerError;
 
+/// BIP-352 limits one recipient group to this many matched outputs.
+///
+/// Only [`Scanner::scan_transaction_full`] applies it, and that function has no
+/// production caller (see its doc comment); the live receive path does not
+/// enforce a K_max.
+const BIP352_K_MAX: usize = 2323;
+
 /// Insert or upgrade a scripthash history entry.
 ///
 /// If the tx is already present with a confirmed height (> 0), it is left
@@ -746,6 +753,12 @@ impl Scanner {
 
     /// Scans a transaction for outputs which definitely belong to us
     /// returns an array of '`OwnedOutput`'s
+    ///
+    /// No production code calls this today: the daemon receives through
+    /// [`Self::scan_transaction_short`] plus `apply_block_relevant` on the
+    /// external indexer. It is kept (and covered by the BIP-352 vector tests in
+    /// `bip352_vectors.rs`) as the entry point for scanning full block
+    /// responses again.
     pub fn scan_transaction_full(
         &mut self,
         item: &FullTxItem,
@@ -765,6 +778,39 @@ impl Scanner {
             ecdh_shared_secret,
         ) {
             Ok(mut spouts) => {
+                // Scope, stated plainly: `scan_transaction_full` currently has no
+                // production caller. It is exercised by the BIP-352 vector tests in
+                // `bip352_vectors.rs` and is the intended entry point if/when full
+                // block responses are scanned again. The live receive path is
+                // `scan_transaction_short` plus `apply_block_relevant` on the
+                // external indexer (see `scan_blocks`), and that path enforces no
+                // K_max at all. The truncation below therefore does NOT today
+                // constrain live scanning; it is here so the full-block entry point
+                // is correct whenever it is used again.
+                //
+                // `bdk_sp` derives one candidate for every matching output. The BIP-352
+                // receiver limit is protocol-visible: accepting a 2324th candidate would
+                // desynchronise a sender and receiver that correctly stop at K_max.
+                //
+                // Truncating is equivalent to stopping the scan at K_max because
+                // `bdk_sp::receive::scan_txouts` returns its matches in ascending
+                // derivation order: it pushes into `spouts_found` from a `while let`
+                // loop whose `matched_tweaks` counter starts at 0 and increments once
+                // per match, so element `i` is always the match for `k = i`. That
+                // holds no matter which candidate a given `k` picks up. Several
+                // candidates *can* satisfy one `k` — two identical output scripts, or
+                // a transaction carrying both `P_k` and `P_k + m*G` — and
+                // `find_spout_for_tweak` then returns whichever comes first in the
+                // *candidate pool*, whose order earlier `swap_remove`s have already
+                // scrambled. But `swap_remove` mutates only that pool, never the
+                // results vector, so pool order can change *which* output is reported
+                // for a `k`, not the index it is reported at. `truncate` therefore
+                // keeps exactly `k = 0..=K_max-1` and drops the highest `k`, never an
+                // arbitrary match. Covered by
+                // `bip352_vectors::official_vectors_enforce_k_max_at_the_blindbit_boundary`,
+                // which asserts the per-index tweak identity, not just the count.
+                spouts.truncate(BIP352_K_MAX);
+
                 // todo: come back here if something does not work due to wrong txids being used in
                 // spuot outpoints
 
@@ -791,3 +837,7 @@ impl Scanner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bip352_vectors.rs"]
+mod bip352_vectors;

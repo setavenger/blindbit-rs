@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libprotobuf-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            pkg-config \
+            protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Test workspace
+        run: cargo test --workspace
+      # --no-deps keeps -D warnings on the three supported crates without
+      # also linting workspace path dependencies. blindbit-lib is knowingly
+      # not clippy-clean (AGENTS.md), so linting it here would fail the job
+      # on pre-existing warnings in files the change never touched.
+      - name: Lint supported crates
+        run: cargo clippy --no-deps -p friglet -p friglet-ipc -p friglet-tray --all-targets -- -D warnings
