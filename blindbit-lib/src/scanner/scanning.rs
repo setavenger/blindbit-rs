@@ -124,6 +124,7 @@ impl Scanner {
                             self.stage.last_scanned_block_height = block_identifier.block_height;
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
+                            #[cfg(feature = "serde")]
                             if block_identifier.block_height % 1000 == 0 {
                                 if let Err(e) = self.save_to_file(&self.state_file) {
                                     tracing::warn!(error = %e, "failed to save periodic checkpoint");
@@ -244,6 +245,7 @@ impl Scanner {
                         |_txout_index, _script| true, // include all pending outputs
                     );
 
+                    #[cfg(feature = "serde")]
                     if let Err(save_err) = self.save_to_file(&self.state_file) {
                         tracing::warn!(error = %save_err, "failed to save state");
                     } else {
@@ -450,9 +452,10 @@ impl Scanner {
             "balance after scan"
         );
 
-        // Always persist progress at the end of a scan range so watch_chain
+        // With persistence enabled, save progress at the end of a scan range so watch_chain
         // resumes from the correct height after a restart, even when no
         // wallet-relevant transactions were found in this range.
+        #[cfg(feature = "serde")]
         if let Err(e) = self.save_to_file(&self.state_file) {
             tracing::warn!(error = %e, "failed to save state after scan");
         }
