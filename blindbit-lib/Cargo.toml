@@ -42,3 +42,10 @@ silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", versi
 # bitcoin-p2p is on a specific revision of rust-bitcoin which creates some issues
 bitcoin-p2p = { git = "https://github.com/2140-dev/bitcoin-p2p", version = "0.1.0" }
 
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The BIP-352 vector tests are synchronous, but tonic's `connect_lazy` needs a
+# Tokio runtime in scope to build the (never-connected) oracle channel. Declared
+# explicitly so the tests do not depend on tonic's transitive feature selection.
+tokio = { version = "1.48.0", features = ["rt", "time", "net"] }
