@@ -578,15 +578,42 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
 
         // ---- Block headers -----------------------------------------------
         "blockchain.headers.subscribe" => {
-            let index = state.index.lock().await;
-            let result = match &index.tip {
-                Some((height, hex)) if !hex.is_empty() => {
-                    json!({ "height": height, "hex": hex })
-                }
-                Some((height, _)) => json!({ "height": height, "hex": Value::Null }),
-                None => json!({ "height": 0, "hex": Value::Null }),
-            };
-            JsonRpcResponse::success(req.id.clone(), result).into_line()
+            // Clone the tip and release the lock before backfilling:
+            // backfill_header takes the same lock and would deadlock.
+            let tip = state.index.lock().await.tip.clone();
+            match tip {
+                Some((height, hex)) if !hex.is_empty() => JsonRpcResponse::success(
+                    req.id.clone(),
+                    json!({ "height": height, "hex": hex }),
+                )
+                .into_line(),
+                // The tip height is known but its header has not been fetched
+                // yet. `hex` is not optional in the Electrum protocol: a null
+                // there is a parse failure for clients, and Sparrow drops the
+                // connection and reconnects in a loop rather than reporting
+                // anything a user could act on. Fetch the header the same way
+                // blockchain.block.header does, and surface a real JSON-RPC
+                // error if that fails.
+                Some((height, _)) => match backfill_header(state, height).await {
+                    Ok(hex) => JsonRpcResponse::success(
+                        req.id.clone(),
+                        json!({ "height": height, "hex": hex }),
+                    )
+                    .into_line(),
+                    Err(error) => JsonRpcResponse::error(
+                        req.id.clone(),
+                        1,
+                        format!("header unavailable for tip height {height}: {error}"),
+                    )
+                    .into_line(),
+                },
+                None => JsonRpcResponse::error(
+                    req.id.clone(),
+                    1,
+                    "no chain tip known yet; the scanner has not reported a height",
+                )
+                .into_line(),
+            }
         }
 
         "blockchain.block.header" => {
