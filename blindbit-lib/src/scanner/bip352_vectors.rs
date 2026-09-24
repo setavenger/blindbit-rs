@@ -1,11 +1,16 @@
 //! Official BIP-352 receiver vectors exercised at the blindbit-lib boundary.
 //!
-//! The boundary under test is [`Scanner::scan_transaction_full`], which has no
-//! production caller today — the daemon receives through
-//! `Scanner::scan_transaction_short` plus `apply_block_relevant` on the external
-//! indexer. These tests are what exercises it, and they pin its behaviour for
-//! whenever full block responses are scanned again; they say nothing directly
-//! about the live short-scan path.
+//! Two boundaries are under test:
+//!
+//! * [`Scanner::scan_transaction_full`], which has no production caller today.
+//!   The first group of tests pins its behaviour for whenever full block
+//!   responses are scanned again.
+//! * The live receive path the daemon actually runs: the oracle's short block
+//!   data through `Scanner::scan_short_block_data` (and so
+//!   `scan_transaction_short` / `match_short_pubkey`), then, on a probable match,
+//!   the full block through `Scanner::apply_matched_block`
+//!   (`apply_block_relevant` on the external indexer). See the section "The live
+//!   short receive path" at the end of this file.
 //!
 //! Fixture provenance (re-checked at runtime by [`vectors`], so a silent swap or
 //! a corrupted copy fails loudly instead of quietly changing coverage):
@@ -1554,4 +1559,498 @@ fn official_vectors_extra_change_label_is_harmless() {
         SCANNED_SUBCASE_COUNT - K_MAX_SUBCASE_COUNT - 1,
         "exactly one non-K_max sub-case (the sender-change vector) registers m=0 itself"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The live short receive path
+// ---------------------------------------------------------------------------
+//
+// Everything above goes through `scan_transaction_full`. The daemon does not:
+// per block it asks the oracle for `BlockScanDataShortResponse`, runs
+// `scan_short_block_data` -> `probabilistic_match` -> `scan_transaction_short`
+// (k = 0 only, labels enumerated by hand, 8-byte x-only prefixes), and only on a
+// probable match fetches the full block and hands it to `apply_matched_block`,
+// i.e. `apply_block_relevant` on the external indexer. A false negative in the
+// short step means the block is never fetched, so the wallet silently never
+// sees the payment. The tests below drive every receiving vector through that
+// exact sequence of production functions.
+
+/// Length of one `outputs_short` entry: the oracle stores `Pubkey[:8]` of every
+/// taproot output (`blindbit-oracle` `dbpebble/store.go`). Deliberately not
+/// shared with `match_short_pubkey`, so a change there cannot silently change
+/// what the test builds too.
+const SHORT_PREFIX_LEN: usize = 8;
+
+/// Height the synthetic blocks claim to be at.
+const LIVE_BLOCK_HEIGHT: u64 = 840_000;
+
+/// A txid as the oracle puts it on the wire: display order (see [`full_item`]).
+fn wire_txid(tx: &Transaction) -> [u8; 32] {
+    let mut txid = tx.compute_txid().to_raw_hash().to_byte_array();
+    txid.reverse();
+    txid
+}
+
+/// The `ComputeIndexTxItem` the oracle serves for `tx`: the 33-byte tweak
+/// (`input_hash * A`) and, for every **taproot** output in output order, the
+/// first [`SHORT_PREFIX_LEN`] bytes of its x-only key. Non-taproot outputs are
+/// not stored by the oracle and so never appear.
+fn short_item(tx: &Transaction, tweak: PublicKey) -> crate::oracle_grpc::ComputeIndexTxItem {
+    let outputs_short = tx
+        .output
+        .iter()
+        .filter(|output| output.script_pubkey.is_p2tr())
+        .flat_map(|output| output.script_pubkey.as_bytes()[2..2 + SHORT_PREFIX_LEN].to_vec())
+        .collect();
+    crate::oracle_grpc::ComputeIndexTxItem {
+        txid: wire_txid(tx).to_vec(),
+        tweak: tweak.serialize().to_vec(),
+        outputs_short,
+    }
+}
+
+/// A non-coinbase transaction that is not ours, so the block the receive step
+/// sees is not just the vector transaction on its own.
+fn decoy_transaction() -> Transaction {
+    let decoy_key = XOnlyPublicKey::from_str(
+        "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    )
+    .expect("decoy key");
+    Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([0x11; 32]),
+                vout: 7,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(5_000),
+            script_pubkey: ScriptBuf::new_p2tr_tweaked(
+                bdk_sp::bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(decoy_key),
+            ),
+        }],
+    }
+}
+
+/// The full block the daemon would fetch over P2P: a coinbase (which
+/// `apply_block_relevant` skips by position), a decoy, then the vector's
+/// transaction.
+fn live_block(tx: &Transaction) -> bitcoin::Block {
+    let coinbase = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x03, 0x40, 0xd1, 0x0c]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(312_500_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+        }],
+    };
+    let mut block = bitcoin::Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::TWO,
+            prev_blockhash: bitcoin::BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: 1_713_571_767,
+            bits: bitcoin::CompactTarget::from_consensus(0x1703_4219),
+            nonce: 0,
+        },
+        txdata: vec![coinbase, decoy_transaction(), tx.clone()],
+    };
+    block.header.merkle_root = block.compute_merkle_root().expect("non-empty block");
+    block
+}
+
+/// The per-block short response the oracle streams, carrying `items`.
+fn short_block(
+    block: &bitcoin::Block,
+    items: Vec<crate::oracle_grpc::ComputeIndexTxItem>,
+) -> crate::oracle_grpc::BlockScanDataShortResponse {
+    let mut block_hash = block.block_hash().to_raw_hash().to_byte_array();
+    block_hash.reverse();
+    crate::oracle_grpc::BlockScanDataShortResponse {
+        block_identifier: Some(crate::oracle_grpc::BlockIdentifier {
+            block_hash: block_hash.to_vec(),
+            block_height: LIVE_BLOCK_HEIGHT,
+        }),
+        comp_index: items,
+        spent_outputs: Vec::new(),
+    }
+}
+
+/// Which k = 0 candidate the vector transaction actually carries, by full
+/// 32-byte key: `Some(None)` for the unlabelled `P_0`, `Some(Some(m))` for
+/// `P_0 + label_m`, `None` if neither. This is independent of the short path
+/// and says which label iteration the short path *must* perform to match.
+fn k0_candidates(
+    tx: &Transaction,
+    given: &ReceivingGiven,
+    scan_sk: SecretKey,
+    spend_pk: PublicKey,
+    shared_secret: PublicKey,
+) -> BTreeSet<Option<u32>> {
+    let keys: HashSet<XOnlyPublicKey> = tx
+        .output
+        .iter()
+        .filter(|output| output.script_pubkey.is_p2tr())
+        .map(|output| {
+            XOnlyPublicKey::from_slice(&output.script_pubkey.as_bytes()[2..]).expect("taproot key")
+        })
+        .collect();
+    std::iter::once(None)
+        .chain(given.labels.iter().map(|&m| Some(m)))
+        .filter(|label| {
+            let label_pt = label.map(|m| label_point(scan_sk, m));
+            let p_0 = get_silentpayment_pubkey(&spend_pk, &shared_secret, 0, label_pt.as_ref());
+            keys.contains(&p_0.x_only_public_key().0)
+        })
+        .collect()
+}
+
+/// No false negatives on the live short path, for every receiving vector.
+///
+/// Each vector transaction is served the way the oracle serves it (8-byte
+/// prefixes of its taproot outputs, the 33-byte tweak, the display-order txid)
+/// and pushed through `scan_short_block_data`, the function the daemon calls per
+/// block. Wherever the vector expects the wallet to find at least one output,
+/// the block must come back as a probable match carrying that txid and tweak.
+///
+/// The k = 0 candidate each matched vector carries is pinned independently (see
+/// [`k0_candidates`]), so the test also proves *which* short-path branch did the
+/// work: the unlabelled `P_0`, a labelled one of either output parity, and the
+/// change label `m = 0`. Dropping the label iteration, or matching on anything
+/// other than the 8-byte x-only prefix, turns this red.
+///
+/// False positives (a probable match where the vector expects nothing) are only
+/// a wasted block fetch; they are counted and reported, and pinned at zero on
+/// these vectors because an 8-byte prefix collision among them would be a
+/// fixture surprise worth looking at.
+#[test]
+fn official_vectors_reach_the_live_short_receive_path() {
+    let mut no_wire_tweak = 0usize;
+    let mut must_match = 0usize;
+    let mut must_not_match = 0usize;
+    let mut false_positives = Vec::new();
+    // Matched sub-cases whose only k = 0 candidate is labelled, by label.
+    let mut label_only: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut unlabelled_k0 = 0usize;
+    let mut parity_cases: BTreeMap<&str, bool> = BTreeMap::new();
+
+    for (case_idx, case) in vectors().iter().enumerate() {
+        for (sub_idx, receiving) in case.receiving.iter().enumerate() {
+            let what = format!("case {} sub {sub_idx} ({})", case_idx + 1, case.comment);
+            let (given, expected) = (&receiving.given, &receiving.expected);
+            let (tx, prevouts) = build_transaction(given);
+
+            let tweak = match compute_tweak_data(&tx, &prevouts) {
+                Ok(tweak) => tweak,
+                Err(err) => {
+                    // The oracle cannot publish a tweak for these, so there is no
+                    // short item to serve; classified as in the boundary test.
+                    let reason = classify_no_tweak(&tx, &prevouts, &err, &what);
+                    assert_eq!(reason, expected_no_tweak_reason(&case.comment), "{what}");
+                    assert!(expected.outputs.is_empty() && expected.n_outputs.is_none());
+                    no_wire_tweak += 1;
+                    continue;
+                }
+            };
+            assert_eq!(
+                tweak.to_string(),
+                expected.tweak.as_deref().expect("vector tweak"),
+                "{what}: served tweak"
+            );
+            let (scan_sk, spend_pk) = scan_keys(given);
+            let shared_secret = bdk_sp::compute_shared_secret(&scan_sk, &tweak);
+
+            let item = short_item(&tx, tweak);
+            assert_eq!(item.tweak.len(), 33, "{what}: served tweak length");
+            assert_eq!(
+                item.outputs_short.len(),
+                SHORT_PREFIX_LEN * given.outputs.len(),
+                "{what}: every vector output is taproot and must be served"
+            );
+
+            let mut scanner = blindbit_scanner(
+                scan_sk,
+                spend_pk,
+                &given.labels,
+                &format!("short-{case_idx}-{sub_idx}"),
+            );
+            let probable = scanner
+                .scan_short_block_data(short_block(&live_block(&tx), vec![item]))
+                .expect("short block scan");
+            let matched = match &probable {
+                Some(probable) => {
+                    assert!(!probable.spent, "{what}: no spent outputs were served");
+                    assert_eq!(
+                        probable.matched_txs,
+                        vec![(wire_txid(&tx), tweak)],
+                        "{what}: probable match must carry the served txid and tweak"
+                    );
+                    true
+                }
+                None => false,
+            };
+
+            let expected_count = expected.n_outputs.unwrap_or(expected.outputs.len());
+            if expected_count == 0 {
+                must_not_match += 1;
+                if matched {
+                    false_positives.push(what);
+                }
+                continue;
+            }
+
+            must_match += 1;
+            assert!(
+                matched,
+                "{what}: FALSE NEGATIVE on the live short path — the vector expects \
+                 {expected_count} output(s), but the block would never be fetched"
+            );
+
+            let k0 = k0_candidates(&tx, given, scan_sk, spend_pk, shared_secret);
+            assert!(
+                !k0.is_empty(),
+                "{what}: a transaction paying us must carry a k = 0 output"
+            );
+            if k0.contains(&None) {
+                unlabelled_k0 += 1;
+            } else {
+                for m in k0.iter().flatten() {
+                    *label_only.entry(*m).or_default() += 1;
+                }
+            }
+
+            for kind in ["even", "odd"] {
+                if case.comment.contains(&format!("label with {kind} parity")) {
+                    parity_cases.insert(kind, !k0.contains(&None));
+                }
+            }
+        }
+    }
+
+    for fp in &false_positives {
+        eprintln!("short-path false positive: {fp}");
+    }
+    eprintln!(
+        "short path: {must_match} sub-cases must match (all did), {must_not_match} must \
+         not, {} false positive(s), {no_wire_tweak} without a wire tweak",
+        false_positives.len()
+    );
+
+    assert_eq!(no_wire_tweak, NO_TWEAK_SUBCASE_COUNT);
+    assert_eq!(
+        must_match + must_not_match + no_wire_tweak,
+        RECEIVING_SUBCASE_COUNT,
+        "not every receiving sub-case reached the short path"
+    );
+    assert_eq!(
+        must_not_match, 1,
+        "the 'recipient ignores unrelated outputs' vector is no longer covered"
+    );
+    assert!(
+        false_positives.is_empty(),
+        "unexpected short-path false positives: {false_positives:?}"
+    );
+
+    // Branch coverage of the short path: vectors that can only be found through
+    // the label iteration, including both parities and the change label m = 0.
+    assert_eq!(
+        parity_cases.get("even"),
+        Some(&true),
+        "the even-parity label vector must be reachable only through a label"
+    );
+    assert_eq!(
+        parity_cases.get("odd"),
+        Some(&true),
+        "the odd-parity label vector must be reachable only through a label"
+    );
+    assert!(
+        label_only.contains_key(&0),
+        "no vector is reachable only through the change label m = 0: {label_only:?}"
+    );
+    let label_only_total: usize = label_only.values().sum();
+    assert_eq!(
+        label_only_total, 7,
+        "label-only coverage changed: {label_only:?}"
+    );
+    assert!(unlabelled_k0 > 0, "no unlabelled k = 0 vector was matched");
+    eprintln!("short path: {unlabelled_k0} matched via P_0, label-only by m: {label_only:?}");
+}
+
+/// Runs one vector through the whole live receive sequence — short scan, then
+/// (only on a probable match, as the daemon does) the full-block step — and
+/// returns every output the indexer now owns in the vector transaction, as
+/// `x-only key -> priv_key_tweak`, plus its label.
+fn live_receive(
+    given: &ReceivingGiven,
+    tx: &Transaction,
+    tweak: PublicKey,
+    tag: &str,
+) -> (Scanner, BTreeMap<XOnlyPublicKey, (SecretKey, Option<u32>)>) {
+    let (scan_sk, spend_pk) = scan_keys(given);
+    let mut scanner = blindbit_scanner(scan_sk, spend_pk, &given.labels, tag);
+    let block = live_block(tx);
+
+    let probable = scanner
+        .scan_short_block_data(short_block(&block, vec![short_item(tx, tweak)]))
+        .expect("short block scan");
+    if let Some(probable) = probable {
+        scanner.apply_matched_block(&block, &probable, LIVE_BLOCK_HEIGHT as u32);
+    }
+
+    let txid = tx.compute_txid();
+    let index = scanner.internal_indexer.index();
+    let labels: BTreeMap<OutPoint, Option<u32>> = index
+        .by_label
+        .iter()
+        .map(|&(label, outpoint)| (outpoint, label))
+        .collect();
+    let mut found = BTreeMap::new();
+    for (outpoint, tweak) in &index.by_shared_secret {
+        assert_eq!(
+            outpoint.txid, txid,
+            "{tag}: indexed an output of another tx"
+        );
+        let script = &tx.output[outpoint.vout as usize].script_pubkey;
+        let xonly = XOnlyPublicKey::from_slice(&script.as_bytes()[2..]).expect("taproot output");
+        let label = *labels
+            .get(outpoint)
+            .expect("every indexed output has a label entry");
+        assert!(
+            found.insert(xonly, (*tweak, label)).is_none(),
+            "{tag}: output key indexed twice"
+        );
+    }
+    (scanner, found)
+}
+
+/// The real receive step after a probable match, for every vector.
+///
+/// After [`official_vectors_reach_the_live_short_receive_path`] establishes that
+/// the block is fetched, this pins what the daemon then *stores*: the vector
+/// transaction is placed in a full block and handed through
+/// `Scanner::apply_matched_block` (the production code that maps the oracle's
+/// display-order txids to the block's transactions and calls
+/// `apply_block_relevant` on the external indexer). The outputs the indexer
+/// owns afterwards must be exactly the vector's `expected.outputs`, with the
+/// vector's `priv_key_tweak` and a label that reproduces the output key.
+///
+/// The K_max vector is excluded here and has its own ignored test (SNB-540).
+#[test]
+fn official_vectors_live_receive_step_finds_expected_outputs() {
+    let mut exercised = 0usize;
+    let mut asserted_outputs = 0usize;
+    let mut labelled_outputs = 0usize;
+
+    for (case_idx, case) in vectors().iter().enumerate() {
+        for (sub_idx, receiving) in case.receiving.iter().enumerate() {
+            let what = format!("case {} sub {sub_idx} ({})", case_idx + 1, case.comment);
+            let (given, expected) = (&receiving.given, &receiving.expected);
+            if expected.n_outputs.is_some() {
+                continue; // K_max: see the ignored SNB-540 test below.
+            }
+            let (tx, prevouts) = build_transaction(given);
+            let Ok(tweak) = compute_tweak_data(&tx, &prevouts) else {
+                continue; // no wire tweak; classified in the short-path test
+            };
+            let (scan_sk, spend_pk) = scan_keys(given);
+            let shared_secret = bdk_sp::compute_shared_secret(&scan_sk, &tweak);
+
+            let (scanner, found) =
+                live_receive(given, &tx, tweak, &format!("live-{case_idx}-{sub_idx}"));
+
+            let found_tweaks: BTreeMap<XOnlyPublicKey, SecretKey> = found
+                .iter()
+                .map(|(key, (tweak, _))| (*key, *tweak))
+                .collect();
+            assert_eq!(
+                found_tweaks,
+                expected_outputs(expected),
+                "{what}: live receive step outputs / priv_key_tweak"
+            );
+
+            // Each stored label must reproduce the output key at some k.
+            for (key, (tweak, label)) in &found {
+                if let Some(m) = label {
+                    assert!(given.labels.contains(m), "{what}: stray label {m}");
+                    labelled_outputs += 1;
+                }
+                let k = (0..given.outputs.len() as u32)
+                    .find(|&k| tweak_for(shared_secret, scan_sk, k, *label) == *tweak)
+                    .unwrap_or_else(|| panic!("{what}: tweak/label mismatch for {key}"));
+                let label_pt = label.map(|m| label_point(scan_sk, m));
+                let p_k = get_silentpayment_pubkey(&spend_pk, &shared_secret, k, label_pt.as_ref());
+                assert_eq!(p_k.x_only_public_key().0, *key, "{what}: stored label");
+            }
+
+            // And the transaction is in the wallet graph iff something was found.
+            let in_graph = scanner
+                .internal_indexer
+                .graph()
+                .get_tx(tx.compute_txid())
+                .is_some();
+            assert_eq!(in_graph, !found.is_empty(), "{what}: wallet graph");
+            let staged = scanner
+                .stage
+                .indexer
+                .txid_to_partial_secret
+                .contains_key(&tx.compute_txid());
+            assert_eq!(staged, !found.is_empty(), "{what}: staged for persistence");
+
+            asserted_outputs += found.len();
+            exercised += 1;
+        }
+    }
+
+    assert_eq!(
+        exercised,
+        SCANNED_SUBCASE_COUNT - K_MAX_SUBCASE_COUNT,
+        "not every scannable non-K_max sub-case reached the live receive step"
+    );
+    assert_eq!(
+        asserted_outputs, EXPECTED_OUTPUT_COUNT,
+        "the fixture's per-output expectations were not all asserted on the live path"
+    );
+    assert_eq!(labelled_outputs, 10, "labelled-output coverage changed");
+}
+
+/// The BIP-352 recipient limit on the live receive path.
+///
+/// Ignored because it fails today: `apply_block_relevant` enforces no K_max, so
+/// the live path stores one output more than BIP-352 allows on this vector.
+/// That is SNB-540; this test is the acceptance check for it. It is also slow
+/// (the external indexer's scan is quadratic in the 2324 outputs).
+#[test]
+#[ignore = "SNB-540: the live receive path enforces no K_max (stores 2324 of 2323)"]
+fn official_vectors_live_receive_step_enforces_k_max() {
+    let mut exercised = 0usize;
+    for case in vectors() {
+        for receiving in &case.receiving {
+            let Some(n_outputs) = receiving.expected.n_outputs else {
+                continue;
+            };
+            let given = &receiving.given;
+            let (tx, prevouts) = build_transaction(given);
+            let tweak = compute_tweak_data(&tx, &prevouts).expect("K_max vector inputs are valid");
+            let (_, found) = live_receive(given, &tx, tweak, "live-kmax");
+            assert_eq!(
+                found.len(),
+                n_outputs,
+                "{}: receiver must stop at K_max",
+                case.comment
+            );
+            exercised += 1;
+        }
+    }
+    assert_eq!(exercised, K_MAX_SUBCASE_COUNT);
 }
