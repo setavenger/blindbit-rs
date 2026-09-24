@@ -173,38 +173,12 @@ impl Scanner {
                         .fetch_block_with_retry(&mut p2p_conn, block_hash, block_identifier.block_height)
                         .await?;
 
-                    // build partial secret hashmap, only populate with txids and secrets where we
-                    // suspect matches, skip the rest
-                    let mut partial_secrets =
-                        HashMap::with_capacity(probable_match.matched_txs.len());
-
-                    for tx in &block.txdata {
-                        if probable_match.spent {
-                            // todo: we will need to look at all spent outpoints in this
-                            // block and find the relevant txids for spent
-                        }
-
-                        for (txid_arr, tweak) in &probable_match.matched_txs {
-                            // this check should be optimised to a map lookup on all items
-                            let mut item_txid = *txid_arr;
-                            item_txid.reverse();
-
-                            if Txid::from_byte_array(item_txid) != tx.compute_txid() {
-                                continue;
-                            }
-
-                            let txid = byte_array_to_txid(txid_arr);
-
-                            partial_secrets.insert(txid, *tweak);
-                        }
-                    }
                     // Apply block to indexer and stage the changes
-                    let indexer_changes = self.internal_indexer.apply_block_relevant(
+                    self.apply_matched_block(
                         &block,
-                        partial_secrets,
+                        &probable_match,
                         block_identifier.block_height as u32,
                     );
-                    self.stage.indexer.merge(indexer_changes);
 
                     // Update block checkpoints: only store blocks where we found something
                     let block_height_u32 = block_identifier.block_height as u32;
@@ -691,6 +665,50 @@ impl Scanner {
         }
     }
 
+    /// The live receive step after a probable match: hands the full block and
+    /// the matched transactions' tweaks to the external indexer, which does the
+    /// real BIP-352 scan, and stages what it found.
+    ///
+    /// `probable_match.matched_txs` carries each txid as the oracle serves it
+    /// (display order) together with the served tweak (`input_hash * A`), which
+    /// `apply_block_relevant` takes as its "partial secret" and finishes the ECDH
+    /// on itself.
+    ///
+    /// Spends need no extra step here: `apply_block_relevant` inserts every
+    /// transaction whose input spends an indexed outpoint into the wallet graph,
+    /// which is what the balance reads.
+    fn apply_matched_block(
+        &mut self,
+        block: &bitcoin::Block,
+        probable_match: &ProbableMatch,
+        height: u32,
+    ) {
+        // build partial secret hashmap, only populate with txids and secrets where we
+        // suspect matches, skip the rest
+        let mut partial_secrets = HashMap::with_capacity(probable_match.matched_txs.len());
+
+        for tx in &block.txdata {
+            for (txid_arr, tweak) in &probable_match.matched_txs {
+                // this check should be optimised to a map lookup on all items
+                let mut item_txid = *txid_arr;
+                item_txid.reverse();
+
+                if Txid::from_byte_array(item_txid) != tx.compute_txid() {
+                    continue;
+                }
+
+                let txid = byte_array_to_txid(txid_arr);
+
+                partial_secrets.insert(txid, *tweak);
+            }
+        }
+        // Apply block to indexer and stage the changes
+        let indexer_changes = self
+            .internal_indexer
+            .apply_block_relevant(block, partial_secrets, height);
+        self.stage.indexer.merge(indexer_changes);
+    }
+
     fn probabilistic_match(
         &mut self,
         item: &ComputeIndexTxItem,
@@ -841,3 +859,7 @@ impl Scanner {
 #[cfg(test)]
 #[path = "bip352_vectors.rs"]
 mod bip352_vectors;
+
+#[cfg(test)]
+#[path = "testkit_t0.rs"]
+mod testkit_t0;
