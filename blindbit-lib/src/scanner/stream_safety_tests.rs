@@ -107,15 +107,22 @@ fn scanner(tag: &str, oracle: &'static str) -> (Scanner, TempState) {
     ));
     let client = crate::OracleServiceClient::new(Channel::from_static(oracle).connect_lazy());
     let socket: SocketAddr = "127.0.0.1:1".parse().expect("socket address");
-    let scanner = Scanner::new(client, socket, scan_sk, spend_pk, 0, state.clone(), Network::Regtest);
+    let scanner = Scanner::new(
+        client,
+        socket,
+        scan_sk,
+        spend_pk,
+        0,
+        state.clone(),
+        Network::Regtest,
+    );
     (scanner, TempState(state))
 }
 
 /// One block at `height` holding a single silent payment to the test wallet,
-/// plus the oracle message that describes it.
+/// served in place of P2P, and the oracle message that describes it.
 struct PaymentBlock {
     height: u64,
-    block: Block,
     message: BlockScanDataShortResponse,
 }
 
@@ -192,7 +199,7 @@ fn payment_block(height: u64) -> PaymentBlock {
         spent_outputs: vec![],
     };
     serve(&block);
-    PaymentBlock { height, block, message }
+    PaymentBlock { height, message }
 }
 
 /// What an oracle sends today for a height it has not indexed: OK, with an
@@ -224,7 +231,6 @@ fn empty_hash_block_mid_range_stops_scan_and_next_scan_finds_its_outputs() {
         let a = payment_block(1100);
         let b = payment_block(1101);
         let c = payment_block(1102);
-        assert_eq!(a.block.block_hash(), served_block(&a.block.block_hash()).unwrap().block_hash());
 
         let first = TestStream::new(vec![
             Ok(a.message.clone()),
@@ -236,9 +242,16 @@ fn empty_hash_block_mid_range_stops_scan_and_next_scan_finds_its_outputs() {
             .await
             .expect_err("a block without a valid hash must stop the scan");
         let msg = err.to_string();
-        assert!(msg.contains(&b.height.to_string()), "error names the height: {msg}");
+        assert!(
+            msg.contains(&b.height.to_string()),
+            "error names the height: {msg}"
+        );
         assert_eq!(scanner.get_last_scanned_block_height(), a.height);
-        assert_eq!(owned_outputs(&scanner), 1, "only the block before the gap is applied");
+        assert_eq!(
+            owned_outputs(&scanner),
+            1,
+            "only the block before the gap is applied"
+        );
 
         // Resume where the scanner says, now that the oracle serves the block.
         let resume = scanner.get_last_scanned_block_height() + 1;
@@ -259,7 +272,11 @@ fn malformed_block_hash_stops_scan() {
         let (mut scanner, _state) = scanner("short-hash", "http://127.0.0.1:1");
         let a = payment_block(1200);
         let mut bad = payment_block(1201).message;
-        bad.block_identifier.as_mut().unwrap().block_hash.truncate(31);
+        bad.block_identifier
+            .as_mut()
+            .unwrap()
+            .block_hash
+            .truncate(31);
         let mut zero = payment_block(1201).message;
         zero.block_identifier.as_mut().unwrap().block_hash = vec![0; 32];
 
@@ -285,9 +302,16 @@ fn skipped_height_stops_scan() {
             .scan_block_stream(a.height, c.height, stream)
             .await
             .expect_err("a height gap must stop the scan");
-        assert!(err.to_string().contains("1301"), "error names the expected height: {err}");
+        assert!(
+            err.to_string().contains("1301"),
+            "error names the expected height: {err}"
+        );
         assert_eq!(scanner.get_last_scanned_block_height(), a.height);
-        assert_eq!(owned_outputs(&scanner), 1, "the block after the gap is not applied");
+        assert_eq!(
+            owned_outputs(&scanner),
+            1,
+            "the block after the gap is not applied"
+        );
     });
 }
 
@@ -326,8 +350,16 @@ fn error_status_mid_stream_is_a_clean_error() {
                 .scan_block_stream(a.height, a.height + 1, stream)
                 .await
                 .expect_err("an error status must end the scan with an error");
-            assert!(err.to_string().contains("1501"), "{code:?}: error names the height: {err}");
-            assert_eq!(scanner.get_last_scanned_block_height(), a.height, "{code:?}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("height 1501") && msg.contains(&format!("{code:?}")),
+                "error names the height and the status code: {msg}"
+            );
+            assert_eq!(
+                scanner.get_last_scanned_block_height(),
+                a.height,
+                "{code:?}"
+            );
             assert_eq!(owned_outputs(&scanner), 1, "{code:?}");
         }
     });
@@ -343,7 +375,10 @@ fn stream_ending_before_requested_end_is_an_error() {
             .scan_block_stream(a.height, a.height + 2, stream)
             .await
             .expect_err("a stream that stops short of `end` must not report success");
-        assert!(err.to_string().contains("1601"), "error names the missing height: {err}");
+        assert!(
+            err.to_string().contains("1601"),
+            "error names the missing height: {err}"
+        );
         assert_eq!(scanner.get_last_scanned_block_height(), a.height);
     });
 }
