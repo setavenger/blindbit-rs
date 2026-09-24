@@ -48,6 +48,26 @@ fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEnt
     }
 }
 
+/// The per-block message source of a block-range scan.
+///
+/// Production scans read a tonic `Streaming`; tests feed messages and error
+/// statuses in-process to exercise how the scanner reacts to what an oracle
+/// can send mid-range.
+pub(crate) trait BlockScanDataStream {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send;
+}
+
+impl BlockScanDataStream for tonic::Streaming<BlockScanDataShortResponse> {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send
+    {
+        self.message()
+    }
+}
+
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
     pub async fn scan_block_range(
@@ -63,13 +83,24 @@ impl Scanner {
             dustlimit: 0,
             cut_through: false,
         });
-        let mut stream = self
+        let stream = self
             .client
             .stream_block_scan_data_short(request)
             .await
             .unwrap()
             .into_inner();
 
+        self.scan_block_stream(start, end, stream).await
+    }
+
+    /// Scan the per-block messages of one `StreamBlockScanDataShort` response
+    /// for the range `start..=end`.
+    pub(crate) async fn scan_block_stream<S: BlockScanDataStream>(
+        &mut self,
+        start: u64,
+        end: u64,
+        mut stream: S,
+    ) -> Result<(), ScannerError> {
         // Stamp sp_start_height into the index so the Electrum server's
         // SP subscription response always uses the correct scan start key.
         // Only set it on the first call; watch_chain increments start each
@@ -92,7 +123,7 @@ impl Scanner {
 
         let mut p2p_conn: Option<p2p::P2pConnection> = None;
 
-        while let Some(block_scan_data) = stream.message().await.unwrap() {
+        while let Some(block_scan_data) = stream.next_message().await.unwrap() {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -485,6 +516,12 @@ impl Scanner {
         height: u64,
     ) -> Result<bitcoin::Block, ScannerError> {
         const MAX_ATTEMPTS: u32 = 4;
+
+        // Tests serve full blocks in-process instead of over P2P.
+        #[cfg(test)]
+        if let Some(block) = super::stream_safety_tests::served_block(&block_hash) {
+            return Ok(block);
+        }
 
         let mut last_err: Option<ScannerError> = None;
         for attempt in 1..=MAX_ATTEMPTS {
