@@ -173,38 +173,14 @@ impl Scanner {
                         .fetch_block_with_retry(&mut p2p_conn, block_hash, block_identifier.block_height)
                         .await?;
 
-                    // build partial secret hashmap, only populate with txids and secrets where we
-                    // suspect matches, skip the rest
-                    let mut partial_secrets =
-                        HashMap::with_capacity(probable_match.matched_txs.len());
-
-                    for tx in &block.txdata {
-                        if probable_match.spent {
-                            // todo: we will need to look at all spent outpoints in this
-                            // block and find the relevant txids for spent
-                        }
-
-                        for (txid_arr, tweak) in &probable_match.matched_txs {
-                            // this check should be optimised to a map lookup on all items
-                            let mut item_txid = *txid_arr;
-                            item_txid.reverse();
-
-                            if Txid::from_byte_array(item_txid) != tx.compute_txid() {
-                                continue;
-                            }
-
-                            let txid = byte_array_to_txid(txid_arr);
-
-                            partial_secrets.insert(txid, *tweak);
-                        }
-                    }
                     // Apply block to indexer and stage the changes
-                    let indexer_changes = self.internal_indexer.apply_block_relevant(
+                    self.apply_matched_block(
                         &block,
-                        partial_secrets,
+                        &probable_match,
                         block_identifier.block_height as u32,
                     );
-                    self.stage.indexer.merge(indexer_changes);
+                    // Record newly found outputs and confirmed spends of owned ones.
+                    self.sync_owned_outputs();
 
                     // Update block checkpoints: only store blocks where we found something
                     let block_height_u32 = block_identifier.block_height as u32;
@@ -664,21 +640,32 @@ impl Scanner {
         }
 
         // Spent-output check — only when we have a valid block_hash to report.
+        // The oracle serves the first 8 bytes of each spent taproot output's
+        // x-only key. A prefix hit on an unspent owned output only makes the
+        // block worth fetching; the spend is confirmed (by exact outpoint) when
+        // the block is applied, so a foreign key sharing the prefix marks
+        // nothing.
         if let Some(block_hash) = block_hash_opt {
             let spent_outputs_count = block_data.spent_outputs.len() / 8;
             for i in 0..spent_outputs_count {
-                let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
-                for pubkey in &self.owned_outputs {
-                    if pubkey[..8] == *spent_output {
-                        probable_match.spent = true;
-
-                        tracing::info!(pubkey = %hex::encode(pubkey), "spent output detected");
-                        if self.notify_spent_outpoints.is_empty() {
-                            continue;
-                        }
-                        if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                            tracing::warn!(error = ?e, "failed to send spent output notification");
-                        }
+                let prefix: [u8; 8] = block_data.spent_outputs[i * 8..(i + 1) * 8]
+                    .try_into()
+                    .expect("slice is 8 bytes");
+                let Some(candidates) = self.owned_prefixes.get(&prefix) else {
+                    continue;
+                };
+                probable_match.spent = true;
+                for outpoint in candidates {
+                    tracing::info!(
+                        outpoint = %outpoint,
+                        short_pubkey = %hex::encode(prefix),
+                        "possible spend of owned output; fetching block to confirm"
+                    );
+                    if self.notify_spent_outpoints.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
+                        tracing::warn!(error = ?e, "failed to send spent output notification");
                     }
                 }
             }
@@ -689,6 +676,50 @@ impl Scanner {
         } else {
             Ok(Some(probable_match))
         }
+    }
+
+    /// The live receive step after a probable match: hands the full block and
+    /// the matched transactions' tweaks to the external indexer, which does the
+    /// real BIP-352 scan, and stages what it found.
+    ///
+    /// `probable_match.matched_txs` carries each txid as the oracle serves it
+    /// (display order) together with the served tweak (`input_hash * A`), which
+    /// `apply_block_relevant` takes as its "partial secret" and finishes the ECDH
+    /// on itself.
+    ///
+    /// Spends need no extra step here: `apply_block_relevant` inserts every
+    /// transaction whose input spends an indexed outpoint into the wallet graph,
+    /// which is what the balance and [`Scanner::sync_owned_outputs`] read.
+    fn apply_matched_block(
+        &mut self,
+        block: &bitcoin::Block,
+        probable_match: &ProbableMatch,
+        height: u32,
+    ) {
+        // build partial secret hashmap, only populate with txids and secrets where we
+        // suspect matches, skip the rest
+        let mut partial_secrets = HashMap::with_capacity(probable_match.matched_txs.len());
+
+        for tx in &block.txdata {
+            for (txid_arr, tweak) in &probable_match.matched_txs {
+                // this check should be optimised to a map lookup on all items
+                let mut item_txid = *txid_arr;
+                item_txid.reverse();
+
+                if Txid::from_byte_array(item_txid) != tx.compute_txid() {
+                    continue;
+                }
+
+                let txid = byte_array_to_txid(txid_arr);
+
+                partial_secrets.insert(txid, *tweak);
+            }
+        }
+        // Apply block to indexer and stage the changes
+        let indexer_changes = self
+            .internal_indexer
+            .apply_block_relevant(block, partial_secrets, height);
+        self.stage.indexer.merge(indexer_changes);
     }
 
     fn probabilistic_match(
@@ -841,3 +872,7 @@ impl Scanner {
 #[cfg(test)]
 #[path = "bip352_vectors.rs"]
 mod bip352_vectors;
+
+#[cfg(test)]
+#[path = "owned_outputs_tests.rs"]
+mod owned_outputs_tests;
