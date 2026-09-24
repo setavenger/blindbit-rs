@@ -7,6 +7,8 @@ mod load;
 mod p2p;
 mod scanner;
 mod scanning;
+#[cfg(test)]
+mod stream_safety_tests;
 mod types;
 mod utils;
 

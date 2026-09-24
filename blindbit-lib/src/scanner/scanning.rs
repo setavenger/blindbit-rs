@@ -10,7 +10,8 @@ use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 use tokio::time;
 
 use crate::oracle_grpc::{
-    BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
+    BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
+    RangedBlockHeightRequestFiltered,
 };
 
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
@@ -48,6 +49,81 @@ fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEnt
     }
 }
 
+/// The per-block message source of a block-range scan.
+///
+/// Production scans read a tonic `Streaming`; tests feed messages and error
+/// statuses in-process to exercise how the scanner reacts to what an oracle
+/// can send mid-range.
+pub(crate) trait BlockScanDataStream {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send;
+}
+
+impl BlockScanDataStream for tonic::Streaming<BlockScanDataShortResponse> {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send
+    {
+        self.message()
+    }
+}
+
+/// Read the next block message, turning an error status into a scanner error
+/// that names the height the scan stopped at.
+///
+/// There is no retry here: the scan stops at `height` and the caller rescans
+/// from there (`watch_chain` on its next poll, `blindbit-cli` on its next run).
+async fn next_block<S: BlockScanDataStream>(
+    stream: &mut S,
+    height: u64,
+) -> Result<Option<BlockScanDataShortResponse>, ScannerError> {
+    stream.next_message().await.map_err(|status| {
+        stream_stopped(
+            height,
+            &format!("oracle stream error {:?}: {}", status.code(), status.message()),
+        )
+    })
+}
+
+/// A block message is only scannable if it is the next height in the range
+/// and carries a real block hash. An oracle answers a height it has not
+/// indexed with an empty hash and no data; treating that as an empty block
+/// would silently skip any payment in it.
+fn check_block_identifier(
+    block_identifier: &BlockIdentifier,
+    expected_height: u64,
+) -> Result<(), ScannerError> {
+    if block_identifier.block_height != expected_height {
+        return Err(stream_stopped(
+            expected_height,
+            &format!(
+                "the oracle sent height {} instead",
+                block_identifier.block_height
+            ),
+        ));
+    }
+    let hash = &block_identifier.block_hash;
+    if hash.len() != 32 || hash.iter().all(|b| *b == 0) {
+        return Err(stream_stopped(
+            expected_height,
+            &format!(
+                "the oracle sent no valid block hash ({} bytes); the height is probably not indexed",
+                hash.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn stream_stopped(height: u64, reason: &str) -> ScannerError {
+    format!(
+        "scan stopped at height {height}: {reason}; nothing from height {height} on was scanned, \
+         rescan from height {height}"
+    )
+    .into()
+}
+
 impl Scanner {
     /// scan a block range for new utxos and spent outpoints
     pub async fn scan_block_range(
@@ -63,13 +139,39 @@ impl Scanner {
             dustlimit: 0,
             cut_through: false,
         });
-        let mut stream = self
+        let stream = self
             .client
             .stream_block_scan_data_short(request)
             .await
-            .unwrap()
+            .map_err(|status| -> ScannerError {
+                format!(
+                    "oracle refused to stream blocks {start}..={end}: {:?}: {}",
+                    status.code(),
+                    status.message()
+                )
+                .into()
+            })?
             .into_inner();
 
+        self.scan_block_stream(start, end, stream).await
+    }
+
+    /// Scan the per-block messages of one `StreamBlockScanDataShort` response
+    /// for the range `start..=end`.
+    ///
+    /// Every height in the range must arrive, in order, with a valid block
+    /// hash. Anything else — a message the oracle sends for a height it has
+    /// not indexed (empty block hash), a skipped or repeated height, an error
+    /// status, or a stream that ends before `end` — stops the scan with an
+    /// error. Such a block is never taken as "no payments": the scan height
+    /// stays at the last block that was fully processed, so the next scan
+    /// resumes at the block that could not be scanned.
+    pub(crate) async fn scan_block_stream<S: BlockScanDataStream>(
+        &mut self,
+        start: u64,
+        end: u64,
+        mut stream: S,
+    ) -> Result<(), ScannerError> {
         // Stamp sp_start_height into the index so the Electrum server's
         // SP subscription response always uses the correct scan start key.
         // Only set it on the first call; watch_chain increments start each
@@ -92,7 +194,9 @@ impl Scanner {
 
         let mut p2p_conn: Option<p2p::P2pConnection> = None;
 
-        while let Some(block_scan_data) = stream.message().await.unwrap() {
+        let mut expected_height = start;
+
+        while let Some(block_scan_data) = next_block(&mut stream, expected_height).await? {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -100,6 +204,8 @@ impl Scanner {
                 )
                 .into());
             };
+            check_block_identifier(&block_identifier, expected_height)?;
+            expected_height += 1;
             let block_id = BlockIdentifierDisplay(&block_identifier);
             tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
 
@@ -141,21 +247,6 @@ impl Scanner {
                         }
                         Some(probable_match) => probable_match,
                     };
-                    // Guard: if block_hash is malformed (already warned in
-                    // scan_short_block_data) we cannot pull the full block
-                    // via P2P.  Advance progress and move on.
-                    if block_identifier.block_hash.len() != 32 {
-                        self.notify_electrum_scan_progress(
-                            block_identifier.block_height,
-                            start,
-                            end,
-                        )
-                        .await;
-                        self.last_scanned_block_height = block_identifier.block_height;
-                        self.stage.last_scanned_block_height = block_identifier.block_height;
-                        continue;
-                    }
-
                     // pull the full block data
 
                     // Ensure we have exactly 32 bytes
@@ -432,6 +523,13 @@ impl Scanner {
             self.stage.last_scanned_block_height = block_identifier.block_height;
         }
 
+        if expected_height <= end {
+            return Err(stream_stopped(
+                expected_height,
+                "the oracle ended the stream before this height",
+            ));
+        }
+
         let outpoints: Vec<(u32, OutPoint)> = self
             .internal_indexer
             .index()
@@ -485,6 +583,12 @@ impl Scanner {
         height: u64,
     ) -> Result<bitcoin::Block, ScannerError> {
         const MAX_ATTEMPTS: u32 = 4;
+
+        // Tests serve full blocks in-process instead of over P2P.
+        #[cfg(test)]
+        if let Some(block) = super::stream_safety_tests::served_block(&block_hash) {
+            return Ok(block);
+        }
 
         let mut last_err: Option<ScannerError> = None;
         for attempt in 1..=MAX_ATTEMPTS {
