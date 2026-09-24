@@ -1,0 +1,315 @@
+{
+  "format": "blindbit-testkit/t0-fixture/1",
+  "scenario": "dust-boundary",
+  "scenario_sha256": "f1d6dad0cb06ead98e50d6a632648a2db543b64218f0f89b4f6572eec8133885",
+  "configuration": "full-basic",
+  "network": "regtest",
+  "wallets": [
+    {
+      "id": "alice",
+      "scan_secret": "ad63c28889ad7ff380f7074702a8741acaaf151a14082c6953b377bfa41e1b4b",
+      "spend_pubkey": "025686035a6d65a6ce575e5ca17b5424c2170ce0fcbac484296f10d12f1cb5c849",
+      "labels": []
+    },
+    {
+      "id": "bob",
+      "scan_secret": "8ce64ceefa2ccfecc2a4792c243bd893b0c16a9f390543af9a92cfa095d77b7f",
+      "spend_pubkey": "024a1a773548136fd37aa0d64631bd513d02bbef2b195282a20d4a71be8e4874e2",
+      "labels": []
+    },
+    {
+      "id": "carol",
+      "scan_secret": "64c737dea7bb114e76073f5c51a2e7dce078aad2001232676867834c3df946bf",
+      "spend_pubkey": "035d77e08054d6b379689f6c7ae0e1aab1cee4111368492c032d5f8b45a2f7c706",
+      "labels": []
+    }
+  ],
+  "actions": [
+    {
+      "index": 0,
+      "kind": "fund",
+      "blocks": [
+        1
+      ]
+    },
+    {
+      "index": 1,
+      "kind": "send",
+      "blocks": [
+        2
+      ]
+    },
+    {
+      "index": 2,
+      "kind": "send",
+      "blocks": [
+        3
+      ]
+    },
+    {
+      "index": 3,
+      "kind": "send",
+      "blocks": [
+        4
+      ]
+    },
+    {
+      "index": 4,
+      "kind": "send_multi",
+      "blocks": [
+        5
+      ]
+    },
+    {
+      "index": 5,
+      "kind": "send_multi",
+      "blocks": [
+        6
+      ]
+    },
+    {
+      "index": 6,
+      "kind": "send",
+      "blocks": [
+        7
+      ]
+    },
+    {
+      "index": 7,
+      "kind": "spend",
+      "blocks": [
+        8
+      ]
+    },
+    {
+      "index": 8,
+      "kind": "spend",
+      "blocks": [
+        9
+      ]
+    }
+  ],
+  "blocks": [
+    {
+      "height": 1,
+      "txs": [
+        {
+          "txid": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904",
+          "hex": "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2f626c696e646269742d746573746b69742f6c69622f66756e642f302f616c6963652f616c6963652d66756e64696e67ffffffff0100e1f5050000000022512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc9600000000",
+          "prevouts": [],
+          "go_tweak": null
+        }
+      ]
+    },
+    {
+      "height": 2,
+      "txs": [
+        {
+          "txid": "4bf47544a5ef982ec803bf8f2c0883ffd922a243cef5bf094b93a73110406504",
+          "hex": "0200000000010104994c76f39b21dc21956632f3997e0adcac3973939287a04d942971ffb4be7f0000000000ffffffff02e803000000000000225120db6ac3688f2f287163a5ff48845f78b68bb8874692ad64d563197f9a9e72c93f18ddf50500000000160014dde5bccf279ebfbfa10e2566f58b8928ea6f615c0140647db8048bc95d9875304a8d579925f677c7980a24881c30deb69f6d1e8755ce5e48a7133f76959605ca3da37b5ddaf13caa79b144e483ca75fc7d587f81294f00000000",
+          "prevouts": [
+            {
+              "outpoint": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904:0",
+              "value_sats": 100000000,
+              "script_pubkey": "512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc96"
+            }
+          ],
+          "go_tweak": "02bd63b9f6daddfabb7be1b35f23e163aa15bae136feeafc9ce6ff52c30b7fa271"
+        }
+      ]
+    },
+    {
+      "height": 3,
+      "txs": [
+        {
+          "txid": "8120839ed47fb7d424203db5b096f9e7202e33d265856d1c8186b8c7119bc2fa",
+          "hex": "020000000001010465401031a7934b09bff5ce43a222d9ff83082c8fbf03c82e98efa54475f44b0100000000ffffffff02e703000000000000225120bc2f732b450768f9c138976ea574129ec8a7d36b6f009094ed4c98afe39ee81631d9f50500000000160014bfcac6afc5863a157520e29f9d480dfc5d88940302483045022100b0adb22f2c9ecc72d9d4580015dd3fe42947d2ee3aea74da920cfa9b2df9099e022011c44b83c4dfd3cfac74dae05fffff7ed4da8e6b1bc3160c5e21ce5e87b0f6cd0121032156667d313d3ec6b12384855a1718e0f632532b2b775cf612b864b1e322f94a00000000",
+          "prevouts": [
+            {
+              "outpoint": "4bf47544a5ef982ec803bf8f2c0883ffd922a243cef5bf094b93a73110406504:1",
+              "value_sats": 99999000,
+              "script_pubkey": "0014dde5bccf279ebfbfa10e2566f58b8928ea6f615c"
+            }
+          ],
+          "go_tweak": "02c54a57d9ce630ea00aed19e0c5b1a23d234c7407c4945e1980abe67404a10642"
+        }
+      ]
+    },
+    {
+      "height": 4,
+      "txs": [
+        {
+          "txid": "f8893ffb0b6f4a1a85f09f0663715cbc01b98fa30de0b3e3e78edba5db9fd16d",
+          "hex": "02000000000101fac29b11c7b886811c6d8565d2332e20e7f996b0b53d2024d4b77fd49e8320810100000000ffffffff02e903000000000000225120551dbe53b946372c216a45c50bab89a9d93de077100a7c6f2c523d288afc427a48d5f50500000000160014f381bcd1e8b99f0132ca5a940aa62d0c0d6fa4a50248304502210093a5fd8c660693a721283388031cff02d09517a0e3ae0b6fc9ff67a366484e3b022065d80422573622db3a11dcd6509fa78459ed11adc3d0a8a1c9537a91c927194601210223aff986eeee8ea76cbb00f585dca543609cc9ae2c8c5e8aead8b51d5271d34a00000000",
+          "prevouts": [
+            {
+              "outpoint": "8120839ed47fb7d424203db5b096f9e7202e33d265856d1c8186b8c7119bc2fa:1",
+              "value_sats": 99998001,
+              "script_pubkey": "0014bfcac6afc5863a157520e29f9d480dfc5d889403"
+            }
+          ],
+          "go_tweak": "02cb97f9555cae63ec0d30a851c33639cba3eff933a7f30a78e82b02ac9949fbb4"
+        }
+      ]
+    },
+    {
+      "height": 5,
+      "txs": [
+        {
+          "txid": "84db90c77a162d4a9df246b1701e65b30500a4731692481d53e26d558dc22342",
+          "hex": "020000000001016dd19fdba5db8ee7e3b3e00da38fb901bc5c7163069ff0851a4a6f0bfb3f89f80100000000ffffffff03e7030000000000002251206d5603ef4a34d145a38db078da2923dae07c5c85a33740a12098f542757f043ee803000000000000225120a73111b4758a7d267072575c905db1e8838cc567f1cbb70f01f3bd9fcdaeabc879cdf505000000001600148f932fe236236761e63e7f604a11cd73a2a2352402473044022019690a312ae39046ece2cdd4ed8cf93eea7dc75fdc263fcc6dddedc1661ee266022035fafa2b0afe6235f380274060c713deab5806765a46763c063e18779410911e012102fb9034f573b3b35d7e18abc72e473fa71f51d3ab990806683786a8afbf21b86800000000",
+          "prevouts": [
+            {
+              "outpoint": "f8893ffb0b6f4a1a85f09f0663715cbc01b98fa30de0b3e3e78edba5db9fd16d:1",
+              "value_sats": 99997000,
+              "script_pubkey": "0014f381bcd1e8b99f0132ca5a940aa62d0c0d6fa4a5"
+            }
+          ],
+          "go_tweak": "0215e4574715afd21bb962eb4f00371542bd5c3f12fc851453e338d252e029fd31"
+        }
+      ]
+    },
+    {
+      "height": 6,
+      "txs": [
+        {
+          "txid": "4bce386788dc6c54d85f199b2200f434149b8e30350a156f148080e083bcaca0",
+          "hex": "020000000001014223c28d556de2531d48921673a40005b3651e70b146f29d4a2d167ac790db840200000000ffffffff03e703000000000000225120fe8bfafdcce9bcc29a0a35ffb7c70625cdc10171e357131dcc7d7e58c8a09739e8030000000000002251209cab02c03df7b04a30d0d87c3fbc781743f3c9d81843a887807abf9369b055a3aac5f50500000000160014aa7dcd2cbe7a7355eae672a1489c65b3b978ead402483045022100cb344da0aca6ac022c4aad750abffe9c9e459b1794460d996c592c8e8b5f773c02204454e5ad804f218d4bd9a17e1e35543ca7d63be029e1298c6a5f19e1be6b1bde012102b147ff0a75f2c687e1b728badd6712eebcab96b630dbd0726bbfbf90a609d85300000000",
+          "prevouts": [
+            {
+              "outpoint": "84db90c77a162d4a9df246b1701e65b30500a4731692481d53e26d558dc22342:2",
+              "value_sats": 99995001,
+              "script_pubkey": "00148f932fe236236761e63e7f604a11cd73a2a23524"
+            }
+          ],
+          "go_tweak": "02235956d370692c0ed38678cf5009b8b3260b44ed3c64b867fc7975c22e47b1de"
+        }
+      ]
+    },
+    {
+      "height": 7,
+      "txs": [
+        {
+          "txid": "771574a83791594cfcb31dbbfebacb8da19daea14d6fb6526a09cd0c9f1c3852",
+          "hex": "02000000000101a0acbc83e08080146f150a35308e9b1434f400229b195fd8546cdc886738ce4b0200000000ffffffff02e90300000000000022512059836ebe9b606f63d4f31af0b937c98d6e6f9e31e0b04c2aedff415aec551c7fc1c1f50500000000160014618bbe62d2c6fd320955abc835f4ee6ba8eace9b024730440220687b19a2a8dfe4e0f1a5d0bff9b8c6357412bf1b302fa1e37ac77f0b18c4a03602204f3bdbb67e56a99aae574649f3d7bbdeea3a8849472a31461d1283485a5a2846012102f7a6c4b1d326c2cf4e1d7dd2004c35571431548a698264f5037597aa183c4f9600000000",
+          "prevouts": [
+            {
+              "outpoint": "4bce386788dc6c54d85f199b2200f434149b8e30350a156f148080e083bcaca0:2",
+              "value_sats": 99993002,
+              "script_pubkey": "0014aa7dcd2cbe7a7355eae672a1489c65b3b978ead4"
+            }
+          ],
+          "go_tweak": "02a7cf9988ae24608f934e58b21989f9f2a58f5d0ca00ac0de90f970dff0510b68"
+        }
+      ]
+    },
+    {
+      "height": 8,
+      "txs": [
+        {
+          "txid": "f262ab90d1387fef953d30109fbb13ba70392c5fa5c64bf9b32d38a65e679838",
+          "hex": "02000000000101a0acbc83e08080146f150a35308e9b1434f400229b195fd8546cdc886738ce4b0100000000ffffffff01e803000000000000160014996a8a5c436bd81f59644ac6fd870a740274442601406bab9de9d6fe9d1042ae437c47c34b9eb31f9f8b0c7a0b9ff6d8f2f265b864a349319e802d3bcf37ba66f5cd1cc06f39285202f2036cb7a8396fa4e04050926b00000000",
+          "prevouts": [
+            {
+              "outpoint": "4bce386788dc6c54d85f199b2200f434149b8e30350a156f148080e083bcaca0:1",
+              "value_sats": 1000,
+              "script_pubkey": "51209cab02c03df7b04a30d0d87c3fbc781743f3c9d81843a887807abf9369b055a3"
+            }
+          ],
+          "go_tweak": null
+        }
+      ]
+    },
+    {
+      "height": 9,
+      "txs": [
+        {
+          "txid": "3f06500ac248b9ce640e36309bc66195c937e4c018081989feaf2a5fb25ae0f8",
+          "hex": "0200000000010152381c9f0ccd096a52b66f4da1ae9da18dcbbafebb1db3fc4c599137a87415770000000000ffffffff01e90300000000000016001495b5de34b11452e814e16197867d4119efba98810140eb950f541027cd48160a1fb67bfeab1f8c106370b3e380bc9bc06e2e92abb0c96679c46c0dad4deeb48aa0934a0ecee69eb2c4ac02ab117667da2387cf914f2400000000",
+          "prevouts": [
+            {
+              "outpoint": "771574a83791594cfcb31dbbfebacb8da19daea14d6fb6526a09cd0c9f1c3852:0",
+              "value_sats": 1001,
+              "script_pubkey": "512059836ebe9b606f63d4f31af0b937c98d6e6f9e31e0b04c2aedff415aec551c7f"
+            }
+          ],
+          "go_tweak": null
+        }
+      ]
+    }
+  ],
+  "expected": [
+    {
+      "ref": "at-limit",
+      "wallet": "bob",
+      "outpoint": "4bf47544a5ef982ec803bf8f2c0883ffd922a243cef5bf094b93a73110406504:0",
+      "amount_sats": 1000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "below-limit",
+      "wallet": "bob",
+      "outpoint": "8120839ed47fb7d424203db5b096f9e7202e33d265856d1c8186b8c7119bc2fa:0",
+      "amount_sats": 999,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "above-limit",
+      "wallet": "carol",
+      "outpoint": "f8893ffb0b6f4a1a85f09f0663715cbc01b98fa30de0b3e3e78edba5db9fd16d:0",
+      "amount_sats": 1001,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "gap-below-k0",
+      "wallet": "bob",
+      "outpoint": "84db90c77a162d4a9df246b1701e65b30500a4731692481d53e26d558dc22342:0",
+      "amount_sats": 999,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "gap-at-k1",
+      "wallet": "bob",
+      "outpoint": "84db90c77a162d4a9df246b1701e65b30500a4731692481d53e26d558dc22342:1",
+      "amount_sats": 1000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "cut-below-k0",
+      "wallet": "carol",
+      "outpoint": "4bce386788dc6c54d85f199b2200f434149b8e30350a156f148080e083bcaca0:0",
+      "amount_sats": 999,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "cut-at-k1",
+      "wallet": "carol",
+      "outpoint": "4bce386788dc6c54d85f199b2200f434149b8e30350a156f148080e083bcaca0:1",
+      "amount_sats": 1000,
+      "label": null,
+      "spent": true,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "spent-above",
+      "wallet": "bob",
+      "outpoint": "771574a83791594cfcb31dbbfebacb8da19daea14d6fb6526a09cd0c9f1c3852:0",
+      "amount_sats": 1001,
+      "label": null,
+      "spent": true,
+      "outcome": "must_find"
+    }
+  ]
+}
