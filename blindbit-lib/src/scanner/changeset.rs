@@ -70,6 +70,13 @@ pub struct ChangeSet {
     pub public_spend_hex: Option<String>,
     /// Maximum label number used
     pub max_label_num: u32,
+    /// Hash of every block scanned within the reorg lookback window
+    /// (`REORG_LOOKBACK` heights below the highest one). Compared with the
+    /// oracle's hashes to detect a chain reorganisation; empty in state files
+    /// written before reorg handling, which start recording from their next
+    /// scan.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scanned_block_hashes: BTreeMap<u32, BlockHash>,
 }
 
 impl Merge for ChangeSet {
@@ -77,6 +84,7 @@ impl Merge for ChangeSet {
     fn merge(&mut self, other: Self) {
         // Merge block checkpoints (extend with new ones)
         self.block_checkpoints.extend(other.block_checkpoints);
+        self.scanned_block_hashes.extend(other.scanned_block_hashes);
         Merge::merge(&mut self.indexer, other.indexer);
 
         // Update metadata with the latest values
@@ -121,5 +129,6 @@ impl Merge for ChangeSet {
             && self.last_scanned_block_height == 0
             && self.last_scanned_block_height_rescan == 0
             && self.owned_outputs.is_empty()
+            && self.scanned_block_hashes.is_empty()
     }
 }
