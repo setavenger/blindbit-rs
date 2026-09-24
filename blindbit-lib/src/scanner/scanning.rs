@@ -10,11 +10,13 @@ use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 use tokio::time;
 
 use crate::oracle_grpc::{
-    BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem, RangedBlockHeightRequestFiltered,
+    BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
+    RangedBlockHeightRequestFiltered,
 };
 
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
 use super::p2p;
+use super::reorg::{BlockCheck, ReorgBelowStreamStart, ReorgTooDeep, block_hash_from_oracle};
 use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
@@ -48,28 +50,223 @@ fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEnt
     }
 }
 
-impl Scanner {
-    /// scan a block range for new utxos and spent outpoints
-    pub async fn scan_block_range(
+/// The per-block message source of a block-range scan.
+///
+/// Production scans read a tonic `Streaming`; tests feed messages and error
+/// statuses in-process to exercise how the scanner reacts to what an oracle
+/// can send mid-range.
+pub(crate) trait BlockScanDataStream {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send;
+}
+
+impl BlockScanDataStream for tonic::Streaming<BlockScanDataShortResponse> {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send
+    {
+        self.message()
+    }
+}
+
+/// Opens `StreamBlockScanDataShort` streams for a range scan. A scan may
+/// open a second stream lower down when it has to locate a fork point.
+pub(crate) trait BlockStreamSource {
+    type Stream: BlockScanDataStream + Send;
+
+    fn open(
         &mut self,
         start: u64,
         end: u64,
-    ) -> Result<(), ScannerError> {
-        // TODO: Implement sync check if needed
+    ) -> impl Future<Output = Result<Self::Stream, ScannerError>> + Send;
+}
 
+/// The oracle's gRPC service as a [`BlockStreamSource`].
+struct OracleStreams(crate::oracle_grpc::oracle_service_client::OracleServiceClient<tonic::transport::Channel>);
+
+impl BlockStreamSource for OracleStreams {
+    type Stream = tonic::Streaming<BlockScanDataShortResponse>;
+
+    async fn open(&mut self, start: u64, end: u64) -> Result<Self::Stream, ScannerError> {
         let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
             start,
             end,
             dustlimit: 0,
             cut_through: false,
         });
-        let mut stream = self
-            .client
+        Ok(self
+            .0
             .stream_block_scan_data_short(request)
             .await
-            .unwrap()
-            .into_inner();
+            .map_err(|status| -> ScannerError {
+                format!(
+                    "oracle refused to stream blocks {start}..={end}: {:?}: {}",
+                    status.code(),
+                    status.message()
+                )
+                .into()
+            })?
+            .into_inner())
+    }
+}
 
+/// Read the next block message, turning an error status into a scanner error
+/// that names the height the scan stopped at.
+///
+/// There is no retry here: the scan stops at `height` and the caller rescans
+/// from there (`watch_chain` on its next poll, `blindbit-cli` on its next run).
+async fn next_block<S: BlockScanDataStream>(
+    stream: &mut S,
+    height: u64,
+) -> Result<Option<BlockScanDataShortResponse>, ScannerError> {
+    stream.next_message().await.map_err(|status| {
+        stream_stopped(
+            height,
+            &format!("oracle stream error {:?}: {}", status.code(), status.message()),
+        )
+    })
+}
+
+/// A block message is only scannable if it is the next height in the range
+/// and carries a real block hash. An oracle answers a height it has not
+/// indexed with an empty hash and no data; treating that as an empty block
+/// would silently skip any payment in it.
+fn check_block_identifier(
+    block_identifier: &BlockIdentifier,
+    expected_height: u64,
+) -> Result<(), ScannerError> {
+    if block_identifier.block_height != expected_height {
+        return Err(stream_stopped(
+            expected_height,
+            &format!(
+                "the oracle sent height {} instead",
+                block_identifier.block_height
+            ),
+        ));
+    }
+    let hash = &block_identifier.block_hash;
+    if hash.len() != 32 || hash.iter().all(|b| *b == 0) {
+        return Err(stream_stopped(
+            expected_height,
+            &format!(
+                "the oracle sent no valid block hash ({} bytes); the height is probably not indexed",
+                hash.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn stream_stopped(height: u64, reason: &str) -> ScannerError {
+    format!(
+        "scan stopped at height {height}: {reason}; nothing from height {height} on was scanned, \
+         rescan from height {height}"
+    )
+    .into()
+}
+
+impl Scanner {
+    /// Scan a block range for new utxos and spent outpoints, after checking
+    /// that the chain already scanned below it was not reorganised.
+    ///
+    /// When `start - 1` is a scanned height, its block is streamed too and
+    /// compared with the remembered hash; a reorganisation is rolled back to
+    /// the fork point and the new branch scanned (see `scanner/reorg.rs`).
+    /// `start = end + 1` only runs that check. A reorganisation deeper than
+    /// [`super::REORG_LOOKBACK`] is a [`ReorgTooDeep`] error.
+    pub async fn scan_block_range(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<(), ScannerError> {
+        let source = OracleStreams(self.client.clone());
+        self.scan_range_from(start, end, source).await
+    }
+
+    /// [`Self::scan_block_range`] over any [`BlockStreamSource`].
+    pub(crate) async fn scan_range_from<Src: BlockStreamSource>(
+        &mut self,
+        start: u64,
+        end: u64,
+        mut source: Src,
+    ) -> Result<(), ScannerError> {
+        // Overlap one block with what was already scanned, so the stream
+        // itself proves the chain below `start` is unchanged.
+        let mut first = match start.checked_sub(1) {
+            Some(prev) if prev > 0 && self.knows_block_hash(prev) => prev,
+            _ => start,
+        };
+        if first > end {
+            return Ok(());
+        }
+        loop {
+            let stream = source.open(first, end).await?;
+            match self.scan_block_stream_from(first, start, end, stream).await {
+                Err(e) => {
+                    let Some(reorg) = e.downcast_ref::<ReorgBelowStreamStart>() else {
+                        return Err(e);
+                    };
+                    // The fork is below the stream's first block: walk up
+                    // from the oldest remembered hash to find it.
+                    match self.lowest_known_block_height() {
+                        Some(lowest) if lowest < reorg.height => {
+                            tracing::warn!(
+                                height = reorg.height,
+                                from = lowest,
+                                "chain reorganisation detected; locating the fork point"
+                            );
+                            first = lowest;
+                        }
+                        _ => {
+                            return Err(Box::new(ReorgTooDeep {
+                                lowest_known_height: reorg.height,
+                                last_scanned_height: self.last_scanned_block_height,
+                            }));
+                        }
+                    }
+                }
+                ok => return ok,
+            }
+        }
+    }
+
+    /// Scan the per-block messages of one `StreamBlockScanDataShort` response
+    /// for the range `start..=end`.
+    ///
+    /// Every height in the range must arrive, in order, with a valid block
+    /// hash. Anything else — a message the oracle sends for a height it has
+    /// not indexed (empty block hash), a skipped or repeated height, an error
+    /// status, or a stream that ends before `end` — stops the scan with an
+    /// error. Such a block is never taken as "no payments": the scan height
+    /// stays at the last block that was fully processed, so the next scan
+    /// resumes at the block that could not be scanned.
+    #[cfg(test)]
+    pub(crate) async fn scan_block_stream<S: BlockScanDataStream>(
+        &mut self,
+        start: u64,
+        end: u64,
+        stream: S,
+    ) -> Result<(), ScannerError> {
+        self.scan_block_stream_from(start, start, end, stream).await
+    }
+
+    /// [`Self::scan_block_stream`] for a stream that begins at `first`, at or
+    /// below the scan's `start`. Blocks below `start` are only checked
+    /// against the remembered hashes, not scanned again. Any block whose
+    /// hash differs from the remembered one is a reorganisation: when a
+    /// block before it in this stream agreed, the one below it is the fork
+    /// point, the state is rolled back there and scanning goes on from that
+    /// block; when it is the stream's first block, the scan returns
+    /// [`ReorgBelowStreamStart`] (or [`ReorgTooDeep`] if nothing older is
+    /// remembered) without changing anything.
+    pub(crate) async fn scan_block_stream_from<S: BlockScanDataStream>(
+        &mut self,
+        first: u64,
+        start: u64,
+        end: u64,
+        mut stream: S,
+    ) -> Result<(), ScannerError> {
         // Stamp sp_start_height into the index so the Electrum server's
         // SP subscription response always uses the correct scan start key.
         // Only set it on the first call; watch_chain increments start each
@@ -92,7 +289,16 @@ impl Scanner {
 
         let mut p2p_conn: Option<p2p::P2pConnection> = None;
 
-        while let Some(block_scan_data) = stream.message().await.unwrap() {
+        let mut expected_height = first;
+        // Blocks from here on are scanned; below it they are only checked.
+        let mut scan_from = start;
+        // Whether an earlier block of this stream is known to be on the
+        // oracle's chain (checked or scanned).
+        let mut have_prior_block = false;
+        // Whether anything was scanned or rolled back (worth a save).
+        let mut changed = false;
+
+        while let Some(block_scan_data) = next_block(&mut stream, expected_height).await? {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -100,6 +306,34 @@ impl Scanner {
                 )
                 .into());
             };
+            check_block_identifier(&block_identifier, expected_height)?;
+            expected_height += 1;
+            let oracle_block_hash = block_hash_from_oracle(&block_identifier.block_hash)
+                .expect("block hash length checked above");
+            let height = block_identifier.block_height;
+            match self.check_block_hash(height, &oracle_block_hash) {
+                BlockCheck::Reorganised if !have_prior_block => {
+                    if self.lowest_known_block_height() == Some(height) {
+                        return Err(Box::new(ReorgTooDeep {
+                            lowest_known_height: height,
+                            last_scanned_height: self.last_scanned_block_height,
+                        }));
+                    }
+                    return Err(Box::new(ReorgBelowStreamStart { height }));
+                }
+                BlockCheck::Reorganised => {
+                    self.rollback_to(height - 1).await?;
+                    scan_from = scan_from.min(height);
+                }
+                BlockCheck::Consistent if height < scan_from => {
+                    // Already scanned, still on the chain.
+                    have_prior_block = true;
+                    continue;
+                }
+                BlockCheck::Consistent => {}
+            }
+            have_prior_block = true;
+            changed = true;
             let block_id = BlockIdentifierDisplay(&block_identifier);
             tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
 
@@ -129,6 +363,7 @@ impl Scanner {
                             .await;
                             self.last_scanned_block_height = block_identifier.block_height;
                             self.stage.last_scanned_block_height = block_identifier.block_height;
+                            self.record_scanned_block_hash(height, oracle_block_hash);
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
                             #[cfg(feature = "serde")]
@@ -141,21 +376,6 @@ impl Scanner {
                         }
                         Some(probable_match) => probable_match,
                     };
-                    // Guard: if block_hash is malformed (already warned in
-                    // scan_short_block_data) we cannot pull the full block
-                    // via P2P.  Advance progress and move on.
-                    if block_identifier.block_hash.len() != 32 {
-                        self.notify_electrum_scan_progress(
-                            block_identifier.block_height,
-                            start,
-                            end,
-                        )
-                        .await;
-                        self.last_scanned_block_height = block_identifier.block_height;
-                        self.stage.last_scanned_block_height = block_identifier.block_height;
-                        continue;
-                    }
-
                     // pull the full block data
 
                     // Ensure we have exactly 32 bytes
@@ -173,38 +393,14 @@ impl Scanner {
                         .fetch_block_with_retry(&mut p2p_conn, block_hash, block_identifier.block_height)
                         .await?;
 
-                    // build partial secret hashmap, only populate with txids and secrets where we
-                    // suspect matches, skip the rest
-                    let mut partial_secrets =
-                        HashMap::with_capacity(probable_match.matched_txs.len());
-
-                    for tx in &block.txdata {
-                        if probable_match.spent {
-                            // todo: we will need to look at all spent outpoints in this
-                            // block and find the relevant txids for spent
-                        }
-
-                        for (txid_arr, tweak) in &probable_match.matched_txs {
-                            // this check should be optimised to a map lookup on all items
-                            let mut item_txid = *txid_arr;
-                            item_txid.reverse();
-
-                            if Txid::from_byte_array(item_txid) != tx.compute_txid() {
-                                continue;
-                            }
-
-                            let txid = byte_array_to_txid(txid_arr);
-
-                            partial_secrets.insert(txid, *tweak);
-                        }
-                    }
                     // Apply block to indexer and stage the changes
-                    let indexer_changes = self.internal_indexer.apply_block_relevant(
+                    self.apply_matched_block(
                         &block,
-                        partial_secrets,
+                        &probable_match,
                         block_identifier.block_height as u32,
                     );
-                    self.stage.indexer.merge(indexer_changes);
+                    // Record newly found outputs and confirmed spends of owned ones.
+                    self.sync_owned_outputs();
 
                     // Update block checkpoints: only store blocks where we found something
                     let block_height_u32 = block_identifier.block_height as u32;
@@ -430,6 +626,19 @@ impl Scanner {
             // Update last scanned block height and stage it
             self.last_scanned_block_height = block_identifier.block_height;
             self.stage.last_scanned_block_height = block_identifier.block_height;
+            self.record_scanned_block_hash(height, oracle_block_hash);
+        }
+
+        if expected_height <= end {
+            return Err(stream_stopped(
+                expected_height,
+                "the oracle ended the stream before this height",
+            ));
+        }
+
+        if !changed {
+            // Only checked blocks that were already scanned.
+            return Ok(());
         }
 
         let outpoints: Vec<(u32, OutPoint)> = self
@@ -485,6 +694,12 @@ impl Scanner {
         height: u64,
     ) -> Result<bitcoin::Block, ScannerError> {
         const MAX_ATTEMPTS: u32 = 4;
+
+        // Tests serve full blocks in-process instead of over P2P.
+        #[cfg(test)]
+        if let Some(block) = super::stream_safety_tests::served_block(&block_hash) {
+            return Ok(block);
+        }
 
         let mut last_err: Option<ScannerError> = None;
         for attempt in 1..=MAX_ATTEMPTS {
@@ -585,10 +800,23 @@ impl Scanner {
                 }
             };
 
-            if oracle_tip > self.last_scanned_block_height {
+            // With no new block, still check the scanned tip (or the
+            // oracle's, if it is behind) against the oracle: a reorganisation
+            // can replace blocks without making the chain longer.
+            let (from, to) = if oracle_tip > self.last_scanned_block_height {
                 let from = self.last_scanned_block_height + 1;
                 tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
-                if let Err(e) = self.scan_block_range(from, oracle_tip).await {
+                (from, oracle_tip)
+            } else {
+                (oracle_tip + 1, oracle_tip)
+            };
+            if let Err(e) = self.scan_block_range(from, to).await {
+                if e.downcast_ref::<ReorgTooDeep>().is_some() {
+                    tracing::error!(
+                        error = %e,
+                        "wallet state cannot follow the chain; scanning is halted until it is rescanned"
+                    );
+                } else {
                     tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
                 }
             }
@@ -664,21 +892,32 @@ impl Scanner {
         }
 
         // Spent-output check — only when we have a valid block_hash to report.
+        // The oracle serves the first 8 bytes of each spent taproot output's
+        // x-only key. A prefix hit on an unspent owned output only makes the
+        // block worth fetching; the spend is confirmed (by exact outpoint) when
+        // the block is applied, so a foreign key sharing the prefix marks
+        // nothing.
         if let Some(block_hash) = block_hash_opt {
             let spent_outputs_count = block_data.spent_outputs.len() / 8;
             for i in 0..spent_outputs_count {
-                let spent_output = &block_data.spent_outputs[i * 8..(i + 1) * 8];
-                for pubkey in &self.owned_outputs {
-                    if pubkey[..8] == *spent_output {
-                        probable_match.spent = true;
-
-                        tracing::info!(pubkey = %hex::encode(pubkey), "spent output detected");
-                        if self.notify_spent_outpoints.is_empty() {
-                            continue;
-                        }
-                        if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                            tracing::warn!(error = ?e, "failed to send spent output notification");
-                        }
+                let prefix: [u8; 8] = block_data.spent_outputs[i * 8..(i + 1) * 8]
+                    .try_into()
+                    .expect("slice is 8 bytes");
+                let Some(candidates) = self.owned_prefixes.get(&prefix) else {
+                    continue;
+                };
+                probable_match.spent = true;
+                for outpoint in candidates {
+                    tracing::info!(
+                        outpoint = %outpoint,
+                        short_pubkey = %hex::encode(prefix),
+                        "possible spend of owned output; fetching block to confirm"
+                    );
+                    if self.notify_spent_outpoints.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
+                        tracing::warn!(error = ?e, "failed to send spent output notification");
                     }
                 }
             }
@@ -689,6 +928,50 @@ impl Scanner {
         } else {
             Ok(Some(probable_match))
         }
+    }
+
+    /// The live receive step after a probable match: hands the full block and
+    /// the matched transactions' tweaks to the external indexer, which does the
+    /// real BIP-352 scan, and stages what it found.
+    ///
+    /// `probable_match.matched_txs` carries each txid as the oracle serves it
+    /// (display order) together with the served tweak (`input_hash * A`), which
+    /// `apply_block_relevant` takes as its "partial secret" and finishes the ECDH
+    /// on itself.
+    ///
+    /// Spends need no extra step here: `apply_block_relevant` inserts every
+    /// transaction whose input spends an indexed outpoint into the wallet graph,
+    /// which is what the balance and [`Scanner::sync_owned_outputs`] read.
+    fn apply_matched_block(
+        &mut self,
+        block: &bitcoin::Block,
+        probable_match: &ProbableMatch,
+        height: u32,
+    ) {
+        // build partial secret hashmap, only populate with txids and secrets where we
+        // suspect matches, skip the rest
+        let mut partial_secrets = HashMap::with_capacity(probable_match.matched_txs.len());
+
+        for tx in &block.txdata {
+            for (txid_arr, tweak) in &probable_match.matched_txs {
+                // this check should be optimised to a map lookup on all items
+                let mut item_txid = *txid_arr;
+                item_txid.reverse();
+
+                if Txid::from_byte_array(item_txid) != tx.compute_txid() {
+                    continue;
+                }
+
+                let txid = byte_array_to_txid(txid_arr);
+
+                partial_secrets.insert(txid, *tweak);
+            }
+        }
+        // Apply block to indexer and stage the changes
+        let indexer_changes = self
+            .internal_indexer
+            .apply_block_relevant(block, partial_secrets, height);
+        self.stage.indexer.merge(indexer_changes);
     }
 
     fn probabilistic_match(
@@ -841,3 +1124,7 @@ impl Scanner {
 #[cfg(test)]
 #[path = "bip352_vectors.rs"]
 mod bip352_vectors;
+
+#[cfg(test)]
+#[path = "owned_outputs_tests.rs"]
+mod owned_outputs_tests;

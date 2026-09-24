@@ -3,34 +3,38 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::bdk_chain::bdk_core::Merge;
 use std::collections::BTreeMap;
 
-/// Helper module for hex encoding/decoding byte arrays in serialization
-#[cfg(feature = "serde")]
-mod serde_hex {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use super::types::OwnedOutputRecord;
 
-    pub fn serialize_vec<S>(vec: &Vec<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let hex_strings: Vec<String> = vec.iter().map(|bytes| hex::encode(bytes)).collect();
-        hex_strings.serialize(serializer)
+/// Deserialisation of the persisted `owned_outputs` array.
+#[cfg(feature = "serde")]
+mod owned_outputs_serde {
+    use super::OwnedOutputRecord;
+    use serde::{Deserialize, Deserializer};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Record(OwnedOutputRecord),
+        /// State files written before owned outputs were recorded stored bare
+        /// hex keys here. No released writer ever populated that list, and a
+        /// bare key carries no outpoint, so such entries are dropped; the
+        /// records are rebuilt from the indexer on load
+        /// (`Scanner::sync_owned_outputs`).
+        Legacy(#[allow(dead_code)] String),
     }
 
-    pub fn deserialize_vec<'de, D>(deserializer: D) -> Result<Vec<[u8; 32]>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<OwnedOutputRecord>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let hex_strings: Vec<String> = Vec::deserialize(deserializer)?;
-        let mut result = Vec::new();
-        for hex_string in hex_strings {
-            let bytes = hex::decode(&hex_string)
-                .map_err(|e| serde::de::Error::custom(format!("Invalid hex string: {}", e)))?;
-            let bytes_array: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| serde::de::Error::custom("Expected 32 bytes"))?;
-            result.push(bytes_array);
-        }
-        Ok(result)
+        let entries: Vec<Entry> = Vec::deserialize(deserializer)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Entry::Record(record) => Some(record),
+                Entry::Legacy(_) => None,
+            })
+            .collect())
     }
 }
 
@@ -53,21 +57,26 @@ pub struct ChangeSet {
     pub last_scanned_block_height: u64,
     /// The last block height that was scanned on most recent rescan
     pub last_scanned_block_height_rescan: u64,
-    /// Owned output pubkeys; used to check for spent outputs (hex encoded in JSON)
+    /// Wallet-owned outputs (full x-only key, label, spent status); the
+    /// scanner matches the oracle's spent-output prefixes against these.
     #[cfg_attr(
         feature = "serde",
-        serde(
-            serialize_with = "serde_hex::serialize_vec",
-            deserialize_with = "serde_hex::deserialize_vec"
-        )
+        serde(default, deserialize_with = "owned_outputs_serde::deserialize")
     )]
-    pub owned_outputs: Vec<[u8; 32]>,
+    pub owned_outputs: Vec<OwnedOutputRecord>,
     /// Secret scan key (hex encoded) - needed to reconstruct the indexer
     pub secret_scan_hex: Option<String>,
     /// Public spend key (hex encoded) - needed to reconstruct the indexer
     pub public_spend_hex: Option<String>,
     /// Maximum label number used
     pub max_label_num: u32,
+    /// Hash of every block scanned within the reorg lookback window
+    /// (`REORG_LOOKBACK` heights below the highest one). Compared with the
+    /// oracle's hashes to detect a chain reorganisation; empty in state files
+    /// written before reorg handling, which start recording from their next
+    /// scan.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scanned_block_hashes: BTreeMap<u32, BlockHash>,
 }
 
 impl Merge for ChangeSet {
@@ -75,6 +84,7 @@ impl Merge for ChangeSet {
     fn merge(&mut self, other: Self) {
         // Merge block checkpoints (extend with new ones)
         self.block_checkpoints.extend(other.block_checkpoints);
+        self.scanned_block_hashes.extend(other.scanned_block_hashes);
         Merge::merge(&mut self.indexer, other.indexer);
 
         // Update metadata with the latest values
@@ -85,10 +95,16 @@ impl Merge for ChangeSet {
             self.last_scanned_block_height_rescan = other.last_scanned_block_height_rescan;
         }
 
-        // Merge owned_outputs (deduplicate)
+        // Merge owned_outputs by outpoint; the newer record wins (it may carry
+        // a spend the older one did not).
         for output in other.owned_outputs {
-            if !self.owned_outputs.contains(&output) {
-                self.owned_outputs.push(output);
+            match self
+                .owned_outputs
+                .iter_mut()
+                .find(|existing| existing.outpoint == output.outpoint)
+            {
+                Some(existing) => *existing = output,
+                None => self.owned_outputs.push(output),
             }
         }
 
@@ -113,5 +129,6 @@ impl Merge for ChangeSet {
             && self.last_scanned_block_height == 0
             && self.last_scanned_block_height_rescan == 0
             && self.owned_outputs.is_empty()
+            && self.scanned_block_hashes.is_empty()
     }
 }
