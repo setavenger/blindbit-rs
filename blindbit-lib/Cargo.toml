@@ -18,8 +18,11 @@ name = "stream_oracle"
 # bitcoin = { version = "0.32.7", features = ["secp256k1"] }
 # bdk_sp = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 # indexer = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
-bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
-indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
+# Pinned to the fork's `snb-540-scan-k-max` branch (setavenger/bdk-sp PR #1), which stops
+# `scan_txouts` at BIP-352 K_max (SNB-540). Move this pin to the fork's merged commit once
+# that PR lands.
+bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", rev = "94b72f60b0015793e4db67355bdab8d240eecc00", version = "0.1.0" }
+indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", rev = "94b72f60b0015793e4db67355bdab8d240eecc00", version = "0.1.0" }
 
 
 prost = "0.14.1"
