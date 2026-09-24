@@ -446,7 +446,7 @@ dependencies = [
 [[package]]
 name = "bdk_sp"
 version = "0.1.0"
-source = "git+https://github.com/setavenger/bdk-sp#783c63c9b59fcbfeb008ff2266913a30cd75c132"
+source = "git+https://github.com/setavenger/bdk-sp?rev=94b72f60b0015793e4db67355bdab8d240eecc00#94b72f60b0015793e4db67355bdab8d240eecc00"
 dependencies = [
  "bitcoin 0.32.7",
  "serde",
@@ -2442,7 +2442,7 @@ dependencies = [
 [[package]]
 name = "indexer"
 version = "0.1.0"
-source = "git+https://github.com/setavenger/bdk-sp#783c63c9b59fcbfeb008ff2266913a30cd75c132"
+source = "git+https://github.com/setavenger/bdk-sp?rev=94b72f60b0015793e4db67355bdab8d240eecc00#94b72f60b0015793e4db67355bdab8d240eecc00"
 dependencies = [
  "bdk_bitcoind_rpc",
  "bdk_chain",

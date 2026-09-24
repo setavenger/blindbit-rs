@@ -22,9 +22,9 @@ use super::ScannerError;
 
 /// BIP-352 limits one recipient group to this many matched outputs.
 ///
-/// Only [`Scanner::scan_transaction_full`] applies it, and that function has no
-/// production caller (see its doc comment); the live receive path does not
-/// enforce a K_max.
+/// [`Scanner::scan_transaction_full`] applies it explicitly. The live receive
+/// path relies on `bdk_sp::receive::scan_txouts`, which stops at the same limit
+/// (`bdk_sp::K_MAX`, SNB-540).
 const BIP352_K_MAX: usize = 2323;
 
 /// Insert or upgrade a scripthash history entry.
@@ -802,10 +802,10 @@ impl Scanner {
                 // `bip352_vectors.rs` and is the intended entry point if/when full
                 // block responses are scanned again. The live receive path is
                 // `scan_transaction_short` plus `apply_block_relevant` on the
-                // external indexer (see `scan_blocks`), and that path enforces no
-                // K_max at all. The truncation below therefore does NOT today
-                // constrain live scanning; it is here so the full-block entry point
-                // is correct whenever it is used again.
+                // external indexer (see `scan_blocks`); that path gets its K_max
+                // from `bdk_sp::receive::scan_txouts` itself (SNB-540). The
+                // truncation below does not constrain live scanning; it keeps the
+                // full-block entry point correct independently of that.
                 //
                 // `bdk_sp` derives one candidate for every matching output. The BIP-352
                 // receiver limit is protocol-visible: accepting a 2324th candidate would
