@@ -186,6 +186,11 @@ pub enum FetchFailure {
     /// The connection broke some other way (I/O error, undecodable data, a
     /// `reject`).
     Broken(String),
+    /// The node sent the block without its witness data.
+    WitnessStripped,
+    /// The node sent a block that fails its checks (another block, or a
+    /// merkle root or witness commitment mismatch).
+    BadBlock(String),
 }
 
 impl FetchFailure {
@@ -195,7 +200,11 @@ impl FetchFailure {
     fn is_transient(&self) -> bool {
         matches!(
             self,
-            Self::Connect(_) | Self::Closed { .. } | Self::Broken(_)
+            Self::Connect(_)
+                | Self::Closed { .. }
+                | Self::Broken(_)
+                | Self::WitnessStripped
+                | Self::BadBlock(_)
         )
     }
 }
@@ -225,6 +234,8 @@ impl fmt::Display for FetchFailure {
             Self::NotFound => write!(f, "peer answered notfound"),
             Self::NoAnswer(waited) => write!(f, "no block after {}", human_duration(*waited)),
             Self::Broken(error) => write!(f, "connection broke: {error}"),
+            Self::WitnessStripped => write!(f, "block came without its witness data"),
+            Self::BadBlock(error) => write!(f, "bad block: {error}"),
         }
     }
 }
@@ -438,6 +449,17 @@ impl fmt::Display for BlockFetchError {
                 )?
             }
             FetchFailure::Broken(error) => write!(f, "the connection broke ({error}){tries}.")?,
+            FetchFailure::WitnessStripped => write!(
+                f,
+                "the node sent the block without its witness data{tries}, which friglet needs \
+                 to give your wallet its transactions whole. Point p2p_node_addr at a node that \
+                 serves witness data (every Bitcoin Core since 0.13.1 does)."
+            )?,
+            FetchFailure::BadBlock(error) => write!(
+                f,
+                "the node sent a block that fails its checks ({error}){tries}. Point \
+                 p2p_node_addr at a Bitcoin Core node you trust."
+            )?,
         }
         if let Some(retry) = self.retry {
             write!(
@@ -681,7 +703,11 @@ impl P2pConnection {
     ) -> Result<Block, FetchFailure> {
         let primitives_block_hash =
             PrimitivesBlockHash::from_byte_array(*block_hash.as_byte_array());
-        let inventory = Inventory::Block(primitives_block_hash);
+        // With witnesses: the wallet stores these transactions and the
+        // Electrum server hands them to wallets, which need them whole (a
+        // plain `MSG_BLOCK` strips every witness: right txids, wrong sizes
+        // and fee rates).
+        let inventory = Inventory::WitnessBlock(primitives_block_hash);
         let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
 
         // The writer thread only goes away once a write failed: the peer is gone.
@@ -703,6 +729,7 @@ impl P2pConnection {
                     let block_bytes = encode::serialize(&block);
                     let block: Block = bitcoin::consensus::encode::deserialize(&block_bytes)
                         .map_err(|e| FetchFailure::Broken(format!("undecodable block: {e}")))?;
+                    check_block(&block, block_hash)?;
                     tracing::info!(
                         peer = %self.peer,
                         block_hash = %block.block_hash(),
@@ -755,6 +782,52 @@ impl P2pConnection {
         }
     }
 }
+
+/// The block is the one asked for and arrived whole: its transactions match
+/// the header's merkle root and, when it holds segwit transactions, their
+/// witnesses match the coinbase's commitment. A node that strips or garbles
+/// witness data fails here, rather than friglet storing those transactions
+/// and serving them to wallets without their witnesses.
+fn check_block(block: &Block, requested: BlockHash) -> Result<(), FetchFailure> {
+    if block.block_hash() != requested {
+        return Err(FetchFailure::BadBlock(format!(
+            "it is block {}",
+            block.block_hash()
+        )));
+    }
+    if !block.check_merkle_root() {
+        return Err(FetchFailure::BadBlock(
+            "its transactions do not match its merkle root".to_string(),
+        ));
+    }
+    // A witness commitment requires the coinbase's witness reserved value,
+    // so a committed block without it was stripped on the way.
+    let coinbase = block.txdata.first();
+    let commits = coinbase.is_some_and(|tx| {
+        tx.output.iter().any(|out| {
+            out.script_pubkey
+                .as_bytes()
+                .starts_with(&WITNESS_COMMITMENT_PREFIX)
+        })
+    });
+    if commits
+        && coinbase
+            .and_then(|tx| tx.input.first())
+            .is_none_or(|input| input.witness.is_empty())
+    {
+        return Err(FetchFailure::WitnessStripped);
+    }
+    if !block.check_witness_commitment() {
+        return Err(FetchFailure::BadBlock(
+            "its witnesses do not match its witness commitment".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed`: the start of a BIP 141 witness
+/// commitment output.
+const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
 fn handshake_failure(error: P2pNetError, opened: Instant) -> FetchFailure {
     match error {

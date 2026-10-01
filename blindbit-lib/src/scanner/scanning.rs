@@ -743,7 +743,7 @@ impl Scanner {
     /// whose message says what the node did and what the user can do;
     /// `watch_chain` then retries the block on a growing interval
     /// ([`p2p::FetchBackoff`]).
-    async fn fetch_block_with_retry(
+    pub(crate) async fn fetch_block_with_retry(
         &self,
         block_hash: BlockHash,
         height: u64,
@@ -803,6 +803,7 @@ impl Scanner {
     /// [`Scanner::start_at_oracle_floor_if_below`]).
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         loop {
+            self.restore_missing_witnesses_when_due().await;
             let oracle_tip = match self
                 .client
                 .get_info(tonic::Request::new(()))

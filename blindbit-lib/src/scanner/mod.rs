@@ -23,6 +23,9 @@ mod state_file_tests;
 mod stream_safety_tests;
 mod types;
 mod utils;
+mod witness;
+#[cfg(test)]
+mod witness_tests;
 
 /// Shared error type for scanner operations used across async tasks.
 pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
