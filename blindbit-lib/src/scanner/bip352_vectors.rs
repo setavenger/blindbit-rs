@@ -1312,10 +1312,9 @@ fn official_vectors_survive_sparse_vout_layouts() {
 /// carries `t_k`, so the dropped candidate is provably the highest `k` rather
 /// than an arbitrary one.
 ///
-/// This case is expensive: `scan_txouts` rescans the shrinking candidate pool
-/// for every derivation order, which is quadratic in the 2324 outputs. The
-/// workspace builds libsecp256k1 optimised even in debug (root `Cargo.toml`),
-/// which keeps it to seconds rather than minutes.
+/// This case is expensive (~80s in a debug build): `scan_txouts` rescans the
+/// shrinking candidate pool for every derivation order, which is quadratic in
+/// the 2324 outputs.
 #[test]
 fn official_vectors_enforce_k_max_at_the_blindbit_boundary() {
     let mut exercised = 0usize;

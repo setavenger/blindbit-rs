@@ -18,11 +18,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
-
-# Compile libsecp256k1 (C, built by secp256k1-sys) with optimisations in dev
-# and test builds too. At -O0 every EC operation is ~5x slower, which made the
-# BIP-352 vector tests (the K_max case scans 2324 outputs quadratically) the
-# longest part of CI and debug builds of the daemon needlessly slow to scan.
-# Only this one C library is affected, so compile time barely changes.
-[profile.dev.package.secp256k1-sys]
-opt-level = 3
