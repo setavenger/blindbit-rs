@@ -21,7 +21,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use friglet_ipc::{Client, Request, Response, StatusInfo};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -43,6 +43,9 @@ const DAEMON_EXE: &str = if cfg!(windows) {
     "friglet"
 };
 
+/// The spawned daemon's most recent stdout/stderr lines (ANSI-stripped).
+pub type RecentOutput = Arc<StdMutex<VecDeque<String>>>;
+
 /// Outcome of [`attach_or_spawn`].
 #[derive(Debug)]
 pub enum Attachment {
@@ -50,8 +53,9 @@ pub enum Attachment {
     /// `GetStatus` answer so the caller can read `spawned_by_tray` from the
     /// daemon's own self-report instead of assuming it.
     Attached(StatusInfo),
-    /// No daemon was reachable; we spawned one and it came up.
-    Spawned(Child),
+    /// No daemon was reachable; we spawned one and it came up. The output
+    /// buffer keeps filling while it runs, so a later crash can be explained.
+    Spawned(Child, RecentOutput),
     /// No daemon was reachable and it is not configured yet: spawning would
     /// only fail with `missing required setting ...`, so first-run setup is
     /// needed instead (see `setup::is_configured`).
@@ -158,7 +162,7 @@ pub fn locate_daemon_binary_from_env() -> Option<PathBuf> {
 /// that exits immediately after spawning (bad config, missing key file,
 /// stale/incompatible binary, ...) surfaces an actual reason instead of just
 /// an opaque exit code.
-fn spawn_daemon(bin: &Path) -> io::Result<(Child, Arc<StdMutex<VecDeque<String>>>)> {
+fn spawn_daemon(bin: &Path) -> io::Result<(Child, RecentOutput)> {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -234,7 +238,7 @@ where
 
 /// Join the captured output into a single diagnostic string, empty if
 /// nothing was captured before the daemon exited.
-fn recent_output_tail(recent_output: &StdMutex<VecDeque<String>>) -> String {
+pub fn recent_output_tail(recent_output: &StdMutex<VecDeque<String>>) -> String {
     recent_output
         .lock()
         .unwrap()
@@ -324,7 +328,7 @@ where
             return Attachment::Unreachable { reason };
         }
         if probe(socket_path, PROBE_TIMEOUT).await.is_some() {
-            return Attachment::Spawned(child);
+            return Attachment::Spawned(child, recent_output);
         }
     }
 
@@ -381,10 +385,152 @@ pub async fn perform_quit(socket_path: &str, spawned_by_tray: bool, child: Optio
     }
 }
 
+/// First restart delay after a crash; doubles per consecutive failure.
+pub const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Restart delay ceiling.
+pub const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A daemon reachable this long counts as recovered: the backoff resets.
+pub const HEALTHY_RESET_AFTER: Duration = Duration::from_secs(60);
+
+/// How the last tray-owned daemon ended, for the status window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExitReport {
+    pub at: SystemTime,
+    /// e.g. `exit status: 1` or `signal: 9 (SIGKILL)`.
+    pub status: String,
+    /// Last lines the daemon printed before it ended.
+    pub output: String,
+}
+
+/// Crash/restart bookkeeping for a daemon the tray keeps running. Pure
+/// state machine (time passed in) so it is unit-testable; the tray's poller
+/// drives it.
+#[derive(Debug, Clone, Default)]
+pub struct Supervision {
+    /// Consecutive failed runs since the daemon was last healthy; sets the
+    /// backoff.
+    pub failures: u32,
+    /// Restarts performed this tray session.
+    pub restarts: u32,
+    pub last_exit: Option<ExitReport>,
+    /// Why the latest restart attempt could not bring a daemon up.
+    pub last_spawn_error: Option<String>,
+    /// When the next automatic restart is due (`None`: nothing pending).
+    pub next_restart_at: Option<Instant>,
+    healthy_since: Option<Instant>,
+}
+
+impl Supervision {
+    pub fn backoff(failures: u32) -> Duration {
+        RESTART_BACKOFF_BASE
+            .saturating_mul(2u32.saturating_pow(failures.min(16)))
+            .min(RESTART_BACKOFF_MAX)
+    }
+
+    /// The tray-owned daemon ended without being asked to: schedule a
+    /// restart after the current backoff.
+    pub fn on_exit(&mut self, report: ExitReport, now: Instant) {
+        self.last_exit = Some(report);
+        self.schedule_restart(now);
+    }
+
+    /// A restart attempt failed (spawn error / socket never came up).
+    pub fn on_restart_failed(&mut self, reason: String, now: Instant) {
+        self.last_spawn_error = Some(reason);
+        self.schedule_restart(now);
+    }
+
+    /// A restart attempt brought the daemon up.
+    pub fn on_restarted(&mut self) {
+        self.restarts += 1;
+        self.last_spawn_error = None;
+        self.next_restart_at = None;
+    }
+
+    fn schedule_restart(&mut self, now: Instant) {
+        self.next_restart_at = Some(now + Self::backoff(self.failures));
+        self.failures = self.failures.saturating_add(1);
+        self.healthy_since = None;
+    }
+
+    /// The daemon answered a status poll.
+    pub fn on_reachable(&mut self, now: Instant) {
+        let since = *self.healthy_since.get_or_insert(now);
+        if now.duration_since(since) >= HEALTHY_RESET_AFTER {
+            self.failures = 0;
+        }
+    }
+
+    pub fn on_unreachable(&mut self) {
+        self.healthy_since = None;
+    }
+
+    pub fn restart_due(&self, now: Instant) -> bool {
+        self.next_restart_at.is_some_and(|at| now >= at)
+    }
+
+    /// Manual retry: restart now, with a fresh backoff.
+    pub fn reset(&mut self) {
+        self.failures = 0;
+        self.next_restart_at = None;
+        self.last_spawn_error = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    fn report(status: &str) -> ExitReport {
+        ExitReport {
+            at: SystemTime::now(),
+            status: status.to_string(),
+            output: String::new(),
+        }
+    }
+
+    #[test]
+    fn supervision_backs_off_exponentially_and_caps() {
+        assert_eq!(Supervision::backoff(0), Duration::from_secs(1));
+        assert_eq!(Supervision::backoff(1), Duration::from_secs(2));
+        assert_eq!(Supervision::backoff(5), Duration::from_secs(32));
+        assert_eq!(Supervision::backoff(6), RESTART_BACKOFF_MAX);
+        assert_eq!(Supervision::backoff(u32::MAX), RESTART_BACKOFF_MAX);
+
+        let t0 = Instant::now();
+        let mut s = Supervision::default();
+        s.on_exit(report("signal: 9 (SIGKILL)"), t0);
+        assert!(!s.restart_due(t0));
+        assert!(s.restart_due(t0 + Duration::from_secs(1)));
+        s.on_restart_failed("socket never came up".into(), t0 + Duration::from_secs(1));
+        assert!(!s.restart_due(t0 + Duration::from_secs(2)));
+        assert!(s.restart_due(t0 + Duration::from_secs(3)));
+        s.on_restarted();
+        assert_eq!(s.restarts, 1);
+        assert_eq!(s.next_restart_at, None);
+        assert_eq!(s.failures, 2, "backoff only resets after a healthy period");
+    }
+
+    #[test]
+    fn supervision_resets_backoff_after_a_healthy_minute() {
+        let t0 = Instant::now();
+        let mut s = Supervision::default();
+        s.on_exit(report("exit status: 1"), t0);
+        s.on_restarted();
+        s.on_reachable(t0);
+        s.on_reachable(t0 + Duration::from_secs(30));
+        assert_eq!(s.failures, 1);
+        s.on_reachable(t0 + HEALTHY_RESET_AFTER);
+        assert_eq!(s.failures, 0);
+        // A flapping daemon never accumulates a healthy minute.
+        s.on_exit(report("exit status: 1"), t0 + Duration::from_secs(61));
+        s.on_unreachable();
+        assert_eq!(s.failures, 1);
+        s.reset();
+        assert_eq!((s.failures, s.next_restart_at), (0, None));
+        assert!(s.last_exit.is_some(), "the crash report stays visible");
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
