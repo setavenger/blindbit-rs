@@ -27,6 +27,13 @@ use super::ScannerError;
 /// (`bdk_sp::K_MAX`, SNB-540).
 const BIP352_K_MAX: usize = 2323;
 
+// The live path is only correct while the pinned bdk_sp stops at the same
+// limit, so a bdk_sp that disagrees with BIP-352 must fail the build.
+const _: () = assert!(
+    BIP352_K_MAX == bdk_sp::K_MAX as usize,
+    "bdk_sp::K_MAX differs from BIP-352 K_max"
+);
+
 /// Insert or upgrade a scripthash history entry.
 ///
 /// If the tx is already present with a confirmed height (> 0), it is left
