@@ -164,6 +164,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         })
         .unwrap_or_default();
     let header_sidecar = blockheader::sidecar_path(&cfg.state_file);
+    let pending_file = blockheader::pending_path(&cfg.state_file);
     let persisted_headers = blockheader::load_headers(&header_sidecar);
 
     let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
@@ -277,6 +278,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
                 oracle_url,
                 block_checkpoints,
                 header_sidecar,
+                pending_file,
                 electrum_clients,
             )
             .await
