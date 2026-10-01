@@ -87,6 +87,17 @@ impl WalletElectrumIndex {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Height to report as the chain tip once `scanned` is scanned. While a
+    /// restored state is rescanned for missed spends (`scan_health.
+    /// state_rescan`), the tip stays at the height the state had reached, so
+    /// clients never see wallet history above the tip.
+    pub fn tip_height_for(&self, scanned: u32) -> u32 {
+        match self.scan_health.state_rescan {
+            Some(rescan) => scanned.max(u32::try_from(rescan.until_height).unwrap_or(u32::MAX)),
+            None => scanned,
+        }
+    }
 }
 
 /// Compute the Electrum scripthash for a script.

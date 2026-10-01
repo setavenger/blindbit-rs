@@ -19,13 +19,13 @@ mod utils;
 pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
 
 // Re-export public types and the main Scanner struct
-pub use changeset::ChangeSet;
+pub use changeset::{ChangeSet, STATE_FORMAT_VERSION};
 pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
-pub use health::{OracleFloorStart, ScanHealth, ScanStall, ScanStopped};
+pub use health::{OracleFloorStart, ScanHealth, ScanStall, ScanStopped, StateRescan};
 pub use p2p::broadcast_tx;
 pub use scanner::Scanner;
-pub use types::{BlockIdentifierDisplay, OwnedOutput};
+pub use types::{BlockIdentifierDisplay, OwnedOutput, OwnedOutputRecord};
 
 // Re-export load_scanner function when serde feature is enabled
 #[cfg(feature = "serde")]

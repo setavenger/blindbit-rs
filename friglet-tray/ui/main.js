@@ -69,6 +69,14 @@ function renderScanHealth(health) {
         `${start.requested_height.toLocaleString()}: the oracle has no data below it.`,
     );
   }
+  const rescan = health.state_rescan;
+  if (rescan) {
+    notes.push(
+      `Rescanning blocks ${rescan.from_height.toLocaleString()}–` +
+        `${rescan.until_height.toLocaleString()} once: the state file predates ` +
+        `spend tracking, so spends it missed are being looked for.`,
+    );
+  }
   $("scan-notes-block").hidden = notes.length === 0;
   setText("scan-notes", notes.join("\n"));
 }

@@ -30,6 +30,21 @@ pub struct ScanHealth {
     /// Set when the wallet's start height lay below the oracle's first
     /// indexed block, so scanning began at the oracle's floor instead.
     pub oracle_floor_start: Option<OracleFloorStart>,
+    /// Set while a state file from before owned outputs were recorded is
+    /// being rescanned for spends it missed; cleared once the scan is back
+    /// at `until_height`.
+    pub state_rescan: Option<StateRescan>,
+}
+
+/// The restored state predates owned-output records (state format 0), so
+/// blocks `from_height..=until_height` are scanned again to find spends of
+/// its outputs that it never fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateRescan {
+    /// Height of the oldest output the state still showed unspent.
+    pub from_height: u64,
+    /// Height the state had been scanned to.
+    pub until_height: u64,
 }
 
 /// The scan cannot get past `height`.
@@ -243,12 +258,25 @@ impl Scanner {
         });
     }
 
+    /// The scan made progress or is caught up: clear any stall, and end a
+    /// state rescan ([`StateRescan`]) once it is back where it started.
     pub(crate) async fn clear_stall(&self) {
         let mut idx = self.electrum_index.lock().await;
         if idx.scan_health.stall.take().is_some() {
             tracing::info!(
                 height = self.last_scanned_block_height,
                 "scan is making progress again"
+            );
+        }
+        if idx
+            .scan_health
+            .state_rescan
+            .is_some_and(|rescan| self.last_scanned_block_height >= rescan.until_height)
+        {
+            idx.scan_health.state_rescan = None;
+            tracing::info!(
+                height = self.last_scanned_block_height,
+                "rescan for spends missed by the old state file is complete"
             );
         }
     }
