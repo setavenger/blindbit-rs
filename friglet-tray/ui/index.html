@@ -10,7 +10,7 @@
   <main>
     <header>
       <h1>Friglet</h1>
-      <span id="reachable" class="pill pill-bad">unreachable</span>
+      <span id="daemon-pill" class="pill pill-neutral" title="Daemon">starting…</span>
     </header>
 
     <nav class="tabs">
@@ -20,6 +20,11 @@
     </nav>
 
     <div id="view-status">
+      <section id="problems" class="card problems" hidden>
+        <span class="label">Needs attention</span>
+        <ul id="problem-list" class="problem-list"></ul>
+      </section>
+
       <section id="daemon-health" class="card health" hidden>
         <div class="row">
           <span class="label">Daemon</span>
@@ -29,11 +34,12 @@
         <code id="health-output" class="error" hidden></code>
       </section>
 
-      <section class="card">
+      <section class="card live">
         <div class="row">
           <span class="label">Scanning</span>
-          <span id="scanning" class="value">–</span>
+          <span id="scan-pill" class="pill pill-neutral">–</span>
         </div>
+        <p id="scan-detail" class="small muted"></p>
         <div class="row">
           <span class="label">Height</span>
           <span class="value"><span id="scanned-height">–</span> / <span id="tip-height">–</span></span>
@@ -45,7 +51,7 @@
         </div>
       </section>
 
-      <section class="card">
+      <section class="card live">
         <div class="row">
           <span class="label">Network</span>
           <span id="network" class="value">–</span>
@@ -64,18 +70,29 @@
         </div>
       </section>
 
+      <div class="actions">
+        <button id="start-btn" disabled>Start scanning</button>
+        <button id="stop-btn" class="secondary" disabled>Stop scanning</button>
+      </div>
+      <p id="scan-action-msg" class="small"></p>
+
+      <section class="card">
+        <div class="row">
+          <span class="label">Daemon</span>
+          <span id="daemon-state" class="value">–</span>
+        </div>
+        <p id="daemon-detail" class="small muted"></p>
+        <div class="actions">
+          <button id="start-daemon-btn" class="secondary" disabled>Start daemon</button>
+          <button id="stop-daemon-btn" class="secondary" disabled>Stop daemon</button>
+        </div>
+        <p id="daemon-action-msg" class="small"></p>
+      </section>
+
       <section class="card">
         <div class="col">
           <span class="label">SP address</span>
           <code id="sp-address">–</code>
-        </div>
-        <div class="col" id="error-block" hidden>
-          <span class="label">Last error</span>
-          <code id="last-error" class="error"></code>
-        </div>
-        <div class="col" id="stall-block" hidden>
-          <span class="label">Scan stalled</span>
-          <code id="stall" class="error"></code>
         </div>
         <div class="col" id="scan-notes-block" hidden>
           <span class="label">Scan notes</span>
@@ -83,11 +100,28 @@
         </div>
       </section>
 
-      <div class="actions">
-        <button id="start-btn">Start scanning</button>
-        <button id="stop-btn" class="secondary">Stop scanning</button>
-      </div>
-      <p id="action-error" class="error small"></p>
+      <section class="card">
+        <div class="col">
+          <span class="label">Daemon log</span>
+          <code id="daemon-log-path">–</code>
+        </div>
+        <div class="col">
+          <span class="label">Tray log</span>
+          <code id="tray-log-path">–</code>
+        </div>
+        <div class="actions">
+          <button id="open-logs-btn" class="secondary">Open log folder</button>
+        </div>
+        <p id="logs-msg" class="small"></p>
+      </section>
+
+      <section class="card">
+        <details id="recent-errors" class="recent-errors">
+          <summary><span class="label">Recent errors</span> <span id="recent-count" class="label"></span></summary>
+          <p id="no-recent-errors" class="small muted">None this session.</p>
+          <ul id="recent-list" class="problem-list"></ul>
+        </details>
+      </section>
     </div>
 
     <div id="view-wallet" hidden>

@@ -34,8 +34,14 @@ const RECENT_OUTPUT_LINES: usize = 20;
 /// Timeout for a single connect + GetStatus probe.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// How often / how long to retry the socket after spawning the daemon.
+/// Generous: before it binds its socket the daemon may ask the oracle for
+/// the chain tip and load a large state file, and a debug build is slow.
+/// Giving up too early killed healthy-but-slow daemons and showed a crash.
 const SPAWN_CONNECT_INTERVAL: Duration = Duration::from_millis(250);
-const SPAWN_CONNECT_ATTEMPTS: u32 = 20;
+const SPAWN_CONNECT_ATTEMPTS: u32 = 120;
+/// How long Stop daemon waits for the daemon to exit (it waits up to ~12 s
+/// for a scan task stuck in a P2P block download before exiting).
+pub const STOP_DAEMON_TIMEOUT: Duration = Duration::from_secs(20);
 
 const DAEMON_EXE: &str = if cfg!(windows) {
     "friglet.exe"
@@ -52,7 +58,7 @@ pub enum Attachment {
     /// A daemon was already listening on the control socket; carries its
     /// `GetStatus` answer so the caller can read `spawned_by_tray` from the
     /// daemon's own self-report instead of assuming it.
-    Attached(StatusInfo),
+    Attached(Box<StatusInfo>),
     /// No daemon was reachable; we spawned one and it came up. The output
     /// buffer keeps filling while it runs, so a later crash can be explained.
     Spawned(Child, RecentOutput),
@@ -155,8 +161,9 @@ pub fn locate_daemon_binary_from_env() -> Option<PathBuf> {
 /// Spawn `bin` and continuously drain its stdout/stderr in the background.
 ///
 /// Draining (rather than `Stdio::null()`) matters for two reasons: it keeps
-/// the daemon's own log lines visible (at debug level, prefixed
-/// `friglet-daemon`), and — the important part — it prevents the daemon
+/// the daemon's own log lines visible in the tray's output (target
+/// `friglet-daemon`, at the line's own level: info, warn or error), and —
+/// the important part — it prevents the daemon
 /// from blocking on a full pipe buffer once it starts logging heavily during
 /// a long scan. The last [`RECENT_OUTPUT_LINES`] lines are kept so a daemon
 /// that exits immediately after spawning (bad config, missing key file,
@@ -226,7 +233,12 @@ where
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let stripped = strip_ansi(&line);
-            tracing::debug!(target: "friglet-daemon", "{stripped}");
+            match daemon_line_level(&stripped) {
+                tracing::Level::ERROR => tracing::error!(target: "friglet-daemon", "{stripped}"),
+                tracing::Level::WARN => tracing::warn!(target: "friglet-daemon", "{stripped}"),
+                tracing::Level::INFO => tracing::info!(target: "friglet-daemon", "{stripped}"),
+                _ => tracing::debug!(target: "friglet-daemon", "{stripped}"),
+            }
             let mut buf = recent_output.lock().unwrap();
             if buf.len() >= RECENT_OUTPUT_LINES {
                 buf.pop_front();
@@ -234,6 +246,47 @@ where
             buf.push_back(stripped);
         }
     });
+}
+
+/// The level of one daemon log line (`<timestamp>  INFO message`); lines
+/// without one (panics, clap usage errors) count as errors.
+fn daemon_line_level(line: &str) -> tracing::Level {
+    match line
+        .split_whitespace()
+        .take(2)
+        .find(|w| matches!(*w, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"))
+    {
+        Some("ERROR") => tracing::Level::ERROR,
+        Some("WARN") => tracing::Level::WARN,
+        Some("INFO") => tracing::Level::INFO,
+        Some("DEBUG") => tracing::Level::DEBUG,
+        Some(_) => tracing::Level::TRACE,
+        None => tracing::Level::ERROR,
+    }
+}
+
+/// The captured output's error lines without their timestamp and level
+/// (`friglet exited with an error: ...`), or the whole tail when there are
+/// none. Keeps failure reasons short and identical across retries, so a
+/// repeated failure is listed once with a count instead of once per attempt.
+pub fn failure_summary(recent_output: &StdMutex<VecDeque<String>>) -> String {
+    let lines = recent_output.lock().unwrap();
+    let errors: Vec<String> = lines
+        .iter()
+        .filter(|l| daemon_line_level(l) == tracing::Level::ERROR)
+        .map(|l| {
+            let mut words = l.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some(_), Some("ERROR")) => words.collect::<Vec<_>>().join(" "),
+                _ => l.clone(),
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        lines.iter().cloned().collect::<Vec<_>>().join(" | ")
+    } else {
+        errors.join(" | ")
+    }
 }
 
 /// Join the captured output into a single diagnostic string, empty if
@@ -279,7 +332,7 @@ where
     C: FnOnce() -> bool,
 {
     if let Some(status) = probe(socket_path, PROBE_TIMEOUT).await {
-        return Attachment::Attached(status);
+        return Attachment::Attached(Box::new(status));
     }
 
     if needs_setup() {
@@ -309,10 +362,11 @@ where
         // Spawned daemon died already (e.g. bad config)? Stop waiting.
         if let Ok(Some(status)) = child.try_wait() {
             let tail = recent_output_tail(&recent_output);
-            let mut reason = if tail.is_empty() {
+            let summary = failure_summary(&recent_output);
+            let mut reason = if summary.is_empty() {
                 format!("spawned daemon exited immediately ({status})")
             } else {
-                format!("spawned daemon exited immediately ({status}): {tail}")
+                format!("spawned daemon exited immediately ({status}): {summary}")
             };
             // A clap usage dump means the binary rejected our zero-arg
             // invocation — i.e. it's an outdated friglet that still requires
@@ -335,11 +389,11 @@ where
     // The socket never came up; kill the child so we don't leave an
     // untracked daemon behind.
     let _ = child.kill().await;
-    let tail = recent_output_tail(&recent_output);
-    let reason = if tail.is_empty() {
+    let summary = failure_summary(&recent_output);
+    let reason = if summary.is_empty() {
         format!("spawned daemon but its control socket never came up at {socket_path}")
     } else {
-        format!("spawned daemon but its control socket never came up at {socket_path}: {tail}")
+        format!("spawned daemon but its control socket never came up at {socket_path}: {summary}")
     };
     Attachment::Unreachable { reason }
 }
@@ -359,6 +413,78 @@ pub async fn shutdown_via_socket(socket_path: &str, timeout: Duration) -> bool {
         .ok()
         .flatten()
         .is_some()
+}
+
+/// How [`stop_daemon`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The daemon exited; carries how (e.g. `exit status: 0`).
+    Stopped(String),
+    /// It did not exit in time and was killed (we held its process).
+    Killed,
+    /// Nothing was answering and the tray held no process.
+    NotRunning,
+    /// It acknowledged but kept answering (an attached daemon we cannot
+    /// kill), or something else started a new one right away.
+    StillRunning(String),
+}
+
+/// Stop the daemon for good — whoever started it. Asks it to shut down over
+/// the socket; with a process handle (tray-spawned) waits for the exit and
+/// kills it after [`STOP_DAEMON_TIMEOUT`]; without one (attached) waits
+/// until the socket stops answering and then checks that no other daemon
+/// (e.g. one a service manager restarted) took its place.
+pub async fn stop_daemon(
+    socket_path: &str,
+    child: Option<Child>,
+    pid_before: Option<u32>,
+) -> StopOutcome {
+    let acked = shutdown_via_socket(socket_path, PROBE_TIMEOUT).await;
+    if let Some(mut child) = child {
+        return match tokio::time::timeout(STOP_DAEMON_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) => StopOutcome::Stopped(status.to_string()),
+            Ok(Err(e)) => StopOutcome::Stopped(format!("unknown ({e})")),
+            Err(_) => {
+                let _ = child.kill().await;
+                StopOutcome::Killed
+            }
+        };
+    }
+    if !acked {
+        return match probe(socket_path, PROBE_TIMEOUT).await {
+            None => StopOutcome::NotRunning,
+            Some(_) => StopOutcome::StillRunning(
+                "the daemon did not accept the shutdown request".to_string(),
+            ),
+        };
+    }
+    let deadline = Instant::now() + STOP_DAEMON_TIMEOUT;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if probe(socket_path, PROBE_TIMEOUT).await.is_none() {
+            // Gone. A service manager (systemd Restart=…) would bring a new
+            // one up within moments: look once more.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            return match probe(socket_path, PROBE_TIMEOUT).await {
+                Some(status) => StopOutcome::StillRunning(format!(
+                    "it stopped, but a new daemon{} started right away — it is managed \
+                     outside the tray (e.g. a systemd service); stop it there",
+                    status
+                        .pid
+                        .map(|p| format!(" (PID {p})"))
+                        .unwrap_or_default()
+                )),
+                None => StopOutcome::Stopped(match pid_before {
+                    Some(pid) => format!("PID {pid} exited"),
+                    None => "exited".to_string(),
+                }),
+            };
+        }
+    }
+    StopOutcome::StillRunning(format!(
+        "the daemon acknowledged the shutdown but still answers after {}s",
+        STOP_DAEMON_TIMEOUT.as_secs()
+    ))
 }
 
 /// Apply the quit rule: shut the daemon down only if the tray spawned it.
@@ -591,6 +717,50 @@ mod tests {
         assert_eq!(
             locate_daemon_binary(None, Some(&empty), Some(&path_var)),
             None
+        );
+    }
+
+    #[test]
+    fn daemon_lines_keep_their_level() {
+        use tracing::Level;
+        let line = |l: &str| format!("2026-10-01T21:47:13.159300Z  {l} scan task stopped");
+        assert_eq!(daemon_line_level(&line("INFO")), Level::INFO);
+        assert_eq!(daemon_line_level(&line("WARN")), Level::WARN);
+        assert_eq!(daemon_line_level(&line("ERROR")), Level::ERROR);
+        assert_eq!(daemon_line_level(&line("DEBUG")), Level::DEBUG);
+        // Not a tracing line: a panic or the fatal-error fallback.
+        assert_eq!(
+            daemon_line_level("Error: missing required setting"),
+            Level::ERROR
+        );
+        // A level word later in the message does not count.
+        assert_eq!(
+            daemon_line_level("2026-10-01T21:47:13Z  INFO peer said ERROR"),
+            Level::INFO
+        );
+    }
+
+    #[test]
+    fn failure_summary_keeps_only_error_lines() {
+        let out = StdMutex::new(VecDeque::from([
+            "2026-10-01T22:33:03.683804Z  INFO logging to file path=/x/friglet.log".to_string(),
+            "2026-10-01T22:33:03.702243Z ERROR friglet exited with an error: invalid \
+             p2p_node_addr `nope.invalid:38333`"
+                .to_string(),
+        ]));
+        assert_eq!(
+            failure_summary(&out),
+            "friglet exited with an error: invalid p2p_node_addr `nope.invalid:38333`"
+        );
+        let plain = StdMutex::new(VecDeque::from(["Error: bad flag".to_string()]));
+        assert_eq!(failure_summary(&plain), "Error: bad flag");
+        let info_only = StdMutex::new(VecDeque::from([
+            "2026-10-01T22:33:03Z  INFO a".to_string(),
+            "2026-10-01T22:33:04Z  INFO b".to_string(),
+        ]));
+        assert_eq!(
+            failure_summary(&info_only),
+            "2026-10-01T22:33:03Z  INFO a | 2026-10-01T22:33:04Z  INFO b"
         );
     }
 

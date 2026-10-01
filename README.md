@@ -146,8 +146,56 @@ What to expect from it:
 monitors the `friglet` daemon over its control socket. It shows live status
 (scan height, progress, network, Electrum clients, oracle connectivity, SP
 address, errors) in the tray menu and in a status window (hidden by default,
-opened via the tray menu; closing it hides it again). The tray menu also
-offers Start/Stop scanning and Quit.
+opened via the tray menu; closing it hides it again). The tray menu and the
+Status tab offer Start/Stop scanning, Start/Stop daemon and Quit; a button
+or menu item is only enabled when it does what it says (Start scanning is
+greyed out while a scan runs, Stop daemon while none is running).
+
+**Scanning and daemon controls**
+
+- **Stop scanning** pauses the scan loop; the status says *paused* and the
+  height stays where it is until **Start scanning**. The pause lasts until
+  you press Start (it also survives a settings save, which restarts the
+  daemon in-process), but not a restart of the daemon process. If the scan
+  is in the middle of downloading a block from the P2P node, it can only
+  stop once that download returns: the status says *stopping…* until then,
+  never *paused* early.
+- **Stop daemon** stops the daemon process whoever started it — this tray,
+  an earlier tray session, or something else (a terminal, a service, an
+  autostart entry); the Status tab says which one it is and what Quit will
+  do. A stopped daemon stays stopped: the tray's automatic restart never
+  undoes it, and neither does a daemon that exits normally (exit status 0,
+  e.g. `kill`/SIGTERM from outside the tray). **Start daemon** starts it
+  again (or attaches to one that is running). If a service manager such as
+  systemd restarts the daemon right away, Stop daemon says so — stop it
+  there.
+
+**Waiting vs. errors.** Some conditions are normal for a few moments: the
+oracle announces a new block before it has indexed it, the oracle or the
+daemon does not answer for a moment (a restart after saving settings, a
+reconnect). The Status tab shows these as a neutral *waiting* /
+*reconnecting…* state. Only when a stall or an unreachable oracle lasts
+2 minutes, or the daemon stays unreachable for 10 seconds, does it become an
+error. Errors are shown under **Needs attention** with the time they began
+and stay there until they are resolved; every error of the session is also
+listed under **Recent errors** (with a count when it repeats), and written
+to the log.
+
+**Logs.** The daemon writes its log to a file as well as to stderr, and the
+tray writes its own:
+
+| Platform | Folder | Files |
+| --- | --- | --- |
+| Linux | `$XDG_STATE_HOME/friglet`, i.e. `~/.local/state/friglet` | `friglet.log`, `friglet-tray.log` |
+| macOS | `~/Library/Logs/friglet` | `friglet.log`, `friglet-tray.log` |
+| Windows | `%LOCALAPPDATA%\friglet\logs` | `friglet.log`, `friglet-tray.log` |
+
+Each file is capped at 10 MiB: it is then renamed to `*.log.1` (the previous
+`.1` becomes `.2`, an older `.2` is dropped). `FRIGLET_LOG_FILE=<path>`
+moves the daemon's log, `FRIGLET_LOG_FILE=off` turns the file off. The
+Status tab shows both paths and has an **Open log folder** button; a daemon
+started by the tray also has its output forwarded to the tray's own
+stderr (`friglet-daemon` lines) when the tray runs in a terminal.
 
 The window's **Settings** tab lets you view and edit all daemon settings —
 wallet descriptor, network, wallet birthday, Bitcoin node, oracle URL, and
@@ -223,14 +271,16 @@ Lifecycle behavior:
   setup mode described above instead of spawn-failing. Otherwise it spawns
   the `friglet` binary (search order: `FRIGLET_DAEMON_BIN` env var, then
   `friglet` next to the tray executable, then `friglet` on `PATH`) and
-  retries the socket for a few seconds. If nothing comes up the tray keeps
-  running, shows "Daemon: unreachable" (or "Setup required — open window"),
-  and a "Retry / Start daemon" menu item retriggers the whole logic.
+  waits for its socket (up to ~30 s, less if the daemon exits). If nothing
+  comes up the tray keeps running, shows why, and **Start daemon** retriggers
+  the whole logic.
 - **Quit rule**: if the tray spawned the daemon, Quit sends `Shutdown` over
   the control socket (killing the child as a fallback) before exiting. If the
   tray merely attached to a daemon it did not spawn, Quit leaves the daemon
   running. The Quit menu item's label ("Quit (stops daemon)" vs. "Quit
-  (keeps daemon running)") always reflects which applies. Ownership is
+  (keeps daemon running)", or plain "Quit" when no daemon runs) always
+  reflects which applies. To stop a daemon the tray did not start, use
+  **Stop daemon** before Quit. Ownership is
   self-reported by the daemon (it echoes back whether it was launched with
   `FRIGLET_SPAWNED_BY_TRAY=1`) rather than tracked only in the tray's own
   memory, so a tray that crashes or is relaunched still correctly shuts down
@@ -247,13 +297,10 @@ Lifecycle behavior:
   the crash (exit status/signal, time, the daemon's last output lines),
   the restart count and the countdown to the next attempt; the tray label
   reads "Daemon: crashed — restarting". A daemon that is alive but silent
-  for 2 minutes is replaced. "Retry / Start daemon" restarts immediately.
-  Only Quit stops it for good; an externally started daemon is never
-  restarted by the tray.
-- **Scanning start/stop is not sticky across a daemon restart**: `Stop`
-  pauses only the scan task, not the process. If the tray-spawned daemon is
-  later shut down (Quit) and a new one is spawned, the new daemon starts
-  scanning again by default, same as any fresh launch.
+  for 2 minutes is replaced. **Start daemon** restarts immediately; **Stop
+  daemon** or Quit stop it for good. A daemon that exits normally (status
+  0) is not restarted, and an externally started daemon is never restarted
+  by the tray.
 
 For manual testing without a real daemon there is a fake daemon that speaks
 the control protocol: `cargo run -p friglet-tray --example fake-daemon`.

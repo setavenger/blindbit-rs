@@ -6,7 +6,8 @@ mod server;
 mod supervisor;
 mod types;
 
-use std::sync::atomic::AtomicU64;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -46,6 +47,11 @@ enum RunOutcome {
 
 /// How long a restart waits for the previous run's tasks to wind down.
 const RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an exiting daemon waits for the scan task to end so it can save
+/// the state. The task can be stuck in a blocking P2P block download (up to
+/// 90 s); the process then exits without the final save — the scan loop's
+/// last checkpoint stays on disk, written atomically.
+const EXIT_SCAN_WAIT: Duration = Duration::from_secs(10);
 
 fn main() {
     let cli = Cli::parse();
@@ -61,12 +67,20 @@ fn main() {
     // subscriptions taken at startup, listeners and the scan task — and then
     // starts over from the config file. Same PID, so a supervising tray keeps
     // its child handle.
+    //
+    // Logging starts before the config is read so a configuration error
+    // also lands in the log file.
+    if !args.print_config {
+        init_logging(args.log_level.as_deref().unwrap_or("info"));
+    }
+    // A pause requested over the control socket outlives a settings restart.
+    let scan_paused = Arc::new(AtomicBool::new(false));
     loop {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("failed to build the tokio runtime");
-        let outcome = runtime.block_on(run(args.clone()));
+        let outcome = runtime.block_on(run(args.clone(), scan_paused.clone()));
         runtime.shutdown_timeout(RESTART_SHUTDOWN_TIMEOUT);
         match outcome {
             Ok(RunOutcome::Exit) => return,
@@ -74,7 +88,12 @@ fn main() {
                 tracing::info!("restarting with the new settings");
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                if LOG_FILE.get().is_some() {
+                    // Goes to stderr and the log file.
+                    tracing::error!("friglet exited with an error: {e}");
+                } else {
+                    eprintln!("Error: {e}");
+                }
                 std::process::exit(1);
             }
         }
@@ -84,10 +103,17 @@ fn main() {
 type LogFilterHandle =
     tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 
-/// Set up logging once per process; later runs (in-process restarts) only
-/// swap the filter so a changed `log_level` takes effect. `RUST_LOG` takes
-/// precedence over `log_level`. Only colour when stderr is a TTY so a
-/// tray-piped daemon never emits ANSI into the capture pipe.
+/// The log file this process writes (`None` inside: no file, e.g. its
+/// directory is not writable or `FRIGLET_LOG_FILE=off`). Set once logging
+/// is initialised.
+static LOG_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Set up logging once per process; later calls (after the config is read,
+/// and on in-process restarts) only swap the filter so `log_level` takes
+/// effect. `RUST_LOG` takes precedence over `log_level`. Lines go to stderr
+/// — colour only when it is a TTY, so a tray-piped daemon never emits ANSI
+/// into the capture pipe — and to the log file
+/// (`friglet_ipc::logfile::daemon_log_file`).
 fn init_logging(log_level: &str) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -100,6 +126,18 @@ fn init_logging(log_level: &str) {
         return;
     }
     let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    let path = friglet_ipc::logfile::daemon_log_file();
+    let (file, file_error) = match path.as_deref().map(friglet_ipc::logfile::RotatingLog::open) {
+        Some(Ok(log)) => (Some(log), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
+    let file_layer = file.clone().map(|log| {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(move || log.clone())
+    });
     tracing_subscriber::registry()
         .with(filter)
         .with(
@@ -107,11 +145,25 @@ fn init_logging(log_level: &str) {
                 .with_target(false)
                 .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
         )
+        .with(file_layer)
         .init();
     let _ = HANDLE.set(handle);
+    let _ = LOG_FILE.set(file.as_ref().map(|log| log.path()));
+    match (&path, file_error) {
+        (Some(path), Some(e)) => tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "cannot write the log file; logging to stderr only"
+        ),
+        (Some(path), None) => tracing::info!(path = %path.display(), "logging to file"),
+        (None, _) => {}
+    }
 }
 
-async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + Send + Sync>> {
+async fn run(
+    args: ScanArgs,
+    scan_paused: Arc<AtomicBool>,
+) -> Result<RunOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let config::Loaded {
         config: mut merged,
         file: config_file,
@@ -126,6 +178,7 @@ async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + S
         return Ok(RunOutcome::Exit);
     }
 
+    // Apply the configured level (logging itself started in `main`).
     init_logging(&merged.log_level);
 
     // New wallet: birthday = the oracle's current tip, recorded in the
@@ -275,17 +328,29 @@ async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + S
     // The scan task lives in a supervisor so it can be stopped/started via
     // the control socket.  watch_chain polls the oracle for new blocks and
     // runs indefinitely — no end_height needed.
-    let supervisor = Arc::new(ScanSupervisor::new({
-        let scanner = scanner_instance.clone();
-        move || {
-            let scanner = scanner.clone();
-            Box::pin(async move {
-                let mut s = scanner.lock().await;
-                s.watch_chain().await.map_err(|e| e.to_string())
-            })
-        }
-    }));
-    supervisor.start();
+    let supervisor = Arc::new(ScanSupervisor::new(
+        {
+            let scanner = scanner_instance.clone();
+            move || {
+                let scanner = scanner.clone();
+                Box::pin(async move {
+                    let mut s = scanner.lock().await;
+                    s.watch_chain().await.map_err(|e| e.to_string())
+                })
+            }
+        },
+        scan_paused.clone(),
+    ));
+    if scan_paused.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!(
+            "scanning stays paused (it was paused before the restart); Start resumes it"
+        );
+    } else {
+        supervisor.start();
+    }
+
+    let oracle_status = Arc::new(std::sync::Mutex::new(control::OracleStatus::default()));
+    control::spawn_oracle_poller(cfg.oracle_url.clone(), oracle_status.clone());
 
     let shutdown_token = CancellationToken::new();
     let electrum_clients = Arc::new(AtomicU64::new(0));
@@ -301,7 +366,8 @@ async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + S
         state_file: cfg.state_file.clone(),
         config_path,
         apply_lock: Mutex::new(()),
-        oracle_tip_cache: std::sync::Mutex::new(control::OracleTipCache::default()),
+        oracle: oracle_status,
+        log_file: LOG_FILE.get().cloned().flatten(),
         shutdown: shutdown_token.clone(),
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         spawned_by_tray: control::ControlCtx::spawned_by_tray_from_env(),
@@ -385,8 +451,29 @@ async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + S
         }
     };
 
-    supervisor.stop().await;
-    control_ctx.save_state().await;
+    // A restart must not overlap with the old scan task (both would write the
+    // state file), so it waits as long as needed; an exit gives up after
+    // EXIT_SCAN_WAIT (see there).
+    let restarting = failure.is_none() && control_ctx.restart_requested();
+    if supervisor.cancel() {
+        let limit = (!restarting).then_some(EXIT_SCAN_WAIT);
+        if !supervisor.wait_stopped(Some(Duration::from_secs(2))).await {
+            tracing::info!(
+                "waiting for the scan task to finish a blocking step (such as a P2P block download)"
+            );
+        }
+        if supervisor.wait_stopped(limit).await {
+            control_ctx.save_state().await;
+        } else {
+            tracing::warn!(
+                "the scan task did not stop within {}s; exiting without a final state save \
+                 (the last checkpoint is kept)",
+                EXIT_SCAN_WAIT.as_secs()
+            );
+        }
+    } else {
+        control_ctx.save_state().await;
+    }
     if owns_socket {
         cleanup_socket(&cfg.control_socket);
     }

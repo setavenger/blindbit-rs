@@ -67,6 +67,10 @@ docker logs friglet
 docker stop friglet
 ```
 
+The daemon also writes its log to `/data/friglet.log` in the volume
+(`FRIGLET_LOG_FILE` in the image; capped at 10 MiB, rotated to
+`friglet.log.1`/`.2`). Set `-e FRIGLET_LOG_FILE=off` to log to stdout only.
+
 Caveat: while a scan is actively running (including the initial catch-up),
 the scan task holds the scanner lock, so `/height` and `/subscribe` block
 until the scan pauses. Use `docker logs` (scan progress lines) or the
