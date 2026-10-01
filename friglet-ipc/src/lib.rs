@@ -26,6 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub use interprocess::local_socket::tokio::Listener;
 
+pub mod descriptor;
+pub mod network;
+
 /// Daemon configuration as exchanged over IPC and layered from
 /// file / environment / CLI. Field names double as TOML keys and
 /// `FRIGLET_*` environment variable suffixes.
@@ -40,10 +43,18 @@ pub struct DaemonConfig {
     pub network: String,
     /// BlindBit oracle URL.
     pub oracle_url: String,
-    /// Bitcoin P2P node address (`host:port`). Required to start scanning.
+    /// Bitcoin P2P node address: `host:port`, `ip:port`, or a bare host/IP
+    /// (the network's default port). Hostnames are resolved at daemon start.
+    /// Required to start scanning.
     pub p2p_node_addr: Option<String>,
-    /// Wallet birthday block height. Required to start scanning.
+    /// Wallet birthday block height. Required to start scanning unless
+    /// `start_at_tip` is set.
     pub start_height: Option<u64>,
+    /// New wallet: when `start_height` is unset, the daemon uses the
+    /// oracle's current chain tip as the birthday (nothing to rescan) and
+    /// persists that height as `start_height`, clearing this flag.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_at_tip: bool,
     /// Spend public key (33-byte hex). Required to start scanning.
     pub spend_pubkey: Option<String>,
     /// Maximum Silent Payments label number.
@@ -72,6 +83,7 @@ impl Default for DaemonConfig {
             oracle_url: "https://oracle.setor.dev".to_string(),
             p2p_node_addr: None,
             start_height: None,
+            start_at_tip: false,
             spend_pubkey: None,
             max_label_num: 0,
             http_addr: "127.0.0.1:8080".to_string(),
@@ -95,16 +107,23 @@ pub enum Request {
     /// Current effective configuration (never contains the scan secret).
     GetConfig,
     /// Replace the daemon configuration: the daemon validates it, persists
-    /// it to its config file (TOML) and applies it. Scanner-affecting fields
-    /// restart the scan task; bind addresses (`http_addr`, `electrum_addr`)
-    /// only take effect after a daemon restart (reported via
-    /// [`Response::OkWithNote`]).
+    /// it to its config file (TOML) and, when anything changed, restarts
+    /// itself in-process so every setting takes full effect (Electrum
+    /// clients are disconnected and reconnect to the new wallet view). The
+    /// answer ([`Response::OkWithNote`]) is sent before the restart.
     SetConfig(Box<DaemonConfig>),
     /// Replace the scan secret: a hex-encoded 32-byte secp256k1 secret key.
-    /// The daemon validates it and writes it to its key file (0600 on Unix).
-    /// The secret is deliberately not part of [`DaemonConfig`], so this is a
-    /// separate verb; `GetConfig` never returns it.
+    /// The daemon validates it, writes it to its key file (0600 on Unix) and
+    /// restarts like [`Request::SetConfig`]. The secret is deliberately not
+    /// part of [`DaemonConfig`], so this is a separate verb; `GetConfig`
+    /// never returns it.
     SetScanKey(String),
+    /// [`Request::SetConfig`] and [`Request::SetScanKey`] in one step (one
+    /// validation, one restart) — used when switching wallets.
+    ApplySettings {
+        config: Box<DaemonConfig>,
+        scan_key: Option<String>,
+    },
     /// Gracefully shut down the whole daemon process.
     Shutdown,
 }
@@ -159,6 +178,64 @@ pub struct StatusInfo {
     /// instead of assuming it did not spawn it.
     #[serde(default)]
     pub spawned_by_tray: bool,
+    /// Conditions of the scan beyond its progress: why it is stuck, and
+    /// whether it started above the configured start height.
+    #[serde(default)]
+    pub scan_health: ScanHealthInfo,
+}
+
+/// Scan conditions the user should see (see [`StatusInfo::scan_health`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanHealthInfo {
+    /// Set while the scan cannot get past a height. The daemon keeps
+    /// retrying; this clears once the scan makes progress again.
+    pub stall: Option<ScanStallInfo>,
+    /// Set when the configured start height lay below the oracle's first
+    /// indexed block, so scanning began at that block instead.
+    pub start_adjusted: Option<StartAdjustedInfo>,
+    /// Set while a state file written before spends were tracked is being
+    /// rescanned once for the spends it missed.
+    pub state_rescan: Option<StateRescanInfo>,
+    /// Set when the state file could not be restored: it was moved to
+    /// `backup_path` and the wallet is being scanned again from its start
+    /// height.
+    pub state_reset: Option<StateResetInfo>,
+}
+
+/// The state file could not be restored (see [`ScanHealthInfo::state_reset`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateResetInfo {
+    pub backup_path: String,
+    pub error: String,
+}
+
+/// Blocks `from_height..=until_height` are scanned again because the state
+/// file predates spend tracking (see blindbit-lib `StateRescan`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRescanInfo {
+    pub from_height: u64,
+    pub until_height: u64,
+}
+
+/// The scan cannot get past `height`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanStallInfo {
+    /// First height that could not be scanned.
+    pub height: u64,
+    /// Why, as the scanner reported it.
+    pub reason: String,
+    /// Unix time (seconds) of the first failed attempt at this height.
+    pub since_unix: u64,
+}
+
+/// Scanning began at `oracle_floor` instead of the configured
+/// `requested_height`: the oracle has no data below it, so blocks
+/// `requested_height..oracle_floor` were not scanned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAdjustedInfo {
+    pub requested_height: u64,
+    pub oracle_floor: u64,
 }
 
 /// A configured Silent Payments label and its receive address.
@@ -458,6 +535,25 @@ mod tests {
             }],
             version: "test".to_string(),
             spawned_by_tray: true,
+            scan_health: ScanHealthInfo {
+                stall: Some(ScanStallInfo {
+                    height: 102,
+                    reason: "the oracle sent no valid block hash".to_string(),
+                    since_unix: 1_790_000_000,
+                }),
+                start_adjusted: Some(StartAdjustedInfo {
+                    requested_height: 1,
+                    oracle_floor: 100,
+                }),
+                state_rescan: Some(StateRescanInfo {
+                    from_height: 100,
+                    until_height: 101,
+                }),
+                state_reset: Some(StateResetInfo {
+                    backup_path: "/tmp/scanner_state.json.unreadable-1".to_string(),
+                    error: "Failed to parse JSON".to_string(),
+                }),
+            },
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
@@ -482,6 +578,7 @@ mod tests {
         assert_eq!(status.outputs_found, 0);
         assert!(status.label_addresses.is_empty());
         assert!(!status.spawned_by_tray);
+        assert_eq!(status.scan_health, ScanHealthInfo::default());
     }
 
     #[test]

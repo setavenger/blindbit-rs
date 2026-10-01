@@ -10,6 +10,8 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* `hidden` must win over the display: flex of .card / .col / .row. */
+[hidden] { display: none !important; }
 
 body {
   background: var(--bg);
@@ -71,6 +73,9 @@ code {
   color: var(--text);
 }
 .error { color: var(--bad); }
+/* `.col` sets display: flex, which would override the `hidden` attribute. */
+.col[hidden] { display: none; }
+#scan-notes { font-size: 13px; white-space: pre-line; }
 .small { font-size: 12px; min-height: 18px; }
 
 .banner {
@@ -81,6 +86,9 @@ code {
   font-size: 13px;
 }
 .banner strong { color: var(--accent); }
+.health { border-color: var(--bad); }
+.health.recovered { border-color: var(--border); }
+#health-output { max-height: 96px; overflow-y: auto; white-space: pre-wrap; }
 .banner-path {
   display: block;
   margin-top: 4px;
@@ -105,12 +113,12 @@ code {
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .tab:hover { color: var(--text); }
 
-input, select { user-select: text; }
+input, select, textarea { user-select: text; }
 fieldset { border: none; display: flex; flex-direction: column; gap: 12px; }
 fieldset:disabled { opacity: 0.5; }
 .field { display: flex; flex-direction: column; gap: 4px; }
 .field label { color: var(--muted); font-size: 12px; }
-.field input, .field select {
+.field input, .field select, .field textarea, input.indented {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -119,8 +127,34 @@ fieldset:disabled { opacity: 0.5; }
   font-size: 13px;
   padding: 7px 9px;
 }
-.field input.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
-.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+/* WebKitGTK draws native <select>s with the GTK theme (light, low contrast
+   on this dark UI); draw it ourselves. */
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.field input.mono, .field textarea.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
+.field textarea { resize: vertical; word-break: break-all; }
+.field input:focus, .field select:focus, .field textarea:focus, input.indented:focus { outline: none; border-color: var(--accent); }
+.hint { color: var(--muted); font-size: 12px; }
+.hint strong { color: var(--text); font-weight: 600; }
+.hint.ok { color: var(--good); }
+.hint.warn { color: var(--accent); }
+.hint.error { color: var(--bad); }
+.hint code { font-size: 11px; }
+.choice { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; cursor: pointer; }
+.choice input { margin-top: 3px; accent-color: var(--accent); }
+.indented { margin-left: 22px; }
+input.indented:disabled { opacity: 0.5; }
+details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; }
+details.advanced[open] summary { margin-bottom: 4px; }
 .ok { color: var(--good); }
 
 .wallet-placeholder, .wallet-empty {

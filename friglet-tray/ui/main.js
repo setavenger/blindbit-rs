@@ -13,8 +13,47 @@ function setText(id, value) {
 
 let daemonReachable = false;
 
-function render({ reachable, status }) {
+// Crash / restart state of a tray-supervised daemon.
+function renderHealth(daemon, reachable) {
+  const card = $("daemon-health");
+  const pending = daemon?.restart_in_secs != null;
+  const show = daemon && (daemon.last_exit || daemon.last_error || pending);
+  card.hidden = !show;
+  if (!show) return;
+
+  const recovered = reachable && !pending;
+  card.classList.toggle("recovered", recovered);
+  const pill = $("health-state");
+  pill.className = `pill ${recovered ? "pill-good" : "pill-bad"}`;
+  if (pending) {
+    pill.textContent = daemon.restart_in_secs > 0
+      ? `crashed — restarting in ${daemon.restart_in_secs}s`
+      : "crashed — restarting…";
+  } else if (recovered) {
+    pill.textContent = "restarted";
+  } else {
+    pill.textContent = "restarting…";
+  }
+
+  const parts = [];
+  if (daemon.last_exit) {
+    const when = daemon.last_exit_at
+      ? new Date(daemon.last_exit_at * 1000).toLocaleTimeString()
+      : "";
+    parts.push(`Last crash${when ? ` at ${when}` : ""}: ${daemon.last_exit}.`);
+  }
+  if (daemon.restarts > 0) {
+    parts.push(`Restarted automatically ${daemon.restarts}× this session.`);
+  }
+  if (daemon.last_error) parts.push(`Last restart attempt failed: ${daemon.last_error}`);
+  setText("health-detail", parts.join(" "));
+  $("health-output").hidden = !daemon.last_output;
+  setText("health-output", daemon.last_output ?? "");
+}
+
+function render({ reachable, status, daemon }) {
   daemonReachable = reachable;
+  renderHealth(daemon, reachable);
   const pill = $("reachable");
   pill.textContent = reachable ? "connected" : "unreachable";
   pill.className = `pill ${reachable ? "pill-good" : "pill-bad"}`;
@@ -42,9 +81,50 @@ function render({ reachable, status }) {
 
   $("error-block").hidden = !status.last_error;
   setText("last-error", status.last_error ?? "");
+  renderScanHealth(status.scan_health ?? {});
 
   $("start-btn").disabled = !reachable || status.scanning;
   $("stop-btn").disabled = !reachable || !status.scanning;
+}
+
+// Why the scan is stuck, and where it started (the daemon's `scan_health`;
+// absent from older daemons).
+function renderScanHealth(health) {
+  const stall = health.stall;
+  $("stall-block").hidden = !stall;
+  setText(
+    "stall",
+    stall
+      ? `at height ${stall.height.toLocaleString()} since ` +
+          `${new Date(stall.since_unix * 1000).toLocaleString()}: ${stall.reason}`
+      : "",
+  );
+
+  const notes = [];
+  const start = health.start_adjusted;
+  if (start) {
+    notes.push(
+      `Scanning began at block ${start.oracle_floor.toLocaleString()} instead of ` +
+        `${start.requested_height.toLocaleString()}: the oracle has no data below it.`,
+    );
+  }
+  const reset = health.state_reset;
+  if (reset) {
+    notes.push(
+      `The state file could not be read (${reset.error}). It was moved to ` +
+        `${reset.backup_path}, and the wallet is being scanned again from its start height.`,
+    );
+  }
+  const rescan = health.state_rescan;
+  if (rescan) {
+    notes.push(
+      `Rescanning blocks ${rescan.from_height.toLocaleString()}–` +
+        `${rescan.until_height.toLocaleString()} once: the state file predates ` +
+        `spend tracking, so spends it missed are being looked for.`,
+    );
+  }
+  $("scan-notes-block").hidden = notes.length === 0;
+  setText("scan-notes", notes.join("\n"));
 }
 
 async function refresh() {
@@ -179,6 +259,10 @@ let setupMode = false;
 // Prefill baseline while in setup mode (partial config file over defaults).
 let setupConfig = null;
 
+// Hosted oracles and default P2P ports per network (from the Rust side, so
+// the daemon and the form agree).
+let networkDefaults = { hosted_oracles: {}, default_ports: {} };
+
 function updateSettingsAvailability() {
   $("setup-banner").hidden = !setupMode;
   $("settings-unreachable").hidden = daemonReachable || setupMode;
@@ -186,8 +270,11 @@ function updateSettingsAvailability() {
     ? false
     : !daemonReachable || loadedConfig === null;
   $("cfg-scan-key").placeholder = setupMode
-    ? "required (32-byte hex)"
+    ? "not needed when a descriptor is pasted"
     : "unchanged — enter to replace";
+  $("cfg-descriptor").placeholder = setupMode
+    ? "sp([…/352h/0h/0h]spscan1q…)#…"
+    : "paste a descriptor only to switch to another wallet";
 }
 
 async function refreshSetupState() {
@@ -202,6 +289,9 @@ async function refreshSetupState() {
 
 function enterSetupMode(s) {
   setupMode = true;
+  // Default for a first-time setup: start at login (shown, can be unticked).
+  $("cfg-autostart").checked = true;
+  autostartMessage("Applied when you save.", false);
   setupConfig = s.config;
   const paths = [s.config_path, s.key_file].filter(Boolean);
   $("setup-config-path").textContent = paths.length ? `Writes: ${paths.join(", ")}` : "";
@@ -214,14 +304,158 @@ function enterSetupMode(s) {
 function exitSetupMode() {
   setupMode = false;
   setupConfig = null;
+  autostartMessage("", false);
+  loadAutostart();
   updateSettingsAvailability();
 }
+
+// --- network-dependent defaults --------------------------------------------
+
+const normalizeUrl = (url) => url.trim().replace(/\/+$/, "");
+
+function hostedOracle(network) {
+  return networkDefaults.hosted_oracles[network] ?? null;
+}
+
+function isHostedOracle(url) {
+  return Object.values(networkDefaults.hosted_oracles).includes(normalizeUrl(url));
+}
+
+function updateNetworkHints() {
+  const network = $("cfg-network").value;
+  const hosted = hostedOracle(network);
+  const url = normalizeUrl($("cfg-oracle-url").value);
+  const hint = $("oracle-hint");
+  if (hosted && url === hosted) {
+    hint.textContent = `Hosted ${network} oracle.`;
+    hint.className = "hint";
+  } else if (hosted) {
+    hint.textContent = `Custom oracle. The hosted ${network} oracle is ${hosted}.`;
+    hint.className = "hint";
+  } else {
+    hint.textContent = `There is no hosted oracle for ${network}: enter the URL of your own BlindBit oracle.`;
+    hint.className = url ? "hint" : "hint warn";
+  }
+  const port = networkDefaults.default_ports[network];
+  $("cfg-p2p-addr").placeholder = port ? `node.example.com:${port}` : "host:port";
+}
+
+// Switching networks swaps a hosted (or empty) oracle URL for the new
+// network's hosted one; a custom URL is left alone.
+function onNetworkChange({ reinspect = true } = {}) {
+  const network = $("cfg-network").value;
+  const oracle = $("cfg-oracle-url");
+  if (oracle.value.trim() === "" || isHostedOracle(oracle.value)) {
+    oracle.value = hostedOracle(network) ?? "";
+  }
+  updateNetworkHints();
+  if (reinspect && $("cfg-descriptor").value.trim()) inspectDescriptor();
+}
+
+// --- wallet birthday ---------------------------------------------------------
+
+function setBirthday(mode, height) {
+  $("birthday-tip").checked = mode === "tip";
+  $("birthday-height").checked = mode === "height";
+  if (height != null) $("cfg-start-height").value = height;
+  $("cfg-start-height").disabled = mode !== "height";
+}
+
+// --- descriptor paste ----------------------------------------------------------
+
+// Summary of the currently pasted descriptor (null when empty or invalid).
+let descriptorSummary = null;
+let descriptorSeq = 0;
+// The pasted text carried the spend private key and was replaced by the
+// watch-only form; sticky until the user edits the field again.
+let spendSecretDropped = false;
+
+function descriptorStatus(text, kind) {
+  const el = $("descriptor-status");
+  el.textContent = text;
+  el.className = `hint ${kind ?? ""}`;
+}
+
+async function inspectDescriptor() {
+  const text = $("cfg-descriptor").value.trim();
+  const seq = ++descriptorSeq;
+  if (!text) {
+    descriptorSummary = null;
+    descriptorStatus("", "");
+    return;
+  }
+  try {
+    const s = await invoke("inspect_descriptor", {
+      descriptor: text,
+      network: $("cfg-network").value,
+    });
+    if (seq !== descriptorSeq) return; // superseded by a newer edit
+    const firstLook = descriptorSummary === null;
+    descriptorSummary = s;
+    if ($("cfg-network").value !== s.network) {
+      $("cfg-network").value = s.network;
+      onNetworkChange({ reinspect: false });
+    }
+    $("cfg-spend-pubkey").value = s.spend_pubkey;
+    $("cfg-scan-key").value = ""; // the descriptor supplies the scan key
+    if (s.had_spend_secret) {
+      spendSecretDropped = true;
+      $("cfg-descriptor").value = s.watch_only;
+    }
+    // A different wallet gets its own birthday (Sparrow's bh=, else "new
+    // wallet"); re-pasting the configured wallet keeps the current one.
+    const sameWallet = loadedConfig?.spend_pubkey === s.spend_pubkey;
+    if (firstLook && !sameWallet) {
+      if (s.birth_height != null) setBirthday("height", s.birth_height);
+      else setBirthday("tip");
+    }
+
+    const kind = s.mainnet ? "mainnet" : "test-network";
+    let msg = `✓ Watch-only ${kind} wallet, address ${truncateMiddle(s.sp_address)} — it should match Sparrow's Receive tab.`;
+    if (s.birth_height != null) msg += ` Birthday from the descriptor: block ${s.birth_height}.`;
+    if (spendSecretDropped) {
+      msg = "This descriptor contained your spend PRIVATE key. Friglet only needs the " +
+        "watch-only part: it kept the public key and replaced the text above with the " +
+        "watch-only descriptor. The private key is not stored. " + msg;
+      descriptorStatus(msg, "warn");
+    } else {
+      descriptorStatus(msg, "ok");
+    }
+  } catch (e) {
+    if (seq !== descriptorSeq) return;
+    descriptorSummary = null;
+    descriptorStatus(String(e), "error");
+  }
+}
+
+let descriptorTimer = null;
+$("cfg-descriptor").addEventListener("input", () => {
+  spendSecretDropped = false;
+  clearTimeout(descriptorTimer);
+  descriptorTimer = setTimeout(inspectDescriptor, 200);
+});
+$("cfg-network").addEventListener("change", () => onNetworkChange());
+$("cfg-oracle-url").addEventListener("input", updateNetworkHints);
+$("birthday-tip").addEventListener("change", () => setBirthday("tip"));
+$("birthday-height").addEventListener("change", () => {
+  setBirthday("height");
+  $("cfg-start-height").focus();
+});
+
+// --- form <-> config -------------------------------------------------------------
 
 function fillForm(cfg) {
   $("cfg-network").value = cfg.network;
   $("cfg-oracle-url").value = cfg.oracle_url;
+  // A fresh config still carries the mainnet default oracle; follow the
+  // network unless a custom URL is set.
+  if (isHostedOracle(cfg.oracle_url)) $("cfg-oracle-url").value = hostedOracle(cfg.network) ?? cfg.oracle_url;
   $("cfg-p2p-addr").value = cfg.p2p_node_addr ?? "";
-  $("cfg-start-height").value = cfg.start_height ?? "";
+  if (cfg.start_height != null) setBirthday("height", cfg.start_height);
+  else {
+    $("cfg-start-height").value = "";
+    setBirthday("tip");
+  }
   $("cfg-spend-pubkey").value = cfg.spend_pubkey ?? "";
   $("cfg-max-labels").value = cfg.max_label_num;
   $("cfg-key-file").value = cfg.key_file ?? "";
@@ -229,6 +463,11 @@ function fillForm(cfg) {
   $("cfg-electrum-addr").value = cfg.electrum_addr;
   $("cfg-state-file").value = cfg.state_file;
   $("cfg-scan-key").value = "";
+  $("cfg-descriptor").value = "";
+  descriptorSummary = null;
+  spendSecretDropped = false;
+  descriptorStatus("", "");
+  updateNetworkHints();
 }
 
 // Build the config to send: loaded config + form edits. Empty optional
@@ -236,12 +475,14 @@ function fillForm(cfg) {
 function formConfig() {
   const text = (id) => $(id).value.trim();
   const optional = (id) => text(id) || null;
+  const atTip = $("birthday-tip").checked;
   return {
     ...(loadedConfig ?? setupConfig),
     network: $("cfg-network").value,
     oracle_url: text("cfg-oracle-url"),
     p2p_node_addr: optional("cfg-p2p-addr"),
-    start_height: text("cfg-start-height") === "" ? null : Number(text("cfg-start-height")),
+    start_height: atTip || text("cfg-start-height") === "" ? null : Number(text("cfg-start-height")),
+    start_at_tip: atTip,
     spend_pubkey: optional("cfg-spend-pubkey"),
     max_label_num: Number(text("cfg-max-labels") || "0"),
     key_file: optional("cfg-key-file"),
@@ -249,6 +490,17 @@ function formConfig() {
     electrum_addr: text("cfg-electrum-addr"),
     state_file: text("cfg-state-file"),
   };
+}
+
+// The pasted descriptor to save with, or an error when the field holds
+// something that did not parse.
+function pastedDescriptor() {
+  const text = $("cfg-descriptor").value.trim();
+  if (!text) return { descriptor: null };
+  if (!descriptorSummary) {
+    return { error: "The descriptor could not be read — see the message under it." };
+  }
+  return { descriptor: text };
 }
 
 function settingsMessage(text, isError) {
@@ -276,6 +528,8 @@ async function loadConfig() {
 // locally, then starts the daemon. On success the UI flips back to the
 // normal daemon-backed mode.
 async function saveSetupConfig() {
+  const { descriptor, error } = pastedDescriptor();
+  if (error) return settingsMessage(error, true);
   $("save-btn").disabled = true;
   settingsMessage("Saving…", false);
   const key = $("cfg-scan-key").value;
@@ -283,6 +537,8 @@ async function saveSetupConfig() {
     const spawnError = await invoke("save_local_config", {
       config: formConfig(),
       scanKey: key,
+      descriptor,
+      autostart: $("cfg-autostart").checked,
     });
     if (spawnError) {
       // Files were written; only starting the daemon failed. The next polls
@@ -300,56 +556,116 @@ async function saveSetupConfig() {
   $("save-btn").disabled = false;
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// After a save the daemon restarts in-process; wait until it answers again
+// (a new wallet may first fetch the chain tip from the oracle).
+async function waitForDaemon(timeoutMs = 60000) {
+  await sleep(600); // let the old instance go away first
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return await invoke("get_config");
+    } catch (_) {
+      await sleep(500);
+    }
+  }
+  return null;
+}
+
 async function saveConfig(event) {
   event.preventDefault();
   if (setupMode) return saveSetupConfig();
   if (loadedConfig === null) return;
+  const { descriptor, error } = pastedDescriptor();
+  if (error) return settingsMessage(error, true);
   $("save-btn").disabled = true;
   settingsMessage("Saving…", false);
 
-  const notes = [];
-  // Config first: if the user changed key_file in the same save, the scan
-  // key below must land in the NEW path. A set_config failure aborts the
-  // save before the key is sent anywhere, keeping the form edits intact.
+  // Config + (optional) scan key in one request: the daemon validates both,
+  // persists them and restarts once. A failure leaves the form as typed.
+  const key = $("cfg-scan-key").value.trim();
+  let note;
   try {
-    const note = await invoke("set_config", { config: formConfig() });
-    if (note) notes.push(note);
+    note = await invoke("apply_settings", {
+      config: formConfig(),
+      scanKey: key || null,
+      descriptor,
+    });
   } catch (e) {
     settingsMessage(String(e), true);
     $("save-btn").disabled = false;
     return;
   }
-
-  // The config is persisted daemon-side from here on. Write-only scan key:
-  // only sent when the user typed one; a failure must not skip the reload
-  // below, or the form keeps merging stale hidden fields into later saves.
-  let keyError = null;
-  const key = $("cfg-scan-key").value.trim();
-  if (key !== "") {
-    try {
-      const keyNote = await invoke("set_scan_key", { key });
-      if (keyNote) notes.push(keyNote);
-    } catch (e) {
-      keyError = String(e);
-    }
+  if (!note) {
+    settingsMessage("No changes to save.", false);
+    $("save-btn").disabled = false;
+    return;
   }
 
+  settingsMessage("Saved — restarting the daemon with the new settings…", false);
+  const cfg = await waitForDaemon();
   // Reload so loadedConfig matches what the daemon persisted (loadConfig
   // clears the message, so report the outcome afterwards).
   await loadConfig();
   await refresh();
-  if (keyError) {
-    settingsMessage(`Config saved, but updating the scan key failed: ${keyError}`, true);
-    // fillForm cleared the key input; restore it so the user can retry.
-    $("cfg-scan-key").value = key;
+  if (cfg) {
+    settingsMessage("Saved — the daemon restarted with the new settings. Sparrow reconnects by itself.", false);
   } else {
-    settingsMessage(notes.length ? `Saved. ${notes.join(". ")}` : "Saved.", false);
+    settingsMessage(
+      "Saved, but the daemon has not come back yet — see the Status tab for the reason.",
+      true
+    );
   }
   $("save-btn").disabled = false;
 }
 
+// --- start at login (a tray setting, independent of the daemon) -------------
+
+function autostartMessage(text, isError) {
+  const el = $("autostart-msg");
+  el.textContent = text;
+  el.className = `hint ${isError ? "error" : ""}`;
+}
+
+async function loadAutostart() {
+  try {
+    const enabled = await invoke("get_autostart");
+    // First-run setup shows its own default until Save applies it.
+    if (!setupMode) $("cfg-autostart").checked = enabled;
+  } catch (e) {
+    autostartMessage(String(e), true);
+  }
+}
+
+$("cfg-autostart").addEventListener("change", async () => {
+  // In first-run setup the choice is applied together with Save.
+  if (setupMode) {
+    autostartMessage("Applied when you save.", false);
+    return;
+  }
+  const enabled = $("cfg-autostart").checked;
+  try {
+    await invoke("set_autostart", { enabled });
+    autostartMessage(enabled ? "Friglet starts at login." : "Friglet no longer starts at login.", false);
+  } catch (e) {
+    $("cfg-autostart").checked = !enabled;
+    autostartMessage(String(e), true);
+  }
+});
+
 $("settings-form").addEventListener("submit", saveConfig);
 $("reload-btn").addEventListener("click", loadConfig);
+
+loadAutostart();
+
+invoke("network_defaults")
+  .then((d) => {
+    networkDefaults = d;
+    // The form may have been filled before the defaults arrived.
+    onNetworkChange({ reinspect: false });
+  })
+  .catch((e) => console.error("network_defaults failed", e));
 
 // ---------------------------------------------------------------------------
 // Tabs

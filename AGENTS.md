@@ -71,6 +71,9 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   `FRIGLET_P2P_NODE_ADDR`/`FRIGLET_START_HEIGHT`/`FRIGLET_SPEND_PUBKEY`
   env instead), and a scan secret must exist (key file from the config's
   `key_file` or `<config dir>/friglet/scan.key`, or `FRIGLET_SCAN_SECRET`).
+  `start_at_tip = true` satisfies `start_height`; a `descriptor` key (or
+  `FRIGLET_DESCRIPTOR`) satisfies `spend_pubkey` + the scan secret, and its
+  `bh=` annotation `start_height`.
   A config file that exists but fails to parse counts as configured, so the
   spawn attempt surfaces the daemon's own parse error instead of setup mode
   silently overwriting a hand-written file.
@@ -156,10 +159,24 @@ dbus-run-session -- bash -c '
 - Desktop bundles: `scripts/prepare-sidecar.sh` (stages
   `target/release/friglet` as `friglet-tray/binaries/friglet-<triple>`,
   gitignored), then from `friglet-tray/`:
-  `npx @tauri-apps/cli build --bundles deb,appimage --config
+  `npx @tauri-apps/cli@2 build --bundles deb,appimage --config
   tauri.sidecar.conf.json` (Linux) or `--bundles dmg --config
   tauri.sidecar.conf.json` (macOS host only — dmg cannot be cross-built
   from Linux). Artifacts: `target/release/bundle/{deb,appimage,dmg}/`.
+- CI packaging: `.github/workflows/release.yml` (packaging only, not a
+  second ci.yml). Linux deb+AppImage on `ubuntu-22.04` (glibc floor),
+  macOS universal dmg on `macos-15` (`prepare-sidecar.sh
+  universal-apple-darwin` lipo's both daemon slices; Tauri requires the
+  sidecar to be universal too), Windows msi+nsis best effort
+  (`continue-on-error`). Each job checks the daemon is inside the bundle.
+  Triggers: `v*` tags and `workflow_dispatch` → DRAFT release only (tag must
+  match `tauri.conf.json` version); `pull_request` is path-filtered to
+  packaging files and only uploads artifacts. `TAURI_CLI_VERSION` there is
+  pinned to the locked `tauri` crate version — bump both together.
+- macOS bundles are ad-hoc signed (`bundle.macOS.signingIdentity: "-"`):
+  arm64 needs at least an ad-hoc signature, and it turns Gatekeeper's
+  "damaged" error into the bypassable "Open Anyway" prompt. User steps for
+  unsigned builds: README "Opening unsigned builds".
 - The daemon is a Tauri sidecar (`bundle.externalBin`), but it lives in the
   `tauri.sidecar.conf.json` overlay, NOT the base `tauri.conf.json`:
   tauri-build errors at compile time when an externalBin file is missing,
@@ -190,33 +207,77 @@ dbus-run-session -- bash -c '
   --target x86_64-pc-windows-gnu` passes cleanly (mingw-w64 installed).
   The `x86_64-pc-windows-msvc` target cannot be checked from Linux — the
   `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
-  an environment limitation, not a code problem. No real Windows
-  build/run has been exercised; linking + runtime remain unverified.
+  an environment limitation, not a code problem. On a real MSVC host
+  (`windows-2025` in release.yml) the daemon and tray compile, link and
+  bundle (msi + nsis), and the MSI's `friglet.exe --help` runs; the tray
+  itself (named-pipe control, tray icon, spawning) is still unverified.
 
-## SetConfig / SetScanKey semantics (v1)
+## SP descriptor onboarding (SNB-623)
 
-- The daemon validates a `SetConfig` payload fully before touching anything;
-  invalid input → `Response::Error`, nothing persisted. Valid configs are
-  written as TOML to the config file the daemon loaded (or the default path)
-  and applied: scanner-affecting fields rebuild + restart the scan task;
-  `http_addr`/`electrum_addr`/`control_socket`/`log_level` need a daemon
-  restart (reported via `Response::OkWithNote` — no live rebinding).
-- Known v1 limitation: the Electrum server keeps the index/notification
-  channel of the scanner it was started with, so after a scanner-affecting
-  `SetConfig` it serves the pre-change wallet view until the daemon restarts
-  (the `OkWithNote` message says so). Same for the HTTP `/subscribe` start
-  height.
-- `SetScanKey` writes the key file (0600) but blindbit-lib restores the
-  secret embedded in the state file, so a stale state file pins the old key —
-  the daemon detects this and answers `OkWithNote` telling the user to move
-  the state file.
-- Control-socket integration tests live in `friglet/src/control/mod.rs`
-  (friglet is a bin crate, so no `tests/` dir); they build offline `Scanner`s
-  via a lazy tonic channel (`tonic` is a friglet dependency pinned to
-  blindbit-lib's version) and inject a no-network `scanner_builder`.
-  `GetStatus` also uses tonic to poll the oracle tip (cached ~10s) for
-  `tip_height`; tests use unreachable `oracle_url`s and fall back to the
-  electrum tip within a 2s connect timeout.
+- Parser: `friglet-ipc/src/descriptor.rs` (BIP-392 `sp(...)` + BIP-393 `?bh=`
+  + BIP-380 checksum), shared by daemon and tray; test vectors are Sparrow
+  2.5.5 / drongo fixtures. Sparrow's *Copy Output Descriptor* yields
+  `sp([fp/352h/0h/0h]spscan1q…)?bh=N#cs` (`bh` only once the wallet has a
+  confirmed tx). `tspscan` covers every test network, so the tray defaults
+  test keys to signet.
+- The scan secret never enters `DaemonConfig`: the daemon reads `descriptor`
+  from the raw figment layers, folds the spend key/birthday into the
+  settings and copies the scan key into the key file; the tray parses the
+  descriptor in Rust and only hands the UI a summary without the secret.
+- Spend-secret (`spspend`) descriptors: tray paste → public key derived,
+  secret dropped, field replaced with the watch-only form; config file →
+  refused (the secret would sit on disk).
+- `start_at_tip`: resolved from the oracle tip at daemon start (and in
+  `SetConfig`), then persisted as `start_height` by patching only that key
+  in the config file (`config::persist_start_height`).
+- `oracle_url` follows `network` when no layer sets it; a hosted oracle URL
+  of another network is rejected. `p2p_node_addr` accepts hostnames (DNS at
+  start, IPv4 preferred) and bare hosts (network default port).
+
+## SetConfig / SetScanKey / ApplySettings semantics (SNB-624)
+
+- The daemon validates the payload (config and/or scan key) fully before
+  touching anything; invalid input → `Response::Error`, nothing persisted.
+  Valid input is written (config as TOML to the file the daemon loaded or
+  the default path; scan key to the 0600 key file) and, if anything
+  changed, answered with `OkWithNote` and followed ~100 ms later by an
+  **in-process restart**: `main` runs each daemon run on its own tokio
+  runtime and drops it, so every task of the old run dies (Electrum client
+  connections, the startup-time found-output/reorg subscriptions, listeners,
+  scan task) and the next run re-reads the config. Same PID → the tray's
+  child handle stays valid. Unchanged input → plain `Ok`, no restart.
+- `ApplySettings { config, scan_key }` = SetConfig + SetScanKey with one
+  validation and one restart; the tray's settings save uses it.
+- Wallet-keyed state (`config::wallet_state_file`): the default state path
+  becomes `scanner_state-<network>-<sha256(scan_pub‖spend_pub)[..4]>.json`
+  (a legacy `scanner_state.json` of the same wallet is renamed into place);
+  an explicit `state_file` holding another wallet's keys is refused at
+  startup (blindbit-lib would otherwise silently restore the old keys).
+- Birthday rescans (`config::reconcile_birthday`): `<state>.birthday.json`
+  records the lowest start height the state covers; a lower `start_height`
+  moves the state to `*.json.bak` and scans from scratch.
+- A server dying (HTTP/Electrum/control bind failure) now ends the process
+  with exit code 1 instead of 0, and a control socket that failed to bind
+  (another daemon) is no longer deleted on the way out.
+- Control-socket tests live in `friglet/src/control/mod.rs` (friglet is a
+  bin crate); they build offline `Scanner`s via a lazy tonic channel and
+  assert the restart via `ControlCtx::restart_requested` + the cancelled
+  shutdown token. `GetStatus` uses tonic to poll the oracle tip (cached
+  ~10s) for `tip_height`.
+
+## Tray supervision + autostart (SNB-624, SNB-52)
+
+- `lifecycle::Supervision` is a pure state machine (backoff 1 s doubling to
+  60 s, reset after 60 s healthy); `lib.rs::supervise_tick` runs it from
+  the 1 s poller: reaps an exited child (exit status + last output lines →
+  `ExitReport`), presumes a no-handle owned daemon dead after 15 s silence
+  and a wedged child after 120 s, and restarts via `attach_and_record`.
+  `AppState.supervise` is off for external daemons and in setup mode;
+  `quitting` stops it during Quit. `get_status` carries `daemon`
+  (`DaemonHealth`) for the Status tab's crash card.
+- Autostart: `tauri-plugin-autostart` (XDG autostart `.desktop` /
+  LaunchAgent / Run key), commands `get_autostart`/`set_autostart`; first-run
+  setup passes `autostart` to `save_local_config` (default ticked).
 
 ## Wallet status fields
 

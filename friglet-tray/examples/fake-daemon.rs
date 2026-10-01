@@ -83,6 +83,7 @@ async fn main() -> std::io::Result<()> {
                         ],
                         version: "fake-0.0.0".to_string(),
                         spawned_by_tray: false,
+                        scan_health: Default::default(),
                     }),
                     Request::Start => {
                         scanning.store(true, Ordering::Relaxed);
@@ -121,6 +122,29 @@ async fn main() -> std::io::Result<()> {
                             Response::Error(
                                 "invalid scan key: must be a 32-byte hex string".to_string(),
                             )
+                        }
+                    }
+                    Request::ApplySettings {
+                        config: new_cfg,
+                        scan_key,
+                    } => {
+                        let key_ok = scan_key.as_deref().is_none_or(|k| {
+                            let k = k.trim();
+                            k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit())
+                        });
+                        match check_config(&new_cfg) {
+                            Err(e) => Response::Error(e),
+                            Ok(()) if !key_ok => Response::Error(
+                                "invalid scan key: must be a 32-byte hex string".to_string(),
+                            ),
+                            Ok(()) => {
+                                *config.lock().unwrap() = *new_cfg;
+                                Response::OkWithNote(
+                                    "saved; the daemon restarts to apply it (fake daemon: \
+                                     applied in memory)"
+                                        .to_string(),
+                                )
+                            }
                         }
                     }
                     Request::Shutdown => {

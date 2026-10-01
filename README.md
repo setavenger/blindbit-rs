@@ -50,12 +50,13 @@ cargo run --release --package friglet scan \
 |------|-------------|---------|
 | `--scan-secret` | Scan secret key (32-byte hex, secp256k1) | required |
 | `--spend-pubkey` | Spend public key (33-byte hex, secp256k1) | required |
-| `--start-height` | Wallet birthday block height | required |
-| `--p2p-node-addr` | Bitcoin P2P node address (`host:port`) | required |
-| `--oracle-url` | BlindBit Oracle URL | `https://oracle.setor.dev` |
+| `--start-height` | Wallet birthday block height | required (or `--start-at-tip`) |
+| `--start-at-tip` | New wallet: use the oracle's current tip as the birthday (recorded as `start_height` in the config file on first start) | off |
+| `--p2p-node-addr` | Bitcoin P2P node: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start | required |
+| `--oracle-url` | BlindBit Oracle URL | hosted oracle of `--network` (mainnet `https://oracle.setor.dev`, signet `https://signet.oracle.setor.dev`; none for other networks) |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
-| `--state-file` | Path to persist scanner state | `<config dir>/friglet/scanner_state.json` |
+| `--state-file` | Path to persist scanner state. The default is kept per wallet (`scanner_state-<network>-<id>.json` next to it), so new keys start a fresh scan; an explicit path holding another wallet's state is refused | `<config dir>/friglet/scanner_state.json` |
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
 
@@ -72,6 +73,23 @@ with no flags at all.
 - Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
   `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
 - `--print-config` prints the merged configuration as TOML and exits.
+
+Instead of the hex keys, the config can name the wallet by its Silent
+Payments descriptor as Sparrow exports it (BIP-392; in Sparrow: wallet
+**Settings** tab → right-click **Descriptor** → **Copy Output Descriptor**):
+
+```toml
+network = "signet"            # spscan… = mainnet, tspscan… = a test network
+descriptor = "sp([0f056943/352h/1h/0h]tspscan1q…)#7eve6al9"
+p2p_node_addr = "signet-node.example:38333"
+```
+
+`descriptor` (or `FRIGLET_DESCRIPTOR`) supplies `spend_pubkey`, the scan key
+(copied into the key file on startup) and, via its `?bh=` annotation,
+`start_height` when that is unset. It is never echoed back by `GetConfig` or
+`--print-config`. A descriptor holding the spend **private** key
+(`spspend…`) is refused — friglet is watch-only and will not keep that key
+on disk.
 
 The scan secret is kept out of the config file. It is read from, in order:
 `--scan-secret` (deprecated), `FRIGLET_SCAN_SECRET`, or the key file at
@@ -100,6 +118,26 @@ Once running, `friglet` exposes the following endpoints on `--http-addr`:
 
 The built-in Electrum server (bound to `--electrum-addr`) allows wallets such as Sparrow to connect directly and query Silent Payment UTXOs without any additional infrastructure.
 
+What to expect from it:
+
+- **New blocks** are announced with the real header of the tip block. friglet
+  asks the oracle which block is at the scanned height and fetches that
+  block's 80-byte header from the P2P peer.
+- **Broadcasting** succeeds only once the P2P peer (`--p2p-node-addr`) has the
+  transaction in its mempool, which usually takes 5–10 seconds. Otherwise
+  Sparrow shows an error. The P2P protocol does not say why a peer refuses a
+  transaction. friglet reports what it can tell: missing or spent inputs, a
+  fee below the peer's mempool minimum, or a dropped connection, which means
+  the transaction is invalid. Broadcasts that have not confirmed are kept in
+  `<state file>.pending.json`. While they are pending, friglet re-announces
+  them whenever the peer's mempool loses them, including after a restart. It
+  stops when they confirm or when a conflicting transaction confirms.
+- **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
+  with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
+  minimum fee rate that the P2P peer's mempool currently accepts. Keep
+  Sparrow's fee rate source on an external service (mempool.space by
+  default), or set fee rates by hand.
+
 ---
 
 ### Tray app (friglet-tray)
@@ -112,14 +150,23 @@ opened via the tray menu; closing it hides it again). The tray menu also
 offers Start/Stop scanning and Quit.
 
 The window's **Settings** tab lets you view and edit all daemon settings —
-network, oracle URL, P2P node address, start height, scan key, spend pubkey,
-max labels, HTTP/Electrum bind addresses, state and key file paths. Saving
-sends the config to the daemon, which validates it, persists it to its config
-file (and the scan key to the 0600 key file) and applies it: scan settings
-restart the scan task immediately, while bind-address changes take effect on
-the next daemon restart (the UI surfaces the daemon's note about this). The
-scan key is write-only — it is never displayed and only sent when you type a
-new one.
+wallet descriptor, network, wallet birthday, Bitcoin node, oracle URL, and
+under *Advanced* the scan key, spend pubkey, max labels, HTTP/Electrum bind
+addresses, state and key file paths. Saving sends the config (and a new
+scan key, if a descriptor was pasted) to the daemon in one request; it
+validates it, persists it to its config file (the scan key to the 0600 key
+file) and then **restarts itself in-process** so every setting takes full
+effect — Electrum clients such as Sparrow are disconnected, reconnect on
+their own and see the new wallet. New keys get their own state file, so
+switching wallets starts a fresh scan; moving the birthday back rescans from
+the new height (the old state is kept as `*.json.bak`). The scan key is
+write-only — it is never displayed and only sent when you paste a
+descriptor or type a new key.
+
+**Start at login**: a checkbox on the Settings tab registers the tray as a
+login item (XDG autostart entry on Linux, LaunchAgent on macOS, Run key on
+Windows; the AppImage path when run from one); the tray then starts the
+daemon. It is ticked by default in first-time setup and applied on Save.
 
 The **Wallet** tab is a read-only convenience view, not a spending wallet. It
 shows found transaction/output counts plus copyable base and per-label Silent
@@ -143,12 +190,29 @@ FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
 **First run** — no manual config file needed: launch the tray, and if no
 daemon is running and none is configured yet (no `config.toml`, no
 `FRIGLET_*` env), the window opens automatically on the Settings tab with a
-first-time-setup banner. Fill in the required fields (P2P node address,
-start height, spend pubkey, scan key) and hit Save: the tray validates the
-form, writes the config file (atomic TOML at the platform default path,
-e.g. `~/.config/friglet/config.toml` on Linux or
+first-time-setup banner. Then:
+
+1. In Sparrow, open the Silent Payments wallet, go to its **Settings** tab,
+   right-click the **Descriptor** field and choose **Copy Output
+   Descriptor**. Paste it into *Sparrow wallet descriptor*. The tray picks
+   the network (mainnet for `spscan…`, signet for `tspscan…` unless another
+   test network is selected) and the matching hosted oracle, and shows the
+   wallet's SP address to compare with Sparrow's Receive tab. A pasted
+   `spspend…` descriptor (spend private key) is reduced to its watch-only
+   form on the spot; the private key is never stored.
+2. *Wallet birthday*: **New wallet** starts at the current chain tip
+   (nothing to rescan; the daemon records the tip as `start_height` on
+   first start). **From block height** scans from the height you enter
+   (pre-filled when the descriptor carries Sparrow's `?bh=` birth height).
+3. *Bitcoin node*: any reachable node of that network, `host:port` or just
+   `host`.
+
+Save validates the form (including a DNS lookup of the node), writes the
+config file (atomic TOML at the platform default path, e.g.
+`~/.config/friglet/config.toml` on Linux or
 `~/Library/Application Support/friglet/config.toml` on macOS) and the scan
-key file (0600), then starts the daemon with it.
+key file (0600), then starts the daemon with it. The hex key fields are
+still available under *Advanced*.
 
 Lifecycle behavior:
 
@@ -176,6 +240,16 @@ Lifecycle behavior:
   tray process — this avoids two trays racing to spawn a daemon on a cold
   start (only one would win the control-socket bind; without this guard the
   loser could still send `Shutdown` for the other's daemon at Quit).
+- **Supervision**: a daemon the tray spawned (or one an earlier tray
+  session spawned) is restarted automatically when it dies — crash, kill,
+  `panic = "abort"` in release builds — with exponential backoff (1 s, 2 s,
+  4 s … capped at 60 s; reset after a healthy minute). The Status tab shows
+  the crash (exit status/signal, time, the daemon's last output lines),
+  the restart count and the countdown to the next attempt; the tray label
+  reads "Daemon: crashed — restarting". A daemon that is alive but silent
+  for 2 minutes is replaced. "Retry / Start daemon" restarts immediately.
+  Only Quit stops it for good; an externally started daemon is never
+  restarted by the tray.
 - **Scanning start/stop is not sticky across a daemon restart**: `Stop`
   pauses only the scan task, not the process. If the tray-spawned daemon is
   later shut down (Quit) and a new one is spawned, the new daemon starts
@@ -200,11 +274,11 @@ right next to its own executable.
 #    friglet-tray/binaries/friglet-<target-triple>)
 scripts/prepare-sidecar.sh
 
-# 2. build the bundles (tauri-cli via npx; `cargo install tauri-cli --locked`
+# 2. build the bundles (tauri-cli v2 via npx; `cargo install tauri-cli --locked`
 #    works too — then use `cargo tauri build ...`)
 cd friglet-tray
-npx @tauri-apps/cli build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
-npx @tauri-apps/cli build --bundles dmg --config tauri.sidecar.conf.json           # macOS
+npx @tauri-apps/cli@2 build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
+npx @tauri-apps/cli@2 build --bundles dmg --config tauri.sidecar.conf.json           # macOS
 ```
 
 The `--config tauri.sidecar.conf.json` overlay adds the daemon sidecar
@@ -221,7 +295,56 @@ Artifacts land under `target/release/bundle/`:
   binaries in the embedded `usr/bin/`.
 - `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
   Run `scripts/prepare-sidecar.sh` there first; it picks up the host triple
-  (e.g. `aarch64-apple-darwin`) automatically.
+  (e.g. `aarch64-apple-darwin`) automatically. For one dmg that runs on
+  both Apple Silicon and Intel, stage a fat sidecar with
+  `scripts/prepare-sidecar.sh universal-apple-darwin` and add
+  `--target universal-apple-darwin` to the build (output under
+  `target/universal-apple-darwin/release/bundle/`). The app is ad-hoc
+  signed (`bundle.macOS.signingIdentity: "-"`), not notarized.
+
+### Prebuilt bundles (GitHub Actions)
+
+`.github/workflows/release.yml` runs the same steps on GitHub-hosted
+runners. It only does packaging; tests and lints stay in `ci.yml`.
+
+| Platform | Runner | Bundles |
+|----------|--------|---------|
+| Linux x86_64 | `ubuntu-22.04` (glibc 2.35 minimum) | `.deb`, `.AppImage` |
+| macOS, Apple Silicon + Intel | `macos-15` | universal `.dmg` |
+| Windows x86_64 (best effort, untested) | `windows-2025` | `.msi`, NSIS `-setup.exe` |
+
+It runs on `v*` tag pushes, on manual `workflow_dispatch`, and on pull
+requests that touch packaging files (the workflow, `friglet-tray/tauri*.conf.json`,
+`friglet-tray/icons/`, `friglet-tray/Cargo.toml`/`build.rs`,
+`scripts/prepare-sidecar.sh`). Pull request runs only upload workflow
+artifacts. The Windows job is `continue-on-error`.
+
+To cut a release: set the version in `friglet-tray/tauri.conf.json` (and
+`friglet-tray/Cargo.toml`), then push a matching tag, e.g.
+`git tag v0.1.0 && git push origin v0.1.0`. The workflow attaches the bundles
+and a `SHA256SUMS` file to a **draft** release for that tag; review it and
+publish it by hand. A manual `workflow_dispatch` run creates or updates the
+draft `friglet-tray-dev-<commit>` instead; delete it when you're done.
+Nothing is ever published automatically.
+
+### Opening unsigned builds
+
+The bundles are not code-signed or notarized yet, so each OS warns on first
+launch. Check the download against `SHA256SUMS` first
+(`sha256sum -c SHA256SUMS --ignore-missing`).
+
+- **macOS:** open the dmg and drag `friglet-tray` to Applications. On first
+  launch macOS blocks it; go to System Settings → Privacy & Security and click
+  **Open Anyway** (on macOS 14 and older, right-click the app → Open also
+  works). Or clear the quarantine flag in a terminal:
+  `xattr -dr com.apple.quarantine /Applications/friglet-tray.app`.
+- **Windows:** SmartScreen shows "Windows protected your PC"; click
+  **More info** → **Run anyway**.
+- **Linux:** `sudo apt install ./friglet-tray_<version>_amd64.deb`, or
+  `chmod +x friglet-tray_<version>_amd64.AppImage` and run it (AppImages need
+  FUSE 2, package `libfuse2`/`libfuse2t64`; without it, run with
+  `--appimage-extract-and-run`). On GNOME the tray icon needs the
+  AppIndicator extension (Ubuntu ships it enabled).
 
 ### Standalone daemon
 
