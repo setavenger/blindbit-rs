@@ -79,8 +79,9 @@ jobs:
           bundle=target/release/bundle
           deb=$(echo "$bundle"/deb/*.deb)
           appimage=$(echo "$bundle"/appimage/*.AppImage)
-          dpkg-deb -c "$deb" | grep -E ' \./usr/bin/friglet-tray$'
-          dpkg-deb -c "$deb" | grep -E ' \./usr/bin/friglet$'
+          dpkg-deb -c "$deb" | tee "$RUNNER_TEMP/deb-contents.txt"
+          grep -qE ' (\./)?usr/bin/friglet-tray$' "$RUNNER_TEMP/deb-contents.txt"
+          grep -qE ' (\./)?usr/bin/friglet$' "$RUNNER_TEMP/deb-contents.txt"
           dpkg-deb -x "$deb" "$RUNNER_TEMP/deb"
           "$RUNNER_TEMP/deb/usr/bin/friglet" --help > /dev/null
           chmod +x "$appimage"

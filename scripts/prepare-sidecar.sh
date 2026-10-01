@@ -26,12 +26,17 @@ dest="$dest_dir/friglet-$triple$exe_suffix"
 mkdir -p "$dest_dir"
 
 if [ "$triple" = "universal-apple-darwin" ]; then
-    # One cargo invocation builds both slices concurrently.
+    # One cargo invocation builds both slices concurrently. The universal
+    # tauri build compiles the tray once per arch, and tauri-build checks
+    # for the per-arch sidecar each time, so stage the slices too.
     cargo build --release -p friglet \
         --target aarch64-apple-darwin --target x86_64-apple-darwin
-    lipo -create -output "$dest" \
-        "$target_dir/aarch64-apple-darwin/release/friglet" \
-        "$target_dir/x86_64-apple-darwin/release/friglet"
+    slices=()
+    for arch in aarch64-apple-darwin x86_64-apple-darwin; do
+        cp "$target_dir/$arch/release/friglet" "$dest_dir/friglet-$arch"
+        slices+=("$dest_dir/friglet-$arch")
+    done
+    lipo -create -output "$dest" "${slices[@]}"
 elif [ "${1:-}" != "" ]; then
     cargo build --release -p friglet --target "$triple"
     cp "$target_dir/$triple/release/friglet$exe_suffix" "$dest"
