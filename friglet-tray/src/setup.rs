@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use friglet_ipc::DaemonConfig;
+use friglet_ipc::descriptor::SpDescriptor;
+use friglet_ipc::network::{self, NETWORKS};
 
 /// Environment variables the daemon's config layering honors for the
 /// settings the tray checks (`figment::Env::prefixed("FRIGLET_")` plus the
@@ -19,17 +21,20 @@ const ENV_P2P_NODE_ADDR: &str = "FRIGLET_P2P_NODE_ADDR";
 const ENV_START_HEIGHT: &str = "FRIGLET_START_HEIGHT";
 const ENV_SPEND_PUBKEY: &str = "FRIGLET_SPEND_PUBKEY";
 const ENV_SCAN_SECRET: &str = "FRIGLET_SCAN_SECRET";
-
-const NETWORKS: [&str; 5] = ["bitcoin", "signet", "testnet", "testnet4", "regtest"];
+const ENV_START_AT_TIP: &str = "FRIGLET_START_AT_TIP";
+const ENV_DESCRIPTOR: &str = "FRIGLET_DESCRIPTOR";
 
 /// Is the daemon plausibly configured, i.e. is spawning it likely to get
 /// past `missing required setting ...`? Conservative merged view:
 ///
-/// - the required settings (`p2p_node_addr`, `start_height`, `spend_pubkey`)
-///   are each present in the config file at `config_path` OR supplied via
-///   their `FRIGLET_*` environment variable, AND
+/// - the required settings (`p2p_node_addr`, `start_height` — or
+///   `start_at_tip` —, `spend_pubkey`) are each present in the config file at
+///   `config_path` OR supplied via their `FRIGLET_*` environment variable, AND
 /// - a scan secret is available: the key file (the config's `key_file` or
 ///   `default_key_file`) exists, or `FRIGLET_SCAN_SECRET` is set.
+///
+/// A `descriptor` (config key or `FRIGLET_DESCRIPTOR`) supplies the spend
+/// key and the scan secret, and its `bh=` annotation the start height.
 ///
 /// A config file that exists but fails to parse counts as configured: the
 /// spawn attempt surfaces the daemon's own parse error through the existing
@@ -51,17 +56,38 @@ pub fn is_configured(
     let env_set = |key: &str| env(key).is_some_and(|v| !v.trim().is_empty());
     let file_has = |get: fn(&DaemonConfig) -> bool| file_cfg.as_ref().is_some_and(get);
 
+    // The descriptor lives beside DaemonConfig (it carries the scan secret),
+    // so look it up in the raw file / env.
+    let descriptor = env(ENV_DESCRIPTOR)
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| config_path.and_then(file_descriptor))
+        .and_then(|d| SpDescriptor::parse(&d).ok());
+
     let p2p = file_has(|c| c.p2p_node_addr.is_some()) || env_set(ENV_P2P_NODE_ADDR);
-    let start = file_has(|c| c.start_height.is_some()) || env_set(ENV_START_HEIGHT);
-    let spend = file_has(|c| c.spend_pubkey.is_some()) || env_set(ENV_SPEND_PUBKEY);
+    let start = file_has(|c| c.start_height.is_some() || c.start_at_tip)
+        || env_set(ENV_START_HEIGHT)
+        || env_set(ENV_START_AT_TIP)
+        || descriptor
+            .as_ref()
+            .is_some_and(|d| d.birth_height.is_some());
+    let spend =
+        file_has(|c| c.spend_pubkey.is_some()) || env_set(ENV_SPEND_PUBKEY) || descriptor.is_some();
 
     let key_file = file_cfg
         .as_ref()
         .and_then(|c| c.key_file.clone())
         .or_else(|| default_key_file.map(Path::to_path_buf));
-    let secret = env_set(ENV_SCAN_SECRET) || key_file.is_some_and(|p| p.exists());
+    let secret =
+        env_set(ENV_SCAN_SECRET) || descriptor.is_some() || key_file.is_some_and(|p| p.exists());
 
     p2p && start && spend && secret
+}
+
+/// The `descriptor` key of the TOML file at `path`, if any.
+fn file_descriptor(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    table.get("descriptor")?.as_str().map(str::to_string)
 }
 
 /// [`is_configured`] fed from the real environment and default paths.
@@ -73,9 +99,70 @@ pub fn is_configured_from_env() -> bool {
     )
 }
 
+/// What the tray shows after a descriptor is pasted: everything derived
+/// from it except the scan secret, which never leaves Rust.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DescriptorSummary {
+    /// `true` for spscan (mainnet) keys, `false` for tspscan (test networks).
+    pub mainnet: bool,
+    /// The network the form should switch to: `bitcoin` for mainnet keys;
+    /// for test keys the currently selected test network, else `signet`
+    /// (the only test network with a hosted oracle).
+    pub network: String,
+    pub spend_pubkey: String,
+    /// BIP-352 receive address on `network`, to compare with Sparrow.
+    pub sp_address: String,
+    pub birth_height: Option<u64>,
+    /// The pasted text held the spend private key; it was dropped and the
+    /// form should replace the pasted text with `watch_only`.
+    pub had_spend_secret: bool,
+    pub watch_only: String,
+}
+
+/// Parse a pasted descriptor for the setup/settings form.
+pub fn summarize_descriptor(
+    text: &str,
+    current_network: &str,
+) -> Result<DescriptorSummary, String> {
+    let d = SpDescriptor::parse(text)?;
+    let network = if d.matches_network(current_network) {
+        current_network.to_string()
+    } else if d.matches_network("bitcoin") {
+        "bitcoin".to_string()
+    } else {
+        "signet".to_string()
+    };
+    Ok(DescriptorSummary {
+        mainnet: d.matches_network("bitcoin"),
+        sp_address: d.sp_address(&network),
+        network,
+        spend_pubkey: d.spend_pubkey_hex(),
+        birth_height: d.birth_height,
+        had_spend_secret: d.had_spend_secret,
+        watch_only: d.to_watch_only_string(),
+    })
+}
+
+/// Fold a pasted descriptor into a setup/settings submission: returns the
+/// scan key (hex) and fills `cfg.spend_pubkey`. A spend private key in the
+/// descriptor is dropped (only its public key is used), so nothing secret
+/// beyond the scan key is ever written.
+pub fn keys_from_descriptor(cfg: &mut DaemonConfig, text: &str) -> Result<String, String> {
+    let d = SpDescriptor::parse(text)?;
+    if !d.matches_network(&cfg.network) {
+        return Err(format!(
+            "{}: pick the matching network",
+            d.network_mismatch(&cfg.network)
+        ));
+    }
+    cfg.spend_pubkey = Some(d.spend_pubkey_hex());
+    Ok(d.scan_secret_hex())
+}
+
 /// Validate a setup-mode save tray-side, mirroring the daemon's own startup
 /// validation with friendlier messages. Hex fields are checked for length
-/// only; full secp256k1 validation happens daemon-side at startup.
+/// only; full secp256k1 validation happens daemon-side at startup. The P2P
+/// host is checked for syntax only (see [`resolve_peer`] for DNS).
 pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> {
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!(
@@ -85,9 +172,24 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         ));
     }
     if !cfg.oracle_url.starts_with("http://") && !cfg.oracle_url.starts_with("https://") {
+        return Err(if cfg.oracle_url.trim().is_empty() {
+            format!(
+                "an oracle URL is required: there is no hosted oracle for {}, enter your own",
+                cfg.network
+            )
+        } else {
+            format!(
+                "invalid oracle URL `{}`: must start with http:// or https://",
+                cfg.oracle_url
+            )
+        });
+    }
+    if let Some(hosted_for) = network::hosted_oracle_network(&cfg.oracle_url)
+        && hosted_for != cfg.network
+    {
         return Err(format!(
-            "invalid oracle URL `{}`: must start with http:// or https://",
-            cfg.oracle_url
+            "the oracle URL is the hosted {hosted_for} oracle, but the network is {}",
+            cfg.network
         ));
     }
 
@@ -97,11 +199,12 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or("P2P node address is required (host:port of a Bitcoin node)")?;
-    SocketAddr::from_str(p2p)
-        .map_err(|e| format!("invalid P2P node address `{p2p}`: {e} (expected ip:port)"))?;
+    network::split_peer_addr(p2p, &cfg.network)
+        .map_err(|e| format!("invalid P2P node address: {e}"))?;
 
     match cfg.start_height {
-        None => return Err("start height (wallet birthday) is required".to_string()),
+        None if cfg.start_at_tip => {}
+        None => return Err("wallet birthday (start height) is required".to_string()),
         Some(0) => return Err("invalid start height 0: must be at least 1".to_string()),
         Some(_) => {}
     }
@@ -111,14 +214,19 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or("spend public key is required (33-byte hex)")?;
+        .ok_or(
+            "paste your Sparrow wallet descriptor (or enter the spend public key under Advanced)",
+        )?;
     if spend.len() != 66 || !is_hex(spend) {
         return Err("invalid spend public key: must be 66 hex characters (33 bytes)".to_string());
     }
 
     let key = scan_key.trim();
     if key.is_empty() {
-        return Err("scan key is required for first-time setup (32-byte hex)".to_string());
+        return Err(
+            "paste your Sparrow wallet descriptor (or enter the scan key under Advanced)"
+                .to_string(),
+        );
     }
     if key.len() != 64 || !is_hex(key) {
         return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
@@ -133,6 +241,27 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
     }
 
     Ok(())
+}
+
+/// DNS check for the P2P node so a typo fails at Save instead of as a
+/// daemon that never connects.
+pub async fn resolve_peer(cfg: &DaemonConfig) -> Result<(), String> {
+    let Some(p2p) = cfg.p2p_node_addr.as_deref() else {
+        return Ok(());
+    };
+    let (host, port) = network::split_peer_addr(p2p, &cfg.network)?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let lookup = tokio::net::lookup_host((host.as_str(), port));
+    match tokio::time::timeout(std::time::Duration::from_secs(10), lookup).await {
+        Ok(Ok(mut addrs)) => match addrs.next() {
+            Some(_) => Ok(()),
+            None => Err(format!("P2P node `{host}` has no addresses")),
+        },
+        Ok(Err(e)) => Err(format!("cannot resolve P2P node `{host}`: {e}")),
+        Err(_) => Err(format!("resolving P2P node `{host}` timed out")),
+    }
 }
 
 fn is_hex(s: &str) -> bool {
@@ -190,6 +319,7 @@ mod tests {
     fn valid_config() -> DaemonConfig {
         DaemonConfig {
             network: "signet".to_string(),
+            oracle_url: "https://signet.oracle.setor.dev".to_string(),
             p2p_node_addr: Some("127.0.0.1:38333".to_string()),
             start_height: Some(274010),
             spend_pubkey: Some(SPEND_HEX.to_string()),
@@ -344,7 +474,7 @@ mod tests {
             ),
             (
                 DaemonConfig {
-                    p2p_node_addr: Some("not-an-addr".to_string()),
+                    p2p_node_addr: Some("node.example:notaport".to_string()),
                     ..valid_config()
                 },
                 KEY_HEX,
@@ -352,11 +482,28 @@ mod tests {
             ),
             (
                 DaemonConfig {
+                    oracle_url: "https://oracle.setor.dev".to_string(),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "hosted bitcoin oracle",
+            ),
+            (
+                DaemonConfig {
+                    network: "testnet4".to_string(),
+                    oracle_url: String::new(),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "no hosted oracle for testnet4",
+            ),
+            (
+                DaemonConfig {
                     start_height: None,
                     ..valid_config()
                 },
                 KEY_HEX,
-                "start height (wallet birthday) is required",
+                "wallet birthday (start height) is required",
             ),
             (
                 DaemonConfig {
@@ -374,7 +521,7 @@ mod tests {
                 KEY_HEX,
                 "invalid spend public key",
             ),
-            (valid_config(), "", "scan key is required"),
+            (valid_config(), "", "paste your Sparrow wallet descriptor"),
             (valid_config(), "zz", "invalid scan key"),
             (
                 DaemonConfig {
@@ -389,6 +536,141 @@ mod tests {
             let err = validate_setup(&cfg, key).unwrap_err();
             assert!(err.contains(expected), "expected `{expected}` in `{err}`");
         }
+    }
+
+    /// Sparrow's testnet fixture, as Copy Output Descriptor yields it.
+    const TEST_DESCRIPTOR: &str = "sp([0f056943/352h/1h/0h]tspscan1q05wxw5wc7wqmkf8cnfc6ry76qej8vhr3a3mmxmwgv35s0tlw24fs82k0npv2hv6p97s8sd9t7vpf44kluka9w863zjwxzfrym2ay9ccfzt06c4)#7eve6al9";
+    const MAINNET_SPSPEND: &str = "sp(spspend1qpa55up5q9zn30790dw2pr7dpx0wn2ef9su2vcgn9jje5mwgvrukf66kc2h8rg9l0sn5rdzfwtftrj2lm5p06tktue63sufn02s8q3vch3lrh8)";
+
+    #[test]
+    fn validate_accepts_hostnames_bare_hosts_and_start_at_tip() {
+        for p2p in [
+            "node.example:38333",
+            "node.example",
+            "10.0.0.2",
+            "[::1]:38333",
+        ] {
+            let cfg = DaemonConfig {
+                p2p_node_addr: Some(p2p.to_string()),
+                ..valid_config()
+            };
+            assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()), "{p2p}");
+        }
+        let new_wallet = DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            ..valid_config()
+        };
+        assert_eq!(validate_setup(&new_wallet, KEY_HEX), Ok(()));
+    }
+
+    #[test]
+    fn descriptor_summary_picks_network_and_hides_secret() {
+        let s = summarize_descriptor(TEST_DESCRIPTOR, "bitcoin").unwrap();
+        assert!(!s.mainnet);
+        assert_eq!(s.network, "signet", "test keys default to signet");
+        assert!(s.sp_address.starts_with("tsp1q"));
+        assert_eq!(
+            s.spend_pubkey,
+            "03aacf9858abb3412fa07834abf3029ad6dfe5ba571f51149c612464daba42e309"
+        );
+        assert!(!s.had_spend_secret);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("7d1c6751d8f381bb24f89a71a193da0664765c71ec77b36dc8646907afee5553"),
+            "the scan secret must not reach the UI as hex"
+        );
+
+        // An already selected test network is kept.
+        assert_eq!(
+            summarize_descriptor(TEST_DESCRIPTOR, "testnet4")
+                .unwrap()
+                .network,
+            "testnet4"
+        );
+
+        // Spend-secret form: flagged, and the watch-only text replaces it.
+        let s = summarize_descriptor(MAINNET_SPSPEND, "signet").unwrap();
+        assert!(s.mainnet && s.had_spend_secret);
+        assert_eq!(s.network, "bitcoin");
+        assert!(s.watch_only.starts_with("sp(spscan1") && !s.watch_only.contains("spspend"));
+    }
+
+    #[test]
+    fn keys_from_descriptor_fills_spend_key_and_checks_network() {
+        let mut cfg = valid_config();
+        cfg.spend_pubkey = None;
+        let scan = keys_from_descriptor(&mut cfg, TEST_DESCRIPTOR).unwrap();
+        assert_eq!(
+            scan,
+            "7d1c6751d8f381bb24f89a71a193da0664765c71ec77b36dc8646907afee5553"
+        );
+        assert_eq!(
+            cfg.spend_pubkey.as_deref(),
+            Some("03aacf9858abb3412fa07834abf3029ad6dfe5ba571f51149c612464daba42e309")
+        );
+        assert_eq!(validate_setup(&cfg, &scan), Ok(()));
+
+        // Spend private key: only the derived public key is used.
+        let mut main = DaemonConfig {
+            network: "bitcoin".to_string(),
+            ..valid_config()
+        };
+        let scan = keys_from_descriptor(&mut main, MAINNET_SPSPEND).unwrap();
+        assert_eq!(
+            scan,
+            "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c"
+        );
+        assert_eq!(
+            main.spend_pubkey.as_deref(),
+            Some("025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36")
+        );
+
+        let err = keys_from_descriptor(&mut valid_config(), MAINNET_SPSPEND).unwrap_err();
+        assert!(err.contains("mainnet"), "{err}");
+    }
+
+    #[test]
+    fn descriptor_or_start_at_tip_counts_as_configured() {
+        let dir = temp_dir("descriptor-configured");
+        let config = dir.join("config.toml");
+        fs::write(
+            &config,
+            format!("p2p_node_addr = \"node.example\"\nstart_at_tip = true\ndescriptor = \"{TEST_DESCRIPTOR}\"\n"),
+        )
+        .unwrap();
+        // No key file, no spend_pubkey: the descriptor supplies both.
+        assert!(is_configured(
+            Some(&config),
+            Some(&dir.join("scan.key")),
+            &no_env
+        ));
+
+        // Without start_at_tip and no bh= annotation, the birthday is missing.
+        fs::write(
+            &config,
+            format!("p2p_node_addr = \"node.example\"\ndescriptor = \"{TEST_DESCRIPTOR}\"\n"),
+        )
+        .unwrap();
+        assert!(!is_configured(
+            Some(&config),
+            Some(&dir.join("scan.key")),
+            &no_env
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_peer_reports_dns_failures() {
+        let cfg = |p2p: &str| DaemonConfig {
+            p2p_node_addr: Some(p2p.to_string()),
+            ..valid_config()
+        };
+        assert_eq!(resolve_peer(&cfg("127.0.0.1:38333")).await, Ok(()));
+        assert_eq!(resolve_peer(&cfg("localhost")).await, Ok(()));
+        let err = resolve_peer(&cfg("no-such-host.invalid"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no-such-host.invalid"), "{err}");
     }
 
     #[test]

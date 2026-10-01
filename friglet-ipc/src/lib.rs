@@ -26,6 +26,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub use interprocess::local_socket::tokio::Listener;
 
+pub mod descriptor;
+pub mod network;
+
 /// Daemon configuration as exchanged over IPC and layered from
 /// file / environment / CLI. Field names double as TOML keys and
 /// `FRIGLET_*` environment variable suffixes.
@@ -40,10 +43,18 @@ pub struct DaemonConfig {
     pub network: String,
     /// BlindBit oracle URL.
     pub oracle_url: String,
-    /// Bitcoin P2P node address (`host:port`). Required to start scanning.
+    /// Bitcoin P2P node address: `host:port`, `ip:port`, or a bare host/IP
+    /// (the network's default port). Hostnames are resolved at daemon start.
+    /// Required to start scanning.
     pub p2p_node_addr: Option<String>,
-    /// Wallet birthday block height. Required to start scanning.
+    /// Wallet birthday block height. Required to start scanning unless
+    /// `start_at_tip` is set.
     pub start_height: Option<u64>,
+    /// New wallet: when `start_height` is unset, the daemon uses the
+    /// oracle's current chain tip as the birthday (nothing to rescan) and
+    /// persists that height as `start_height`, clearing this flag.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_at_tip: bool,
     /// Spend public key (33-byte hex). Required to start scanning.
     pub spend_pubkey: Option<String>,
     /// Maximum Silent Payments label number.
@@ -72,6 +83,7 @@ impl Default for DaemonConfig {
             oracle_url: "https://oracle.setor.dev".to_string(),
             p2p_node_addr: None,
             start_height: None,
+            start_at_tip: false,
             spend_pubkey: None,
             max_label_num: 0,
             http_addr: "127.0.0.1:8080".to_string(),

@@ -114,6 +114,54 @@ async fn set_scan_key(
     send_with_note(&state.socket_path, Request::SetScanKey(key)).await
 }
 
+/// Per-network defaults for the settings form.
+#[derive(Serialize)]
+struct NetworkDefaults {
+    hosted_oracles: std::collections::BTreeMap<&'static str, &'static str>,
+    default_ports: std::collections::BTreeMap<&'static str, u16>,
+}
+
+#[tauri::command]
+fn network_defaults() -> NetworkDefaults {
+    use friglet_ipc::network::{NETWORKS, default_p2p_port, hosted_oracle_url};
+    NetworkDefaults {
+        hosted_oracles: NETWORKS
+            .into_iter()
+            .filter_map(|n| hosted_oracle_url(n).map(|u| (n, u)))
+            .collect(),
+        default_ports: NETWORKS
+            .into_iter()
+            .filter_map(|n| default_p2p_port(n).map(|p| (n, p)))
+            .collect(),
+    }
+}
+
+/// Parse a pasted SP descriptor for the settings form. Returns everything
+/// the form needs except the scan secret, which stays on the Rust side.
+#[tauri::command]
+fn inspect_descriptor(
+    descriptor: String,
+    network: String,
+) -> Result<setup::DescriptorSummary, String> {
+    setup::summarize_descriptor(&descriptor, &network)
+}
+
+/// Settings-mode wallet switch: send the pasted descriptor's scan key to the
+/// daemon (after `set_config` stored its spend key and network).
+#[tauri::command]
+async fn set_descriptor_scan_key(
+    state: State<'_, Arc<AppState>>,
+    descriptor: String,
+    network: String,
+) -> Result<Option<String>, String> {
+    let mut cfg = DaemonConfig {
+        network,
+        ..DaemonConfig::default()
+    };
+    let scan_key = setup::keys_from_descriptor(&mut cfg, &descriptor)?;
+    send_with_note(&state.socket_path, Request::SetScanKey(scan_key)).await
+}
+
 /// Payload for the `get_setup_state` command.
 #[derive(Serialize)]
 struct SetupStatePayload {
@@ -165,13 +213,22 @@ async fn get_setup_state(state: State<'_, Arc<AppState>>) -> Result<SetupStatePa
 /// `Ok(None)`: saved and the daemon came up. `Ok(Some(reason))`: files were
 /// saved but the daemon still failed to start (the reason is the spawn
 /// diagnostic). `Err(msg)`: validation or write failed, nothing spawned.
+///
+/// A non-empty `descriptor` supplies the keys (scan key + spend public key)
+/// and takes precedence over `scan_key` / `config.spend_pubkey`.
 #[tauri::command]
 async fn save_local_config(
     state: State<'_, Arc<AppState>>,
-    config: DaemonConfig,
+    mut config: DaemonConfig,
     scan_key: String,
+    descriptor: Option<String>,
 ) -> Result<Option<String>, String> {
+    let scan_key = match descriptor.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => setup::keys_from_descriptor(&mut config, d)?,
+        _ => scan_key,
+    };
     setup::validate_setup(&config, &scan_key)?;
+    setup::resolve_peer(&config).await?;
     let config_path = friglet_ipc::default_config_path()
         .ok_or("cannot determine the platform config directory")?;
     let key_file = setup::write_local_config(&config_path, &config, &scan_key)?;
@@ -580,7 +637,10 @@ pub fn run() {
             set_config,
             set_scan_key,
             get_setup_state,
-            save_local_config
+            save_local_config,
+            inspect_descriptor,
+            set_descriptor_scan_key,
+            network_defaults
         ])
         .on_window_event(|window, event| {
             // Tray-only app: closing the status window hides it.

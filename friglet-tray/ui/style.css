@@ -105,12 +105,12 @@ code {
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .tab:hover { color: var(--text); }
 
-input, select { user-select: text; }
+input, select, textarea { user-select: text; }
 fieldset { border: none; display: flex; flex-direction: column; gap: 12px; }
 fieldset:disabled { opacity: 0.5; }
 .field { display: flex; flex-direction: column; gap: 4px; }
 .field label { color: var(--muted); font-size: 12px; }
-.field input, .field select {
+.field input, .field select, .field textarea, input.indented {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -119,8 +119,21 @@ fieldset:disabled { opacity: 0.5; }
   font-size: 13px;
   padding: 7px 9px;
 }
-.field input.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
-.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+.field input.mono, .field textarea.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
+.field textarea { resize: vertical; word-break: break-all; }
+.field input:focus, .field select:focus, .field textarea:focus, input.indented:focus { outline: none; border-color: var(--accent); }
+.hint { color: var(--muted); font-size: 12px; }
+.hint strong { color: var(--text); font-weight: 600; }
+.hint.ok { color: var(--good); }
+.hint.warn { color: var(--accent); }
+.hint.error { color: var(--bad); }
+.hint code { font-size: 11px; }
+.choice { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; cursor: pointer; }
+.choice input { margin-top: 3px; accent-color: var(--accent); }
+.indented { margin-left: 22px; }
+input.indented:disabled { opacity: 0.5; }
+details.advanced summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; }
+details.advanced[open] summary { margin-bottom: 4px; }
 .ok { color: var(--good); }
 
 .wallet-placeholder, .wallet-empty {

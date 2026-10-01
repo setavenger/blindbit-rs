@@ -71,6 +71,9 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   `FRIGLET_P2P_NODE_ADDR`/`FRIGLET_START_HEIGHT`/`FRIGLET_SPEND_PUBKEY`
   env instead), and a scan secret must exist (key file from the config's
   `key_file` or `<config dir>/friglet/scan.key`, or `FRIGLET_SCAN_SECRET`).
+  `start_at_tip = true` satisfies `start_height`; a `descriptor` key (or
+  `FRIGLET_DESCRIPTOR`) satisfies `spend_pubkey` + the scan secret, and its
+  `bh=` annotation `start_height`.
   A config file that exists but fails to parse counts as configured, so the
   spawn attempt surfaces the daemon's own parse error instead of setup mode
   silently overwriting a hand-written file.
@@ -192,6 +195,28 @@ dbus-run-session -- bash -c '
   `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
   an environment limitation, not a code problem. No real Windows
   build/run has been exercised; linking + runtime remain unverified.
+
+## SP descriptor onboarding (SNB-623)
+
+- Parser: `friglet-ipc/src/descriptor.rs` (BIP-392 `sp(...)` + BIP-393 `?bh=`
+  + BIP-380 checksum), shared by daemon and tray; test vectors are Sparrow
+  2.5.5 / drongo fixtures. Sparrow's *Copy Output Descriptor* yields
+  `sp([fp/352h/0h/0h]spscan1q…)?bh=N#cs` (`bh` only once the wallet has a
+  confirmed tx). `tspscan` covers every test network, so the tray defaults
+  test keys to signet.
+- The scan secret never enters `DaemonConfig`: the daemon reads `descriptor`
+  from the raw figment layers, folds the spend key/birthday into the
+  settings and copies the scan key into the key file; the tray parses the
+  descriptor in Rust and only hands the UI a summary without the secret.
+- Spend-secret (`spspend`) descriptors: tray paste → public key derived,
+  secret dropped, field replaced with the watch-only form; config file →
+  refused (the secret would sit on disk).
+- `start_at_tip`: resolved from the oracle tip at daemon start (and in
+  `SetConfig`), then persisted as `start_height` by patching only that key
+  in the config file (`config::persist_start_height`).
+- `oracle_url` follows `network` when no layer sets it; a hosted oracle URL
+  of another network is rejected. `p2p_node_addr` accepts hostnames (DNS at
+  start, IPv4 preferred) and bare hosts (network default port).
 
 ## SetConfig / SetScanKey semantics (v1)
 
