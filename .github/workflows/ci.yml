@@ -3,8 +3,12 @@ name: CI
 on:
   pull_request:
   push:
+    # integration too: PRs target it, and a PR run can only restore caches
+    # saved on its own ref, its base branch or the default branch. A run on
+    # each merge into integration leaves a warm rust-cache for every PR.
     branches:
       - master
+      - integration
 
 permissions:
   contents: read
