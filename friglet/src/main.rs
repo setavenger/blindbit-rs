@@ -6,8 +6,9 @@ mod server;
 mod supervisor;
 mod types;
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
@@ -33,21 +34,84 @@ enum Commands {
     Scan(ScanArgs),
 }
 
-#[tokio::main]
-async fn main() {
+/// How a daemon run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    /// Shutdown requested (signal or control socket): exit the process.
+    Exit,
+    /// Settings changed over the control socket: run again from the
+    /// (re-read) configuration.
+    Restart,
+}
+
+/// How long a restart waits for the previous run's tasks to wind down.
+const RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn main() {
     let cli = Cli::parse();
     // No subcommand runs the scan daemon from config file / env alone.
     let args = match cli.command {
         Some(Commands::Scan(args)) => args,
         None => ScanArgs::default(),
     };
-    if let Err(e) = run(args).await {
-        eprintln!("Error: {e}");
-        std::process::exit(1);
+    // Each run gets its own runtime: a settings change restarts the daemon
+    // in-process by dropping the whole runtime, which tears down every task
+    // the run spawned — the Electrum client connections (so Sparrow
+    // reconnects and sees the new wallet), the reorg / found-output
+    // subscriptions taken at startup, listeners and the scan task — and then
+    // starts over from the config file. Same PID, so a supervising tray keeps
+    // its child handle.
+    loop {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build the tokio runtime");
+        let outcome = runtime.block_on(run(args.clone()));
+        runtime.shutdown_timeout(RESTART_SHUTDOWN_TIMEOUT);
+        match outcome {
+            Ok(RunOutcome::Exit) => return,
+            Ok(RunOutcome::Restart) => {
+                tracing::info!("restarting with the new settings");
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
-async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+type LogFilterHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+/// Set up logging once per process; later runs (in-process restarts) only
+/// swap the filter so a changed `log_level` takes effect. `RUST_LOG` takes
+/// precedence over `log_level`. Only colour when stderr is a TTY so a
+/// tray-piped daemon never emits ANSI into the capture pipe.
+fn init_logging(log_level: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    static HANDLE: OnceLock<LogFilterHandle> = OnceLock::new();
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level));
+    if let Some(handle) = HANDLE.get() {
+        let _ = handle.reload(filter);
+        return;
+    }
+    let (filter, handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+        )
+        .init();
+    let _ = HANDLE.set(handle);
+}
+
+async fn run(args: ScanArgs) -> Result<RunOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let config::Loaded {
         config: mut merged,
         file: config_file,
@@ -59,20 +123,10 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
 
     if args.print_config {
         print!("{}", toml::to_string_pretty(&merged)?);
-        return Ok(());
+        return Ok(RunOutcome::Exit);
     }
 
-    // Initialise structured logging.  RUST_LOG takes precedence; the
-    // configured log_level sets the default when RUST_LOG is not set.
-    // Only colour when stderr is a TTY so a tray-piped daemon never emits
-    // ANSI into the capture pipe.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&merged.log_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .init();
+    init_logging(&merged.log_level);
 
     // New wallet: birthday = the oracle's current tip, recorded in the
     // config file so later restarts keep the same birthday.
@@ -93,7 +147,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         }
     }
 
-    let cfg = config::resolve(merged)?;
+    let mut cfg = config::resolve(merged)?;
     if let Some(d) = &descriptor {
         config::store_descriptor_scan_key(d, &cfg.key_file)?;
         // A descriptor in the config file carries the scan secret.
@@ -109,6 +163,20 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
             "the scan secret from --scan-secret / FRIGLET_SCAN_SECRET differs from \
                     the configured descriptor's scan key; remove one of them"
                 .into(),
+        );
+    }
+    // One state file per wallet: new keys start fresh automatically.
+    cfg.state_file = config::wallet_state_file(
+        &cfg.state_file,
+        &cfg.raw.network,
+        &secret_scan,
+        &cfg.spend_pubkey,
+    )?;
+    if let Some(previous) = config::reconcile_birthday(&cfg.state_file, cfg.start_height)? {
+        tracing::warn!(
+            previous_start_height = previous,
+            start_height = cfg.start_height,
+            "wallet birthday moved back: rescanning from the new birthday (old state kept as .json.bak)"
         );
     }
     let label_addresses = control::derive_label_addresses(
@@ -130,6 +198,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         p2p_peer = %cfg.p2p_addr,
         network = %cfg.network,
         start_height = cfg.start_height,
+        state_file = %cfg.state_file.display(),
         "starting friglet"
     );
 
@@ -228,13 +297,12 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         outputs_found,
         label_addresses: std::sync::Mutex::new(label_addresses),
         settings: std::sync::Mutex::new(cfg.raw.clone()),
+        state_file: cfg.state_file.clone(),
         config_path,
         apply_lock: Mutex::new(()),
-        scanner_builder: Box::new(|cfg| {
-            Box::pin(async move { scanner::load_scanner(&cfg).await.map_err(|e| e.to_string()) })
-        }),
         oracle_tip_cache: std::sync::Mutex::new(control::OracleTipCache::default()),
         shutdown: shutdown_token.clone(),
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
         spawned_by_tray: control::ControlCtx::spawned_by_tray_from_env(),
     });
     let control_server = control::run(cfg.control_socket.clone(), {
@@ -288,34 +356,47 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         }
     };
 
-    // Run everything until a server dies or shutdown is requested; leaving
-    // the select! drops the HTTP/Electrum/control listeners.
-    tokio::select! {
-        _ = http_server => {
-            tracing::info!("HTTP server stopped");
-        }
-        _ = electrum_server => {
-            tracing::info!("Electrum server stopped");
-        }
+    // Run everything until a server dies or shutdown/restart is requested;
+    // leaving the select! drops the HTTP/Electrum/control listeners. A dead
+    // server is an error (non-zero exit), so a supervising tray sees a crash
+    // rather than a deliberate stop.
+    let mut owns_socket = true;
+    let failure: Option<String> = tokio::select! {
+        _ = http_server => Some("HTTP server stopped".to_string()),
+        _ = electrum_server => Some("Electrum server stopped".to_string()),
         result = control_server => {
-            if let Err(e) = result {
-                tracing::error!(error = %e, "control socket server failed");
-            }
+            // The control server only returns when binding failed — possibly
+            // because another daemon owns the socket, so leave the file alone.
+            owns_socket = false;
+            Some(match result {
+                Err(e) => format!("control socket server failed: {e}"),
+                Ok(()) => "control socket server stopped".to_string(),
+            })
         }
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
+            None
         }
         _ = shutdown_token.cancelled() => {
             tracing::info!("shutting down");
+            None
         }
-    }
+    };
 
     supervisor.stop().await;
     control_ctx.save_state().await;
-    cleanup_socket(&cfg.control_socket);
+    if owns_socket {
+        cleanup_socket(&cfg.control_socket);
+    }
+    if let Some(reason) = failure {
+        return Err(reason.into());
+    }
+    if control_ctx.restart_requested() {
+        tracing::info!("friglet stopped for a restart");
+        return Ok(RunOutcome::Restart);
+    }
     tracing::info!("friglet stopped");
-
-    Ok(())
+    Ok(RunOutcome::Exit)
 }
 
 async fn shutdown_signal() {

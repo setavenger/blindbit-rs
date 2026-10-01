@@ -56,7 +56,7 @@ cargo run --release --package friglet scan \
 | `--oracle-url` | BlindBit Oracle URL | hosted oracle of `--network` (mainnet `https://oracle.setor.dev`, signet `https://signet.oracle.setor.dev`; none for other networks) |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
-| `--state-file` | Path to persist scanner state | `<config dir>/friglet/scanner_state.json` |
+| `--state-file` | Path to persist scanner state. The default is kept per wallet (`scanner_state-<network>-<id>.json` next to it), so new keys start a fresh scan; an explicit path holding another wallet's state is refused | `<config dir>/friglet/scanner_state.json` |
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
 
@@ -150,14 +150,23 @@ opened via the tray menu; closing it hides it again). The tray menu also
 offers Start/Stop scanning and Quit.
 
 The window's **Settings** tab lets you view and edit all daemon settings —
-network, oracle URL, P2P node address, start height, scan key, spend pubkey,
-max labels, HTTP/Electrum bind addresses, state and key file paths. Saving
-sends the config to the daemon, which validates it, persists it to its config
-file (and the scan key to the 0600 key file) and applies it: scan settings
-restart the scan task immediately, while bind-address changes take effect on
-the next daemon restart (the UI surfaces the daemon's note about this). The
-scan key is write-only — it is never displayed and only sent when you type a
-new one.
+wallet descriptor, network, wallet birthday, Bitcoin node, oracle URL, and
+under *Advanced* the scan key, spend pubkey, max labels, HTTP/Electrum bind
+addresses, state and key file paths. Saving sends the config (and a new
+scan key, if a descriptor was pasted) to the daemon in one request; it
+validates it, persists it to its config file (the scan key to the 0600 key
+file) and then **restarts itself in-process** so every setting takes full
+effect — Electrum clients such as Sparrow are disconnected, reconnect on
+their own and see the new wallet. New keys get their own state file, so
+switching wallets starts a fresh scan; moving the birthday back rescans from
+the new height (the old state is kept as `*.json.bak`). The scan key is
+write-only — it is never displayed and only sent when you paste a
+descriptor or type a new key.
+
+**Start at login**: a checkbox on the Settings tab registers the tray as a
+login item (XDG autostart entry on Linux, LaunchAgent on macOS, Run key on
+Windows; the AppImage path when run from one); the tray then starts the
+daemon. It is ticked by default in first-time setup and applied on Save.
 
 The **Wallet** tab is a read-only convenience view, not a spending wallet. It
 shows found transaction/output counts plus copyable base and per-label Silent
@@ -231,6 +240,16 @@ Lifecycle behavior:
   tray process — this avoids two trays racing to spawn a daemon on a cold
   start (only one would win the control-socket bind; without this guard the
   loser could still send `Shutdown` for the other's daemon at Quit).
+- **Supervision**: a daemon the tray spawned (or one an earlier tray
+  session spawned) is restarted automatically when it dies — crash, kill,
+  `panic = "abort"` in release builds — with exponential backoff (1 s, 2 s,
+  4 s … capped at 60 s; reset after a healthy minute). The Status tab shows
+  the crash (exit status/signal, time, the daemon's last output lines),
+  the restart count and the countdown to the next attempt; the tray label
+  reads "Daemon: crashed — restarting". A daemon that is alive but silent
+  for 2 minutes is replaced. "Retry / Start daemon" restarts immediately.
+  Only Quit stops it for good; an externally started daemon is never
+  restarted by the tray.
 - **Scanning start/stop is not sticky across a daemon restart**: `Stop`
   pauses only the scan task, not the process. If the tray-spawned daemon is
   later shut down (Quit) and a new one is spawned, the new daemon starts

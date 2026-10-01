@@ -20,6 +20,15 @@
     </nav>
 
     <div id="view-status">
+      <section id="daemon-health" class="card health" hidden>
+        <div class="row">
+          <span class="label">Daemon</span>
+          <span id="health-state" class="pill pill-bad"></span>
+        </div>
+        <p id="health-detail" class="small"></p>
+        <code id="health-output" class="error" hidden></code>
+      </section>
+
       <section class="card">
         <div class="row">
           <span class="label">Scanning</span>
@@ -224,6 +233,15 @@
         </fieldset>
       </form>
       <p id="settings-msg" class="small"></p>
+
+      <section class="card">
+        <label class="choice">
+          <input type="checkbox" id="cfg-autostart" />
+          <span><strong>Start Friglet when I log in</strong> — keeps the wallet server
+            running for Sparrow after a reboot.</span>
+        </label>
+        <p id="autostart-msg" class="hint"></p>
+      </section>
     </div>
   </main>
 

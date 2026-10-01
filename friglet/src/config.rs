@@ -533,6 +533,140 @@ fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
     friglet_ipc::write_key_file(path, secret_hex, false)
 }
 
+/// The scan secret / spend pubkey hex a scanner state file was written for.
+fn state_file_keys(path: &Path) -> Option<(String, String)> {
+    let json = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let scan = value.get("secret_scan_hex")?.as_str()?.to_ascii_lowercase();
+    let spend = value
+        .get("public_spend_hex")?
+        .as_str()?
+        .to_ascii_lowercase();
+    Some((scan, spend))
+}
+
+fn same_wallet(path: &Path, scan_secret: &SecretKey, spend_pubkey: &PublicKey) -> Option<bool> {
+    let (scan, spend) = state_file_keys(path)?;
+    Some(
+        scan == hex::encode(scan_secret.secret_bytes())
+            && spend == hex::encode(spend_pubkey.serialize()),
+    )
+}
+
+/// The scanner state file actually used for this wallet.
+///
+/// blindbit-lib restores the keys embedded in the state file, so one state
+/// file must never be shared between wallets:
+///
+/// - The default location (`<config dir>/friglet/scanner_state.json`) is
+///   keyed by wallet: `scanner_state-<network>-<id>.json` next to it, `id`
+///   being a hash of the scan and spend public keys. Changing keys therefore
+///   starts a fresh state, and switching back finds the old one again. A
+///   legacy unkeyed default file of this same wallet is renamed into place.
+/// - An explicitly configured path is used as is, but refused when it holds
+///   another wallet's state (instead of silently scanning the old keys).
+pub fn wallet_state_file(
+    configured: &Path,
+    network: &str,
+    scan_secret: &SecretKey,
+    spend_pubkey: &PublicKey,
+) -> Result<PathBuf, String> {
+    let is_default = friglet_ipc::default_state_file().as_deref() == Some(configured)
+        || configured.as_os_str() == "scanner_state.json";
+    if !is_default {
+        if same_wallet(configured, scan_secret, spend_pubkey) == Some(false) {
+            return Err(format!(
+                "state file {} belongs to a different wallet; point state_file at a new path \
+                 (or remove it) — or drop the state_file setting so friglet keeps one state \
+                 file per wallet",
+                configured.display()
+            ));
+        }
+        return Ok(configured.to_path_buf());
+    }
+
+    use bitcoin::hashes::{Hash, sha256};
+    let scan_pubkey =
+        PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::new(), scan_secret);
+    let mut engine = sha256::Hash::engine();
+    bitcoin::hashes::HashEngine::input(&mut engine, &scan_pubkey.serialize());
+    bitcoin::hashes::HashEngine::input(&mut engine, &spend_pubkey.serialize());
+    let id = hex::encode(&sha256::Hash::from_engine(engine).to_byte_array()[..4]);
+    let keyed = configured.with_file_name(format!("scanner_state-{network}-{id}.json"));
+
+    if !keyed.exists() && same_wallet(configured, scan_secret, spend_pubkey) == Some(true) {
+        std::fs::rename(configured, &keyed).map_err(|e| {
+            format!(
+                "cannot move {} to {}: {e}",
+                configured.display(),
+                keyed.display()
+            )
+        })?;
+        let legacy_headers = crate::blockheader::sidecar_path(configured);
+        if legacy_headers.exists() {
+            let _ = std::fs::rename(&legacy_headers, crate::blockheader::sidecar_path(&keyed));
+        }
+        // Unconfirmed broadcasts belong to this wallet too.
+        let legacy_pending = crate::blockheader::pending_path(configured);
+        if legacy_pending.exists() {
+            let _ = std::fs::rename(&legacy_pending, crate::blockheader::pending_path(&keyed));
+        }
+        tracing::info!(from = %configured.display(), to = %keyed.display(), "moved scanner state to its per-wallet file");
+    }
+    Ok(keyed)
+}
+
+/// Sidecar recording the lowest start height `state_file` has scanned from.
+fn birthday_sidecar(state_file: &Path) -> PathBuf {
+    state_file.with_extension("birthday.json")
+}
+
+/// Rescan when the wallet birthday moved back: if `start_height` is below
+/// the height the existing state was scanned from, the state is moved aside
+/// (`*.json.bak`) so scanning starts over from the new birthday. Returns the
+/// previous birthday when that happened. Moving the birthday forward keeps
+/// the state (it already covers the later range).
+pub fn reconcile_birthday(state_file: &Path, start_height: u64) -> Result<Option<u64>, String> {
+    let sidecar = birthday_sidecar(state_file);
+    let recorded = std::fs::read_to_string(&sidecar)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("start_height")?.as_u64());
+    let record = |height: u64| {
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({ "start_height": height }).to_string(),
+        )
+        .map_err(|e| format!("cannot write {}: {e}", sidecar.display()))
+    };
+    match recorded {
+        Some(previous) if start_height < previous => {
+            if state_file.exists() {
+                let backup = state_file.with_extension("json.bak");
+                std::fs::rename(state_file, &backup).map_err(|e| {
+                    format!(
+                        "cannot move {} aside for a rescan: {e}",
+                        state_file.display()
+                    )
+                })?;
+            }
+            record(start_height)?;
+            Ok(Some(previous))
+        }
+        Some(_) => Ok(None),
+        None => {
+            if let Some(parent) = sidecar.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            record(start_height)?;
+            Ok(None)
+        }
+    }
+}
+
 /// Restrict the state file to owner read/write.
 ///
 /// Limitation: blindbit-lib's `save_to_file` unconditionally embeds
@@ -869,6 +1003,136 @@ mod tests {
                 std::fs::read_to_string(&fresh).unwrap().trim(),
                 "start_height = 7"
             );
+            Ok(())
+        });
+    }
+
+    fn keys(secret_hex: &str, spend_hex: &str) -> (SecretKey, PublicKey) {
+        (
+            SecretKey::from_str(secret_hex).unwrap(),
+            PublicKey::from_str(spend_hex).unwrap(),
+        )
+    }
+
+    fn write_state(path: &Path, secret: &SecretKey, spend: &PublicKey) {
+        std::fs::write(
+            path,
+            serde_json::json!({
+                "secret_scan_hex": hex::encode(secret.secret_bytes()),
+                "public_spend_hex": hex::encode(spend.serialize()),
+                "last_scanned_block_height": 7,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Point the platform config dir into the jail; returns the default
+    /// state file path there.
+    fn jailed_default_state_file(jail: &mut figment::Jail) -> PathBuf {
+        let dir = jail.directory().to_path_buf();
+        jail.set_env("XDG_CONFIG_HOME", dir.display());
+        let base = friglet_ipc::default_state_file().unwrap();
+        assert!(base.starts_with(jail.directory()));
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        base
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn default_state_file_is_keyed_by_wallet() {
+        figment::Jail::expect_with(|jail| {
+            let base = jailed_default_state_file(jail);
+            let (a_scan, a_spend) = keys(SECRET_HEX, MAINNET_DESCRIPTOR_SPEND);
+            let (b_scan, b_spend) = keys(MAINNET_DESCRIPTOR_SCAN, MAINNET_DESCRIPTOR_SPEND);
+
+            // The bare default name is treated as the default location.
+            let a = wallet_state_file(Path::new("scanner_state.json"), "signet", &a_scan, &a_spend)
+                .unwrap();
+            assert!(a.to_string_lossy().starts_with("scanner_state-signet-"));
+            let a = base.with_file_name(a);
+            let b = wallet_state_file(&base, "signet", &b_scan, &b_spend).unwrap();
+            assert_ne!(
+                a.file_name(),
+                b.file_name(),
+                "new keys get a fresh state file"
+            );
+            assert_eq!(
+                wallet_state_file(&base, "signet", &a_scan, &a_spend).unwrap(),
+                a,
+                "stable per wallet"
+            );
+            let b_main = wallet_state_file(&base, "bitcoin", &b_scan, &b_spend).unwrap();
+            assert_ne!(b, b_main, "and per network");
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_default_state_of_the_same_wallet_is_moved_into_place() {
+        figment::Jail::expect_with(|jail| {
+            let base = jailed_default_state_file(jail);
+            let (scan, spend) = keys(SECRET_HEX, MAINNET_DESCRIPTOR_SPEND);
+            write_state(&base, &scan, &spend);
+            std::fs::write(crate::blockheader::sidecar_path(&base), "{}").unwrap();
+            std::fs::write(crate::blockheader::pending_path(&base), "{}").unwrap();
+
+            // Another wallet leaves the legacy file alone ...
+            let (other, other_spend) = keys(MAINNET_DESCRIPTOR_SCAN, MAINNET_DESCRIPTOR_SPEND);
+            let keyed_other = wallet_state_file(&base, "signet", &other, &other_spend).unwrap();
+            assert!(base.exists() && !keyed_other.exists());
+
+            // ... the wallet it belongs to adopts it.
+            let keyed = wallet_state_file(&base, "signet", &scan, &spend).unwrap();
+            assert!(!base.exists());
+            assert!(keyed.exists());
+            assert!(crate::blockheader::sidecar_path(&keyed).exists());
+            assert!(crate::blockheader::pending_path(&keyed).exists());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn explicit_state_file_of_another_wallet_is_refused() {
+        figment::Jail::expect_with(|jail| {
+            let path = jail.directory().join("custom.json");
+            let (scan, spend) = keys(SECRET_HEX, MAINNET_DESCRIPTOR_SPEND);
+            assert_eq!(
+                wallet_state_file(&path, "signet", &scan, &spend).unwrap(),
+                path
+            );
+            write_state(&path, &scan, &spend);
+            assert_eq!(
+                wallet_state_file(&path, "signet", &scan, &spend).unwrap(),
+                path
+            );
+
+            let (other, other_spend) = keys(MAINNET_DESCRIPTOR_SCAN, MAINNET_DESCRIPTOR_SPEND);
+            let err = wallet_state_file(&path, "signet", &other, &other_spend).unwrap_err();
+            assert!(err.contains("different wallet"), "{err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn birthday_moving_back_triggers_a_rescan() {
+        figment::Jail::expect_with(|jail| {
+            let state = jail.directory().join("w.json");
+            std::fs::write(&state, "{}").unwrap();
+
+            // First sight: record, keep state.
+            assert_eq!(reconcile_birthday(&state, 1000).unwrap(), None);
+            assert!(state.exists());
+            // Forward: the state already covers it.
+            assert_eq!(reconcile_birthday(&state, 1500).unwrap(), None);
+            assert!(state.exists());
+            // Backwards: state moved aside, new birthday recorded.
+            assert_eq!(reconcile_birthday(&state, 900).unwrap(), Some(1000));
+            assert!(!state.exists());
+            assert!(state.with_extension("json.bak").exists());
+            assert_eq!(reconcile_birthday(&state, 900).unwrap(), None);
+            assert_eq!(reconcile_birthday(&state, 950).unwrap(), None);
             Ok(())
         });
     }
