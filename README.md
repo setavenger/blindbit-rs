@@ -255,11 +255,11 @@ right next to its own executable.
 #    friglet-tray/binaries/friglet-<target-triple>)
 scripts/prepare-sidecar.sh
 
-# 2. build the bundles (tauri-cli via npx; `cargo install tauri-cli --locked`
+# 2. build the bundles (tauri-cli v2 via npx; `cargo install tauri-cli --locked`
 #    works too — then use `cargo tauri build ...`)
 cd friglet-tray
-npx @tauri-apps/cli build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
-npx @tauri-apps/cli build --bundles dmg --config tauri.sidecar.conf.json           # macOS
+npx @tauri-apps/cli@2 build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
+npx @tauri-apps/cli@2 build --bundles dmg --config tauri.sidecar.conf.json           # macOS
 ```
 
 The `--config tauri.sidecar.conf.json` overlay adds the daemon sidecar
@@ -276,7 +276,56 @@ Artifacts land under `target/release/bundle/`:
   binaries in the embedded `usr/bin/`.
 - `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
   Run `scripts/prepare-sidecar.sh` there first; it picks up the host triple
-  (e.g. `aarch64-apple-darwin`) automatically.
+  (e.g. `aarch64-apple-darwin`) automatically. For one dmg that runs on
+  both Apple Silicon and Intel, stage a fat sidecar with
+  `scripts/prepare-sidecar.sh universal-apple-darwin` and add
+  `--target universal-apple-darwin` to the build (output under
+  `target/universal-apple-darwin/release/bundle/`). The app is ad-hoc
+  signed (`bundle.macOS.signingIdentity: "-"`), not notarized.
+
+### Prebuilt bundles (GitHub Actions)
+
+`.github/workflows/release.yml` runs the same steps on GitHub-hosted
+runners. It only does packaging; tests and lints stay in `ci.yml`.
+
+| Platform | Runner | Bundles |
+|----------|--------|---------|
+| Linux x86_64 | `ubuntu-22.04` (glibc 2.35 minimum) | `.deb`, `.AppImage` |
+| macOS, Apple Silicon + Intel | `macos-15` | universal `.dmg` |
+| Windows x86_64 (best effort, untested) | `windows-2025` | `.msi`, NSIS `-setup.exe` |
+
+It runs on `v*` tag pushes, on manual `workflow_dispatch`, and on pull
+requests that touch packaging files (the workflow, `friglet-tray/tauri*.conf.json`,
+`friglet-tray/icons/`, `friglet-tray/Cargo.toml`/`build.rs`,
+`scripts/prepare-sidecar.sh`). Pull request runs only upload workflow
+artifacts. The Windows job is `continue-on-error`.
+
+To cut a release: set the version in `friglet-tray/tauri.conf.json` (and
+`friglet-tray/Cargo.toml`), then push a matching tag, e.g.
+`git tag v0.1.0 && git push origin v0.1.0`. The workflow attaches the bundles
+and a `SHA256SUMS` file to a **draft** release for that tag; review it and
+publish it by hand. A manual `workflow_dispatch` run creates or updates the
+draft `friglet-tray-dev-<commit>` instead; delete it when you're done.
+Nothing is ever published automatically.
+
+### Opening unsigned builds
+
+The bundles are not code-signed or notarized yet, so each OS warns on first
+launch. Check the download against `SHA256SUMS` first
+(`sha256sum -c SHA256SUMS --ignore-missing`).
+
+- **macOS:** open the dmg and drag `friglet-tray` to Applications. On first
+  launch macOS blocks it; go to System Settings → Privacy & Security and click
+  **Open Anyway** (on macOS 14 and older, right-click the app → Open also
+  works). Or clear the quarantine flag in a terminal:
+  `xattr -dr com.apple.quarantine /Applications/friglet-tray.app`.
+- **Windows:** SmartScreen shows "Windows protected your PC"; click
+  **More info** → **Run anyway**.
+- **Linux:** `sudo apt install ./friglet-tray_<version>_amd64.deb`, or
+  `chmod +x friglet-tray_<version>_amd64.AppImage` and run it (AppImages need
+  FUSE 2, package `libfuse2`/`libfuse2t64`; without it, run with
+  `--appimage-extract-and-run`). On GNOME the tray icon needs the
+  AppIndicator extension (Ubuntu ships it enabled).
 
 ### Standalone daemon
 

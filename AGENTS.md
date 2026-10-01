@@ -159,10 +159,24 @@ dbus-run-session -- bash -c '
 - Desktop bundles: `scripts/prepare-sidecar.sh` (stages
   `target/release/friglet` as `friglet-tray/binaries/friglet-<triple>`,
   gitignored), then from `friglet-tray/`:
-  `npx @tauri-apps/cli build --bundles deb,appimage --config
+  `npx @tauri-apps/cli@2 build --bundles deb,appimage --config
   tauri.sidecar.conf.json` (Linux) or `--bundles dmg --config
   tauri.sidecar.conf.json` (macOS host only — dmg cannot be cross-built
   from Linux). Artifacts: `target/release/bundle/{deb,appimage,dmg}/`.
+- CI packaging: `.github/workflows/release.yml` (packaging only, not a
+  second ci.yml). Linux deb+AppImage on `ubuntu-22.04` (glibc floor),
+  macOS universal dmg on `macos-15` (`prepare-sidecar.sh
+  universal-apple-darwin` lipo's both daemon slices; Tauri requires the
+  sidecar to be universal too), Windows msi+nsis best effort
+  (`continue-on-error`). Each job checks the daemon is inside the bundle.
+  Triggers: `v*` tags and `workflow_dispatch` → DRAFT release only (tag must
+  match `tauri.conf.json` version); `pull_request` is path-filtered to
+  packaging files and only uploads artifacts. `TAURI_CLI_VERSION` there is
+  pinned to the locked `tauri` crate version — bump both together.
+- macOS bundles are ad-hoc signed (`bundle.macOS.signingIdentity: "-"`):
+  arm64 needs at least an ad-hoc signature, and it turns Gatekeeper's
+  "damaged" error into the bypassable "Open Anyway" prompt. User steps for
+  unsigned builds: README "Opening unsigned builds".
 - The daemon is a Tauri sidecar (`bundle.externalBin`), but it lives in the
   `tauri.sidecar.conf.json` overlay, NOT the base `tauri.conf.json`:
   tauri-build errors at compile time when an externalBin file is missing,
@@ -193,8 +207,10 @@ dbus-run-session -- bash -c '
   --target x86_64-pc-windows-gnu` passes cleanly (mingw-w64 installed).
   The `x86_64-pc-windows-msvc` target cannot be checked from Linux — the
   `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
-  an environment limitation, not a code problem. No real Windows
-  build/run has been exercised; linking + runtime remain unverified.
+  an environment limitation, not a code problem. On a real MSVC host
+  (`windows-2025` in release.yml) the daemon and tray compile, link and
+  bundle (msi + nsis), and the MSI's `friglet.exe --help` runs; the tray
+  itself (named-pipe control, tray icon, spawning) is still unverified.
 
 ## SP descriptor onboarding (SNB-623)
 
