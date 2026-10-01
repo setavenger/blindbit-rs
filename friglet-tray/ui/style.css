@@ -71,6 +71,7 @@ code {
   color: var(--text);
 }
 .error { color: var(--bad); }
+#scan-notes { font-size: 13px; white-space: pre-line; }
 .small { font-size: 12px; min-height: 18px; }
 
 .banner {

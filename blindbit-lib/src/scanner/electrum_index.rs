@@ -7,6 +7,8 @@ use bitcoin::ScriptBuf;
 use bitcoin::hashes::{Hash, sha256};
 use std::collections::HashMap;
 
+use super::health::ScanHealth;
+
 /// Lightweight Electrum-compatible index built from scanner state.
 #[derive(Default)]
 pub struct WalletElectrumIndex {
@@ -54,6 +56,10 @@ pub struct WalletElectrumIndex {
 
     /// Ordered list of confirmed SP receives.
     pub sp_history: Vec<SpHistoryEntry>,
+
+    /// Stalls and start-height adjustments of the running scan, published
+    /// here for status readers (see `scanner/health.rs`).
+    pub scan_health: ScanHealth,
 }
 
 /// A single entry in a scripthash's transaction history.

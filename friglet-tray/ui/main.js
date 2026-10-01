@@ -42,9 +42,35 @@ function render({ reachable, status }) {
 
   $("error-block").hidden = !status.last_error;
   setText("last-error", status.last_error ?? "");
+  renderScanHealth(status.scan_health ?? {});
 
   $("start-btn").disabled = !reachable || status.scanning;
   $("stop-btn").disabled = !reachable || !status.scanning;
+}
+
+// Why the scan is stuck, and where it started (the daemon's `scan_health`;
+// absent from older daemons).
+function renderScanHealth(health) {
+  const stall = health.stall;
+  $("stall-block").hidden = !stall;
+  setText(
+    "stall",
+    stall
+      ? `at height ${stall.height.toLocaleString()} since ` +
+          `${new Date(stall.since_unix * 1000).toLocaleString()}: ${stall.reason}`
+      : "",
+  );
+
+  const notes = [];
+  const start = health.start_adjusted;
+  if (start) {
+    notes.push(
+      `Scanning began at block ${start.oracle_floor.toLocaleString()} instead of ` +
+        `${start.requested_height.toLocaleString()}: the oracle has no data below it.`,
+    );
+  }
+  $("scan-notes-block").hidden = notes.length === 0;
+  setText("scan-notes", notes.join("\n"));
 }
 
 async function refresh() {
