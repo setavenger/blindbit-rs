@@ -9,6 +9,7 @@ on:
     branches:
       - master
       - integration
+      - snb-625-demo-base  # DEMO ONLY: stands in for integration
 
 permissions:
   contents: read
