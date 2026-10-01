@@ -4,21 +4,27 @@
 //! The testkit runs each scenario at T0 in Go: it builds and signs the
 //! transactions with its own vector-gated BIP-352 sender, one per block, and
 //! exports them with the scenario's expected found-set as a JSON fixture. This
-//! module replays those chains, in-process, through exactly the per-block steps
-//! `Scanner::scan_block_range` takes, with only the gRPC stream and the P2P
-//! block fetch replaced:
+//! module replays those chains, in-process, through the scan loop itself:
+//! every block goes through `Scanner::scan_block_stream`, the same per-block
+//! loop `Scanner::scan_block_range` and `watch_chain` run, with only the gRPC
+//! stream and the P2P block fetch replaced (an in-process stream, and full
+//! blocks served from memory). There is no copy of the per-block steps here to
+//! fall out of step with production:
 //!
 //! 1. an in-process oracle derives, from the transactions and their prevouts
 //!    alone, what blindbit-oracle serves per block (`BlockScanDataShortResponse`):
 //!    the tweak `input_hash * A` of every transaction with a taproot output, the
 //!    8-byte prefixes of its taproot output keys, and the 8-byte prefixes of every
 //!    taproot output the block spends;
-//! 2. [`Scanner::scan_short_block_data`] decides from that short data whether the
-//!    block is worth fetching (`scan_transaction_short` / `match_short_pubkey`,
-//!    plus the spent-output check);
-//! 3. only then does the full block go through [`Scanner::apply_matched_block`],
-//!    i.e. `apply_block_relevant` on the external indexer, and become a
-//!    checkpoint.
+//! 2. the scan loop checks the block against the chain it already scanned,
+//!    and [`Scanner::scan_short_block_data`] decides from the short data whether
+//!    the block is worth fetching (`scan_transaction_short` /
+//!    `match_short_pubkey`, plus the spent-output check against the owned
+//!    outputs);
+//! 3. only then is the full block fetched and indexed
+//!    ([`Scanner::apply_matched_block`], i.e. `apply_block_relevant` on the
+//!    external indexer), the owned outputs and their spends recorded
+//!    (`sync_owned_outputs`), and the block kept as a checkpoint.
 //!
 //! Each wallet's found-set is then read from the scanner's indexer, as the
 //! balance reads it, and judged against the fixture's answer key: every
@@ -33,8 +39,9 @@
 //!
 //! # Fixture provenance
 //!
-//! * source repo: `setavenger/blindbit-testkit`, commit `b1f962e` (testkit PR #25,
-//!   which adds the `export-fixture` command; SNB-517)
+//! * source repo: `setavenger/blindbit-testkit`, commit `68f9f1c` (the merge of
+//!   testkit PR #25 into master, which adds the `export-fixture` command;
+//!   SNB-517)
 //! * command (from the testkit checkout):
 //!
 //!   ```text
@@ -74,6 +81,7 @@ use tonic::transport::Channel;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
 use super::Scanner;
+use crate::scanner::stream_safety_tests::{TempState, TestStream, run, serve};
 
 // ---------------------------------------------------------------------------
 // Pinned fixtures
@@ -137,35 +145,6 @@ const FIXTURES: &[Pinned] = &[
 const MANIFEST: &str = include_str!("../../tests/data/testkit-t0/SHA256SUMS");
 
 const FIXTURE_FORMAT: &str = "blindbit-testkit/t0-fixture/1";
-
-/// Outputs whose spent status the live receive path on this branch cannot see
-/// yet, and why. Each entry is asserted to still fail in exactly that way, so a
-/// fix turns this test red until the entry is removed.
-///
-/// `Scanner::owned_outputs` is the set `scan_short_block_data` matches the
-/// oracle's spent-output prefixes against, and nothing writes it
-/// (`add_owned_output` has no caller). A block whose only relevance to the wallet
-/// is a spend is therefore never fetched, the spending transaction never reaches
-/// the wallet graph, and the output stays unspent in the balance. Outputs listed
-/// here are spent by a transaction that pays the wallet nothing, which is every
-/// spend the scenarios make.
-///
-/// The fix is blindbit-rs PR #19 (record owned outputs so spends are detected).
-/// With it, `process_block` must also call `scanner.sync_owned_outputs()` after
-/// `apply_matched_block`, as `scan_block_range` then does; with that one line
-/// added this list must become empty, and every scenario here passes (checked
-/// against #19 when this module was written).
-const KNOWN_SPEND_GAP: &[(&str, &str)] = &[
-    ("dust-boundary", "cut-at-k1"),
-    ("dust-boundary", "spent-above"),
-    ("k-gap", "spent-k0"),
-    ("labelled-multi", "labelled-bob"),
-    ("rescan", "paid-then-spent"),
-    ("spent-outputs", "spent-alone"),
-    ("spent-outputs", "spent-labelled"),
-    ("spent-outputs", "spent-pair-k0"),
-    ("spent-outputs", "spent-pair-k1"),
-];
 
 fn fixture_sha256(bytes: &[u8]) -> String {
     hex::encode(sha256::Hash::hash(bytes).to_byte_array())
@@ -484,43 +463,40 @@ fn wallet_scanner(fixture: &Fixture, wallet: &FixtureWallet) -> Scanner {
     let spend_pk = PublicKey::from_str(&wallet.spend_pubkey).expect("spend pubkey");
     let max_label = wallet.labels.iter().copied().max().unwrap_or(0);
     let socket: SocketAddr = "127.0.0.1:18444".parse().expect("socket address");
-    let state_file: PathBuf = std::env::temp_dir().join(format!(
-        "blindbit-testkit-t0-{}-{}-{}.json",
-        fixture.scenario,
-        wallet.id,
-        std::process::id()
-    ));
     Scanner::new(
         oracle_client(),
         socket,
         scan_sk,
         spend_pk,
         max_label,
-        state_file,
+        state_file(fixture, wallet),
         Network::Regtest,
     )
 }
 
-/// One block of `Scanner::scan_block_range`, minus the gRPC stream and the P2P
-/// fetch: the short data decides whether the block is fetched, and only a
-/// fetched block reaches the indexer and becomes a checkpoint.
-///
-/// Keep this in step with `scan_block_range`. It calls the same functions in the
-/// same order; a step added there after `apply_matched_block` (for example
-/// recording owned outputs) must be added here too, or this harness stops
-/// exercising it.
+/// Where a wallet's scanner saves its state: the scan loop saves after every
+/// block it indexes. Removed when the scenario ends.
+fn state_file(fixture: &Fixture, wallet: &FixtureWallet) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "blindbit-testkit-t0-{}-{}-{}.json",
+        fixture.scenario,
+        wallet.id,
+        std::process::id()
+    ))
+}
+
+/// One block through the scan loop (`Scanner::scan_block_stream`, the loop
+/// `scan_block_range` runs), with the oracle's message for it streamed
+/// in-process and the full block served in place of the P2P fetch.
 fn process_block(scanner: &mut Scanner, block: &ChainBlock) {
-    let probable_match = scanner
-        .scan_short_block_data(block.short.clone())
-        .unwrap_or_else(|e| panic!("block {}: short scan failed: {e:?}", block.height));
-    if let Some(probable_match) = probable_match {
-        scanner.apply_matched_block(&block.block, &probable_match, block.height);
-        let hash = block.block.block_hash();
-        scanner.block_checkpoints.insert(block.height, hash);
-        scanner.stage.block_checkpoints.insert(block.height, hash);
-    }
-    scanner.last_scanned_block_height = u64::from(block.height);
-    scanner.stage.last_scanned_block_height = u64::from(block.height);
+    serve(&block.block);
+    let height = u64::from(block.height);
+    run(scanner.scan_block_stream(
+        height,
+        height,
+        TestStream::new(vec![Ok(block.short.clone())]),
+    ))
+    .unwrap_or_else(|e| panic!("block {}: scan failed: {e}", block.height));
 }
 
 /// One output as the wallet reports it.
@@ -751,6 +727,11 @@ fn judge(fixture: &Fixture, found: &BTreeMap<String, BTreeMap<OutPoint, Found>>)
 /// the served data and must reproduce it. Returns every failure.
 fn run_scenario(fixture: &Fixture) -> Vec<Failure> {
     let chain = build_chain(fixture);
+    let _state_files: Vec<TempState> = fixture
+        .wallets
+        .iter()
+        .map(|wallet| TempState(state_file(fixture, wallet)))
+        .collect();
     let mut scanners: Vec<(String, Scanner)> = fixture
         .wallets
         .iter()
@@ -830,38 +811,19 @@ fn run_scenario(fixture: &Fixture) -> Vec<Failure> {
     failures
 }
 
-/// Runs one scenario and fails with every failure named, except the entries of
-/// [`KNOWN_SPEND_GAP`], which must fail exactly as recorded.
+/// Runs one scenario and fails with every failure named.
 fn assert_scenario(name: &str) {
     let fixture = fixture(name);
     let failures = run_scenario(&fixture);
-
-    let known: Vec<&str> = KNOWN_SPEND_GAP
+    let failures: Vec<String> = failures
         .iter()
-        .filter(|(scenario, _)| *scenario == name)
-        .map(|(_, reference)| *reference)
-        .collect();
-    let is_known_gap = |failure: &Failure| {
-        matches!(failure, Failure::Mismatched { reference, field: "spent", expected, reported, .. }
-            if known.contains(&reference.as_str()) && expected == "true" && reported == "false")
-    };
-    let unexpected: Vec<String> = failures
-        .iter()
-        .filter(|failure| !is_known_gap(failure))
         .map(|failure| format!("  {failure}"))
         .collect();
     assert!(
-        unexpected.is_empty(),
+        failures.is_empty(),
         "testkit scenario {name} at T0 through blindbit-lib's live receive path:\n{}",
-        unexpected.join("\n")
+        failures.join("\n")
     );
-    for &reference in &known {
-        assert!(
-            failures.iter().any(|failure| is_known_gap(failure)
-                && matches!(failure, Failure::Mismatched { reference: r, .. } if r == reference)),
-            "{name}/{reference} is listed in KNOWN_SPEND_GAP but its spend is now detected; remove the entry"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
