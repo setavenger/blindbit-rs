@@ -132,30 +132,60 @@
         <fieldset id="settings-fields" disabled>
           <section class="card">
             <div class="field">
+              <label for="cfg-descriptor">Sparrow wallet descriptor</label>
+              <textarea id="cfg-descriptor" rows="3" class="mono" spellcheck="false"
+                        autocomplete="off" placeholder="sp([…/352h/0h/0h]spscan1q…)#…"></textarea>
+              <p class="hint">In Sparrow, open the Silent Payments wallet, go to the
+                <strong>Settings</strong> tab, right-click the <strong>Descriptor</strong> field
+                and choose <strong>Copy Output Descriptor</strong>, then paste it here.</p>
+              <p id="descriptor-status" class="hint" aria-live="polite"></p>
+            </div>
+            <div class="field">
               <label for="cfg-network">Network</label>
               <select id="cfg-network">
-                <option value="bitcoin">bitcoin</option>
+                <option value="bitcoin">bitcoin (mainnet)</option>
                 <option value="signet">signet</option>
                 <option value="testnet">testnet</option>
                 <option value="testnet4">testnet4</option>
                 <option value="regtest">regtest</option>
               </select>
             </div>
-            <div class="field">
-              <label for="cfg-oracle-url">Oracle URL</label>
-              <input id="cfg-oracle-url" type="text" placeholder="https://oracle.setor.dev" />
-            </div>
-            <div class="field">
-              <label for="cfg-p2p-addr">P2P node address (host:port)</label>
-              <input id="cfg-p2p-addr" type="text" placeholder="127.0.0.1:8333" />
-            </div>
-            <div class="field">
-              <label for="cfg-start-height">Start height (wallet birthday)</label>
-              <input id="cfg-start-height" type="number" min="1" step="1" />
-            </div>
           </section>
 
           <section class="card">
+            <span class="label">Wallet birthday</span>
+            <label class="choice">
+              <input type="radio" name="birthday" id="birthday-tip" value="tip" />
+              <span><strong>New wallet</strong> — nothing received yet. Start at the
+                current block; nothing to rescan.</span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="birthday" id="birthday-height" value="height" />
+              <span><strong>Existing wallet</strong> — already received payments. Scan
+                from this block height:</span>
+            </label>
+            <input id="cfg-start-height" class="indented" type="number" min="1" step="1"
+                   placeholder="block height, e.g. 850000" aria-label="Start block height" />
+            <p class="hint indented">Use a height at or before the wallet's first payment
+              (a block explorer shows a transaction's block height). Lower = longer scan.</p>
+          </section>
+
+          <section class="card">
+            <div class="field">
+              <label for="cfg-p2p-addr">Bitcoin node (host:port)</label>
+              <input id="cfg-p2p-addr" type="text" spellcheck="false" placeholder="node.example.com:8333" />
+              <p class="hint">Any reachable Bitcoin node on this network — your own node
+                or a public one. A hostname works; the port defaults to the network's.</p>
+            </div>
+            <div class="field">
+              <label for="cfg-oracle-url">BlindBit oracle URL</label>
+              <input id="cfg-oracle-url" type="text" spellcheck="false" placeholder="https://oracle.setor.dev" />
+              <p id="oracle-hint" class="hint"></p>
+            </div>
+          </section>
+
+          <details class="card advanced">
+            <summary>Advanced</summary>
             <div class="field">
               <label for="cfg-scan-key">Scan key (32-byte hex, write-only)</label>
               <input id="cfg-scan-key" type="password" autocomplete="off"
@@ -173,9 +203,6 @@
               <label for="cfg-key-file">Key file path</label>
               <input id="cfg-key-file" type="text" class="mono" spellcheck="false" />
             </div>
-          </section>
-
-          <section class="card">
             <div class="field">
               <label for="cfg-http-addr">HTTP bind address</label>
               <input id="cfg-http-addr" type="text" placeholder="127.0.0.1:8080" />
@@ -188,7 +215,7 @@
               <label for="cfg-state-file">State file path</label>
               <input id="cfg-state-file" type="text" class="mono" spellcheck="false" />
             </div>
-          </section>
+          </details>
 
           <div class="actions">
             <button type="submit" id="save-btn">Save</button>

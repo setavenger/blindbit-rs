@@ -48,7 +48,11 @@ async fn main() {
 }
 
 async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (merged, config_file) = config::load(&args)?;
+    let config::Loaded {
+        config: mut merged,
+        file: config_file,
+        descriptor,
+    } = config::load(&args)?;
     // Where SetConfig persists changes: the file we loaded, or the default
     // location when the daemon started without one.
     let config_path = config_file.or_else(config::default_config_path);
@@ -70,8 +74,43 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
+    // New wallet: birthday = the oracle's current tip, recorded in the
+    // config file so later restarts keep the same birthday.
+    if let Some(height) = config::resolve_start_at_tip(&mut merged).await? {
+        tracing::info!(
+            start_height = height,
+            "new wallet: starting at the current chain tip"
+        );
+        match &config_path {
+            Some(path) => {
+                if let Err(e) = config::persist_start_height(path, height) {
+                    tracing::warn!(error = %e, "set start_height = {height} in the config to keep this birthday");
+                }
+            }
+            None => tracing::warn!(
+                "no config file location: set start_height = {height} to keep this birthday"
+            ),
+        }
+    }
+
     let cfg = config::resolve(merged)?;
+    if let Some(d) = &descriptor {
+        config::store_descriptor_scan_key(d, &cfg.key_file)?;
+        // A descriptor in the config file carries the scan secret.
+        if let Some(path) = &config_path {
+            config::tighten_state_file_perms(path);
+        }
+    }
     let secret_scan = config::resolve_scan_secret(args.scan_secret.as_deref(), &cfg.key_file)?;
+    if let Some(d) = &descriptor
+        && d.scan_secret != secret_scan
+    {
+        return Err(
+            "the scan secret from --scan-secret / FRIGLET_SCAN_SECRET differs from \
+                    the configured descriptor's scan key; remove one of them"
+                .into(),
+        );
+    }
     let label_addresses = control::derive_label_addresses(
         secret_scan,
         cfg.spend_pubkey,

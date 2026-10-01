@@ -50,9 +50,10 @@ cargo run --release --package friglet scan \
 |------|-------------|---------|
 | `--scan-secret` | Scan secret key (32-byte hex, secp256k1) | required |
 | `--spend-pubkey` | Spend public key (33-byte hex, secp256k1) | required |
-| `--start-height` | Wallet birthday block height | required |
-| `--p2p-node-addr` | Bitcoin P2P node address (`host:port`) | required |
-| `--oracle-url` | BlindBit Oracle URL | `https://oracle.setor.dev` |
+| `--start-height` | Wallet birthday block height | required (or `--start-at-tip`) |
+| `--start-at-tip` | New wallet: use the oracle's current tip as the birthday (recorded as `start_height` in the config file on first start) | off |
+| `--p2p-node-addr` | Bitcoin P2P node: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start | required |
+| `--oracle-url` | BlindBit Oracle URL | hosted oracle of `--network` (mainnet `https://oracle.setor.dev`, signet `https://signet.oracle.setor.dev`; none for other networks) |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
 | `--state-file` | Path to persist scanner state | `<config dir>/friglet/scanner_state.json` |
@@ -72,6 +73,23 @@ with no flags at all.
 - Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
   `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
 - `--print-config` prints the merged configuration as TOML and exits.
+
+Instead of the hex keys, the config can name the wallet by its Silent
+Payments descriptor as Sparrow exports it (BIP-392; in Sparrow: wallet
+**Settings** tab → right-click **Descriptor** → **Copy Output Descriptor**):
+
+```toml
+network = "signet"            # spscan… = mainnet, tspscan… = a test network
+descriptor = "sp([0f056943/352h/1h/0h]tspscan1q…)#7eve6al9"
+p2p_node_addr = "signet-node.example:38333"
+```
+
+`descriptor` (or `FRIGLET_DESCRIPTOR`) supplies `spend_pubkey`, the scan key
+(copied into the key file on startup) and, via its `?bh=` annotation,
+`start_height` when that is unset. It is never echoed back by `GetConfig` or
+`--print-config`. A descriptor holding the spend **private** key
+(`spspend…`) is refused — friglet is watch-only and will not keep that key
+on disk.
 
 The scan secret is kept out of the config file. It is read from, in order:
 `--scan-secret` (deprecated), `FRIGLET_SCAN_SECRET`, or the key file at
@@ -143,12 +161,29 @@ FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray
 **First run** — no manual config file needed: launch the tray, and if no
 daemon is running and none is configured yet (no `config.toml`, no
 `FRIGLET_*` env), the window opens automatically on the Settings tab with a
-first-time-setup banner. Fill in the required fields (P2P node address,
-start height, spend pubkey, scan key) and hit Save: the tray validates the
-form, writes the config file (atomic TOML at the platform default path,
-e.g. `~/.config/friglet/config.toml` on Linux or
+first-time-setup banner. Then:
+
+1. In Sparrow, open the Silent Payments wallet, go to its **Settings** tab,
+   right-click the **Descriptor** field and choose **Copy Output
+   Descriptor**. Paste it into *Sparrow wallet descriptor*. The tray picks
+   the network (mainnet for `spscan…`, signet for `tspscan…` unless another
+   test network is selected) and the matching hosted oracle, and shows the
+   wallet's SP address to compare with Sparrow's Receive tab. A pasted
+   `spspend…` descriptor (spend private key) is reduced to its watch-only
+   form on the spot; the private key is never stored.
+2. *Wallet birthday*: **New wallet** starts at the current chain tip
+   (nothing to rescan; the daemon records the tip as `start_height` on
+   first start). **Existing wallet** scans from the block height you enter
+   (pre-filled when the descriptor carries Sparrow's `?bh=` birth height).
+3. *Bitcoin node*: any reachable node of that network, `host:port` or just
+   `host`.
+
+Save validates the form (including a DNS lookup of the node), writes the
+config file (atomic TOML at the platform default path, e.g.
+`~/.config/friglet/config.toml` on Linux or
 `~/Library/Application Support/friglet/config.toml` on macOS) and the scan
-key file (0600), then starts the daemon with it.
+key file (0600), then starts the daemon with it. The hex key fields are
+still available under *Advanced*.
 
 Lifecycle behavior:
 

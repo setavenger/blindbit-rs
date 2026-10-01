@@ -318,8 +318,12 @@ impl ControlCtx {
     }
 
     /// Validate → persist → apply a full config replacement.
-    async fn set_config(&self, new_cfg: DaemonConfig) -> Response {
+    async fn set_config(&self, mut new_cfg: DaemonConfig) -> Response {
         let _guard = self.apply_lock.lock().await;
+        // New wallet → pin the birthday to the oracle tip before persisting.
+        if let Err(e) = config::resolve_start_at_tip(&mut new_cfg).await {
+            return Response::Error(e);
+        }
         let resolved = match config::validate_daemon_config(&new_cfg) {
             Ok(r) => r,
             Err(e) => return Response::Error(e),
@@ -703,6 +707,7 @@ mod tests {
             oracle_url: "http://127.0.0.1:1".to_string(),
             p2p_node_addr: Some("127.0.0.1:18444".to_string()),
             start_height: Some(100),
+            start_at_tip: false,
             spend_pubkey: Some(SPEND_PK.to_string()),
             max_label_num: 0,
             http_addr: "127.0.0.1:0".to_string(),
