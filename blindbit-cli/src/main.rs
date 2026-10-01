@@ -1,7 +1,7 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
 use bitcoin_rev::Network;
 
@@ -58,7 +58,20 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Display, not the Debug form `main` would print for a returned error: a
+            // stopped scan (`ScanStopped`) says which height it stopped at and where to
+            // rescan from, and its Debug form is a struct dump.
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
