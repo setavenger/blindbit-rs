@@ -351,7 +351,10 @@ async function inspectDescriptor() {
       spendSecretDropped = true;
       $("cfg-descriptor").value = s.watch_only;
     }
-    if (firstLook) {
+    // A different wallet gets its own birthday (Sparrow's bh=, else "new
+    // wallet"); re-pasting the configured wallet keeps the current one.
+    const sameWallet = loadedConfig?.spend_pubkey === s.spend_pubkey;
+    if (firstLook && !sameWallet) {
       if (s.birth_height != null) setBirthday("height", s.birth_height);
       else setBirthday("tip");
     }

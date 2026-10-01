@@ -193,7 +193,7 @@ first-time-setup banner. Then:
    form on the spot; the private key is never stored.
 2. *Wallet birthday*: **New wallet** starts at the current chain tip
    (nothing to rescan; the daemon records the tip as `start_height` on
-   first start). **Existing wallet** scans from the block height you enter
+   first start). **From block height** scans from the height you enter
    (pre-filled when the descriptor carries Sparrow's `?bh=` birth height).
 3. *Bitcoin node*: any reachable node of that network, `host:port` or just
    `host`.

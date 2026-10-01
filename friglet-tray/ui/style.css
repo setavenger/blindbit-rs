@@ -10,6 +10,8 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* `hidden` must win over the display: flex of .card / .col / .row. */
+[hidden] { display: none !important; }
 
 body {
   background: var(--bg);
@@ -119,6 +121,19 @@ fieldset:disabled { opacity: 0.5; }
   font: inherit;
   font-size: 13px;
   padding: 7px 9px;
+}
+/* WebKitGTK draws native <select>s with the GTK theme (light, low contrast
+   on this dark UI); draw it ourselves. */
+.field select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 28px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
 }
 .field input.mono, .field textarea.mono { font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
 .field textarea { resize: vertical; word-break: break-all; }
