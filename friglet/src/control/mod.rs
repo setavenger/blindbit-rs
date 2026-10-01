@@ -141,6 +141,13 @@ fn scan_health_info(health: &scanner::ScanHealth) -> friglet_ipc::ScanHealthInfo
                 from_height: rescan.from_height,
                 until_height: rescan.until_height,
             }),
+        state_reset: health
+            .state_file_reset
+            .as_ref()
+            .map(|reset| friglet_ipc::StateResetInfo {
+                backup_path: reset.backup_path.display().to_string(),
+                error: reset.error.clone(),
+            }),
     }
 }
 
@@ -856,6 +863,10 @@ mod tests {
                 from_height: 100_500,
                 until_height: 101_000,
             });
+            idx.scan_health.state_file_reset = Some(scanner::StateFileReset {
+                backup_path: "/data/scanner_state.json.unreadable-1".into(),
+                error: "Failed to parse JSON".to_string(),
+            });
         }
 
         let health = ctx.status().await.scan_health;
@@ -875,6 +886,13 @@ mod tests {
             Some(friglet_ipc::StateRescanInfo {
                 from_height: 100_500,
                 until_height: 101_000,
+            })
+        );
+        assert_eq!(
+            health.state_reset,
+            Some(friglet_ipc::StateResetInfo {
+                backup_path: "/data/scanner_state.json.unreadable-1".to_string(),
+                error: "Failed to parse JSON".to_string(),
             })
         );
     }

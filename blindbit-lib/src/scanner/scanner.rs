@@ -614,6 +614,10 @@ impl Scanner {
     /// This saves the ChangeSet which contains all the indexer and chain state changes.
     /// The ChangeSet can be used to reconstruct the scanner state on restart.
     ///
+    /// The write is atomic (temporary file, `fsync`, rename): a crash leaves
+    /// the previous state or the new one, never a truncated file. The file is
+    /// owner-only, since it holds the scan secret.
+    ///
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ScannerError> {
@@ -649,7 +653,7 @@ impl Scanner {
         changeset.format_version = STATE_FORMAT_VERSION;
 
         let json = serde_json::to_string_pretty(&changeset)?;
-        std::fs::write(path, json)?;
+        super::state_file::write_atomically(path.as_ref(), json.as_bytes())?;
         Ok(())
     }
 
