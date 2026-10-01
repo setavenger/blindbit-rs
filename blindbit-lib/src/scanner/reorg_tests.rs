@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::receive::get_silentpayment_pubkey;
@@ -27,11 +29,15 @@ use bitcoin::{
 use bitcoin_rev::Network;
 use tonic::transport::Channel;
 
+use super::health::{OracleProbe, indexed_block_hash};
 use super::reorg::ReorgTooDeep;
 use super::scanning::{BlockScanDataStream, BlockStreamSource};
 use super::stream_safety_tests::serve;
 use super::{REORG_LOOKBACK, Scanner, ScannerError};
-use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
+use crate::oracle_grpc::{
+    BlockHashResponse, BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem,
+};
+use prost::Message as _;
 
 const FORK: u64 = 104;
 
@@ -49,6 +55,31 @@ struct Oracle {
     /// stream began below it (so the first block of a stream is always
     /// served).
     fail_at: Option<u64>,
+    /// What the scanner asked of this oracle (shared by its clones).
+    traffic: Arc<Traffic>,
+}
+
+/// Requests and response payload bytes (gRPC message plus its 5-byte frame
+/// header), as the oracle would send them.
+#[derive(Default)]
+struct Traffic {
+    streams: AtomicUsize,
+    streamed_blocks: AtomicUsize,
+    streamed_bytes: AtomicUsize,
+    lookups: AtomicUsize,
+    lookup_bytes: AtomicUsize,
+}
+
+impl Traffic {
+    fn take(&self) -> [usize; 5] {
+        [
+            self.streams.swap(0, Ordering::SeqCst),
+            self.streamed_blocks.swap(0, Ordering::SeqCst),
+            self.streamed_bytes.swap(0, Ordering::SeqCst),
+            self.lookups.swap(0, Ordering::SeqCst),
+            self.lookup_bytes.swap(0, Ordering::SeqCst),
+        ]
+    }
 }
 
 struct ChainStream(VecDeque<Result<Message, tonic::Status>>);
@@ -65,6 +96,7 @@ impl BlockStreamSource for Oracle {
     type Stream = ChainStream;
 
     async fn open(&mut self, start: u64, end: u64) -> Result<ChainStream, ScannerError> {
+        self.traffic.streams.fetch_add(1, Ordering::SeqCst);
         let mut items = VecDeque::new();
         for height in start..=end {
             if self.fail_at == Some(height) && start < height {
@@ -72,11 +104,38 @@ impl BlockStreamSource for Oracle {
                 break;
             }
             match self.chain.get(&height) {
-                Some(message) => items.push_back(Ok(message.clone())),
+                Some(message) => {
+                    self.traffic.streamed_blocks.fetch_add(1, Ordering::SeqCst);
+                    self.traffic
+                        .streamed_bytes
+                        .fetch_add(message.encoded_len() + 5, Ordering::SeqCst);
+                    items.push_back(Ok(message.clone()))
+                }
                 None => break,
             }
         }
         Ok(ChainStream(items))
+    }
+}
+
+impl OracleProbe for Oracle {
+    async fn block_hash_at(&mut self, height: u64) -> Result<Option<BlockHash>, ScannerError> {
+        let block_hash = self
+            .chain
+            .get(&height)
+            .and_then(|m| m.block_identifier.as_ref())
+            .map(|id| id.block_hash.clone())
+            .unwrap_or_default();
+        self.traffic.lookups.fetch_add(1, Ordering::SeqCst);
+        self.traffic.lookup_bytes.fetch_add(
+            BlockHashResponse {
+                block_hash: block_hash.clone(),
+            }
+            .encoded_len()
+                + 5,
+            Ordering::SeqCst,
+        );
+        Ok(indexed_block_hash(&block_hash))
     }
 }
 
@@ -95,6 +154,7 @@ impl Oracle {
                 .map(|(h, m)| (*h, m.clone()))
                 .collect(),
             fail_at: None,
+            traffic: Arc::default(),
         }
     }
 
@@ -672,8 +732,8 @@ fn reorg_deeper_than_the_lookback_is_a_loud_error_and_changes_nothing() {
     });
 }
 
-/// With no reorg, the watch loop's check reads one block and changes
-/// nothing, and continuing the chain still scans new blocks.
+/// With no reorg, the watch loop's check changes nothing, and continuing
+/// the chain still scans new blocks.
 #[test]
 fn unchanged_chain_passes_the_check() {
     run(async {
@@ -690,5 +750,218 @@ fn unchanged_chain_passes_the_check() {
         watch_step(&mut scanner, &longer).await.expect("extend");
         assert_eq!(scanner.get_last_scanned_block_height(), 107);
         assert_eq!(balance(&scanner), 100_000);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// What a poll costs, and an oracle that switches branches mid-stream
+// ---------------------------------------------------------------------------
+
+/// An oracle that switches from `before` to `after` once a stream has
+/// delivered `switch_after` blocks; lookups answer from the current branch.
+#[derive(Clone)]
+struct SwitchingOracle {
+    before: Oracle,
+    after: Oracle,
+    switch_after: usize,
+    switched: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BlockStreamSource for SwitchingOracle {
+    type Stream = ChainStream;
+
+    async fn open(&mut self, start: u64, end: u64) -> Result<ChainStream, ScannerError> {
+        let mut items = VecDeque::new();
+        for height in start..=end {
+            let switched = self.switched.load(Ordering::SeqCst);
+            if !switched && items.len() == self.switch_after {
+                self.switched.store(true, Ordering::SeqCst);
+            }
+            let chain = if self.switched.load(Ordering::SeqCst) {
+                &self.after
+            } else {
+                &self.before
+            };
+            match chain.chain.get(&height) {
+                Some(message) => items.push_back(Ok(message.clone())),
+                None => break,
+            }
+        }
+        Ok(ChainStream(items))
+    }
+}
+
+impl OracleProbe for SwitchingOracle {
+    async fn block_hash_at(&mut self, height: u64) -> Result<Option<BlockHash>, ScannerError> {
+        if self.switched.load(Ordering::SeqCst) {
+            self.after.block_hash_at(height).await
+        } else {
+            self.before.block_hash_at(height).await
+        }
+    }
+}
+
+/// With no new block, a poll checks the scanned tip with one hash lookup and
+/// downloads no block; a new block is streamed once, not together with the
+/// block below it.
+#[test]
+fn idle_poll_is_one_hash_lookup_and_a_new_block_is_streamed_once() {
+    run(async {
+        let (mut scanner, _state) = wallet("poll-cost");
+        let s = scenario();
+        scan_old_chain(&mut scanner, &s).await;
+        let tip_block = s.old.chain[&s.old.tip()].encoded_len() + 5;
+        s.old.traffic.take();
+
+        for _ in 0..3 {
+            assert!(!scanner.watch_step(s.old.tip(), s.old.clone()).await);
+            let [streams, blocks, _, lookups, lookup_bytes] = s.old.traffic.take();
+            assert_eq!((streams, blocks, lookups), (0, 0, 1), "idle poll");
+            assert!(
+                lookup_bytes < tip_block,
+                "{lookup_bytes} B lookup vs the {tip_block} B block the overlap streamed"
+            );
+        }
+
+        let mut longer = s.old.clone();
+        longer.empty(0xa, 107);
+        assert!(!scanner.watch_step(107, longer.clone()).await);
+        let [streams, blocks, _, lookups, _] = longer.traffic.take();
+        assert_eq!((streams, blocks), (1, 1), "only the new block is streamed");
+        // The block below it before, and both again after the stream.
+        assert_eq!(lookups, 3);
+        assert_eq!(scanner.get_last_scanned_block_height(), 107);
+        assert_eq!(scanner.scan_health().await.stall, None);
+    });
+}
+
+/// A one-block tip replacement is located with lookups; only the fork point
+/// and the new block are streamed, not the whole lookback window.
+#[test]
+fn tip_reorg_streams_from_the_fork_point_only() {
+    run(async {
+        let (mut scanner, _state) = wallet("locate-cheap");
+        let (recv_tx, tweak, outpoint, _) = payment(0x61, 40_000);
+        let tip = 101 + u64::from(REORG_LOOKBACK) + 10;
+        let mut old = Oracle::default();
+        old.block(0xa, 101, vec![(recv_tx, Some(tweak))], &[]);
+        for h in 102..=tip {
+            old.empty(0xa, h);
+        }
+        scanner
+            .scan_range_from(101, tip, old.clone())
+            .await
+            .expect("old chain scans");
+
+        let mut replaced = old.branch_at(tip - 1);
+        replaced.empty(0xb, tip);
+        assert!(!scanner.watch_step(tip, replaced.clone()).await);
+        let [streams, blocks, _, lookups, _] = replaced.traffic.take();
+        assert_eq!(streams, 1);
+        assert_eq!(blocks, 2, "the fork point (checked) and the replaced tip");
+        // 1 for the tip, 1 for the oldest remembered height, a binary search
+        // over the 144-height window, 3 after the stream.
+        assert!(lookups <= 14, "{lookups} lookups");
+        assert_eq!(scanner.get_last_scanned_block_height(), tip);
+        assert_eq!(owned_height(&scanner, outpoint), Some(101));
+    });
+}
+
+/// The oracle switches branches while a stream runs: it serves 105 from the
+/// old branch (a payment) and 106 from the new one, which forks at 104. Each
+/// block looks fine on its own, since nothing links 106' to 105. The check
+/// after the stream finds the disagreement and rolls the payment back.
+#[test]
+fn oracle_switching_branches_mid_stream_is_rolled_back() {
+    run(async {
+        let (mut scanner, _state) = wallet("mid-stream");
+        let s = scenario();
+        let mut upto_fork = s.old.branch_at(FORK);
+        upto_fork.traffic = Arc::default();
+        scanner
+            .scan_range_from(101, FORK, upto_fork)
+            .await
+            .expect("chain up to the fork scans");
+        let mut new = s.new.clone();
+        new.empty(0xb, 108);
+        let oracle = SwitchingOracle {
+            before: s.old.clone(),
+            after: new.clone(),
+            switch_after: 1,
+            switched: Arc::default(),
+        };
+
+        assert!(!scanner.watch_step(106, oracle).await);
+
+        assert_eq!(
+            owned_height(&scanner, s.evicted),
+            None,
+            "old 106 was never served"
+        );
+        assert_eq!(
+            owned_height(&scanner, s.reconfirmed),
+            Some(106),
+            "the old 105 payment is gone and found again at 106'"
+        );
+        assert_eq!(anchor_heights(&scanner, s.reconfirmed.txid), vec![106]);
+        assert_eq!(balance(&scanner), 80_000);
+        assert_eq!(scanner.get_last_scanned_block_height(), 106);
+        let mut probe = new.clone();
+        for height in 101..=106 {
+            assert_eq!(
+                scanner.oracle_view(&mut probe, height).await.unwrap(),
+                super::reorg::OracleView::Same,
+                "remembered hash at {height} is on the new branch"
+            );
+        }
+    });
+}
+
+/// A reorganisation below the lookback halts the wallet loudly: a stall in
+/// the status says what to do, every poll fails again, and each poll costs
+/// two hash lookups rather than a stream of the lookback window.
+#[test]
+fn too_deep_reorg_is_a_stall_and_polls_stay_cheap() {
+    run(async {
+        let (mut scanner, _state) = wallet("too-deep-stall");
+        let tip = 101 + u64::from(REORG_LOOKBACK) + 10;
+        let mut old = Oracle::default();
+        for h in 101..=tip {
+            old.empty(0xa, h);
+        }
+        scanner
+            .scan_range_from(101, tip, old.clone())
+            .await
+            .expect("old chain scans");
+        let mut new = old.branch_at(101);
+        for h in 102..=tip {
+            new.empty(0xb, h);
+        }
+
+        let mut first_since = None;
+        for _ in 0..3 {
+            assert!(!scanner.watch_step(tip, new.clone()).await);
+            let [streams, blocks, _, lookups, _] = new.traffic.take();
+            assert_eq!((streams, blocks, lookups), (0, 0, 2));
+            let stall = scanner
+                .scan_health()
+                .await
+                .stall
+                .expect("published as a stall");
+            assert!(
+                stall
+                    .reason
+                    .contains("deeper than the scanner can roll back")
+                    && stall.reason.contains("rescan"),
+                "{}",
+                stall.reason
+            );
+            assert_eq!(stall.height, tip + 1);
+            assert_eq!(
+                *first_since.get_or_insert(stall.since_unix),
+                stall.since_unix
+            );
+        }
+        assert_eq!(scanner.get_last_scanned_block_height(), tip);
     });
 }

@@ -6,14 +6,26 @@
 //! oracle streams for a height the scanner already knows is compared with
 //! that hash:
 //!
-//! - A range scan that continues the scanned chain starts its stream one
-//!   height early, at the last scanned height, so the first message proves
-//!   the chain underneath is unchanged. `watch_chain` does the same when the
-//!   oracle has no new block, which catches a same-height tip replacement.
-//! - When that first message disagrees, the fork is somewhere below it: the
-//!   scan reopens the stream at the lowest remembered height and walks up.
-//!   The first height whose hash disagrees is the first disconnected block,
-//!   the one below it is the fork point.
+//! - Before a range scan continues the scanned chain, the last scanned block
+//!   is checked with one `GetBlockHashByHeight` lookup (a few dozen bytes)
+//!   instead of being streamed again. `watch_chain` runs the same check when
+//!   the oracle has no new block, which catches a same-height tip
+//!   replacement without downloading anything else.
+//! - When that block disagrees, the fork is somewhere below it. A binary
+//!   search over the remembered heights, again with lookups only, finds the
+//!   highest one the oracle still agrees with ([`Scanner::locate_fork`]);
+//!   the stream that rolls back and rescans starts there. If the oracle
+//!   disagrees even at the oldest remembered height, that is
+//!   [`ReorgTooDeep`] without streaming anything.
+//! - A stream reads the oracle's index height by height, so an oracle that
+//!   switches branches while a stream runs can hand over blocks of both. When
+//!   a stream ends, its newest blocks ([`POST_STREAM_CHECK`]) and the block
+//!   below them are checked again; a disagreement is handled like any other
+//!   reorganisation. Reorganisations happen at the tip, which is where a
+//!   stream ends, so that window covers them.
+//! - Inside a stream, every block whose height has a remembered hash is still
+//!   compared with it. The first height whose hash disagrees is the first
+//!   disconnected block, the one below it is the fork point.
 //! - Everything learned above the fork point is rolled back
 //!   ([`Scanner::rollback_to`]): transactions and anchors from disconnected
 //!   blocks, the owned-output records they created, spent marks they set,
@@ -35,6 +47,7 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::v2::SpIndexerV2;
 
 use super::ScannerError;
+use super::health::OracleProbe;
 use super::scanner::Scanner;
 
 /// How many of the most recent scanned heights keep their block hash, and so
@@ -44,6 +57,10 @@ use super::scanner::Scanner;
 /// mainnet reorganisation since 2013; storing it costs a few kilobytes of
 /// state.
 pub const REORG_LOOKBACK: u32 = 144;
+
+/// How many of the newest blocks a stream delivered are checked against the
+/// oracle again once the stream has ended (see the module docs).
+pub(crate) const POST_STREAM_CHECK: u64 = 6;
 
 /// A chain reorganisation reaches at or below the oldest block hash the
 /// scanner still remembers, so the fork point cannot be found.
@@ -102,6 +119,20 @@ pub(crate) fn block_hash_from_oracle(display_order: &[u8]) -> Option<BlockHash> 
     Some(BlockHash::from_byte_array(bytes))
 }
 
+/// A remembered block compared with the block the oracle serves now at the
+/// same height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OracleView {
+    /// The oracle serves the remembered block.
+    Same,
+    /// The oracle serves a different block: the chain was reorganised.
+    Different,
+    /// Nothing is remembered at that height, or the oracle serves no block
+    /// there (an empty hash or `NOT_FOUND`). It cannot be checked yet, which
+    /// is not a reorganisation.
+    Unknown,
+}
+
 /// What the scanner does with one oracle block, judged by its hash.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BlockCheck {
@@ -118,10 +149,6 @@ impl Scanner {
             .keys()
             .next()
             .map(|height| u64::from(*height))
-    }
-
-    pub(crate) fn knows_block_hash(&self, height: u64) -> bool {
-        u32::try_from(height).is_ok_and(|height| self.scanned_block_hashes.contains_key(&height))
     }
 
     pub(crate) fn check_block_hash(&self, height: u64, hash: &BlockHash) -> BlockCheck {
@@ -147,8 +174,81 @@ impl Scanner {
             .next_back()
             .expect("just inserted");
         let keep_from = highest.saturating_sub(REORG_LOOKBACK - 1);
-        self.scanned_block_hashes = self.scanned_block_hashes.split_off(&keep_from);
-        self.stage.scanned_block_hashes = self.scanned_block_hashes.clone();
+        while self
+            .scanned_block_hashes
+            .first_key_value()
+            .is_some_and(|(height, _)| *height < keep_from)
+        {
+            self.scanned_block_hashes.pop_first();
+        }
+        // Not copied into `stage`: `save_to_file` writes the current window.
+    }
+
+    /// Compare the remembered block at `height` with the oracle's, with one
+    /// `GetBlockHashByHeight` lookup (none when nothing is remembered there).
+    pub(crate) async fn oracle_view<P: OracleProbe>(
+        &self,
+        oracle: &mut P,
+        height: u64,
+    ) -> Result<OracleView, ScannerError> {
+        let Some(known) = u32::try_from(height)
+            .ok()
+            .and_then(|height| self.scanned_block_hashes.get(&height))
+            .copied()
+        else {
+            return Ok(OracleView::Unknown);
+        };
+        Ok(match oracle.block_hash_at(height).await? {
+            Some(hash) if hash == known => OracleView::Same,
+            Some(_) => OracleView::Different,
+            None => OracleView::Unknown,
+        })
+    }
+
+    /// The oracle disagrees with the remembered block at `disagreeing`. Find
+    /// the highest remembered height below it that the oracle still agrees
+    /// with, the fork point, with a binary search over lookups. A height the
+    /// oracle cannot answer for counts as disagreeing, which can only move
+    /// the result lower.
+    ///
+    /// When the oracle disagrees at the oldest remembered height the fork
+    /// cannot be located: [`ReorgTooDeep`], found without streaming anything,
+    /// so a halted wallet costs two lookups per poll.
+    pub(crate) async fn locate_fork<P: OracleProbe>(
+        &self,
+        oracle: &mut P,
+        disagreeing: u64,
+    ) -> Result<u64, ScannerError> {
+        let lowest = self
+            .lowest_known_block_height()
+            .filter(|lowest| *lowest <= disagreeing)
+            .ok_or_else(|| format!("no remembered block hash at or below height {disagreeing}"))?;
+        match self.oracle_view(oracle, lowest).await? {
+            OracleView::Same => {}
+            OracleView::Different => {
+                return Err(Box::new(ReorgTooDeep {
+                    lowest_known_height: lowest,
+                    last_scanned_height: self.last_scanned_block_height,
+                }));
+            }
+            OracleView::Unknown => {
+                return Err(format!(
+                    "chain reorganisation detected at height {disagreeing}, but the oracle serves \
+                     no block at height {lowest}, the oldest one remembered; retrying"
+                )
+                .into());
+            }
+        }
+        let (mut agrees, mut differs) = (lowest, disagreeing);
+        while differs - agrees > 1 {
+            let mid = agrees + (differs - agrees) / 2;
+            if self.oracle_view(oracle, mid).await? == OracleView::Same {
+                agrees = mid;
+            } else {
+                differs = mid;
+            }
+        }
+        Ok(agrees)
     }
 
     /// Undo everything learned from blocks above `fork_height`, which were
@@ -191,7 +291,6 @@ impl Scanner {
         self.block_checkpoints.split_off(&(fork + 1));
         self.stage.block_checkpoints.split_off(&(fork + 1));
         self.scanned_block_hashes.split_off(&(fork + 1));
-        self.stage.scanned_block_hashes = self.scanned_block_hashes.clone();
         self.last_scanned_block_height = self.last_scanned_block_height.min(fork_height);
         self.stage.last_scanned_block_height = self.last_scanned_block_height;
         self.last_scanned_block_height_rescan =
