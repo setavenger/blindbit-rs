@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bitcoin::BlockHash;
 use bitcoin::Network as BTCNetwork;
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin_rev::Network;
@@ -20,8 +20,9 @@ use tonic::transport::Channel;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
-use super::changeset::ChangeSet;
+use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
 use super::config::ScannerConfig;
+use super::types::OwnedOutputRecord;
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
 use super::ScannerError;
 
@@ -59,9 +60,22 @@ pub struct Scanner {
     /// the last block height that was scanned on most recent rescan
     pub(crate) last_scanned_block_height_rescan: u64,
 
-    /// owned output pubkeys; used to check for spent outputs
-    // todo: should this be a hashmap instead of a vector?
-    pub(crate) owned_outputs: Vec<[u8; 32]>,
+    /// Wallet-owned outputs, keyed by outpoint. Maintained by
+    /// [`Scanner::sync_owned_outputs`] from the indexer after every applied
+    /// block and on restore; persisted as the state file's `owned_outputs`.
+    pub(crate) owned_outputs: BTreeMap<OutPoint, OwnedOutputRecord>,
+
+    /// 8-byte x-only key prefix -> *unspent* owned outpoints with that prefix.
+    /// Lets the per-block spent-output check run in O(spent prefixes).
+    pub(crate) owned_prefixes: HashMap<[u8; 8], Vec<OutPoint>>,
+
+    /// Hash of each scanned height within the reorg lookback window; see
+    /// [`ChangeSet::scanned_block_hashes`] and `scanner/reorg.rs`.
+    pub(crate) scanned_block_hashes: BTreeMap<u32, BlockHash>,
+
+    /// sends the fork height whenever a chain reorganisation rolled the
+    /// wallet state back
+    pub(crate) notify_reorg: broadcast::Sender<u32>,
 
     /// Staged changes that can be persisted
     pub(crate) stage: ChangeSet,
@@ -113,6 +127,7 @@ impl Scanner {
 
         // Initialize the staged changeset with initial state
         let mut stage = ChangeSet {
+            format_version: STATE_FORMAT_VERSION,
             block_checkpoints: block_checkpoints.clone(),
             indexer: indexer.initial_changeset(),
             last_scanned_block_height: 0,
@@ -121,6 +136,8 @@ impl Scanner {
             secret_scan_hex: Some(hex::encode(secret_scan.secret_bytes())),
             public_spend_hex: Some(hex::encode(public_spend.serialize())),
             max_label_num,
+            scanned_block_hashes: BTreeMap::new(),
+            oracle_floor_start: None,
         };
 
         // Merge the initial label changes
@@ -143,7 +160,10 @@ impl Scanner {
             notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: 0,
             last_scanned_block_height_rescan: 0,
-            owned_outputs: vec![],
+            owned_outputs: BTreeMap::new(),
+            owned_prefixes: HashMap::new(),
+            scanned_block_hashes: BTreeMap::new(),
+            notify_reorg: broadcast::channel(16).0,
             stage,
             state_file,
             network,
@@ -371,7 +391,7 @@ impl Scanner {
         // Header hex is not recoverable without re-fetching; Sparrow's BlockHeaderTip
         // handles an empty hex gracefully.
         if self.last_scanned_block_height > 0 {
-            let h = self.last_scanned_block_height as u32;
+            let h = index.tip_height_for(self.last_scanned_block_height as u32);
             let hex = index.headers.get(&h).cloned().unwrap_or_default();
             index.tip = Some((h, hex));
         }
@@ -389,17 +409,160 @@ impl Scanner {
         self.notify_spent_outpoints.subscribe()
     }
 
+    /// subscribe to chain reorganisations: each message is the fork height
+    /// the wallet state was rolled back to (everything above it was dropped
+    /// and is rescanned from the oracle's current chain)
+    pub fn subscribe_to_reorgs(&self) -> broadcast::Receiver<u32> {
+        self.notify_reorg.subscribe()
+    }
+
     /// subscribe to notifications when a probabilistic match is found
     pub fn subscribe_to_probabilistic_matches(&self) -> broadcast::Receiver<[u8; 32]> {
         self.notify_probabilistic_matches.subscribe()
     }
 
-    /// add an owned output pubkey
-    /// if already exists nothing happens
-    pub fn add_owned_output(&mut self, pubkey: [u8; 32]) {
-        // todo: should this be a hashmap instead of a vector?
-        if !self.owned_outputs.contains(&pubkey) {
-            self.owned_outputs.push(pubkey);
+    /// All wallet-owned outputs found so far (spent and unspent), in outpoint
+    /// order.
+    pub fn owned_outputs(&self) -> impl Iterator<Item = &OwnedOutputRecord> {
+        self.owned_outputs.values()
+    }
+
+    /// Bring [`Self::owned_outputs`] in line with the indexer.
+    ///
+    /// Every output the indexer has matched (`by_script`, full BIP-352 match)
+    /// gets a record with its full x-only key and label. A record is marked
+    /// spent only when a *confirmed* transaction in the wallet graph has an
+    /// input whose `previous_output` is exactly that outpoint; the oracle's
+    /// 8-byte spent prefixes only decide which blocks get fetched and never
+    /// mark anything themselves. New or changed records are staged.
+    pub(crate) fn sync_owned_outputs(&mut self) {
+        let index = self.internal_indexer.index();
+        let graph = self.internal_indexer.graph();
+
+        let labels: HashMap<OutPoint, Option<u32>> = index
+            .by_label
+            .iter()
+            .map(|(label, outpoint)| (*outpoint, *label))
+            .collect();
+        let anchor_height = |txid: Txid| {
+            graph
+                .get_tx_node(txid)
+                .and_then(|node| node.anchors.iter().map(|a| a.block_id.height).min())
+        };
+
+        let mut changed: Vec<OutPoint> = Vec::new();
+
+        for (xonly, outpoint) in index.by_xonly() {
+            if self.owned_outputs.contains_key(outpoint) {
+                continue;
+            }
+            let Some(txout) = graph.get_txout(*outpoint) else {
+                continue;
+            };
+            let Some(height) = anchor_height(outpoint.txid) else {
+                continue;
+            };
+            self.owned_outputs.insert(
+                *outpoint,
+                OwnedOutputRecord {
+                    outpoint: *outpoint,
+                    pubkey: xonly,
+                    amount_sat: txout.value.to_sat(),
+                    height,
+                    label: labels.get(outpoint).copied().flatten(),
+                    spent_by: None,
+                    spent_height: None,
+                },
+            );
+            changed.push(*outpoint);
+        }
+
+        for node in graph.full_txs() {
+            let Some(spent_height) = node.anchors.iter().map(|a| a.block_id.height).min() else {
+                continue;
+            };
+            for input in &node.tx.input {
+                let Some(record) = self.owned_outputs.get_mut(&input.previous_output) else {
+                    continue;
+                };
+                if record.spent_by == Some(node.txid) && record.spent_height == Some(spent_height) {
+                    continue;
+                }
+                record.spent_by = Some(node.txid);
+                record.spent_height = Some(spent_height);
+                changed.push(input.previous_output);
+            }
+        }
+
+        if !changed.is_empty() {
+            self.stage.merge(ChangeSet {
+                owned_outputs: changed
+                    .iter()
+                    .filter_map(|outpoint| self.owned_outputs.get(outpoint).cloned())
+                    .collect(),
+                ..ChangeSet::default()
+            });
+        }
+
+        self.owned_prefixes.clear();
+        for record in self.owned_outputs.values().filter(|r| !r.is_spent()) {
+            self.owned_prefixes
+                .entry(record.short_pubkey())
+                .or_default()
+                .push(record.outpoint);
+        }
+    }
+
+    /// Upgrade a restored state written before owned outputs were recorded
+    /// (format 0).
+    ///
+    /// That code fetched a block only when it held a probable *receive*, so a
+    /// block whose only wallet-relevant transaction spent one of our outputs
+    /// was never fetched, and the spend is missing from the restored graph.
+    /// Every output the graph still shows unspent may have been spent that
+    /// way, at or after its own height. The scan is therefore rewound to just
+    /// below the oldest such output, so the next scan revisits every block a
+    /// missed spend can be in; with the owned outputs now recorded, it fetches
+    /// those blocks. Re-applying blocks already in the graph is idempotent.
+    ///
+    /// The rewind is published in the scan health ([`StateRescan`]) and the
+    /// state is marked current, so it happens once: the next save persists
+    /// the lower height together with the new format.
+    ///
+    /// [`StateRescan`]: super::health::StateRescan
+    fn rescan_for_missed_spends(&mut self) {
+        self.stage.format_version = STATE_FORMAT_VERSION;
+        let previous_height = self.last_scanned_block_height;
+        let Some(oldest_unspent) = self
+            .owned_outputs
+            .values()
+            .filter(|record| !record.is_spent())
+            .map(|record| u64::from(record.height))
+            .min()
+            .filter(|height| *height <= previous_height)
+        else {
+            tracing::info!(
+                "state file predates owned-output records; no unspent output to re-check"
+            );
+            return;
+        };
+
+        let resume_height = oldest_unspent - 1;
+        tracing::warn!(
+            from_height = oldest_unspent,
+            previous_height,
+            unspent_outputs = self.owned_outputs.values().filter(|r| !r.is_spent()).count(),
+            "state file predates owned-output records, so spends in blocks it never fetched \
+             can be missing; rescanning from the oldest unspent output"
+        );
+        self.update_last_scanned_block_height(resume_height);
+        let rescan = super::health::StateRescan {
+            from_height: oldest_unspent,
+            until_height: previous_height,
+        };
+        // `from_changeset` holds the only reference to the new index.
+        if let Some(index) = Arc::get_mut(&mut self.electrum_index) {
+            index.get_mut().scan_health.state_rescan = Some(rescan);
         }
     }
 
@@ -481,7 +644,9 @@ impl Scanner {
         }
         changeset.last_scanned_block_height = self.last_scanned_block_height;
         changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
-        changeset.owned_outputs = self.owned_outputs.clone();
+        changeset.owned_outputs = self.owned_outputs.values().cloned().collect();
+        changeset.scanned_block_hashes = self.scanned_block_hashes.clone();
+        changeset.format_version = STATE_FORMAT_VERSION;
 
         let json = serde_json::to_string_pretty(&changeset)?;
         std::fs::write(path, json)?;
@@ -556,16 +721,25 @@ impl Scanner {
         let _public_spend = PublicKey::from_slice(&public_spend_bytes)?;
 
         // Reconstruct the indexer from the changeset (this restores the graph and transaction data)
-        let mut indexer = SpIndexerV2::try_from(changeset.indexer.clone())
-            .map_err(|e| format!("Failed to reconstruct indexer from changeset: {:?}", e))?;
+        let (Some(indexer_scan_sk), Some(indexer_spend_pk)) =
+            (changeset.indexer.scan_sk, changeset.indexer.spend_pk)
+        else {
+            return Err("Failed to reconstruct indexer from changeset: keys missing".into());
+        };
+        let mut indexer = SpIndexerV2::new(indexer_scan_sk, indexer_spend_pk);
 
-        // Regenerate labels
+        // Regenerate labels BEFORE applying the changeset: `apply_changeset`
+        // re-runs the BIP-352 scan (`index_tx`) over every stored transaction,
+        // and `load_from_file` blanks the persisted `label_lookup`. Labels added
+        // afterwards would leave every labelled output (change included, m = 0)
+        // out of the restored index.
         // ignore change set and be aligned with max_label_num
         let max_label_num = changeset.max_label_num;
         _ = indexer.add_label(0);
         for i in 1..=max_label_num {
             _ = indexer.add_label(i);
         }
+        indexer.apply_changeset(changeset.indexer.clone());
 
         // Reconstruct block checkpoints from the changeset
         let mut block_checkpoints = changeset.block_checkpoints.clone();
@@ -582,8 +756,16 @@ impl Scanner {
         let sp_address = indexer
             .get_address(convert_network(network))
             .to_string();
+        let oracle_floor_start = changeset.oracle_floor_start;
+        let format_version = changeset.format_version;
 
-        Ok(Self {
+        let owned_outputs = changeset
+            .owned_outputs
+            .iter()
+            .map(|record| (record.outpoint, record.clone()))
+            .collect();
+
+        let mut scanner = Self {
             client,
             p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
@@ -593,7 +775,10 @@ impl Scanner {
             notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: changeset.last_scanned_block_height,
             last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
-            owned_outputs: changeset.owned_outputs.clone(),
+            owned_outputs,
+            owned_prefixes: HashMap::new(),
+            scanned_block_hashes: changeset.scanned_block_hashes.clone(),
+            notify_reorg: broadcast::channel(16).0,
             stage: changeset,
             state_file: state_file,
             network: network,
@@ -602,9 +787,17 @@ impl Scanner {
                 let mut idx = WalletElectrumIndex::new();
                 idx.sp_address = sp_address;
                 idx.sp_labels = (0..=max_label_num).collect();
+                idx.scan_health.oracle_floor_start = oracle_floor_start;
                 idx
             })),
-        })
+        };
+        // Records older state files never had, spends already in the graph,
+        // and the prefix lookup, all derived from the restored indexer.
+        scanner.sync_owned_outputs();
+        if format_version < STATE_FORMAT_VERSION {
+            scanner.rescan_for_missed_spends();
+        }
+        Ok(scanner)
     }
 }
 

@@ -130,7 +130,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
     let scanner_instance = Arc::new(Mutex::new(loaded_scanner));
 
     // Grab Electrum index + push receiver before the scan task locks the scanner.
-    let (electrum_index, found_utxos_rx, mut outputs_found_rx) = {
+    let (electrum_index, found_utxos_rx, mut outputs_found_rx, reorg_rx) = {
         let s = scanner_instance.lock().await;
         let index = s.electrum_index();
         {
@@ -142,6 +142,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
             index,
             s.subscribe_to_found_utxos(),
             s.subscribe_to_found_utxos(),
+            s.subscribe_to_reorgs(),
         )
     };
     {
@@ -232,6 +233,7 @@ async fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sy
             if let Err(e) = electrum::run(
                 electrum_index,
                 found_utxos_rx,
+                reorg_rx,
                 &electrum_addr,
                 p2p_addr,
                 network,

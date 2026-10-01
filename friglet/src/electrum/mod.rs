@@ -104,7 +104,9 @@ struct ElectrumServerState {
     p2p_peer: SocketAddr,
     network: Network,
     oracle_url: String,
-    block_checkpoints: HashMap<u32, BlockHash>,
+    /// Wallet checkpoints (heights with findings) snapshotted at startup;
+    /// entries above a reorg's fork point are dropped when it happens.
+    block_checkpoints: std::sync::Mutex<HashMap<u32, BlockHash>>,
     header_sidecar: PathBuf,
     header_fetch_lock: Mutex<()>,
     /// Broadcast channel: pre-serialised JSON notification lines sent to every
@@ -124,6 +126,7 @@ struct ElectrumServerState {
 pub async fn run(
     index: Arc<Mutex<WalletElectrumIndex>>,
     mut found_rx: broadcast::Receiver<usize>,
+    mut reorg_rx: broadcast::Receiver<u32>,
     addr: &str,
     p2p_peer: SocketAddr,
     network: Network,
@@ -139,7 +142,7 @@ pub async fn run(
         p2p_peer,
         network,
         oracle_url,
-        block_checkpoints,
+        block_checkpoints: std::sync::Mutex::new(block_checkpoints),
         header_sidecar,
         header_fetch_lock: Mutex::new(()),
         push_tx: push_tx.clone(),
@@ -176,6 +179,22 @@ pub async fn run(
                     }
                 }
                 push_notifications(&state).await;
+            }
+        });
+    }
+
+    // Chain reorganisations: the scanner already dropped the disconnected
+    // blocks from the index; forget their hashes and cached headers here too
+    // so no header of a block that left the chain is served again.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match reorg_rx.recv().await {
+                    Ok(fork) => forget_blocks_above(&state, fork).await,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
             }
         });
     }
@@ -277,9 +296,44 @@ async fn push_notifications(state: &ElectrumServerState) {
         .send(serde_json::to_string(&notification).unwrap() + "\n");
 }
 
+/// Drop block hashes and headers above a reorg's fork point, and rewrite
+/// the header sidecar without them.
+async fn forget_blocks_above(state: &ElectrumServerState, fork: u32) {
+    state
+        .block_checkpoints
+        .lock()
+        .expect("checkpoint lock")
+        .retain(|height, _| *height <= fork);
+    let headers = {
+        let mut index = state.index.lock().await;
+        index.headers.retain(|height, _| *height <= fork);
+        index.headers.clone()
+    };
+    tracing::warn!(
+        fork,
+        "chain reorganisation: dropped cached headers above the fork point"
+    );
+    let sidecar = state.header_sidecar.clone();
+    match tokio::task::spawn_blocking(move || blockheader::save_headers(&sidecar, &headers)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            path = %state.header_sidecar.display(),
+            error = %error,
+            "failed to rewrite block-header sidecar after reorg"
+        ),
+        Err(error) => tracing::warn!(error = %error, "block-header sidecar write task failed"),
+    }
+}
+
 async fn resolve_block_hash(state: &ElectrumServerState, height: u32) -> Result<BlockHash, String> {
-    if let Some(hash) = state.block_checkpoints.get(&height) {
-        return Ok(*hash);
+    let checkpoint = state
+        .block_checkpoints
+        .lock()
+        .expect("checkpoint lock")
+        .get(&height)
+        .copied();
+    if let Some(hash) = checkpoint {
+        return Ok(hash);
     }
 
     let oracle_url = state.oracle_url.clone();
@@ -835,5 +889,64 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
             format!("Method not found: {}", req.method),
         )
         .into_line(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+
+    #[tokio::test]
+    async fn reorg_forgets_hashes_and_headers_above_the_fork() {
+        let dir =
+            std::env::temp_dir().join(format!("friglet-electrum-reorg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("scanner_state.headers.json");
+        let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+
+        let index = Arc::new(Mutex::new(WalletElectrumIndex::new()));
+        {
+            let mut idx = index.lock().await;
+            for height in [100u32, 104, 105, 106] {
+                idx.headers.insert(height, format!("header-{height}"));
+            }
+        }
+        let state = ElectrumServerState {
+            index: index.clone(),
+            p2p_peer: "127.0.0.1:1".parse().unwrap(),
+            network: Network::Regtest,
+            oracle_url: "http://127.0.0.1:1".into(),
+            block_checkpoints: std::sync::Mutex::new(HashMap::from([
+                (0, hash(0)),
+                (104, hash(4)),
+                (105, hash(5)),
+            ])),
+            header_sidecar: sidecar.clone(),
+            header_fetch_lock: Mutex::new(()),
+            push_tx: broadcast::channel(1).0,
+        };
+
+        forget_blocks_above(&state, 104).await;
+
+        let mut checkpoints: Vec<u32> = state
+            .block_checkpoints
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        checkpoints.sort();
+        assert_eq!(checkpoints, vec![0, 104]);
+        let mut cached: Vec<u32> = index.lock().await.headers.keys().copied().collect();
+        cached.sort();
+        assert_eq!(cached, vec![100, 104]);
+        let mut persisted: Vec<u32> = blockheader::load_headers(&sidecar)
+            .keys()
+            .copied()
+            .collect();
+        persisted.sort();
+        assert_eq!(persisted, vec![100, 104], "sidecar rewritten without them");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

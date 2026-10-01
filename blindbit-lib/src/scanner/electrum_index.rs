@@ -7,6 +7,8 @@ use bitcoin::ScriptBuf;
 use bitcoin::hashes::{Hash, sha256};
 use std::collections::HashMap;
 
+use super::health::ScanHealth;
+
 /// Lightweight Electrum-compatible index built from scanner state.
 #[derive(Default)]
 pub struct WalletElectrumIndex {
@@ -54,6 +56,10 @@ pub struct WalletElectrumIndex {
 
     /// Ordered list of confirmed SP receives.
     pub sp_history: Vec<SpHistoryEntry>,
+
+    /// Stalls and start-height adjustments of the running scan, published
+    /// here for status readers (see `scanner/health.rs`).
+    pub scan_health: ScanHealth,
 }
 
 /// A single entry in a scripthash's transaction history.
@@ -80,6 +86,17 @@ pub struct SpHistoryEntry {
 impl WalletElectrumIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Height to report as the chain tip once `scanned` is scanned. While a
+    /// restored state is rescanned for missed spends (`scan_health.
+    /// state_rescan`), the tip stays at the height the state had reached, so
+    /// clients never see wallet history above the tip.
+    pub fn tip_height_for(&self, scanned: u32) -> u32 {
+        match self.scan_health.state_rescan {
+            Some(rescan) => scanned.max(u32::try_from(rescan.until_height).unwrap_or(u32::MAX)),
+            None => scanned,
+        }
     }
 }
 
