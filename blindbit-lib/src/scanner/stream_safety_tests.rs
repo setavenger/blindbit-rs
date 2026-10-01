@@ -47,7 +47,7 @@ pub(super) fn served_block(hash: &BlockHash) -> Option<Block> {
         .and_then(|blocks| blocks.get(hash).cloned())
 }
 
-fn serve(block: &Block) {
+pub(super) fn serve(block: &Block) {
     SERVED_BLOCKS
         .lock()
         .unwrap()

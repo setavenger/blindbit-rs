@@ -73,6 +73,8 @@ code {
   color: var(--text);
 }
 .error { color: var(--bad); }
+/* `.col` sets display: flex, which would override the `hidden` attribute. */
+.col[hidden] { display: none; }
 #scan-notes { font-size: 13px; white-space: pre-line; }
 .small { font-size: 12px; min-height: 18px; }
 

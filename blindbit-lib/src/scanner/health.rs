@@ -34,6 +34,19 @@ pub struct ScanHealth {
     /// being rescanned for spends it missed; cleared once the scan is back
     /// at `until_height`.
     pub state_rescan: Option<StateRescan>,
+    /// Set when the state file could not be restored, so it was moved aside
+    /// and a new scan started from the configured start height.
+    pub state_file_reset: Option<StateFileReset>,
+}
+
+/// The state file could not be restored. It was moved to `backup_path`
+/// (never overwritten) and a new scan started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateFileReset {
+    /// Where the unreadable state file was moved.
+    pub backup_path: std::path::PathBuf,
+    /// Why it could not be restored.
+    pub error: String,
 }
 
 /// The restored state predates owned-output records (state format 0), so
@@ -238,6 +251,15 @@ fn unix_now() -> u64 {
 }
 
 impl Scanner {
+    /// Record that this scanner replaces a state file that could not be
+    /// restored. Called right after construction, before the index is shared.
+    #[cfg(feature = "serde")]
+    pub(crate) fn note_state_file_reset(&mut self, reset: StateFileReset) {
+        if let Some(index) = std::sync::Arc::get_mut(&mut self.electrum_index) {
+            index.get_mut().scan_health.state_file_reset = Some(reset);
+        }
+    }
+
     /// Current scan health as published to status readers.
     pub async fn scan_health(&self) -> ScanHealth {
         self.electrum_index.lock().await.scan_health.clone()

@@ -108,6 +108,13 @@ function renderScanHealth(health) {
         `${start.requested_height.toLocaleString()}: the oracle has no data below it.`,
     );
   }
+  const reset = health.state_reset;
+  if (reset) {
+    notes.push(
+      `The state file could not be read (${reset.error}). It was moved to ` +
+        `${reset.backup_path}, and the wallet is being scanned again from its start height.`,
+    );
+  }
   const rescan = health.state_rescan;
   if (rescan) {
     notes.push(

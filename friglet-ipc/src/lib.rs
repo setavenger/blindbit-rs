@@ -197,6 +197,17 @@ pub struct ScanHealthInfo {
     /// Set while a state file written before spends were tracked is being
     /// rescanned once for the spends it missed.
     pub state_rescan: Option<StateRescanInfo>,
+    /// Set when the state file could not be restored: it was moved to
+    /// `backup_path` and the wallet is being scanned again from its start
+    /// height.
+    pub state_reset: Option<StateResetInfo>,
+}
+
+/// The state file could not be restored (see [`ScanHealthInfo::state_reset`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateResetInfo {
+    pub backup_path: String,
+    pub error: String,
 }
 
 /// Blocks `from_height..=until_height` are scanned again because the state
@@ -537,6 +548,10 @@ mod tests {
                 state_rescan: Some(StateRescanInfo {
                     from_height: 100,
                     until_height: 101,
+                }),
+                state_reset: Some(StateResetInfo {
+                    backup_path: "/tmp/scanner_state.json.unreadable-1".to_string(),
+                    error: "Failed to parse JSON".to_string(),
                 }),
             },
         };

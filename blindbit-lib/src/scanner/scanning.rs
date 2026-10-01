@@ -17,6 +17,11 @@ use crate::oracle_grpc::{
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
 use super::health::ScanStopped;
 use super::p2p;
+use super::health::OracleProbe;
+use super::reorg::{
+    BlockCheck, OracleView, POST_STREAM_CHECK, ReorgBelowStreamStart, ReorgTooDeep,
+    block_hash_from_oracle,
+};
 use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
@@ -67,6 +72,57 @@ impl BlockScanDataStream for tonic::Streaming<BlockScanDataShortResponse> {
     ) -> impl Future<Output = Result<Option<BlockScanDataShortResponse>, tonic::Status>> + Send
     {
         self.message()
+    }
+}
+
+/// Opens `StreamBlockScanDataShort` streams for a range scan. A scan may
+/// open a second stream lower down when it has to locate a fork point.
+pub(crate) trait BlockStreamSource {
+    type Stream: BlockScanDataStream + Send;
+
+    fn open(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> impl Future<Output = Result<Self::Stream, ScannerError>> + Send;
+}
+
+/// The oracle's gRPC service as a [`BlockStreamSource`] and [`OracleProbe`].
+#[derive(Clone)]
+struct OracleStreams(crate::oracle_grpc::oracle_service_client::OracleServiceClient<tonic::transport::Channel>);
+
+impl OracleProbe for OracleStreams {
+    async fn block_hash_at(&mut self, height: u64) -> Result<Option<BlockHash>, ScannerError> {
+        self.0.block_hash_at(height).await
+    }
+}
+
+impl BlockStreamSource for OracleStreams {
+    type Stream = tonic::Streaming<BlockScanDataShortResponse>;
+
+    async fn open(&mut self, start: u64, end: u64) -> Result<Self::Stream, ScannerError> {
+        let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
+            start,
+            end,
+            dustlimit: 0,
+            cut_through: false,
+        });
+        Ok(self
+            .0
+            .stream_block_scan_data_short(request)
+            .await
+            .map_err(|status| -> ScannerError {
+                Box::new(ScanStopped {
+                    height: start,
+                    reason: format!(
+                        "oracle refused to stream blocks {start}..={end}: {:?}: {}",
+                        status.code(),
+                        status.message()
+                    ),
+                    not_indexed: status.code() == tonic::Code::NotFound,
+                })
+            })?
+            .into_inner())
     }
 }
 
@@ -128,38 +184,109 @@ fn stream_stopped(height: u64, reason: &str) -> ScannerError {
 }
 
 impl Scanner {
-    /// scan a block range for new utxos and spent outpoints
+    /// Scan a block range for new utxos and spent outpoints, after checking
+    /// that the chain already scanned below it was not reorganised.
+    ///
+    /// When `start - 1` is a scanned height, the oracle's hash for it is
+    /// looked up and compared with the remembered one; a reorganisation is
+    /// rolled back to the fork point and the new branch scanned (see
+    /// `scanner/reorg.rs`). `start = end + 1` only runs that check, which
+    /// streams nothing unless the chain changed. A reorganisation deeper than
+    /// [`super::REORG_LOOKBACK`] is a [`ReorgTooDeep`] error.
     pub async fn scan_block_range(
         &mut self,
         start: u64,
         end: u64,
     ) -> Result<(), ScannerError> {
-        // TODO: Implement sync check if needed
+        let source = OracleStreams(self.client.clone());
+        self.scan_range_from(start, end, source).await
+    }
 
-        let request = tonic::Request::new(RangedBlockHeightRequestFiltered {
-            start,
-            end,
-            dustlimit: 0,
-            cut_through: false,
-        });
-        let stream = self
-            .client
-            .stream_block_scan_data_short(request)
-            .await
-            .map_err(|status| -> ScannerError {
-                Box::new(ScanStopped {
-                    height: start,
-                    reason: format!(
-                        "oracle refused to stream blocks {start}..={end}: {:?}: {}",
-                        status.code(),
-                        status.message()
-                    ),
-                    not_indexed: status.code() == tonic::Code::NotFound,
-                })
-            })?
-            .into_inner();
-
-        self.scan_block_stream(start, end, stream).await
+    /// [`Self::scan_block_range`] over any oracle.
+    pub(crate) async fn scan_range_from<Src: BlockStreamSource + OracleProbe>(
+        &mut self,
+        start: u64,
+        end: u64,
+        mut source: Src,
+    ) -> Result<(), ScannerError> {
+        let mut start = start;
+        // The block below `start` is checked with a hash lookup instead of
+        // being streamed again.
+        let mut first = start;
+        if let Some(prev) = start.checked_sub(1).filter(|prev| *prev > 0)
+            && self.oracle_view(&mut source, prev).await? == OracleView::Different
+        {
+            tracing::warn!(
+                height = prev,
+                "chain reorganisation detected; locating the fork point"
+            );
+            first = self.locate_fork(&mut source, prev).await?;
+        }
+        let mut restarts = 0;
+        loop {
+            if first > end {
+                return Ok(());
+            }
+            let stream = source.open(first, end).await?;
+            match self.scan_block_stream_from(first, start, end, stream).await {
+                Err(e) => {
+                    let Some(reorg) = e.downcast_ref::<ReorgBelowStreamStart>() else {
+                        return Err(e);
+                    };
+                    // The chain changed again between the lookups and the
+                    // stream: walk up from the oldest remembered hash.
+                    match self.lowest_known_block_height() {
+                        Some(lowest) if lowest < reorg.height => {
+                            tracing::warn!(
+                                height = reorg.height,
+                                from = lowest,
+                                "chain reorganisation detected; locating the fork point"
+                            );
+                            first = lowest;
+                        }
+                        _ => {
+                            return Err(Box::new(ReorgTooDeep {
+                                lowest_known_height: reorg.height,
+                                last_scanned_height: self.last_scanned_block_height,
+                            }));
+                        }
+                    }
+                }
+                Ok(()) => {
+                    // A stream that ran while the oracle switched branches
+                    // can hand over blocks of both: check its newest blocks,
+                    // and the one below them, again.
+                    let check_from = end
+                        .saturating_sub(POST_STREAM_CHECK - 1)
+                        .max(first.saturating_sub(1))
+                        .max(1);
+                    let mut disagreeing = None;
+                    for height in check_from..=end {
+                        if self.oracle_view(&mut source, height).await? == OracleView::Different {
+                            disagreeing = Some(height);
+                            break;
+                        }
+                    }
+                    let Some(height) = disagreeing else {
+                        return Ok(());
+                    };
+                    restarts += 1;
+                    if restarts > 3 {
+                        return Err(format!(
+                            "the oracle's chain kept changing while blocks up to {end} were \
+                             scanned; will retry"
+                        )
+                        .into());
+                    }
+                    tracing::warn!(
+                        height,
+                        "chain reorganisation while scanning; locating the fork point"
+                    );
+                    first = self.locate_fork(&mut source, height).await?;
+                    start = self.last_scanned_block_height + 1;
+                }
+            }
+        }
     }
 
     /// Scan the per-block messages of one `StreamBlockScanDataShort` response
@@ -172,8 +299,28 @@ impl Scanner {
     /// error. Such a block is never taken as "no payments": the scan height
     /// stays at the last block that was fully processed, so the next scan
     /// resumes at the block that could not be scanned.
+    #[cfg(test)]
     pub(crate) async fn scan_block_stream<S: BlockScanDataStream>(
         &mut self,
+        start: u64,
+        end: u64,
+        stream: S,
+    ) -> Result<(), ScannerError> {
+        self.scan_block_stream_from(start, start, end, stream).await
+    }
+
+    /// [`Self::scan_block_stream`] for a stream that begins at `first`, at or
+    /// below the scan's `start`. Blocks below `start` are only checked
+    /// against the remembered hashes, not scanned again. Any block whose
+    /// hash differs from the remembered one is a reorganisation: when a
+    /// block before it in this stream agreed, the one below it is the fork
+    /// point, the state is rolled back there and scanning goes on from that
+    /// block; when it is the stream's first block, the scan returns
+    /// [`ReorgBelowStreamStart`] (or [`ReorgTooDeep`] if nothing older is
+    /// remembered) without changing anything.
+    pub(crate) async fn scan_block_stream_from<S: BlockScanDataStream>(
+        &mut self,
+        first: u64,
         start: u64,
         end: u64,
         mut stream: S,
@@ -200,7 +347,14 @@ impl Scanner {
 
         let mut p2p_conn: Option<p2p::P2pConnection> = None;
 
-        let mut expected_height = start;
+        let mut expected_height = first;
+        // Blocks from here on are scanned; below it they are only checked.
+        let mut scan_from = start;
+        // Whether an earlier block of this stream is known to be on the
+        // oracle's chain (checked or scanned).
+        let mut have_prior_block = false;
+        // Whether anything was scanned or rolled back (worth a save).
+        let mut changed = false;
 
         while let Some(block_scan_data) = next_block(&mut stream, expected_height).await? {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
@@ -212,6 +366,32 @@ impl Scanner {
             };
             check_block_identifier(&block_identifier, expected_height)?;
             expected_height += 1;
+            let oracle_block_hash = block_hash_from_oracle(&block_identifier.block_hash)
+                .expect("block hash length checked above");
+            let height = block_identifier.block_height;
+            match self.check_block_hash(height, &oracle_block_hash) {
+                BlockCheck::Reorganised if !have_prior_block => {
+                    if self.lowest_known_block_height() == Some(height) {
+                        return Err(Box::new(ReorgTooDeep {
+                            lowest_known_height: height,
+                            last_scanned_height: self.last_scanned_block_height,
+                        }));
+                    }
+                    return Err(Box::new(ReorgBelowStreamStart { height }));
+                }
+                BlockCheck::Reorganised => {
+                    self.rollback_to(height - 1).await?;
+                    scan_from = scan_from.min(height);
+                }
+                BlockCheck::Consistent if height < scan_from => {
+                    // Already scanned, still on the chain.
+                    have_prior_block = true;
+                    continue;
+                }
+                BlockCheck::Consistent => {}
+            }
+            have_prior_block = true;
+            changed = true;
             let block_id = BlockIdentifierDisplay(&block_identifier);
             tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
 
@@ -241,6 +421,7 @@ impl Scanner {
                             .await;
                             self.last_scanned_block_height = block_identifier.block_height;
                             self.stage.last_scanned_block_height = block_identifier.block_height;
+                            self.record_scanned_block_hash(height, oracle_block_hash);
                             // Periodically checkpoint progress so a crash/restart during a
                             // long initial catch-up scan doesn't lose everything.
                             #[cfg(feature = "serde")]
@@ -505,6 +686,7 @@ impl Scanner {
             // Update last scanned block height and stage it
             self.last_scanned_block_height = block_identifier.block_height;
             self.stage.last_scanned_block_height = block_identifier.block_height;
+            self.record_scanned_block_hash(height, oracle_block_hash);
         }
 
         if expected_height <= end {
@@ -512,6 +694,11 @@ impl Scanner {
                 expected_height,
                 "the oracle ended the stream before this height",
             ));
+        }
+
+        if !changed {
+            // Only checked blocks that were already scanned.
+            return Ok(());
         }
 
         let outpoints: Vec<(u32, OutPoint)> = self
@@ -685,31 +872,58 @@ impl Scanner {
                 }
             };
 
-            if oracle_tip > self.last_scanned_block_height {
-                let from = self.last_scanned_block_height + 1;
-                tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
-                match self.scan_block_range(from, oracle_tip).await {
-                    Ok(()) => self.clear_stall().await,
-                    Err(e) => {
-                        let mut probe = self.client.clone();
-                        if self
-                            .start_at_oracle_floor_if_below(&e, from, oracle_tip, &mut probe)
-                            .await
-                        {
-                            continue;
-                        }
-                        tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
-                        let height = e
-                            .downcast_ref::<ScanStopped>()
-                            .map_or(self.last_scanned_block_height + 1, |s| s.height);
-                        self.report_stall(height, e.to_string()).await;
-                    }
-                }
-            } else {
-                self.clear_stall().await;
+            let oracle = OracleStreams(self.client.clone());
+            if !self.watch_step(oracle_tip, oracle).await {
+                time::sleep(time::Duration::from_secs(10)).await;
             }
+        }
+    }
 
-            time::sleep(time::Duration::from_secs(10)).await;
+    /// One poll of [`Self::watch_chain`], once the oracle's tip is known:
+    /// scan new blocks, or with none, check the scanned tip (or the oracle's,
+    /// if it is behind) against the oracle, since a reorganisation can
+    /// replace blocks without making the chain longer. Publishes a stall on
+    /// failure and clears it on success. Returns `true` when the next poll
+    /// should run right away.
+    pub(crate) async fn watch_step<Src: BlockStreamSource + OracleProbe + Clone>(
+        &mut self,
+        oracle_tip: u64,
+        mut oracle: Src,
+    ) -> bool {
+        let (from, to) = if oracle_tip > self.last_scanned_block_height {
+            let from = self.last_scanned_block_height + 1;
+            tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
+            (from, oracle_tip)
+        } else {
+            (oracle_tip + 1, oracle_tip)
+        };
+        match self.scan_range_from(from, to, oracle.clone()).await {
+            Ok(()) => {
+                self.clear_stall().await;
+                false
+            }
+            Err(e) => {
+                if from <= to
+                    && self
+                        .start_at_oracle_floor_if_below(&e, from, to, &mut oracle)
+                        .await
+                {
+                    return true;
+                }
+                if e.downcast_ref::<ReorgTooDeep>().is_some() {
+                    tracing::error!(
+                        error = %e,
+                        "wallet state cannot follow the chain; scanning is halted until it is rescanned"
+                    );
+                } else {
+                    tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
+                }
+                let height = e
+                    .downcast_ref::<ScanStopped>()
+                    .map_or(self.last_scanned_block_height + 1, |s| s.height);
+                self.report_stall(height, e.to_string()).await;
+                false
+            }
         }
     }
 

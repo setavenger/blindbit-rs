@@ -69,6 +69,14 @@ pub struct Scanner {
     /// Lets the per-block spent-output check run in O(spent prefixes).
     pub(crate) owned_prefixes: HashMap<[u8; 8], Vec<OutPoint>>,
 
+    /// Hash of each scanned height within the reorg lookback window; see
+    /// [`ChangeSet::scanned_block_hashes`] and `scanner/reorg.rs`.
+    pub(crate) scanned_block_hashes: BTreeMap<u32, BlockHash>,
+
+    /// sends the fork height whenever a chain reorganisation rolled the
+    /// wallet state back
+    pub(crate) notify_reorg: broadcast::Sender<u32>,
+
     /// Staged changes that can be persisted
     pub(crate) stage: ChangeSet,
 
@@ -128,6 +136,7 @@ impl Scanner {
             secret_scan_hex: Some(hex::encode(secret_scan.secret_bytes())),
             public_spend_hex: Some(hex::encode(public_spend.serialize())),
             max_label_num,
+            scanned_block_hashes: BTreeMap::new(),
             oracle_floor_start: None,
         };
 
@@ -153,6 +162,8 @@ impl Scanner {
             last_scanned_block_height_rescan: 0,
             owned_outputs: BTreeMap::new(),
             owned_prefixes: HashMap::new(),
+            scanned_block_hashes: BTreeMap::new(),
+            notify_reorg: broadcast::channel(16).0,
             stage,
             state_file,
             network,
@@ -398,6 +409,13 @@ impl Scanner {
         self.notify_spent_outpoints.subscribe()
     }
 
+    /// subscribe to chain reorganisations: each message is the fork height
+    /// the wallet state was rolled back to (everything above it was dropped
+    /// and is rescanned from the oracle's current chain)
+    pub fn subscribe_to_reorgs(&self) -> broadcast::Receiver<u32> {
+        self.notify_reorg.subscribe()
+    }
+
     /// subscribe to notifications when a probabilistic match is found
     pub fn subscribe_to_probabilistic_matches(&self) -> broadcast::Receiver<[u8; 32]> {
         self.notify_probabilistic_matches.subscribe()
@@ -596,6 +614,10 @@ impl Scanner {
     /// This saves the ChangeSet which contains all the indexer and chain state changes.
     /// The ChangeSet can be used to reconstruct the scanner state on restart.
     ///
+    /// The write is atomic (temporary file, `fsync`, rename): a crash leaves
+    /// the previous state or the new one, never a truncated file. The file is
+    /// owner-only, since it holds the scan secret.
+    ///
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ScannerError> {
@@ -627,10 +649,11 @@ impl Scanner {
         changeset.last_scanned_block_height = self.last_scanned_block_height;
         changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
         changeset.owned_outputs = self.owned_outputs.values().cloned().collect();
+        changeset.scanned_block_hashes = self.scanned_block_hashes.clone();
         changeset.format_version = STATE_FORMAT_VERSION;
 
         let json = serde_json::to_string_pretty(&changeset)?;
-        std::fs::write(path, json)?;
+        super::state_file::write_atomically(path.as_ref(), json.as_bytes())?;
         Ok(())
     }
 
@@ -758,6 +781,8 @@ impl Scanner {
             last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
             owned_outputs,
             owned_prefixes: HashMap::new(),
+            scanned_block_hashes: changeset.scanned_block_hashes.clone(),
+            notify_reorg: broadcast::channel(16).0,
             stage: changeset,
             state_file: state_file,
             network: network,
