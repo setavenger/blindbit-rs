@@ -468,6 +468,9 @@ where
             lc.recent_output = Some(recent_output);
             state.supervise.store(true, Ordering::SeqCst);
             state.setup_needed.store(false, Ordering::SeqCst);
+            let mut sup = state.supervision.lock().unwrap();
+            sup.next_restart_at = None;
+            sup.last_spawn_error = None;
             None
         }
         Attachment::SetupRequired => {
@@ -478,9 +481,16 @@ where
         }
         Attachment::Unreachable { reason } => {
             tracing::warn!(%reason, "daemon unreachable");
-            // The tray tried to start a configured daemon: keep trying.
+            // The tray tried to start a configured daemon: keep trying,
+            // with backoff (whether this was startup, Save, Retry or an
+            // automatic restart).
             state.supervise.store(true, Ordering::SeqCst);
             state.setup_needed.store(false, Ordering::SeqCst);
+            state
+                .supervision
+                .lock()
+                .unwrap()
+                .on_restart_failed(reason.clone(), Instant::now());
             Some(reason)
         }
     }
@@ -599,19 +609,14 @@ where
         return;
     }
     tracing::info!("restarting the daemon");
-    match attach_and_record_with(state, locate, needs_setup).await {
-        None if !state.setup_needed.load(Ordering::SeqCst) => {
-            state.supervision.lock().unwrap().on_restarted();
-        }
-        None => {}
-        Some(reason) => {
-            tracing::warn!(%reason, "daemon restart failed; backing off");
-            state
-                .supervision
-                .lock()
-                .unwrap()
-                .on_restart_failed(reason, Instant::now());
-        }
+    // A failure is recorded (and the next attempt scheduled) by
+    // attach_and_record itself.
+    if attach_and_record_with(state, locate, needs_setup)
+        .await
+        .is_none()
+        && !state.setup_needed.load(Ordering::SeqCst)
+    {
+        state.supervision.lock().unwrap().on_restarted();
     }
 }
 
@@ -1339,6 +1344,23 @@ mod tests {
         );
         assert_eq!(health.restart_in_secs, Some(2), "second attempt after 2s");
         assert_eq!(health.restarts, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_first_start_is_retried_with_backoff() {
+        let path = test_socket_path("first-start-fail");
+        let _ = std::fs::remove_file(&path);
+        let state = test_state(path);
+        let reason = attach_and_record_with(&state, || None, || false).await;
+        assert!(reason.is_some());
+        let health = daemon_health(&state);
+        assert!(health.supervised);
+        assert_eq!(health.restart_in_secs, Some(1), "retried after 1s");
+        assert!(
+            health
+                .last_error
+                .is_some_and(|e| e.contains("binary not found"))
+        );
     }
 
     #[test]
