@@ -204,8 +204,10 @@ dbus-run-session -- bash -c '
   --target x86_64-pc-windows-gnu` passes cleanly (mingw-w64 installed).
   The `x86_64-pc-windows-msvc` target cannot be checked from Linux — the
   `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
-  an environment limitation, not a code problem. No real Windows
-  build/run has been exercised; linking + runtime remain unverified.
+  an environment limitation, not a code problem. On a real MSVC host
+  (`windows-2025` in release.yml) the daemon and tray compile, link and
+  bundle (msi + nsis), and the MSI's `friglet.exe --help` runs; the tray
+  itself (named-pipe control, tray icon, spawning) is still unverified.
 
 ## SetConfig / SetScanKey semantics (v1)
 

@@ -129,16 +129,21 @@ jobs:
           --target universal-apple-darwin
           --bundles dmg --config tauri.sidecar.conf.json
       - name: Check the daemon is bundled
+        # Tauri deletes the intermediate .app, so check the copy in the dmg.
         run: |
-          bundle=target/universal-apple-darwin/release/bundle
-          app="$bundle/macos/friglet-tray.app"
+          dmg=$(echo target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          mnt="$RUNNER_TEMP/dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+          app="$mnt/friglet-tray.app"
           for bin in friglet-tray friglet; do
+            echo "$bin: $(lipo -archs "$app/Contents/MacOS/$bin")"
             lipo "$app/Contents/MacOS/$bin" -verify_arch arm64 x86_64
           done
           "$app/Contents/MacOS/friglet" --help > /dev/null
           codesign --verify --deep --strict "$app"
           codesign -dv "$app" 2>&1 | grep 'Signature=adhoc'
-          ls -l "$bundle"/dmg/*.dmg
+          hdiutil detach "$mnt"
+          ls -l "$dmg"
       - uses: actions/upload-artifact@v6
         with:
           name: friglet-tray-macos-universal
