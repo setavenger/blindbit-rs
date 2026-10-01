@@ -25,6 +25,7 @@ use super::config::ScannerConfig;
 use super::types::OwnedOutputRecord;
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
 use super::ScannerError;
+use super::p2p;
 
 /// Main scanner struct for scanning the blockchain for Silent Payments outputs
 pub struct Scanner {
@@ -93,6 +94,13 @@ pub struct Scanner {
     /// Shared with the Electrum TCP server via Arc so it can serve requests
     /// without waiting on the scanner lock.
     pub(crate) electrum_index: Arc<Mutex<WalletElectrumIndex>>,
+
+    /// How a full-block fetch retries within one scan.
+    pub(crate) p2p_retry: p2p::RetryPolicy,
+
+    /// Rounds of failed fetches of the block the scan is stuck on, across
+    /// `watch_chain` polls.
+    pub(crate) fetch_backoff: p2p::FetchBackoff,
 }
 
 impl Scanner {
@@ -174,6 +182,8 @@ impl Scanner {
                 idx.sp_labels = (0..=max_label_num).collect();
                 idx
             })),
+            p2p_retry: p2p::RetryPolicy::default(),
+            fetch_backoff: p2p::FetchBackoff::default(),
         }
     }
 
@@ -794,6 +804,8 @@ impl Scanner {
                 idx.scan_health.oracle_floor_start = oracle_floor_start;
                 idx
             })),
+            p2p_retry: p2p::RetryPolicy::default(),
+            fetch_backoff: p2p::FetchBackoff::default(),
         };
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.

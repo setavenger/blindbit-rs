@@ -8,6 +8,8 @@ mod load;
 #[cfg(test)]
 mod oracle_floor_tests;
 mod p2p;
+#[cfg(test)]
+mod p2p_tests;
 mod reorg;
 #[cfg(test)]
 mod reorg_tests;
@@ -32,7 +34,9 @@ pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, e
 pub use health::{
     OracleFloorStart, ScanHealth, ScanStall, ScanStopped, StateFileReset, StateRescan,
 };
-pub use p2p::broadcast_tx;
+pub use p2p::{
+    BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy, broadcast_tx,
+};
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
 pub use scanner::Scanner;
 pub use types::{BlockIdentifierDisplay, OwnedOutput, OwnedOutputRecord};
