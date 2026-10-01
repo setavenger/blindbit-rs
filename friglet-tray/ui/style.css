@@ -83,6 +83,9 @@ code {
   font-size: 13px;
 }
 .banner strong { color: var(--accent); }
+.health { border-color: var(--bad); }
+.health.recovered { border-color: var(--border); }
+#health-output { max-height: 96px; overflow-y: auto; white-space: pre-wrap; }
 .banner-path {
   display: block;
   margin-top: 4px;

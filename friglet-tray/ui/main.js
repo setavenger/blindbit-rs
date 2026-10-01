@@ -13,8 +13,47 @@ function setText(id, value) {
 
 let daemonReachable = false;
 
-function render({ reachable, status }) {
+// Crash / restart state of a tray-supervised daemon.
+function renderHealth(daemon, reachable) {
+  const card = $("daemon-health");
+  const pending = daemon?.restart_in_secs != null;
+  const show = daemon && (daemon.last_exit || daemon.last_error || pending);
+  card.hidden = !show;
+  if (!show) return;
+
+  const recovered = reachable && !pending;
+  card.classList.toggle("recovered", recovered);
+  const pill = $("health-state");
+  pill.className = `pill ${recovered ? "pill-good" : "pill-bad"}`;
+  if (pending) {
+    pill.textContent = daemon.restart_in_secs > 0
+      ? `crashed — restarting in ${daemon.restart_in_secs}s`
+      : "crashed — restarting…";
+  } else if (recovered) {
+    pill.textContent = "restarted";
+  } else {
+    pill.textContent = "restarting…";
+  }
+
+  const parts = [];
+  if (daemon.last_exit) {
+    const when = daemon.last_exit_at
+      ? new Date(daemon.last_exit_at * 1000).toLocaleTimeString()
+      : "";
+    parts.push(`Last crash${when ? ` at ${when}` : ""}: ${daemon.last_exit}.`);
+  }
+  if (daemon.restarts > 0) {
+    parts.push(`Restarted automatically ${daemon.restarts}× this session.`);
+  }
+  if (daemon.last_error) parts.push(`Last restart attempt failed: ${daemon.last_error}`);
+  setText("health-detail", parts.join(" "));
+  $("health-output").hidden = !daemon.last_output;
+  setText("health-output", daemon.last_output ?? "");
+}
+
+function render({ reachable, status, daemon }) {
   daemonReachable = reachable;
+  renderHealth(daemon, reachable);
   const pill = $("reachable");
   pill.textContent = reachable ? "connected" : "unreachable";
   pill.className = `pill ${reachable ? "pill-good" : "pill-bad"}`;
@@ -209,6 +248,9 @@ async function refreshSetupState() {
 
 function enterSetupMode(s) {
   setupMode = true;
+  // Default for a first-time setup: start at login (shown, can be unticked).
+  $("cfg-autostart").checked = true;
+  autostartMessage("Applied when you save.", false);
   setupConfig = s.config;
   const paths = [s.config_path, s.key_file].filter(Boolean);
   $("setup-config-path").textContent = paths.length ? `Writes: ${paths.join(", ")}` : "";
@@ -221,6 +263,8 @@ function enterSetupMode(s) {
 function exitSetupMode() {
   setupMode = false;
   setupConfig = null;
+  autostartMessage("", false);
+  loadAutostart();
   updateSettingsAvailability();
 }
 
@@ -453,6 +497,7 @@ async function saveSetupConfig() {
       config: formConfig(),
       scanKey: key,
       descriptor,
+      autostart: $("cfg-autostart").checked,
     });
     if (spawnError) {
       // Files were written; only starting the daemon failed. The next polls
@@ -470,6 +515,23 @@ async function saveSetupConfig() {
   $("save-btn").disabled = false;
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// After a save the daemon restarts in-process; wait until it answers again
+// (a new wallet may first fetch the chain tip from the oracle).
+async function waitForDaemon(timeoutMs = 60000) {
+  await sleep(600); // let the old instance go away first
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return await invoke("get_config");
+    } catch (_) {
+      await sleep(500);
+    }
+  }
+  return null;
+}
+
 async function saveConfig(event) {
   event.preventDefault();
   if (setupMode) return saveSetupConfig();
@@ -479,58 +541,82 @@ async function saveConfig(event) {
   $("save-btn").disabled = true;
   settingsMessage("Saving…", false);
 
-  const notes = [];
-  const network = $("cfg-network").value;
-  // Config first: if the user changed key_file in the same save, the scan
-  // key below must land in the NEW path. A set_config failure aborts the
-  // save before the key is sent anywhere, keeping the form edits intact.
+  // Config + (optional) scan key in one request: the daemon validates both,
+  // persists them and restarts once. A failure leaves the form as typed.
+  const key = $("cfg-scan-key").value.trim();
+  let note;
   try {
-    const note = await invoke("set_config", { config: formConfig() });
-    if (note) notes.push(note);
+    note = await invoke("apply_settings", {
+      config: formConfig(),
+      scanKey: key || null,
+      descriptor,
+    });
   } catch (e) {
     settingsMessage(String(e), true);
     $("save-btn").disabled = false;
     return;
   }
-
-  // The config is persisted daemon-side from here on. Write-only scan key
-  // (from the pasted descriptor, else the manual field): only sent when
-  // given; a failure must not skip the reload below, or the form keeps
-  // merging stale hidden fields into later saves.
-  let keyError = null;
-  const key = $("cfg-scan-key").value.trim();
-  try {
-    let keyNote = null;
-    if (descriptor) {
-      keyNote = await invoke("set_descriptor_scan_key", { descriptor, network });
-    } else if (key !== "") {
-      keyNote = await invoke("set_scan_key", { key });
-    }
-    if (keyNote) notes.push(keyNote);
-  } catch (e) {
-    keyError = String(e);
+  if (!note) {
+    settingsMessage("No changes to save.", false);
+    $("save-btn").disabled = false;
+    return;
   }
 
+  settingsMessage("Saved — restarting the daemon with the new settings…", false);
+  const cfg = await waitForDaemon();
   // Reload so loadedConfig matches what the daemon persisted (loadConfig
   // clears the message, so report the outcome afterwards).
   await loadConfig();
   await refresh();
-  if (keyError) {
-    settingsMessage(`Config saved, but updating the scan key failed: ${keyError}`, true);
-    // fillForm cleared the inputs; restore them so the user can retry.
-    $("cfg-scan-key").value = key;
-    if (descriptor) {
-      $("cfg-descriptor").value = descriptor;
-      inspectDescriptor();
-    }
+  if (cfg) {
+    settingsMessage("Saved — the daemon restarted with the new settings. Sparrow reconnects by itself.", false);
   } else {
-    settingsMessage(notes.length ? `Saved. ${notes.join(". ")}` : "Saved.", false);
+    settingsMessage(
+      "Saved, but the daemon has not come back yet — see the Status tab for the reason.",
+      true
+    );
   }
   $("save-btn").disabled = false;
 }
 
+// --- start at login (a tray setting, independent of the daemon) -------------
+
+function autostartMessage(text, isError) {
+  const el = $("autostart-msg");
+  el.textContent = text;
+  el.className = `hint ${isError ? "error" : ""}`;
+}
+
+async function loadAutostart() {
+  try {
+    const enabled = await invoke("get_autostart");
+    // First-run setup shows its own default until Save applies it.
+    if (!setupMode) $("cfg-autostart").checked = enabled;
+  } catch (e) {
+    autostartMessage(String(e), true);
+  }
+}
+
+$("cfg-autostart").addEventListener("change", async () => {
+  // In first-run setup the choice is applied together with Save.
+  if (setupMode) {
+    autostartMessage("Applied when you save.", false);
+    return;
+  }
+  const enabled = $("cfg-autostart").checked;
+  try {
+    await invoke("set_autostart", { enabled });
+    autostartMessage(enabled ? "Friglet starts at login." : "Friglet no longer starts at login.", false);
+  } catch (e) {
+    $("cfg-autostart").checked = !enabled;
+    autostartMessage(String(e), true);
+  }
+});
+
 $("settings-form").addEventListener("submit", saveConfig);
 $("reload-btn").addEventListener("click", loadConfig);
+
+loadAutostart();
 
 invoke("network_defaults")
   .then((d) => {

@@ -199,7 +199,7 @@ async fn spawns_and_connects_when_socket_comes_up() {
     let bin_for_locator: PathBuf = bin.clone();
     let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
     match att {
-        Attachment::Spawned(mut child) => {
+        Attachment::Spawned(mut child, _) => {
             let _ = child.kill().await;
         }
         other => panic!("expected Spawned, got {other:?}"),
