@@ -3,6 +3,8 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::bdk_chain::bdk_core::Merge;
 use std::collections::BTreeMap;
 
+use super::health::OracleFloorStart;
+
 /// Helper module for hex encoding/decoding byte arrays in serialization
 #[cfg(feature = "serde")]
 mod serde_hex {
@@ -68,6 +70,13 @@ pub struct ChangeSet {
     pub public_spend_hex: Option<String>,
     /// Maximum label number used
     pub max_label_num: u32,
+    /// Set when the wallet's start height lay below the oracle's first
+    /// indexed block and scanning began there instead.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub oracle_floor_start: Option<OracleFloorStart>,
 }
 
 impl Merge for ChangeSet {
@@ -103,6 +112,10 @@ impl Merge for ChangeSet {
         // Use the maximum label number
         if other.max_label_num > self.max_label_num {
             self.max_label_num = other.max_label_num;
+        }
+
+        if other.oracle_floor_start.is_some() {
+            self.oracle_floor_start = other.oracle_floor_start;
         }
     }
 

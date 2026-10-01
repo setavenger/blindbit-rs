@@ -118,6 +118,26 @@ pub(crate) fn wallet_network(network: bitcoin_rev::Network) -> BitcoinNetwork {
     }
 }
 
+/// The scanner's published health as sent over the control socket.
+fn scan_health_info(health: &scanner::ScanHealth) -> friglet_ipc::ScanHealthInfo {
+    friglet_ipc::ScanHealthInfo {
+        stall: health
+            .stall
+            .as_ref()
+            .map(|stall| friglet_ipc::ScanStallInfo {
+                height: stall.height,
+                reason: stall.reason.clone(),
+                since_unix: stall.since_unix,
+            }),
+        start_adjusted: health
+            .oracle_floor_start
+            .map(|start| friglet_ipc::StartAdjustedInfo {
+                requested_height: start.requested_height,
+                oracle_floor: start.floor_height,
+            }),
+    }
+}
+
 /// Everything the request handler needs from the daemon.
 pub struct ControlCtx {
     pub supervisor: Arc<ScanSupervisor>,
@@ -234,6 +254,7 @@ impl ControlCtx {
             let addr = (!idx.sp_address.is_empty()).then(|| idx.sp_address.clone());
             (tip, idx.scan_progress, addr, idx.sp_history.len() as u64)
         };
+        let scan_health = scan_health_info(&index.lock().await.scan_health);
 
         // While the scan task runs it holds the scanner mutex, so fall back
         // to the electrum index tip (which the scanner advances per scanned
@@ -266,6 +287,7 @@ impl ControlCtx {
             label_addresses: self.label_addresses.lock().unwrap().clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             spawned_by_tray: self.spawned_by_tray,
+            scan_health,
         }
     }
 
@@ -773,6 +795,7 @@ mod tests {
             label_addresses: Vec::new(),
             version: "test".to_string(),
             spawned_by_tray: false,
+            scan_health: Default::default(),
         }
     }
 
@@ -799,6 +822,44 @@ mod tests {
         }
 
         assert_eq!(ctx.status().await.tx_count, 2);
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_stalled_scan_and_an_adjusted_start() {
+        let dir = temp_dir("status-scan-health");
+        let ctx = test_ctx(&dir);
+        assert_eq!(
+            ctx.status().await.scan_health,
+            friglet_ipc::ScanHealthInfo::default()
+        );
+
+        let index = ctx.electrum_index.lock().unwrap().clone();
+        {
+            let mut idx = index.lock().await;
+            idx.scan_health.stall = Some(scanner::ScanStall {
+                height: 100_002,
+                reason: "scan stopped at height 100002: the oracle sent no valid block hash"
+                    .to_string(),
+                since_unix: 1_790_000_000,
+            });
+            idx.scan_health.oracle_floor_start = Some(scanner::OracleFloorStart {
+                requested_height: 50_000,
+                floor_height: 100_000,
+            });
+        }
+
+        let health = ctx.status().await.scan_health;
+        let stall = health.stall.expect("stall is reported");
+        assert_eq!(stall.height, 100_002);
+        assert_eq!(stall.since_unix, 1_790_000_000);
+        assert!(stall.reason.contains("no valid block hash"));
+        assert_eq!(
+            health.start_adjusted,
+            Some(friglet_ipc::StartAdjustedInfo {
+                requested_height: 50_000,
+                oracle_floor: 100_000,
+            })
+        );
     }
 
     #[tokio::test]

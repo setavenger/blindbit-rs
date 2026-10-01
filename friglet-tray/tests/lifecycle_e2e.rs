@@ -42,6 +42,7 @@ fn dummy_status() -> StatusInfo {
         label_addresses: Vec::new(),
         version: "test".to_string(),
         spawned_by_tray: false,
+        scan_health: Default::default(),
     }
 }
 
