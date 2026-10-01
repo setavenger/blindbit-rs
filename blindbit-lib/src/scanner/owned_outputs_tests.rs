@@ -481,3 +481,158 @@ fn owned_outputs_labels_and_spends_survive_restart() {
     );
     assert_eq!(balance(&restored), 0);
 }
+
+/// A state file written by the code before owned outputs were recorded
+/// (integration 93f6a92): a payment and a change output received at 100, the
+/// wallet scanned on to 300, and the payment spent at 200 in a block that
+/// code never fetched, so the spend is not in the file.
+#[cfg(feature = "serde")]
+const STATE_BEFORE_OWNED_OUTPUTS: &str = include_str!("testdata/state_before_owned_outputs.json");
+
+#[cfg(feature = "serde")]
+fn restore(tag: &str, json: &str) -> (Scanner, PathBuf) {
+    let path = state_file(tag);
+    std::fs::write(&path, json).expect("write state file");
+    let changeset = Scanner::load_from_file(&path).expect("load state");
+    let socket: SocketAddr = "127.0.0.1:8333".parse().unwrap();
+    let scanner = Scanner::from_changeset(
+        oracle_client(),
+        socket,
+        changeset,
+        path.clone(),
+        Network::Regtest,
+    )
+    .expect("restore");
+    (scanner, path)
+}
+
+#[cfg(feature = "serde")]
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(future)
+}
+
+/// An old state file still loads, and because its spends of owned outputs
+/// may be missing, the scan rewinds to just below its oldest unspent output.
+/// Rescanning from there finds the missed spend; the upgraded file then
+/// loads without another rewind.
+#[cfg(feature = "serde")]
+#[test]
+fn state_file_from_before_owned_outputs_rescans_for_missed_spends() {
+    let old: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
+    assert!(old.get("format_version").is_none());
+    assert_eq!(old["owned_outputs"], serde_json::json!([]));
+    assert_eq!(old["last_scanned_block_height"], 300);
+    let tweak = served_tweak(0x33);
+    let pay_key = sp_output_key(&tweak, None);
+    // The old field held bare hex keys; no released writer filled it, but such
+    // entries must not break the load either.
+    let mut with_legacy_keys = old.clone();
+    with_legacy_keys["owned_outputs"] = serde_json::json!([pay_key.to_string()]);
+
+    for (case, json) in [
+        ("as written", STATE_BEFORE_OWNED_OUTPUTS.to_string()),
+        ("legacy keys", with_legacy_keys.to_string()),
+    ] {
+        let (mut scanner, path) = restore("pre-records", &json);
+
+        // Both outputs are back, the change output with its label.
+        let records: Vec<_> = scanner.owned_outputs().cloned().collect();
+        assert_eq!(records.len(), 2, "{case}");
+        let pay = records
+            .iter()
+            .find(|r| r.pubkey == pay_key)
+            .expect("payment record")
+            .clone();
+        let change = records.iter().find(|r| r.pubkey != pay_key).unwrap();
+        assert_eq!((pay.amount_sat, pay.label, pay.height), (50_000, None, 100));
+        assert_eq!(
+            (change.amount_sat, change.label, change.height),
+            (20_000, Some(0), 100)
+        );
+        assert_eq!(balance(&scanner), 70_000, "{case}: the spend is missing");
+
+        // Rewound to just below the oldest unspent output, and says so.
+        assert_eq!(scanner.get_last_scanned_block_height(), 99, "{case}");
+        let health = block_on(scanner.scan_health());
+        assert_eq!(
+            health.state_rescan,
+            Some(crate::scanner::StateRescan {
+                from_height: 100,
+                until_height: 300,
+            }),
+            "{case}"
+        );
+        // Electrum clients keep seeing the old tip while the rescan runs.
+        block_on(scanner.rebuild_electrum_index_from_graph(1));
+        let tip = block_on(scanner.electrum_index().lock()).tip.clone();
+        assert_eq!(tip.map(|(height, _)| height), Some(300), "{case}");
+
+        // The rescan reaches block 200; with the output recorded, the oracle's
+        // spent prefix now gets that block fetched and the spend found.
+        let spend = spend_of(pay.outpoint);
+        assert!(process_block(
+            &mut scanner,
+            &block(SPEND_HEIGHT, vec![spend.clone()]),
+            SPEND_HEIGHT,
+            vec![],
+            &[pay_key],
+        ));
+        assert_eq!(
+            record(&scanner, pay.outpoint).spent_by,
+            Some(spend.compute_txid()),
+            "{case}"
+        );
+        assert_eq!(balance(&scanner), 20_000, "{case}");
+        scanner.update_last_scanned_block_height(300);
+        block_on(scanner.clear_stall());
+        assert_eq!(block_on(scanner.scan_health()).state_rescan, None);
+
+        // Saved in the current format, it restores without another rewind.
+        scanner.save_to_file(&path).expect("save");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["format_version"],
+            crate::scanner::STATE_FORMAT_VERSION
+        );
+        let (again, path) = restore("pre-records", &serde_json::to_string(&saved).unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(again.get_last_scanned_block_height(), 300, "{case}");
+        assert_eq!(block_on(again.scan_health()).state_rescan, None, "{case}");
+        assert_eq!(balance(&again), 20_000, "{case}");
+    }
+}
+
+/// Without an unspent output there is nothing a missed spend could affect:
+/// the old file is upgraded in place, without a rescan.
+#[cfg(feature = "serde")]
+#[test]
+fn state_file_from_before_owned_outputs_without_unspent_outputs_is_not_rescanned() {
+    let mut old: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
+    // The same wallet before anything was found.
+    let fresh = {
+        let scanner = scanner("pre-records-empty-src", 1);
+        let mut json = serde_json::to_value(&scanner.stage).unwrap();
+        json.as_object_mut().unwrap().remove("format_version");
+        json
+    };
+    old["indexer"] = fresh["indexer"].clone();
+    old["block_checkpoints"] = fresh["block_checkpoints"].clone();
+
+    let (scanner, path) = restore("pre-records-empty", &old.to_string());
+    assert_eq!(scanner.owned_outputs().count(), 0);
+    assert_eq!(scanner.get_last_scanned_block_height(), 300);
+    assert_eq!(block_on(scanner.scan_health()).state_rescan, None);
+    scanner.save_to_file(&path).expect("save");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        saved["format_version"],
+        crate::scanner::STATE_FORMAT_VERSION
+    );
+}

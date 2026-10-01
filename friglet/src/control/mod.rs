@@ -135,6 +135,12 @@ fn scan_health_info(health: &scanner::ScanHealth) -> friglet_ipc::ScanHealthInfo
                 requested_height: start.requested_height,
                 oracle_floor: start.floor_height,
             }),
+        state_rescan: health
+            .state_rescan
+            .map(|rescan| friglet_ipc::StateRescanInfo {
+                from_height: rescan.from_height,
+                until_height: rescan.until_height,
+            }),
     }
 }
 
@@ -846,6 +852,10 @@ mod tests {
                 requested_height: 50_000,
                 floor_height: 100_000,
             });
+            idx.scan_health.state_rescan = Some(scanner::StateRescan {
+                from_height: 100_500,
+                until_height: 101_000,
+            });
         }
 
         let health = ctx.status().await.scan_health;
@@ -858,6 +868,13 @@ mod tests {
             Some(friglet_ipc::StartAdjustedInfo {
                 requested_height: 50_000,
                 oracle_floor: 100_000,
+            })
+        );
+        assert_eq!(
+            health.state_rescan,
+            Some(friglet_ipc::StateRescanInfo {
+                from_height: 100_500,
+                until_height: 101_000,
             })
         );
     }

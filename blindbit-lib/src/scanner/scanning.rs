@@ -371,7 +371,9 @@ impl Scanner {
 
                         let mut idx = self.electrum_index.lock().await;
                         idx.headers.insert(block_height_u32, header_hex.clone());
-                        idx.tip = Some((block_height_u32, header_hex));
+                        if idx.tip_height_for(block_height_u32) == block_height_u32 {
+                            idx.tip = Some((block_height_u32, header_hex));
+                        }
 
                         for tx in &block.txdata {
                             let txid = tx.compute_txid();
@@ -643,7 +645,8 @@ impl Scanner {
                 .as_ref()
                 .map(|(_, hex)| hex.clone())
                 .unwrap_or_default();
-            idx.tip = Some((height_u32, header_hex));
+            let tip_height = idx.tip_height_for(height_u32);
+            idx.tip = Some((tip_height, header_hex));
         }
 
         let utxo_count = self.internal_indexer.index().by_shared_secret.len();

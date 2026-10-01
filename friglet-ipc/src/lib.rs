@@ -175,6 +175,17 @@ pub struct ScanHealthInfo {
     /// Set when the configured start height lay below the oracle's first
     /// indexed block, so scanning began at that block instead.
     pub start_adjusted: Option<StartAdjustedInfo>,
+    /// Set while a state file written before spends were tracked is being
+    /// rescanned once for the spends it missed.
+    pub state_rescan: Option<StateRescanInfo>,
+}
+
+/// Blocks `from_height..=until_height` are scanned again because the state
+/// file predates spend tracking (see blindbit-lib `StateRescan`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRescanInfo {
+    pub from_height: u64,
+    pub until_height: u64,
 }
 
 /// The scan cannot get past `height`.
@@ -503,6 +514,10 @@ mod tests {
                 start_adjusted: Some(StartAdjustedInfo {
                     requested_height: 1,
                     oracle_floor: 100,
+                }),
+                state_rescan: Some(StateRescanInfo {
+                    from_height: 100,
+                    until_height: 101,
                 }),
             },
         };

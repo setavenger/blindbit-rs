@@ -6,6 +6,16 @@ use std::collections::BTreeMap;
 use super::health::OracleFloorStart;
 use super::types::OwnedOutputRecord;
 
+/// Format of the persisted [`ChangeSet`] this build writes.
+///
+/// - `0` (field absent): written before owned outputs were recorded. Such a
+///   state never fetched blocks whose only wallet-relevant transaction was a
+///   spend, so spends of its outputs may be missing; restoring it rescans
+///   from the oldest unspent output (see `Scanner::from_changeset`).
+/// - `1`: `owned_outputs` holds [`OwnedOutputRecord`]s. Builds older than
+///   this format cannot read it (they expect bare hex keys there).
+pub const STATE_FORMAT_VERSION: u32 = 1;
+
 /// Deserialisation of the persisted `owned_outputs` array.
 #[cfg(feature = "serde")]
 mod owned_outputs_serde {
@@ -50,6 +60,10 @@ mod owned_outputs_serde {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[must_use]
 pub struct ChangeSet {
+    /// [`STATE_FORMAT_VERSION`] of the build that wrote this state; `0` when
+    /// absent (written before the field existed).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub format_version: u32,
     /// Sparse block checkpoints: only blocks where we found something (height -> hash)
     pub block_checkpoints: BTreeMap<u32, BlockHash>,
     /// Changes related to the Silent Payments indexer data.
@@ -124,6 +138,8 @@ impl Merge for ChangeSet {
         if other.oracle_floor_start.is_some() {
             self.oracle_floor_start = other.oracle_floor_start;
         }
+
+        self.format_version = self.format_version.max(other.format_version);
     }
 
     /// Checks if the [`ChangeSet`] is empty (contains no changes).
