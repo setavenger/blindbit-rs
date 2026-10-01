@@ -100,6 +100,26 @@ Once running, `friglet` exposes the following endpoints on `--http-addr`:
 
 The built-in Electrum server (bound to `--electrum-addr`) allows wallets such as Sparrow to connect directly and query Silent Payment UTXOs without any additional infrastructure.
 
+What to expect from it:
+
+- **New blocks** are announced with the real header of the tip block. friglet
+  asks the oracle which block is at the scanned height and fetches that
+  block's 80-byte header from the P2P peer.
+- **Broadcasting** succeeds only once the P2P peer (`--p2p-node-addr`) has the
+  transaction in its mempool, which usually takes 5–10 seconds. Otherwise
+  Sparrow shows an error. The P2P protocol does not say why a peer refuses a
+  transaction. friglet reports what it can tell: missing or spent inputs, a
+  fee below the peer's mempool minimum, or a dropped connection, which means
+  the transaction is invalid. Broadcasts that have not confirmed are kept in
+  `<state file>.pending.json`. While they are pending, friglet re-announces
+  them whenever the peer's mempool loses them, including after a restart. It
+  stops when they confirm or when a conflicting transaction confirms.
+- **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
+  with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
+  minimum fee rate that the P2P peer's mempool currently accepts. Keep
+  Sparrow's fee rate source on an external service (mempool.space by
+  default), or set fee rates by hand.
+
 ---
 
 ### Tray app (friglet-tray)
