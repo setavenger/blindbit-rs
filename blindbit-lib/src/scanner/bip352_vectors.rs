@@ -1312,9 +1312,10 @@ fn official_vectors_survive_sparse_vout_layouts() {
 /// carries `t_k`, so the dropped candidate is provably the highest `k` rather
 /// than an arbitrary one.
 ///
-/// This case is expensive (~80s in a debug build): `scan_txouts` rescans the
-/// shrinking candidate pool for every derivation order, which is quadratic in
-/// the 2324 outputs.
+/// This case is expensive: `scan_txouts` rescans the shrinking candidate pool
+/// for every derivation order, which is quadratic in the 2324 outputs. The
+/// workspace builds libsecp256k1 optimised even in debug (root `Cargo.toml`),
+/// which keeps it to seconds rather than minutes.
 #[test]
 fn official_vectors_enforce_k_max_at_the_blindbit_boundary() {
     let mut exercised = 0usize;
@@ -2030,7 +2031,8 @@ fn official_vectors_live_receive_step_finds_expected_outputs() {
 /// after `apply_block_relevant` must be exactly the matches for `k = 0..K_max`:
 /// every one of them found, and the `k = K_max` candidate never stored. The
 /// cutoff lives in `bdk_sp::receive::scan_txouts` (SNB-540); without it the live
-/// path stores 2324 outputs here. Slow (~80s in a debug build): the external
+/// path stores 2324 outputs here. Expensive for the same reason as
+/// [`official_vectors_enforce_k_max_at_the_blindbit_boundary`]: the external
 /// indexer's scan is quadratic in the 2324 outputs.
 #[test]
 fn official_vectors_live_receive_step_enforces_k_max() {
