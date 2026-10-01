@@ -3,7 +3,10 @@
 mod changeset;
 mod config;
 pub mod electrum_index;
+mod health;
 mod load;
+#[cfg(test)]
+mod oracle_floor_tests;
 mod p2p;
 mod scanner;
 mod scanning;
@@ -19,6 +22,7 @@ pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
 pub use changeset::ChangeSet;
 pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
+pub use health::{OracleFloorStart, ScanHealth, ScanStall, ScanStopped};
 pub use p2p::broadcast_tx;
 pub use scanner::Scanner;
 pub use types::{BlockIdentifierDisplay, OwnedOutput};

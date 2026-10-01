@@ -690,6 +690,7 @@ mod tests {
                                 label_addresses: Vec::new(),
                                 version: "test".to_string(),
                                 spawned_by_tray,
+                                scan_health: Default::default(),
                             }),
                             _ => Response::Ok,
                         };

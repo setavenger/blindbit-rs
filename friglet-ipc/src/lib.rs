@@ -159,6 +159,42 @@ pub struct StatusInfo {
     /// instead of assuming it did not spawn it.
     #[serde(default)]
     pub spawned_by_tray: bool,
+    /// Conditions of the scan beyond its progress: why it is stuck, and
+    /// whether it started above the configured start height.
+    #[serde(default)]
+    pub scan_health: ScanHealthInfo,
+}
+
+/// Scan conditions the user should see (see [`StatusInfo::scan_health`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanHealthInfo {
+    /// Set while the scan cannot get past a height. The daemon keeps
+    /// retrying; this clears once the scan makes progress again.
+    pub stall: Option<ScanStallInfo>,
+    /// Set when the configured start height lay below the oracle's first
+    /// indexed block, so scanning began at that block instead.
+    pub start_adjusted: Option<StartAdjustedInfo>,
+}
+
+/// The scan cannot get past `height`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanStallInfo {
+    /// First height that could not be scanned.
+    pub height: u64,
+    /// Why, as the scanner reported it.
+    pub reason: String,
+    /// Unix time (seconds) of the first failed attempt at this height.
+    pub since_unix: u64,
+}
+
+/// Scanning began at `oracle_floor` instead of the configured
+/// `requested_height`: the oracle has no data below it, so blocks
+/// `requested_height..oracle_floor` were not scanned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAdjustedInfo {
+    pub requested_height: u64,
+    pub oracle_floor: u64,
 }
 
 /// A configured Silent Payments label and its receive address.
@@ -458,6 +494,17 @@ mod tests {
             }],
             version: "test".to_string(),
             spawned_by_tray: true,
+            scan_health: ScanHealthInfo {
+                stall: Some(ScanStallInfo {
+                    height: 102,
+                    reason: "the oracle sent no valid block hash".to_string(),
+                    since_unix: 1_790_000_000,
+                }),
+                start_adjusted: Some(StartAdjustedInfo {
+                    requested_height: 1,
+                    oracle_floor: 100,
+                }),
+            },
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
@@ -482,6 +529,7 @@ mod tests {
         assert_eq!(status.outputs_found, 0);
         assert!(status.label_addresses.is_empty());
         assert!(!status.spawned_by_tray);
+        assert_eq!(status.scan_health, ScanHealthInfo::default());
     }
 
     #[test]

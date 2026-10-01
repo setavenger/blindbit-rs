@@ -15,6 +15,7 @@ use crate::oracle_grpc::{
 };
 
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
+use super::health::ScanStopped;
 use super::p2p;
 use super::scanner::Scanner;
 use super::types::{BlockIdentifierDisplay, ProbableMatch};
@@ -79,10 +80,11 @@ async fn next_block<S: BlockScanDataStream>(
     height: u64,
 ) -> Result<Option<BlockScanDataShortResponse>, ScannerError> {
     stream.next_message().await.map_err(|status| {
-        stream_stopped(
+        Box::new(ScanStopped {
             height,
-            &format!("oracle stream error {:?}: {}", status.code(), status.message()),
-        )
+            reason: format!("oracle stream error {:?}: {}", status.code(), status.message()),
+            not_indexed: status.code() == tonic::Code::NotFound,
+        }) as ScannerError
     })
 }
 
@@ -105,23 +107,24 @@ fn check_block_identifier(
     }
     let hash = &block_identifier.block_hash;
     if hash.len() != 32 || hash.iter().all(|b| *b == 0) {
-        return Err(stream_stopped(
-            expected_height,
-            &format!(
+        return Err(Box::new(ScanStopped {
+            height: expected_height,
+            reason: format!(
                 "the oracle sent no valid block hash ({} bytes); the height is probably not indexed",
                 hash.len()
             ),
-        ));
+            not_indexed: true,
+        }));
     }
     Ok(())
 }
 
 fn stream_stopped(height: u64, reason: &str) -> ScannerError {
-    format!(
-        "scan stopped at height {height}: {reason}; nothing from height {height} on was scanned, \
-         rescan from height {height}"
-    )
-    .into()
+    Box::new(ScanStopped {
+        height,
+        reason: reason.to_string(),
+        not_indexed: false,
+    })
 }
 
 impl Scanner {
@@ -144,12 +147,15 @@ impl Scanner {
             .stream_block_scan_data_short(request)
             .await
             .map_err(|status| -> ScannerError {
-                format!(
-                    "oracle refused to stream blocks {start}..={end}: {:?}: {}",
-                    status.code(),
-                    status.message()
-                )
-                .into()
+                Box::new(ScanStopped {
+                    height: start,
+                    reason: format!(
+                        "oracle refused to stream blocks {start}..={end}: {:?}: {}",
+                        status.code(),
+                        status.message()
+                    ),
+                    not_indexed: status.code() == tonic::Code::NotFound,
+                })
             })?
             .into_inner();
 
@@ -674,6 +680,12 @@ impl Scanner {
     /// height advances past `last_scanned_block_height`, the missing range is
     /// scanned with `scan_block_range`.  This mirrors `blindbit-desktop`'s
     /// `Watch()` loop and means callers never need to supply an `end_height`.
+    ///
+    /// A scan that cannot get past a height is retried on every poll and
+    /// published as a stall ([`Scanner::scan_health`]) until it makes
+    /// progress. When the wallet's start height lies below the oracle's first
+    /// indexed block, scanning starts at that block instead (see
+    /// [`Scanner::start_at_oracle_floor_if_below`]).
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         loop {
             let oracle_tip = match self
@@ -684,6 +696,11 @@ impl Scanner {
                 Ok(resp) => resp.into_inner().height,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to reach oracle, will retry");
+                    self.report_stall(
+                        self.last_scanned_block_height + 1,
+                        format!("cannot reach the oracle: {e}"),
+                    )
+                    .await;
                     time::sleep(time::Duration::from_secs(10)).await;
                     continue;
                 }
@@ -692,9 +709,25 @@ impl Scanner {
             if oracle_tip > self.last_scanned_block_height {
                 let from = self.last_scanned_block_height + 1;
                 tracing::info!(from, to = oracle_tip, "new blocks available, scanning");
-                if let Err(e) = self.scan_block_range(from, oracle_tip).await {
-                    tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
+                match self.scan_block_range(from, oracle_tip).await {
+                    Ok(()) => self.clear_stall().await,
+                    Err(e) => {
+                        let mut probe = self.client.clone();
+                        if self
+                            .start_at_oracle_floor_if_below(&e, from, oracle_tip, &mut probe)
+                            .await
+                        {
+                            continue;
+                        }
+                        tracing::error!(error = %e, "scan_block_range failed, will retry on next poll");
+                        let height = e
+                            .downcast_ref::<ScanStopped>()
+                            .map_or(self.last_scanned_block_height + 1, |s| s.height);
+                        self.report_stall(height, e.to_string()).await;
+                    }
                 }
+            } else {
+                self.clear_stall().await;
             }
 
             time::sleep(time::Duration::from_secs(10)).await;

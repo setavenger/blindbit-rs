@@ -121,6 +121,7 @@ impl Scanner {
             secret_scan_hex: Some(hex::encode(secret_scan.secret_bytes())),
             public_spend_hex: Some(hex::encode(public_spend.serialize())),
             max_label_num,
+            oracle_floor_start: None,
         };
 
         // Merge the initial label changes
@@ -582,6 +583,7 @@ impl Scanner {
         let sp_address = indexer
             .get_address(convert_network(network))
             .to_string();
+        let oracle_floor_start = changeset.oracle_floor_start;
 
         Ok(Self {
             client,
@@ -602,6 +604,7 @@ impl Scanner {
                 let mut idx = WalletElectrumIndex::new();
                 idx.sp_address = sp_address;
                 idx.sp_labels = (0..=max_label_num).collect();
+                idx.scan_health.oracle_floor_start = oracle_floor_start;
                 idx
             })),
         })

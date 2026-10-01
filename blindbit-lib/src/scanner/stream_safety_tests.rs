@@ -56,10 +56,10 @@ fn serve(block: &Block) {
 }
 
 /// In-process stand-in for the oracle's `StreamBlockScanDataShort` stream.
-struct TestStream(VecDeque<Result<BlockScanDataShortResponse, tonic::Status>>);
+pub(super) struct TestStream(VecDeque<Result<BlockScanDataShortResponse, tonic::Status>>);
 
 impl TestStream {
-    fn new(items: Vec<Result<BlockScanDataShortResponse, tonic::Status>>) -> Self {
+    pub(super) fn new(items: Vec<Result<BlockScanDataShortResponse, tonic::Status>>) -> Self {
         Self(items.into())
     }
 }
@@ -73,7 +73,7 @@ impl BlockScanDataStream for TestStream {
     }
 }
 
-fn run<F: Future>(future: F) -> F::Output {
+pub(super) fn run<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -89,7 +89,7 @@ fn keys() -> (SecretKey, PublicKey) {
     (secret(0x11), secret(0x22).public_key(&Secp256k1::new()))
 }
 
-struct TempState(PathBuf);
+pub(super) struct TempState(pub(super) PathBuf);
 
 impl Drop for TempState {
     fn drop(&mut self) {
@@ -99,7 +99,7 @@ impl Drop for TempState {
 
 /// A scanner whose oracle client points at `oracle` (never contacted unless a
 /// test calls `scan_block_range`). Must be called inside a Tokio runtime.
-fn scanner(tag: &str, oracle: &'static str) -> (Scanner, TempState) {
+pub(super) fn scanner(tag: &str, oracle: &'static str) -> (Scanner, TempState) {
     let (scan_sk, spend_pk) = keys();
     let state = std::env::temp_dir().join(format!(
         "blindbit-stream-safety-{tag}-{}.json",
@@ -121,12 +121,12 @@ fn scanner(tag: &str, oracle: &'static str) -> (Scanner, TempState) {
 
 /// One block at `height` holding a single silent payment to the test wallet,
 /// served in place of P2P, and the oracle message that describes it.
-struct PaymentBlock {
-    height: u64,
-    message: BlockScanDataShortResponse,
+pub(super) struct PaymentBlock {
+    pub(super) height: u64,
+    pub(super) message: BlockScanDataShortResponse,
 }
 
-fn payment_block(height: u64) -> PaymentBlock {
+pub(super) fn payment_block(height: u64) -> PaymentBlock {
     let (scan_sk, spend_pk) = keys();
     // The tweak (`input_hash * A`) the oracle would serve; any point works.
     let tweak = secret(0x40u8.wrapping_add(height as u8)).public_key(&Secp256k1::new());
@@ -204,7 +204,7 @@ fn payment_block(height: u64) -> PaymentBlock {
 
 /// What an oracle sends today for a height it has not indexed: OK, with an
 /// empty block hash and no data.
-fn unindexed_message(height: u64) -> BlockScanDataShortResponse {
+pub(super) fn unindexed_message(height: u64) -> BlockScanDataShortResponse {
     BlockScanDataShortResponse {
         block_identifier: Some(BlockIdentifier {
             block_hash: vec![],
@@ -215,7 +215,7 @@ fn unindexed_message(height: u64) -> BlockScanDataShortResponse {
     }
 }
 
-fn owned_outputs(scanner: &Scanner) -> usize {
+pub(super) fn owned_outputs(scanner: &Scanner) -> usize {
     scanner.internal_indexer.index().by_shared_secret.len()
 }
 
