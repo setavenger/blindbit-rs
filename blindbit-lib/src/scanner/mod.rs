@@ -3,7 +3,10 @@
 mod changeset;
 mod config;
 pub mod electrum_index;
+mod health;
 mod load;
+#[cfg(test)]
+mod oracle_floor_tests;
 mod p2p;
 mod reorg;
 #[cfg(test)]
@@ -19,9 +22,10 @@ mod utils;
 pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
 
 // Re-export public types and the main Scanner struct
-pub use changeset::ChangeSet;
+pub use changeset::{ChangeSet, STATE_FORMAT_VERSION};
 pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
+pub use health::{OracleFloorStart, ScanHealth, ScanStall, ScanStopped, StateRescan};
 pub use p2p::broadcast_tx;
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
 pub use scanner::Scanner;

@@ -20,7 +20,7 @@ use tonic::transport::Channel;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
-use super::changeset::ChangeSet;
+use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
 use super::config::ScannerConfig;
 use super::types::OwnedOutputRecord;
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
@@ -127,6 +127,7 @@ impl Scanner {
 
         // Initialize the staged changeset with initial state
         let mut stage = ChangeSet {
+            format_version: STATE_FORMAT_VERSION,
             block_checkpoints: block_checkpoints.clone(),
             indexer: indexer.initial_changeset(),
             last_scanned_block_height: 0,
@@ -136,6 +137,7 @@ impl Scanner {
             public_spend_hex: Some(hex::encode(public_spend.serialize())),
             max_label_num,
             scanned_block_hashes: BTreeMap::new(),
+            oracle_floor_start: None,
         };
 
         // Merge the initial label changes
@@ -389,7 +391,7 @@ impl Scanner {
         // Header hex is not recoverable without re-fetching; Sparrow's BlockHeaderTip
         // handles an empty hex gracefully.
         if self.last_scanned_block_height > 0 {
-            let h = self.last_scanned_block_height as u32;
+            let h = index.tip_height_for(self.last_scanned_block_height as u32);
             let hex = index.headers.get(&h).cloned().unwrap_or_default();
             index.tip = Some((h, hex));
         }
@@ -511,6 +513,59 @@ impl Scanner {
         }
     }
 
+    /// Upgrade a restored state written before owned outputs were recorded
+    /// (format 0).
+    ///
+    /// That code fetched a block only when it held a probable *receive*, so a
+    /// block whose only wallet-relevant transaction spent one of our outputs
+    /// was never fetched, and the spend is missing from the restored graph.
+    /// Every output the graph still shows unspent may have been spent that
+    /// way, at or after its own height. The scan is therefore rewound to just
+    /// below the oldest such output, so the next scan revisits every block a
+    /// missed spend can be in; with the owned outputs now recorded, it fetches
+    /// those blocks. Re-applying blocks already in the graph is idempotent.
+    ///
+    /// The rewind is published in the scan health ([`StateRescan`]) and the
+    /// state is marked current, so it happens once: the next save persists
+    /// the lower height together with the new format.
+    ///
+    /// [`StateRescan`]: super::health::StateRescan
+    fn rescan_for_missed_spends(&mut self) {
+        self.stage.format_version = STATE_FORMAT_VERSION;
+        let previous_height = self.last_scanned_block_height;
+        let Some(oldest_unspent) = self
+            .owned_outputs
+            .values()
+            .filter(|record| !record.is_spent())
+            .map(|record| u64::from(record.height))
+            .min()
+            .filter(|height| *height <= previous_height)
+        else {
+            tracing::info!(
+                "state file predates owned-output records; no unspent output to re-check"
+            );
+            return;
+        };
+
+        let resume_height = oldest_unspent - 1;
+        tracing::warn!(
+            from_height = oldest_unspent,
+            previous_height,
+            unspent_outputs = self.owned_outputs.values().filter(|r| !r.is_spent()).count(),
+            "state file predates owned-output records, so spends in blocks it never fetched \
+             can be missing; rescanning from the oldest unspent output"
+        );
+        self.update_last_scanned_block_height(resume_height);
+        let rescan = super::health::StateRescan {
+            from_height: oldest_unspent,
+            until_height: previous_height,
+        };
+        // `from_changeset` holds the only reference to the new index.
+        if let Some(index) = Arc::get_mut(&mut self.electrum_index) {
+            index.get_mut().scan_health.state_rescan = Some(rescan);
+        }
+    }
+
     /// Returns an optional reference to the currently staged [`ChangeSet`].
     ///
     /// # Returns
@@ -591,6 +646,7 @@ impl Scanner {
         changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
         changeset.owned_outputs = self.owned_outputs.values().cloned().collect();
         changeset.scanned_block_hashes = self.scanned_block_hashes.clone();
+        changeset.format_version = STATE_FORMAT_VERSION;
 
         let json = serde_json::to_string_pretty(&changeset)?;
         std::fs::write(path, json)?;
@@ -700,6 +756,8 @@ impl Scanner {
         let sp_address = indexer
             .get_address(convert_network(network))
             .to_string();
+        let oracle_floor_start = changeset.oracle_floor_start;
+        let format_version = changeset.format_version;
 
         let owned_outputs = changeset
             .owned_outputs
@@ -729,12 +787,16 @@ impl Scanner {
                 let mut idx = WalletElectrumIndex::new();
                 idx.sp_address = sp_address;
                 idx.sp_labels = (0..=max_label_num).collect();
+                idx.scan_health.oracle_floor_start = oracle_floor_start;
                 idx
             })),
         };
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.
         scanner.sync_owned_outputs();
+        if format_version < STATE_FORMAT_VERSION {
+            scanner.rescan_for_missed_spends();
+        }
         Ok(scanner)
     }
 }

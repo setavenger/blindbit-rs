@@ -3,7 +3,18 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::bdk_chain::bdk_core::Merge;
 use std::collections::BTreeMap;
 
+use super::health::OracleFloorStart;
 use super::types::OwnedOutputRecord;
+
+/// Format of the persisted [`ChangeSet`] this build writes.
+///
+/// - `0` (field absent): written before owned outputs were recorded. Such a
+///   state never fetched blocks whose only wallet-relevant transaction was a
+///   spend, so spends of its outputs may be missing; restoring it rescans
+///   from the oldest unspent output (see `Scanner::from_changeset`).
+/// - `1`: `owned_outputs` holds [`OwnedOutputRecord`]s. Builds older than
+///   this format cannot read it (they expect bare hex keys there).
+pub const STATE_FORMAT_VERSION: u32 = 1;
 
 /// Deserialisation of the persisted `owned_outputs` array.
 #[cfg(feature = "serde")]
@@ -49,6 +60,10 @@ mod owned_outputs_serde {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[must_use]
 pub struct ChangeSet {
+    /// [`STATE_FORMAT_VERSION`] of the build that wrote this state; `0` when
+    /// absent (written before the field existed).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub format_version: u32,
     /// Sparse block checkpoints: only blocks where we found something (height -> hash)
     pub block_checkpoints: BTreeMap<u32, BlockHash>,
     /// Changes related to the Silent Payments indexer data.
@@ -77,6 +92,13 @@ pub struct ChangeSet {
     /// scan.
     #[cfg_attr(feature = "serde", serde(default))]
     pub scanned_block_hashes: BTreeMap<u32, BlockHash>,
+    /// Set when the wallet's start height lay below the oracle's first
+    /// indexed block and scanning began there instead.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub oracle_floor_start: Option<OracleFloorStart>,
 }
 
 impl Merge for ChangeSet {
@@ -120,6 +142,12 @@ impl Merge for ChangeSet {
         if other.max_label_num > self.max_label_num {
             self.max_label_num = other.max_label_num;
         }
+
+        if other.oracle_floor_start.is_some() {
+            self.oracle_floor_start = other.oracle_floor_start;
+        }
+
+        self.format_version = self.format_version.max(other.format_version);
     }
 
     /// Checks if the [`ChangeSet`] is empty (contains no changes).
