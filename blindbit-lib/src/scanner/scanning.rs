@@ -345,8 +345,6 @@ impl Scanner {
             hash: genesis_hash,
         };
 
-        let mut p2p_conn: Option<p2p::P2pConnection> = None;
-
         let mut expected_height = first;
         // Blocks from here on are scanned; below it they are only checked.
         let mut scan_from = start;
@@ -448,7 +446,7 @@ impl Scanner {
                     tracing::debug!(block_hash = %block_hash, "fetching full block via P2P");
 
                     let block = self
-                        .fetch_block_with_retry(&mut p2p_conn, block_hash, block_identifier.block_height)
+                        .fetch_block_with_retry(block_hash, block_identifier.block_height)
                         .await?;
 
                     // Apply block to indexer and stage the changes
@@ -739,81 +737,30 @@ impl Scanner {
         Ok(())
     }
 
-    /// Fetch a full block over P2P, transparently (re)connecting on failure.
-    ///
-    /// The P2P fetch is blocking I/O, so it runs on a fresh connection that is
-    /// reused across calls via `p2p_conn`.  If a fetch fails (the peer closed
-    /// the connection, timed out, or replied notfound), we drop the dead
-    /// connection and retry on a brand-new one with linear backoff.  Only after
-    /// all attempts are exhausted does the error propagate, at which point
-    /// `watch_chain` will retry the whole range on the next poll.
+    /// Fetch a full block over P2P (see [`p2p::BlockFetcher::fetch`]: a
+    /// fresh connection per attempt, exponential backoff between attempts).
+    /// When every attempt fails the error is a [`p2p::BlockFetchError`]
+    /// whose message says what the node did and what the user can do;
+    /// `watch_chain` then retries the block on a growing interval
+    /// ([`p2p::FetchBackoff`]).
     async fn fetch_block_with_retry(
         &self,
-        p2p_conn: &mut Option<p2p::P2pConnection>,
         block_hash: BlockHash,
         height: u64,
     ) -> Result<bitcoin::Block, ScannerError> {
-        const MAX_ATTEMPTS: u32 = 4;
-
         // Tests serve full blocks in-process instead of over P2P.
         #[cfg(test)]
         if let Some(block) = super::stream_safety_tests::served_block(&block_hash) {
             return Ok(block);
         }
 
-        let mut last_err: Option<ScannerError> = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            if p2p_conn.is_none() {
-                match p2p::P2pConnection::connect(self.p2p_peer, self.network) {
-                    Ok(conn) => *p2p_conn = Some(conn),
-                    Err(e) => {
-                        tracing::warn!(
-                            peer = %self.p2p_peer,
-                            attempt,
-                            error = %e,
-                            "failed to open P2P connection"
-                        );
-                        last_err = Some(e);
-                        time::sleep(time::Duration::from_secs(attempt as u64)).await;
-                        continue;
-                    }
-                }
-            }
-
-            match p2p_conn.as_mut().unwrap().fetch_block(block_hash) {
-                Ok(block) => {
-                    // The peer may close the connection after serving a block (connection
-                    // limits, rate limiting, etc.).  Proactively discard the connection
-                    // so the next fetch starts a fresh handshake rather than discovering
-                    // the dead socket mid-read on the next attempt.
-                    *p2p_conn = None;
-                    return Ok(block);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        peer = %self.p2p_peer,
-                        height,
-                        block_hash = %block_hash,
-                        attempt,
-                        max_attempts = MAX_ATTEMPTS,
-                        error = %e,
-                        "block fetch failed; dropping connection and retrying"
-                    );
-                    // Drop the (likely dead) connection so the next attempt
-                    // starts a fresh handshake.
-                    *p2p_conn = None;
-                    last_err = Some(e);
-                    if attempt < MAX_ATTEMPTS {
-                        time::sleep(time::Duration::from_secs(attempt as u64)).await;
-                    }
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            format!("failed to fetch block {block_hash} from {} after {MAX_ATTEMPTS} attempts", self.p2p_peer)
-                .into()
-        }))
+        // Unsized as is, so `watch_step` can downcast it to add when it is
+        // tried again.
+        p2p::BlockFetcher::new(self.p2p_peer, self.network)
+            .with_policy(self.p2p_retry)
+            .fetch(block_hash, height)
+            .await
+            .map_err(|e| -> ScannerError { e })
     }
 
     /// Update Electrum tip height and scan progress after each scanned block.
@@ -849,8 +796,10 @@ impl Scanner {
     ///
     /// A scan that cannot get past a height is retried on every poll and
     /// published as a stall ([`Scanner::scan_health`]) until it makes
-    /// progress. When the wallet's start height lies below the oracle's first
-    /// indexed block, scanning starts at that block instead (see
+    /// progress; a block the P2P node will not serve is retried after 30 s,
+    /// then on an interval doubling up to 5 min. When the wallet's start
+    /// height lies below the oracle's first indexed block, scanning starts at
+    /// that block instead (see
     /// [`Scanner::start_at_oracle_floor_if_below`]).
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
         loop {
@@ -874,7 +823,11 @@ impl Scanner {
 
             let oracle = OracleStreams(self.client.clone());
             if !self.watch_step(oracle_tip, oracle).await {
-                time::sleep(time::Duration::from_secs(10)).await;
+                // A block the P2P node would not serve is retried on a
+                // growing interval (the stall message says when).
+                let poll = time::Duration::from_secs(10);
+                let wait = self.fetch_backoff.take_wait().map_or(poll, |w| w.max(poll));
+                time::sleep(wait).await;
             }
         }
     }
@@ -899,16 +852,20 @@ impl Scanner {
         };
         match self.scan_range_from(from, to, oracle.clone()).await {
             Ok(()) => {
+                self.fetch_backoff.succeeded();
                 self.clear_stall().await;
                 false
             }
-            Err(e) => {
+            Err(mut e) => {
                 if from <= to
                     && self
                         .start_at_oracle_floor_if_below(&e, from, to, &mut oracle)
                         .await
                 {
                     return true;
+                }
+                if let Some(fetch) = e.downcast_mut::<p2p::BlockFetchError>() {
+                    fetch.retry = Some(self.fetch_backoff.failed(fetch.block_hash));
                 }
                 if e.downcast_ref::<ReorgTooDeep>().is_some() {
                     tracing::error!(
