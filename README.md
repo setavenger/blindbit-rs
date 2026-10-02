@@ -145,8 +145,9 @@ What to expect from it:
 `friglet-tray` is a small Tauri v2 system tray app that supervises and
 monitors the `friglet` daemon over its control socket. It shows live status
 (scan height, progress, network, Electrum clients, oracle connectivity, SP
-address, errors) in the tray menu and in a status window (hidden by default,
-opened via the tray menu; closing it hides it again). The tray menu and the
+address, errors) in the tray menu and in a status window (hidden by default;
+a left click on the tray icon opens it, and so does **Open Status Window** in
+the icon's right-click menu; closing it hides it again). The tray menu and the
 Status tab offer Start/Stop scanning, Start/Stop daemon and Quit; a button
 or menu item is only enabled when it does what it says (Start scanning is
 greyed out while a scan runs, Stop daemon while none is running).
@@ -220,6 +221,51 @@ The **Wallet** tab is a read-only convenience view, not a spending wallet. It
 shows found transaction/output counts plus copyable base and per-label Silent
 Payments addresses.
 
+**Tray icon on Linux.** The icon is a StatusNotifierItem (KSNI over D-Bus), so
+it needs a desktop with an SNI tray: Omarchy's bar, KDE Plasma, GNOME with
+the AppIndicator extension, Waybar's `tray` module and the like. Trays that
+only host legacy XEmbed icons do not show it. When no tray is up yet (the
+tray app started before the bar at login) the app keeps running and
+registers the icon as soon as one appears.
+
+**Omarchy / Hyprland: top-bar popup.** Under Hyprland (detected by
+`HYPRLAND_INSTANCE_SIGNATURE`; Omarchy 4 runs it) the window opens like
+Omarchy's own Wi-Fi and Bluetooth panels: floating, right-aligned just under
+the top bar, without a title bar, at a fixed 420×600 (smaller on a short
+screen). A left click on the tray icon opens it and a second one closes it;
+Esc closes it, and so does focusing another window (clicking it, or a
+keybinding). Merely moving the pointer over another window does not, although
+Omarchy focuses windows on hover. The right-click menu is unchanged.
+
+How: before each show the tray asks Hyprland, over its IPC socket, for the
+monitor under the pointer, the bar height (the monitor's reserved top) and
+`general:gaps_out`, and registers a window rule for its own window with the
+Lua API (`hl.window_rule`, Hyprland 0.55+): float, size, and a position
+`gaps_out / 2` below the bar and from the right edge. While the popup is open
+a second rule sets `no_follow_mouse` on every other window, so hovering them
+does not take the focus; hiding the popup turns it off. After the show the
+tray checks where the window landed (`hyprctl clients`) and moves it with
+dispatchers if it is off, which is also the only placement on a Hyprland
+without the Lua API. Nothing is written to your config files. Everywhere
+else (GNOME, KDE, other compositors, macOS, Windows) the window is the
+ordinary one: a left click on the icon opens it, the menu is on right click.
+
+If the tray runs without Hyprland's environment (say from a service that
+lacks `HYPRLAND_INSTANCE_SIGNATURE`) it opens the ordinary window. A static
+rule at the end of `~/.config/hypr/hyprland.lua` still floats it under the
+bar (Omarchy 4 syntax, as in Omarchy's own rules; `31` is Omarchy's default
+26 px bar plus a 5 px gap). The class is expected to be `friglet-tray`; the
+tray logs the one Hyprland reports in popup mode (`Hyprland window class of
+the status window` in `friglet-tray.log`), and `hyprctl clients` shows it:
+
+```lua
+o.window({ class = "^friglet-tray$", title = "^Friglet Status$" }, {
+  float = true,
+  size = { 420, 600 },
+  move = { "(monitor_w-window_w-5)", 31 },
+})
+```
+
 ```bash
 # build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
 # libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)
@@ -229,7 +275,7 @@ cargo build --release -p friglet-tray
 ./target/release/friglet-tray
 
 # optional: show the status window immediately (normally hidden until
-# opened from the tray menu — useful for headless / screenshot testing).
+# opened from the tray icon — useful for headless / screenshot testing).
 # Values: 1/true/yes/on/status → Status tab; settings → Settings tab;
 # wallet → Wallet tab.
 FRIGLET_TRAY_SHOW_ON_START=1 ./target/release/friglet-tray

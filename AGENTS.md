@@ -148,11 +148,21 @@ dbus-run-session -- bash -c '
   init is flaky. The tray and `gtk-sni-tray-standalone` must share that bus.
 - Tray icon: bare Xvfb has no StatusNotifierWatcher. With
   `gtk-sni-tray-standalone -w` (package `haskell-gtk-sni-tray-utils`) under
-  fluxbox the friglet SNI icon renders (ayatana path
-  `/org/ayatana/NotificationItem/tray_icon_tray_app_friglet_tray`).
+  fluxbox the friglet SNI icon renders. Since SNB-656 the Linux tray is
+  tray-icon's KSNI backend (feature `ksni` in `friglet-tray/Cargo.toml`), not
+  libayatana: bus name `org.kde.StatusNotifierItem-<pid>-<n>`, object
+  `/StatusNotifierItem`, `ItemIsMenu=false`, menu at `/MenuBar`. A host's
+  left click is `Activate` (toggles the window), right click opens the menu;
+  e.g. `gdbus call --session -d <name> -o /StatusNotifierItem -m
+  org.kde.StatusNotifierItem.Activate 0 0`. Without a watcher the tray keeps
+  running and retries the icon (2 s, doubling to 30 s).
   `snixembed` is not in Ubuntu apt; `trayer` alone only hosts legacy XEmbed
   icons, not StatusNotifierItem. xdotool clicks do not reach WebKitGTK under
   Xvfb — use `FRIGLET_TRAY_SHOW_ON_START=settings` for the Settings form.
+- Hyprland popup mode (`friglet-tray/src/popup.rs`) is on whenever
+  `HYPRLAND_INSTANCE_SIGNATURE` is set; its socket logic is unit-tested
+  against a fake `.socket.sock` in that file. Keep the socket path under
+  108 bytes (`sun_path`) when faking `XDG_RUNTIME_DIR`.
 
 ## Packaging (M4)
 
