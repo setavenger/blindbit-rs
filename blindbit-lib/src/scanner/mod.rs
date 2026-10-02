@@ -1,5 +1,7 @@
 // todo: make scanner data pulling engine flexible
 
+#[cfg(test)]
+mod cancel_tests;
 mod changeset;
 mod config;
 pub mod electrum_index;
@@ -35,7 +37,8 @@ pub use changeset::{ChangeSet, STATE_FORMAT_VERSION};
 pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
 pub use health::{
-    OracleFloorStart, ScanHealth, ScanStall, ScanStopped, StateFileReset, StateRescan,
+    OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
+    StateRescan,
 };
 pub use p2p::{
     BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy, broadcast_tx,

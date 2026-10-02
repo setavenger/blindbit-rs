@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use bitcoin::Block;
@@ -20,6 +20,7 @@ use bitcoin_p2p::{
 use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
 use bitcoin_rev::consensus::encode;
 use bitcoin_rev::{Network, TestnetVersion};
+use tokio_util::sync::CancellationToken;
 
 use super::ScannerError;
 
@@ -191,6 +192,9 @@ pub enum FetchFailure {
     /// The node sent a block that fails its checks (another block, or a
     /// merkle root or witness commitment mismatch).
     BadBlock(String),
+    /// The fetch was cancelled (see [`BlockFetcher::with_cancel`]): the
+    /// scan is stopping. Says nothing about the node.
+    Cancelled,
 }
 
 impl FetchFailure {
@@ -236,6 +240,7 @@ impl fmt::Display for FetchFailure {
             Self::Broken(error) => write!(f, "connection broke: {error}"),
             Self::WitnessStripped => write!(f, "block came without its witness data"),
             Self::BadBlock(error) => write!(f, "bad block: {error}"),
+            Self::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -460,6 +465,7 @@ impl fmt::Display for BlockFetchError {
                 "the node sent a block that fails its checks ({error}){tries}. Point \
                  p2p_node_addr at a Bitcoin Core node you trust."
             )?,
+            FetchFailure::Cancelled => write!(f, "the download was cancelled.")?,
         }
         if let Some(retry) = self.retry {
             write!(
@@ -529,6 +535,7 @@ pub struct BlockFetcher {
     peer: SocketAddr,
     network: Network,
     policy: RetryPolicy,
+    cancel: CancellationToken,
 }
 
 impl BlockFetcher {
@@ -537,11 +544,20 @@ impl BlockFetcher {
             peer,
             network,
             policy: RetryPolicy::default(),
+            cancel: CancellationToken::new(),
         }
     }
 
     pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// End [`Self::fetch`] as soon as `cancel` is cancelled, wherever it
+    /// waits: connecting, in the handshake, for the block or between
+    /// attempts. It then fails with [`FetchFailure::Cancelled`].
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
         self
     }
 
@@ -554,7 +570,9 @@ impl BlockFetcher {
     /// broken) are retried after 1, 2, 4, 8 s; the others end the call at
     /// once, since asking again right away cannot change the answer.
     ///
-    /// The network I/O itself is blocking, as it always was here.
+    /// The connection's I/O is blocking and runs on a thread of its own, so
+    /// it never blocks the async runtime and the call stays cancellable:
+    /// see [`Self::with_cancel`]. Dropping the future cancels it too.
     pub async fn fetch(
         &self,
         block_hash: BlockHash,
@@ -570,14 +588,19 @@ impl BlockFetcher {
         let mut last = None;
         for attempt in 1..=attempts {
             if attempt > 1 {
-                tokio::time::sleep(self.policy.delay_before(attempt)).await;
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => {
+                        last = Some(FetchFailure::Cancelled);
+                        break;
+                    }
+                    () = tokio::time::sleep(self.policy.delay_before(attempt)) => {}
+                }
             }
             tried = attempt;
-            let result = P2pConnection::open(self.peer, self.network, read_timeout, &mut local_ip)
-                .and_then(|mut connection| {
-                    peer_info = Some(connection.info);
-                    connection.fetch_block(block_hash, self.policy.block_deadline)
-                });
+            let result = self
+                .attempt(block_hash, read_timeout, &mut peer_info, &mut local_ip)
+                .await;
             match result {
                 Ok(block) => {
                     if attempt > 1 {
@@ -590,6 +613,10 @@ impl BlockFetcher {
                         );
                     }
                     return Ok(block);
+                }
+                Err(FetchFailure::Cancelled) => {
+                    last = Some(FetchFailure::Cancelled);
+                    break;
                 }
                 Err(failure) => {
                     tracing::warn!(
@@ -609,6 +636,9 @@ impl BlockFetcher {
                 }
             }
         }
+        if last == Some(FetchFailure::Cancelled) {
+            tracing::info!(peer = %self.peer, height, %block_hash, "block fetch cancelled");
+        }
         Err(Box::new(BlockFetchError {
             peer: self.peer,
             network: self.network,
@@ -620,6 +650,90 @@ impl BlockFetcher {
             local_ip,
             retry: None,
         }))
+    }
+
+    /// One attempt on a fresh connection.
+    ///
+    /// The TCP connect is async, so cancelling abandons it at once. The
+    /// handshake and the download then run on a thread of their own, with
+    /// blocking socket I/O and per-read timeouts as before; this future only
+    /// waits for that thread's answer. On cancellation (or when this future
+    /// is dropped) the socket is shut down, which wakes a read or write
+    /// blocked on it, so the thread ends right away instead of after its
+    /// read timeout.
+    async fn attempt(
+        &self,
+        block_hash: BlockHash,
+        read_timeout: Duration,
+        peer_info: &mut Option<PeerInfo>,
+        local_ip: &mut Option<IpAddr>,
+    ) -> Result<Block, FetchFailure> {
+        tracing::debug!(peer = %self.peer, "opening P2P connection for a block fetch");
+        let opened = Instant::now();
+        let connect =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(self.peer));
+        let stream = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled),
+            connected = connect => match connected {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => return Err(FetchFailure::Connect(e.to_string())),
+                Err(_) => return Err(FetchFailure::Connect("connection timed out".to_string())),
+            },
+        };
+        let stream = stream
+            .into_std()
+            .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+            .map_err(|e| FetchFailure::Broken(e.to_string()))?;
+        if let Ok(local) = stream.local_addr() {
+            *local_ip = Some(local.ip());
+        }
+        let _shutdown = ShutdownOnDrop(
+            stream
+                .try_clone()
+                .map_err(|e| FetchFailure::Broken(e.to_string()))?,
+        );
+
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let (peer, network, deadline) = (self.peer, self.network, self.policy.block_deadline);
+        let cancel = self.cancel.clone();
+        std::thread::Builder::new()
+            .name("p2p-block-fetch".to_string())
+            .spawn(move || {
+                let mut info = None;
+                let result = P2pConnection::handshake(stream, peer, network, read_timeout, opened)
+                    .and_then(|mut connection| {
+                        info = Some(connection.info);
+                        connection.fetch_block(block_hash, deadline, &cancel)
+                    });
+                let _ = answer.send((info, result));
+            })
+            .map_err(|e| FetchFailure::Broken(format!("cannot start the download: {e}")))?;
+
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(FetchFailure::Cancelled),
+            answered = answered => {
+                let (info, result) = answered.map_err(|_| {
+                    FetchFailure::Broken("the download ended without an answer".to_string())
+                })?;
+                if info.is_some() {
+                    *peer_info = info;
+                }
+                result
+            }
+        }
+    }
+}
+
+/// A second handle on a connection's socket that shuts the connection down
+/// when dropped. A shutdown ends a read or write blocked on the socket in
+/// another thread at once (it then sees the connection closed).
+struct ShutdownOnDrop(TcpStream);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
     }
 }
 
@@ -642,21 +756,15 @@ struct P2pConnection {
 }
 
 impl P2pConnection {
-    /// Connect to `peer` and complete the version handshake. Records
-    /// friglet's own address on the connection in `local_ip`.
-    fn open(
+    /// Complete the version handshake on `stream`, a TCP connection to
+    /// `peer` opened at `opened`.
+    fn handshake(
+        stream: TcpStream,
         peer: SocketAddr,
         network: Network,
         read_timeout: Duration,
-        local_ip: &mut Option<IpAddr>,
+        opened: Instant,
     ) -> Result<Self, FetchFailure> {
-        tracing::debug!(peer = %peer, "opening P2P connection for a block fetch");
-        let opened = Instant::now();
-        let stream = TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT)
-            .map_err(|e| FetchFailure::Connect(e.to_string()))?;
-        if let Ok(local) = stream.local_addr() {
-            *local_ip = Some(local.ip());
-        }
         let configure = |stream: &TcpStream| -> io::Result<()> {
             stream.set_read_timeout(Some(read_timeout))?;
             stream.set_write_timeout(Some(READ_TIMEOUT))?;
@@ -700,6 +808,7 @@ impl P2pConnection {
         &mut self,
         block_hash: BlockHash,
         deadline: Duration,
+        cancel: &CancellationToken,
     ) -> Result<Block, FetchFailure> {
         let primitives_block_hash =
             PrimitivesBlockHash::from_byte_array(*block_hash.as_byte_array());
@@ -720,6 +829,12 @@ impl P2pConnection {
         let mut last_idle_log = 0u64;
 
         loop {
+            // The caller has stopped waiting (and shut the socket down);
+            // checked here too in case a platform's shutdown does not wake
+            // a blocked read.
+            if cancel.is_cancelled() {
+                return Err(FetchFailure::Cancelled);
+            }
             if started.elapsed() > deadline {
                 return Err(FetchFailure::NoAnswer(started.elapsed()));
             }
