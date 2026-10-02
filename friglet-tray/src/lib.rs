@@ -4,6 +4,7 @@
 //! window, and manages the daemon lifecycle (attach or spawn, quit rule).
 
 pub mod lifecycle;
+pub mod popup;
 pub mod setup;
 pub mod view;
 
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use friglet_ipc::{Client, DaemonConfig, Request, Response, StatusInfo};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tokio::process::Child;
@@ -935,15 +936,33 @@ fn quit(app: &AppHandle) {
             (lc.spawned_by_tray, lc.child.take())
         };
         lifecycle::perform_quit(&state.socket_path, spawned_by_tray, child).await;
+        // Popup mode: give hover focus back to the other windows.
+        let popup = app.state::<Arc<popup::Popup>>().inner().clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || popup.release()).await;
         app.exit(0);
     });
 }
 
+/// Show the main window: under Hyprland as the top-bar popup, elsewhere as
+/// the ordinary window.
 fn show_status_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
+        app.state::<Arc<popup::Popup>>().show(&window);
     }
+}
+
+/// Left click on the tray icon: toggle the popup under Hyprland, open the
+/// window elsewhere.
+fn tray_left_click(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        app.state::<Arc<popup::Popup>>().toggle(&window);
+    }
+}
+
+/// Esc in the window: closes the popup (no-op outside popup mode).
+#[tauri::command]
+fn dismiss_window(window: tauri::WebviewWindow, popup: State<'_, Arc<popup::Popup>>) {
+    popup.dismiss(&window);
 }
 
 /// Show the main window and switch it to the Settings tab once the UI has
@@ -1117,6 +1136,74 @@ fn refresh(state: &AppState, info: Option<&StatusInfo>) -> (DaemonView, ScanView
     (daemon, scan, spawned_by_tray.unwrap_or(false))
 }
 
+const TRAY_ID: &str = "friglet-tray";
+/// Wait before the first retry to register the tray icon; it doubles up to
+/// `TRAY_RETRY_MAX`.
+const TRAY_RETRY_FIRST: Duration = Duration::from_secs(2);
+const TRAY_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Create the tray icon. A left click opens the window (on Hyprland it
+/// toggles the top-bar popup, see [`popup`]); the menu is on right click.
+/// On Linux the icon is a KSNI StatusNotifierItem (`ItemIsMenu=false`), so
+/// SNI hosts send left clicks as `Activate` instead of opening the menu.
+fn build_tray(app: &AppHandle, menu: &Menu<tauri::Wry>) -> tauri::Result<TrayIcon> {
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(
+            app.default_window_icon()
+                .cloned()
+                .expect("bundled window icon"),
+        )
+        .menu(menu)
+        // macOS / Windows: menu on right click only, like the Linux hosts.
+        .show_menu_on_left_click(false)
+        .tooltip("Friglet")
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                tray_left_click(tray.app_handle());
+            }
+        })
+        .on_menu_event(|app, event| {
+            let state = app.state::<Arc<AppState>>().inner().clone();
+            match event.id().as_ref() {
+                "open-window" => show_status_window(app),
+                "start-scan" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = scan_control(&state, Request::Start).await;
+                    });
+                }
+                "stop-scan" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = scan_control(&state, Request::Stop).await;
+                    });
+                }
+                "start-daemon" => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = start_daemon_now(&state).await;
+                        // An unconfigured daemon lands in setup mode
+                        // instead of a spawn-fail loop; take the user there.
+                        if state.setup_needed.load(Ordering::SeqCst) {
+                            show_settings_window(&app);
+                        }
+                    });
+                }
+                "stop-daemon" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = stop_daemon_now(&state).await;
+                    });
+                }
+                "quit" => quit(app),
+                _ => {}
+            }
+        })
+        .build(app)
+}
+
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let handle = app.handle();
 
@@ -1160,56 +1247,37 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         ],
     )?;
 
-    let tray = TrayIconBuilder::with_id("friglet-tray")
-        .icon(
-            app.default_window_icon()
-                .cloned()
-                .expect("bundled window icon"),
-        )
-        .menu(&menu)
-        .show_menu_on_left_click(true)
-        .tooltip("Friglet")
-        .on_menu_event(|app, event| {
-            let state = app.state::<Arc<AppState>>().inner().clone();
-            match event.id().as_ref() {
-                "open-window" => show_status_window(app),
-                "start-scan" => {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = scan_control(&state, Request::Start).await;
-                    });
+    // Without a StatusNotifierWatcher (the bar is not up yet at login, or
+    // the desktop has no SNI tray) the KSNI backend cannot register the icon
+    // and the build fails. Keep running without it and retry: the window,
+    // the daemon supervision and first-run setup do not need the icon.
+    if let Err(e) = build_tray(handle, &menu) {
+        tracing::warn!(error = %e, "tray icon unavailable; retrying in the background");
+        let handle = handle.clone();
+        let menu = menu.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut delay = TRAY_RETRY_FIRST;
+            loop {
+                tokio::time::sleep(delay).await;
+                match build_tray(&handle, &menu) {
+                    Ok(_) => {
+                        tracing::info!("tray icon registered");
+                        break;
+                    }
+                    Err(e) => tracing::debug!(error = %e, "tray icon still unavailable"),
                 }
-                "stop-scan" => {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = scan_control(&state, Request::Stop).await;
-                    });
-                }
-                "start-daemon" => {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = start_daemon_now(&state).await;
-                        // An unconfigured daemon lands in setup mode
-                        // instead of a spawn-fail loop; take the user there.
-                        if state.setup_needed.load(Ordering::SeqCst) {
-                            show_settings_window(&app);
-                        }
-                    });
-                }
-                "stop-daemon" => {
-                    tauri::async_runtime::spawn(async move {
-                        let _ = stop_daemon_now(&state).await;
-                    });
-                }
-                "quit" => quit(app),
-                _ => {}
+                delay = (delay * 2).min(TRAY_RETRY_MAX);
             }
-        })
-        .build(app)?;
+        });
+    }
 
     // Background poller: refresh shared status every second and update the
     // tray label / tooltip / item enablement when something changed.
     let state = app.state::<Arc<AppState>>().inner().clone();
+    let handle = handle.clone();
     tauri::async_runtime::spawn(async move {
         let mut last_label = String::new();
+        let mut had_tray = false;
         let mut last_enablement: Option<[bool; 4]> = None;
         let mut last_quit_label: Option<&'static str> = None;
         loop {
@@ -1229,10 +1297,19 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             let (daemon, scan, spawned_by_tray) = refresh(&state, info.as_ref());
 
             let label = tray_label(&daemon, &scan, info.as_ref());
-            if label != last_label {
-                tracing::info!(%label, "tray status label updated");
-                let _ = status_item.set_text(&label);
-                let _ = tray.set_tooltip(Some(tray_tooltip(&daemon, &scan, info.as_ref())));
+            let tray = handle.tray_by_id(TRAY_ID);
+            // A tray icon that appeared late (see the retry above) gets the
+            // current tooltip too.
+            let new_tray = tray.is_some() && !had_tray;
+            had_tray = tray.is_some();
+            if label != last_label || new_tray {
+                if label != last_label {
+                    tracing::info!(%label, "tray status label updated");
+                    let _ = status_item.set_text(&label);
+                }
+                if let Some(tray) = tray {
+                    let _ = tray.set_tooltip(Some(tray_tooltip(&daemon, &scan, info.as_ref())));
+                }
                 last_label = label;
             }
 
@@ -1330,6 +1407,7 @@ pub fn run() {
             None,
         ))
         .manage(state)
+        .manage(Arc::new(popup::Popup::detect()))
         .invoke_handler(tauri::generate_handler![
             get_status,
             start_scanning,
@@ -1346,19 +1424,41 @@ pub fn run() {
             set_autostart,
             start_daemon,
             stop_daemon,
-            open_log_folder
+            open_log_folder,
+            dismiss_window
         ])
-        .on_window_event(|window, event| {
+        .on_window_event(|window, event| match event {
             // Tray-only app: closing the status window hides it.
-            if let WindowEvent::CloseRequested { api, .. } = event {
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
-                let _ = window.hide();
+                match window.app_handle().get_webview_window(window.label()) {
+                    Some(webview) => window
+                        .app_handle()
+                        .state::<Arc<popup::Popup>>()
+                        .hide(&webview),
+                    None => {
+                        let _ = window.hide();
+                    }
+                }
             }
+            // The popup closes when another window takes the focus.
+            WindowEvent::Focused(focused) => {
+                if let Some(webview) = window.app_handle().get_webview_window(window.label()) {
+                    window
+                        .app_handle()
+                        .state::<Arc<popup::Popup>>()
+                        .focus_changed(&webview, *focused);
+                }
+            }
+            _ => {}
         })
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            if let Some(window) = app.get_webview_window("main") {
+                app.state::<Arc<popup::Popup>>().prepare(&window);
+            }
             setup_tray(app)?;
 
             if let Some(tab) = show_on_start_env() {

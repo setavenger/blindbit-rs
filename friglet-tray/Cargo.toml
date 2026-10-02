@@ -21,5 +21,13 @@ tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 
+# Linux: route tray-icon to its KSNI (StatusNotifierItem over D-Bus) backend.
+# Tauri enables the libappindicator backend, which never reports clicks
+# (libayatana rejects `Activate`), so a left click on the icon did nothing.
+# With both features on, tray-icon uses KSNI: `ItemIsMenu=false`, left click
+# arrives as `TrayIconEvent::Click`, right click still opens the menu.
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
+
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
