@@ -1,19 +1,21 @@
 //! Owns the background scan task and allows starting/stopping it at runtime.
 //!
-//! `watch_chain(&mut self)` holds the scanner's tokio mutex for its entire
-//! run and is not cancellation-aware internally, so stopping works by
-//! dropping the future: the spawned task `select!`s between the cancellation
-//! token and the scan future, and cancelling drops the future along with the
-//! mutex guard it owns, releasing the scanner lock. In-memory scan progress
-//! is persisted by the scan loop itself (blindbit-lib checkpoints during
-//! scanning); callers additionally save state once the task has ended.
+//! Each run gets a fresh [`CancellationToken`], which the task factory hands
+//! to the scan (`Scanner::watch_chain_until`). Cancelling it stops the scan
+//! at its next safe point: between blocks, or wherever it waits (the poll
+//! interval, a retry wait, an oracle request, a P2P block download), all of
+//! which give way to the token at once. A stop therefore takes effect within
+//! milliseconds, even in the middle of a block download from a stalled
+//! node, and never leaves a block half applied: the scanned height stays
+//! below a block whose download was cut short, and the next start resumes
+//! there. The task then ends, releasing the scanner lock it holds; callers
+//! save the state once it has ended.
 //!
-//! A dropped future only stops at its next `.await`. blindbit-lib downloads
-//! matching blocks from the P2P node with blocking socket I/O inside the scan
-//! future (up to 90 s per attempt), so a stop requested during a download
-//! takes effect only when the download returns. Until then the task is
-//! reported as [`ScanState::Stopping`], never as stopped: the status must not
-//! claim the scan has ended (and offer Start) while it still runs.
+//! As a safety net, a task still running [`CANCEL_GRACE`] after its token
+//! was cancelled is dropped at its next `.await` (that drops the scanner
+//! lock too). Until the task has really ended it is reported as
+//! [`ScanState::Stopping`], never as stopped: the status must not claim the
+//! scan has ended (and offer Start) while it still runs.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,8 +28,13 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// How long a cancelled scan task may take to stop by itself before it is
+/// dropped. The scan stops within milliseconds; this only bounds a task
+/// stuck in a step that does not watch the token.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
 type TaskFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
-type TaskFactory = Box<dyn Fn() -> TaskFuture + Send + Sync>;
+type TaskFactory = Box<dyn Fn(CancellationToken) -> TaskFuture + Send + Sync>;
 
 pub struct ScanSupervisor {
     factory: TaskFactory,
@@ -37,6 +44,8 @@ pub struct ScanSupervisor {
     /// survives an in-process restart (a settings change); cleared by
     /// [`ScanSupervisor::start`].
     paused: Arc<AtomicBool>,
+    /// See [`CANCEL_GRACE`].
+    grace: Duration,
 }
 
 struct Running {
@@ -48,8 +57,11 @@ struct Running {
 }
 
 impl Running {
+    /// The task has not ended. `done` is set as its last step, just before
+    /// the task finishes, so checking it too means a caller woken by
+    /// [`ScanSupervisor::wait_stopped`] never still sees the task alive.
     fn alive(&self) -> bool {
-        !self.handle.is_finished()
+        !self.handle.is_finished() && !*self.done.borrow()
     }
 }
 
@@ -63,12 +75,13 @@ pub enum StartOutcome {
 }
 
 impl ScanSupervisor {
-    /// `factory` produces a fresh scan future for each `start()`. The future
-    /// must tolerate being dropped at any await point (that is how it gets
-    /// cancelled). `paused` carries a requested pause across in-process
-    /// restarts.
+    /// `factory` produces a fresh scan future for each `start()`, given the
+    /// token that stops it: once the token is cancelled the future should
+    /// return at its next safe point. It must also tolerate being dropped
+    /// at any await point (the fallback after [`CANCEL_GRACE`]). `paused`
+    /// carries a requested pause across in-process restarts.
     pub fn new(
-        factory: impl Fn() -> TaskFuture + Send + Sync + 'static,
+        factory: impl Fn(CancellationToken) -> TaskFuture + Send + Sync + 'static,
         paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -76,7 +89,14 @@ impl ScanSupervisor {
             running: Mutex::new(None),
             last_error: Arc::new(Mutex::new(None)),
             paused,
+            grace: CANCEL_GRACE,
         }
+    }
+
+    #[cfg(test)]
+    fn with_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
     }
 
     /// Start the scan task (and end a pause).
@@ -94,24 +114,39 @@ impl ScanSupervisor {
         *self.last_error.lock().unwrap() = None;
         let token = CancellationToken::new();
         let task_token = token.clone();
-        let future = (self.factory)();
+        let mut future = (self.factory)(token.clone());
+        let grace = self.grace;
         let last_error = self.last_error.clone();
         let (done_tx, done) = watch::channel(false);
         let handle = tokio::spawn(async move {
-            tokio::select! {
-                // Check the token first on every wake-up: unbiased, the scan
-                // future may be polled first and run on into its next
-                // blocking step although a stop is pending.
+            let overdue = async {
+                task_token.cancelled().await;
+                tokio::time::sleep(grace).await;
+            };
+            let result = tokio::select! {
                 biased;
-                _ = task_token.cancelled() => {
-                    tracing::info!("scan task cancelled");
+                result = &mut future => Some(result),
+                () = overdue => None,
+            };
+            // Release whatever the task holds (the scanner lock) before
+            // reporting it ended.
+            drop(future);
+            let stopping = task_token.is_cancelled();
+            match result {
+                Some(Ok(())) if stopping => tracing::info!("scan task stopped"),
+                Some(Ok(())) => tracing::info!("scan task ended"),
+                // Most likely a consequence of the stop; not a scan failure.
+                Some(Err(e)) if stopping => {
+                    tracing::warn!(error = %e, "scan task ended with an error while stopping");
                 }
-                result = future => {
-                    if let Err(e) = result {
-                        tracing::error!(error = %e, "scan task terminated with error");
-                        *last_error.lock().unwrap() = Some(e);
-                    }
+                Some(Err(e)) => {
+                    tracing::error!(error = %e, "scan task terminated with error");
+                    *last_error.lock().unwrap() = Some(e);
                 }
+                None => tracing::warn!(
+                    grace_ms = grace.as_millis() as u64,
+                    "scan task did not stop by itself after it was cancelled; dropped it"
+                ),
             }
             let _ = done_tx.send(true);
         });
@@ -124,7 +159,7 @@ impl ScanSupervisor {
     }
 
     /// Pause scanning: remember the pause and cancel the task. Returns
-    /// `false` when no task was running. The task ends at its next await
+    /// `false` when no task was running. The task ends at its next safe
     /// point; see [`ScanSupervisor::wait_stopped`].
     pub fn request_stop(&self) -> bool {
         self.paused.store(true, Ordering::SeqCst);
@@ -213,6 +248,7 @@ impl ScanSupervisor {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
 
     struct ActiveGuard(Arc<AtomicUsize>);
     impl Drop for ActiveGuard {
@@ -221,16 +257,18 @@ mod tests {
         }
     }
 
-    fn pending_task_supervisor() -> (ScanSupervisor, Arc<AtomicUsize>) {
+    /// Tasks that run until their token is cancelled, counting how many are
+    /// alive.
+    fn cooperative_task_supervisor() -> (ScanSupervisor, Arc<AtomicUsize>) {
         let active = Arc::new(AtomicUsize::new(0));
         let counter = active.clone();
         let supervisor = ScanSupervisor::new(
-            move || {
+            move |token| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let guard = ActiveGuard(counter.clone());
                 Box::pin(async move {
                     let _guard = guard;
-                    std::future::pending::<()>().await;
+                    token.cancelled().await;
                     Ok(())
                 })
             },
@@ -241,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_stop_restart_without_leaking_task() {
-        let (supervisor, active) = pending_task_supervisor();
+        let (supervisor, active) = cooperative_task_supervisor();
 
         assert!(!supervisor.is_running());
         assert!(!supervisor.stop().await, "stop while stopped is a no-op");
@@ -277,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn failed_task_reports_last_error() {
         let supervisor = ScanSupervisor::new(
-            || Box::pin(async { Err("oracle unreachable".to_string()) }),
+            |_| Box::pin(async { Err("oracle unreachable".to_string()) }),
             Arc::default(),
         );
         supervisor.start();
@@ -290,30 +328,67 @@ mod tests {
         );
     }
 
-    /// blindbit-lib downloads blocks from the P2P node with blocking I/O
-    /// inside the scan future, so cancellation waits for the download.
-    /// Modelled with a blocking sleep: until the task really ends, the state
-    /// is Stopping (never Paused), Start is refused, and the task makes no
-    /// further progress once it reaches an await.
+    /// The scan waits for a block download that runs on another thread and
+    /// would take 30 s; the token reaches the wait, so the task ends and the
+    /// state is Paused right away. The download thread does not hold it up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_during_a_blocking_download_reports_stopping_until_it_returns() {
-        let blocks = Arc::new(AtomicUsize::new(0));
-        let counter = blocks.clone();
+    async fn stop_during_a_download_pauses_at_once() {
         let supervisor = ScanSupervisor::new(
-            move || {
-                let counter = counter.clone();
+            |token| {
                 Box::pin(async move {
-                    loop {
-                        std::thread::sleep(Duration::from_millis(800));
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        tokio::task::yield_now().await;
+                    let (finished, download) = tokio::sync::oneshot::channel::<()>();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(30));
+                        let _ = finished.send(());
+                    });
+                    tokio::select! {
+                        () = token.cancelled() => Ok(()),
+                        _ = download => Err("downloaded".to_string()),
                     }
                 })
             },
             Arc::default(),
         );
         supervisor.start();
-        tokio::time::sleep(Duration::from_millis(100)).await; // inside the "download"
+        tokio::time::sleep(Duration::from_millis(100)).await; // inside the download
+
+        let began = Instant::now();
+        assert!(supervisor.request_stop());
+        assert!(
+            supervisor
+                .wait_stopped(Some(Duration::from_millis(500)))
+                .await
+        );
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert_eq!(supervisor.state(), ScanState::Paused);
+        assert_eq!(supervisor.last_error(), None);
+        assert_eq!(supervisor.start(), StartOutcome::Started);
+        supervisor.cancel();
+    }
+
+    /// A step that blocks a worker thread cannot be interrupted: until the
+    /// task really ends the state is Stopping (never Paused), Start is
+    /// refused, and the task makes no further progress once it returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_a_blocking_step_reports_stopping_until_it_returns() {
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let counter = blocks.clone();
+        let supervisor = ScanSupervisor::new(
+            move |token| {
+                let counter = counter.clone();
+                Box::pin(async move {
+                    while !token.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(800));
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(())
+                })
+            },
+            Arc::default(),
+        );
+        supervisor.start();
+        tokio::time::sleep(Duration::from_millis(100)).await; // inside the step
 
         assert!(supervisor.request_stop());
         assert!(supervisor.is_paused());
@@ -330,7 +405,7 @@ mod tests {
         assert!(supervisor.wait_stopped(Some(Duration::from_secs(5))).await);
         assert_eq!(supervisor.state(), ScanState::Paused);
         let after_stop = blocks.load(Ordering::SeqCst);
-        assert_eq!(after_stop, 1, "only the download in flight completed");
+        assert_eq!(after_stop, 1, "only the step in flight completed");
         tokio::time::sleep(Duration::from_millis(1000)).await;
         assert_eq!(
             blocks.load(Ordering::SeqCst),
@@ -341,11 +416,70 @@ mod tests {
         supervisor.cancel();
     }
 
+    /// A task that never looks at its token is dropped once the grace
+    /// period is over.
+    #[tokio::test]
+    async fn a_task_that_ignores_the_token_is_dropped_after_the_grace_period() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let counter = active.clone();
+        let supervisor = ScanSupervisor::new(
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let guard = ActiveGuard(counter.clone());
+                Box::pin(async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            },
+            Arc::default(),
+        )
+        .with_grace(Duration::from_millis(300));
+        supervisor.start();
+        let began = Instant::now();
+        assert!(supervisor.request_stop());
+        assert!(
+            !supervisor
+                .wait_stopped(Some(Duration::from_millis(150)))
+                .await
+        );
+        assert_eq!(supervisor.state(), ScanState::Stopping);
+        assert!(supervisor.wait_stopped(Some(Duration::from_secs(2))).await);
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert_eq!(active.load(Ordering::SeqCst), 0, "dropped");
+        assert_eq!(supervisor.state(), ScanState::Paused);
+    }
+
+    /// An error a task returns because it was stopped is not a scan
+    /// failure.
+    #[tokio::test]
+    async fn an_error_while_stopping_is_not_recorded() {
+        let supervisor = ScanSupervisor::new(
+            |token| {
+                Box::pin(async move {
+                    token.cancelled().await;
+                    Err("connection reset".to_string())
+                })
+            },
+            Arc::default(),
+        );
+        supervisor.start();
+        assert!(supervisor.cancel());
+        assert!(supervisor.wait_stopped(Some(Duration::from_secs(1))).await);
+        assert_eq!(supervisor.last_error(), None);
+        assert_eq!(supervisor.state(), ScanState::Paused);
+    }
+
     #[tokio::test]
     async fn cancel_for_shutdown_does_not_record_a_pause() {
         let paused = Arc::new(AtomicBool::new(false));
         let supervisor = ScanSupervisor::new(
-            || Box::pin(std::future::pending::<Result<(), String>>()),
+            |token| {
+                Box::pin(async move {
+                    token.cancelled().await;
+                    Ok(())
+                })
+            },
             paused.clone(),
         );
         supervisor.start();

@@ -15,6 +15,7 @@ use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::{Mutex, broadcast};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
@@ -105,6 +106,10 @@ pub struct Scanner {
     /// When to next try restoring the witness data of wallet transactions
     /// stored without it (see `witness.rs`); `None` once done.
     pub(crate) witness_restore_due: Option<std::time::Instant>,
+
+    /// Stops the running scan at its next safe point once cancelled; set by
+    /// [`Scanner::watch_chain_until`] for its run, never cancelled otherwise.
+    pub(crate) cancel: CancellationToken,
 }
 
 impl Scanner {
@@ -189,6 +194,7 @@ impl Scanner {
             p2p_retry: p2p::RetryPolicy::default(),
             fetch_backoff: p2p::FetchBackoff::default(),
             witness_restore_due: Some(std::time::Instant::now()),
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -812,6 +818,7 @@ impl Scanner {
             p2p_retry: p2p::RetryPolicy::default(),
             fetch_backoff: p2p::FetchBackoff::default(),
             witness_restore_due: Some(std::time::Instant::now()),
+            cancel: CancellationToken::new(),
         };
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.

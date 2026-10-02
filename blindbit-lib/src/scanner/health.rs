@@ -112,6 +112,25 @@ impl std::fmt::Display for ScanStopped {
 
 impl std::error::Error for ScanStopped {}
 
+/// The scan was cancelled (the token given to
+/// [`Scanner::watch_chain_until`](super::Scanner::watch_chain_until) was
+/// cancelled) before it finished.
+///
+/// It stops only where nothing is half done: between blocks, or while it
+/// waits for the oracle, the P2P node or its next poll. Every block up to
+/// the scanned height was fully processed and nothing above it was, so the
+/// next scan resumes at the block after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCancelled;
+
+impl std::fmt::Display for ScanCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("scan cancelled")
+    }
+}
+
+impl std::error::Error for ScanCancelled {}
+
 /// The oracle's per-height block hash lookup (`GetBlockHashByHeight`).
 pub(crate) trait OracleProbe {
     /// The block hash the oracle has indexed at `height`, or `None` when it

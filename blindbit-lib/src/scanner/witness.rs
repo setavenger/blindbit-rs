@@ -15,6 +15,7 @@ use bitcoin::script::Instruction;
 use bitcoin::{BlockHash, Script, Transaction, Txid};
 use indexer::bdk_chain::bdk_core::Merge;
 
+use super::health::ScanCancelled;
 use super::scanner::Scanner;
 
 /// How long to wait before trying again when a block could not be fetched.
@@ -69,7 +70,8 @@ impl Scanner {
     /// Put back the witnesses of wallet transactions stored without them,
     /// once: called on every `watch_chain` poll, it does nothing once a pass
     /// has finished, and after a block could not be fetched it waits 5 min
-    /// before trying again.
+    /// before trying again. A pass cut short by a stop is taken up again as
+    /// soon as scanning resumes.
     pub(crate) async fn restore_missing_witnesses_when_due(&mut self) {
         let Some(due) = self.witness_restore_due else {
             return;
@@ -77,11 +79,11 @@ impl Scanner {
         if Instant::now() < due {
             return;
         }
-        self.witness_restore_due = if self.restore_missing_witnesses().await {
-            None
-        } else {
-            Some(Instant::now() + RETRY_AFTER)
-        };
+        let complete = self.restore_missing_witnesses().await;
+        if !complete && self.cancel.is_cancelled() {
+            return;
+        }
+        self.witness_restore_due = (!complete).then(|| Instant::now() + RETRY_AFTER);
     }
 
     /// Fetch the blocks of wallet transactions stored without witness data
@@ -102,6 +104,11 @@ impl Scanner {
         for ((height, hash), txids) in lacking {
             let block = match self.fetch_block_with_retry(hash, height.into()).await {
                 Ok(block) => block,
+                // Stopping: the blocks restored so far are complete.
+                Err(error) if error.is::<ScanCancelled>() => {
+                    complete = false;
+                    break;
+                }
                 Err(error) => {
                     tracing::warn!(
                         height,

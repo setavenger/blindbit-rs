@@ -780,5 +780,24 @@ $("tab-status").addEventListener("click", () => showTab("status"));
 $("tab-settings").addEventListener("click", () => showTab("settings"));
 $("tab-wallet").addEventListener("click", () => showTab("wallet"));
 
+// Esc closes the window when it is the top-bar popup (Hyprland); for the
+// ordinary window the command does nothing. It acts on the release of a press
+// the page saw: hiding on the press cuts the keystroke in half (in tests under
+// Xvfb WebKitGTK then delivered the press again when the window reappeared,
+// closing it at once), and an Esc that closes a dropdown never reaches the
+// page as a press.
+let escPressed = false;
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") escPressed = !e.defaultPrevented;
+});
+document.addEventListener("keyup", (e) => {
+  if (e.key !== "Escape" || !escPressed) return;
+  escPressed = false;
+  invoke("dismiss_window").catch((err) => console.error("dismiss_window failed", err));
+});
+window.addEventListener("blur", () => {
+  escPressed = false;
+});
+
 refresh();
 setInterval(refresh, 1000);
