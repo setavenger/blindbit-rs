@@ -21,8 +21,12 @@ name = "fetch_block"
 # bitcoin = { version = "0.32.7", features = ["secp256k1"] }
 # bdk_sp = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 # indexer = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
-bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
-indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
+# Pinned to setavenger/bdk-sp commit 94b72f6, "fix(receive): stop scan_txouts at BIP-352
+# K_max" (setavenger/bdk-sp#1, SNB-540). That PR lands in the fork with a merge commit, never
+# squash or rebase, so this exact commit stays in the fork's history and the pin stays valid
+# after the merge. friglet/Cargo.toml pins bdk_sp to the same rev; change both together.
+bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", rev = "94b72f60b0015793e4db67355bdab8d240eecc00", version = "0.1.0" }
+indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", rev = "94b72f60b0015793e4db67355bdab8d240eecc00", version = "0.1.0" }
 
 
 prost = "0.14.1"
