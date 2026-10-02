@@ -99,7 +99,8 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   Unit/e2e coverage: `friglet-tray/src/setup.rs` tests, the
   `setup_required_*` cases in `friglet-tray/tests/lifecycle_e2e.rs`, and
   the setup-mode tests in `friglet-tray/src/lib.rs`.
-- Tray icons are generated placeholders; regenerate with
+- Tray/bundle icons are a small sailing ship (friglet is a little Frigate),
+  drawn by `friglet-tray/icons/generate.py`; regenerate with
   `python3 friglet-tray/icons/generate.py` (stdlib only).
 
 ## Tray testing under headless / computer-use environments
