@@ -1490,6 +1490,55 @@ mod tests {
         serde_json::from_str(&handle_request(&request, state).await).unwrap()
     }
 
+    /// `blockchain.transaction.get` hands Sparrow a wallet transaction with
+    /// its witness: the same wtxid, so the size and fee rate Sparrow shows
+    /// are right, and the txid it asked for.
+    #[tokio::test]
+    async fn transaction_get_serves_a_taproot_spend_with_its_witness() {
+        let dir = temp_dir("tx-get-witness");
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::hashes::Hash::from_byte_array([3; 32]),
+                    vout: 1,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                // A key-path spend: one 64-byte Schnorr signature.
+                witness: Witness::from_slice(&[[5u8; 64]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::from_bytes([&[0x51, 0x20][..], &[6; 32]].concat()),
+            }],
+        };
+        let txid = spend.compute_txid();
+        assert_ne!(txid.to_string(), spend.compute_wtxid().to_string());
+        let mut index = WalletElectrumIndex::new();
+        index.txs.insert(
+            txid.to_string(),
+            bitcoin::consensus::encode::serialize(&spend),
+        );
+        let state = state(index, None, &dir);
+
+        let response = call(
+            &state,
+            "blockchain.transaction.get",
+            vec![json!(txid.to_string())],
+        )
+        .await;
+        let served: Transaction = bitcoin::consensus::encode::deserialize(
+            &hex::decode(response["result"].as_str().expect("raw tx hex")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(served.compute_txid(), txid);
+        assert_eq!(served.compute_wtxid(), spend.compute_wtxid());
+        assert_eq!(served.input[0].witness, spend.input[0].witness);
+        assert_eq!(served.vsize(), spend.vsize());
+    }
+
     #[tokio::test]
     async fn broadcast_errors_are_real_errors() {
         let dir = temp_dir("broadcast-errors");

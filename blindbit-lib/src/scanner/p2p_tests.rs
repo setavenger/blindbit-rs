@@ -14,6 +14,7 @@ use bitcoin::{Block, BlockHash};
 use bitcoin_p2p::p2p_message_types::message::{
     InventoryPayload, NetworkMessage, RawNetworkMessage,
 };
+use bitcoin_p2p::p2p_message_types::message_blockdata::Inventory;
 use bitcoin_p2p::p2p_message_types::message_network::{
     ClientSoftwareVersion, UserAgent, UserAgentVersion, VersionMessage,
 };
@@ -30,13 +31,17 @@ use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
 #[derive(Clone, Copy, Debug)]
-enum Conn {
+pub(super) enum Conn {
     /// Close right after the handshake, as a node that evicts, bans or
     /// disconnects friglet does.
     CloseAfterHandshake,
     /// Start sending the block and close halfway through it.
     CloseMidBlock,
+    /// Serve the block as Bitcoin Core does: with its witnesses for
+    /// `MSG_WITNESS_BLOCK`, without them for `MSG_BLOCK`.
     Serve,
+    /// Serve the block without its witnesses whatever was asked.
+    ServeStripped,
     NotFound,
     /// Never answer the request.
     Ignore,
@@ -48,15 +53,60 @@ enum Conn {
     CloseBeforeVersion,
 }
 
-struct Node {
-    addr: SocketAddr,
+pub(super) struct Node {
+    pub(super) addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+}
+
+/// The block a node serves, as it goes on the wire with and without its
+/// witnesses.
+struct Served {
+    full: bitcoin_rev::Block,
+    stripped: bitcoin_rev::Block,
+}
+
+impl Served {
+    fn new(block: &Block) -> Self {
+        let mut stripped = block.clone();
+        for tx in &mut stripped.txdata {
+            for input in &mut tx.input {
+                input.witness.clear();
+            }
+        }
+        let wire = |block: &Block| -> bitcoin_rev::Block {
+            encode::deserialize(&bitcoin::consensus::encode::serialize(block)).unwrap()
+        };
+        Self {
+            full: wire(block),
+            stripped: wire(&stripped),
+        }
+    }
 }
 
 impl Node {
     /// A node advertising `services` and `height` that handles one
     /// connection after another as `script` says, then stops listening.
     fn spawn(services: ServiceFlags, height: i32, script: Vec<Conn>) -> Self {
+        Self::spawn_serving(services, height, &block(), script)
+    }
+
+    /// A full node at height 1,000 serving `block`.
+    pub(super) fn serving(block: &Block, script: Vec<Conn>) -> Self {
+        Self::spawn_serving(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            1_000,
+            block,
+            script,
+        )
+    }
+
+    fn spawn_serving(
+        services: ServiceFlags,
+        height: i32,
+        block: &Block,
+        script: Vec<Conn>,
+    ) -> Self {
+        let served = Served::new(block);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
@@ -67,7 +117,7 @@ impl Node {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                let _ = serve(stream, conn, services, height);
+                let _ = serve(stream, conn, services, height, &served);
             }
         });
         Node { addr, connections }
@@ -81,7 +131,7 @@ impl Node {
         )
     }
 
-    fn connections(&self) -> usize {
+    pub(super) fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
 }
@@ -134,15 +184,12 @@ fn block() -> Block {
     bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
 }
 
-fn wire_block() -> bitcoin_rev::Block {
-    encode::deserialize(&bitcoin::consensus::encode::serialize(&block())).unwrap()
-}
-
 fn serve(
     stream: TcpStream,
     conn: Conn,
     services: ServiceFlags,
     height: i32,
+    served: &Served,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
@@ -198,13 +245,17 @@ fn serve(
             break items;
         }
     };
+    let witness = matches!(items.0.first(), Some(Inventory::WitnessBlock(_)));
     match conn {
-        Conn::Serve => wire.send(NetworkMessage::Block(wire_block()))?,
+        Conn::Serve if witness => wire.send(NetworkMessage::Block(served.full.clone()))?,
+        Conn::Serve | Conn::ServeStripped => {
+            wire.send(NetworkMessage::Block(served.stripped.clone()))?
+        }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(InventoryPayload(items.0)))?,
         Conn::CloseMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(
                 magic,
-                NetworkMessage::Block(wire_block()),
+                NetworkMessage::Block(served.full.clone()),
             ));
             wire.stream.write_all(&bytes[..bytes.len() / 2])?;
             wire.stream.shutdown(Shutdown::Write)?;
@@ -215,7 +266,7 @@ fn serve(
 }
 
 /// Attempts 10 ms apart, a 2 s budget per block.
-fn fast(attempts: u32) -> RetryPolicy {
+pub(super) fn fast(attempts: u32) -> RetryPolicy {
     RetryPolicy {
         attempts,
         first_delay: Duration::from_millis(10),
@@ -477,7 +528,7 @@ fn the_wait_between_rounds_doubles_up_to_five_minutes_and_restarts_per_block() {
 
 /// The oracle side of a daemon poll: one block at height 1.
 #[derive(Clone)]
-struct OneBlock(BlockScanDataShortResponse);
+pub(super) struct OneBlock(pub(super) BlockScanDataShortResponse);
 
 impl BlockStreamSource for OneBlock {
     type Stream = TestStream;

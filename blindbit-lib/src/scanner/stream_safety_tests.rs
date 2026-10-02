@@ -55,6 +55,13 @@ pub(super) fn serve(block: &Block) {
         .insert(block.block_hash(), block.clone());
 }
 
+/// Stop serving `hash` in-process, so the scan fetches it over P2P.
+pub(super) fn unserve(hash: &BlockHash) {
+    if let Some(blocks) = SERVED_BLOCKS.lock().unwrap().as_mut() {
+        blocks.remove(hash);
+    }
+}
+
 /// In-process stand-in for the oracle's `StreamBlockScanDataShort` stream.
 pub(super) struct TestStream(VecDeque<Result<BlockScanDataShortResponse, tonic::Status>>);
 
@@ -81,11 +88,11 @@ pub(super) fn run<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-fn secret(byte: u8) -> SecretKey {
+pub(super) fn secret(byte: u8) -> SecretKey {
     SecretKey::from_slice(&[byte; 32]).expect("valid secret")
 }
 
-fn keys() -> (SecretKey, PublicKey) {
+pub(super) fn keys() -> (SecretKey, PublicKey) {
     (secret(0x11), secret(0x22).public_key(&Secp256k1::new()))
 }
 

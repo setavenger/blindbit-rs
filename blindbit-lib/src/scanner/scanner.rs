@@ -101,6 +101,10 @@ pub struct Scanner {
     /// Rounds of failed fetches of the block the scan is stuck on, across
     /// `watch_chain` polls.
     pub(crate) fetch_backoff: p2p::FetchBackoff,
+
+    /// When to next try restoring the witness data of wallet transactions
+    /// stored without it (see `witness.rs`); `None` once done.
+    pub(crate) witness_restore_due: Option<std::time::Instant>,
 }
 
 impl Scanner {
@@ -184,6 +188,7 @@ impl Scanner {
             })),
             p2p_retry: p2p::RetryPolicy::default(),
             fetch_backoff: p2p::FetchBackoff::default(),
+            witness_restore_due: Some(std::time::Instant::now()),
         }
     }
 
@@ -806,6 +811,7 @@ impl Scanner {
             })),
             p2p_retry: p2p::RetryPolicy::default(),
             fetch_backoff: p2p::FetchBackoff::default(),
+            witness_restore_due: Some(std::time::Instant::now()),
         };
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.
