@@ -1187,3 +1187,7 @@ mod bip352_vectors;
 #[cfg(test)]
 #[path = "owned_outputs_tests.rs"]
 mod owned_outputs_tests;
+
+#[cfg(test)]
+#[path = "testkit_t0.rs"]
+mod testkit_t0;

@@ -1,0 +1,242 @@
+{
+  "format": "blindbit-testkit/t0-fixture/1",
+  "scenario": "rescan",
+  "scenario_sha256": "f51f4c82de32f57bc1f12687fbc60036455f209ac0de815ae5f2c7d0869471b0",
+  "configuration": "full-basic",
+  "network": "regtest",
+  "wallets": [
+    {
+      "id": "alice",
+      "scan_secret": "ad63c28889ad7ff380f7074702a8741acaaf151a14082c6953b377bfa41e1b4b",
+      "spend_pubkey": "025686035a6d65a6ce575e5ca17b5424c2170ce0fcbac484296f10d12f1cb5c849",
+      "labels": []
+    },
+    {
+      "id": "bob",
+      "scan_secret": "8ce64ceefa2ccfecc2a4792c243bd893b0c16a9f390543af9a92cfa095d77b7f",
+      "spend_pubkey": "024a1a773548136fd37aa0d64631bd513d02bbef2b195282a20d4a71be8e4874e2",
+      "labels": [
+        3
+      ]
+    },
+    {
+      "id": "carol",
+      "scan_secret": "64c737dea7bb114e76073f5c51a2e7dce078aad2001232676867834c3df946bf",
+      "spend_pubkey": "035d77e08054d6b379689f6c7ae0e1aab1cee4111368492c032d5f8b45a2f7c706",
+      "labels": []
+    }
+  ],
+  "actions": [
+    {
+      "index": 0,
+      "kind": "fund",
+      "blocks": [
+        1
+      ]
+    },
+    {
+      "index": 1,
+      "kind": "send",
+      "blocks": [
+        2
+      ]
+    },
+    {
+      "index": 2,
+      "kind": "send",
+      "blocks": [
+        3
+      ]
+    },
+    {
+      "index": 3,
+      "kind": "send_multi",
+      "blocks": [
+        4
+      ]
+    },
+    {
+      "index": 4,
+      "kind": "restart",
+      "component": "scanner",
+      "blocks": []
+    },
+    {
+      "index": 5,
+      "kind": "spend",
+      "blocks": [
+        5
+      ]
+    },
+    {
+      "index": 6,
+      "kind": "restart",
+      "component": "scanner",
+      "blocks": []
+    },
+    {
+      "index": 7,
+      "kind": "send",
+      "blocks": [
+        6
+      ]
+    },
+    {
+      "index": 8,
+      "kind": "restart",
+      "component": "scanner",
+      "blocks": []
+    },
+    {
+      "index": 9,
+      "kind": "restart",
+      "component": "oracle",
+      "blocks": []
+    }
+  ],
+  "blocks": [
+    {
+      "height": 1,
+      "txs": [
+        {
+          "txid": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904",
+          "hex": "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2f626c696e646269742d746573746b69742f6c69622f66756e642f302f616c6963652f616c6963652d66756e64696e67ffffffff0100e1f5050000000022512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc9600000000",
+          "prevouts": [],
+          "go_tweak": null
+        }
+      ]
+    },
+    {
+      "height": 2,
+      "txs": [
+        {
+          "txid": "98bc40820bbe54a6323a34b2401d463e112853af8a525d6a001245307d26b618",
+          "hex": "0200000000010104994c76f39b21dc21956632f3997e0adcac3973939287a04d942971ffb4be7f0000000000ffffffff0238c7000000000000225120db6ac3688f2f287163a5ff48845f78b68bb8874692ad64d563197f9a9e72c93fc819f50500000000160014dde5bccf279ebfbfa10e2566f58b8928ea6f615c01405e66e122ee19a5596082ebbc91c0e4576426b96dfbb9bee48da4826289cbbc6aae2f1802f2c18c3b47ff79974660a912e459b36c45329fe5114aa15a364ca64f00000000",
+          "prevouts": [
+            {
+              "outpoint": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904:0",
+              "value_sats": 100000000,
+              "script_pubkey": "512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc96"
+            }
+          ],
+          "go_tweak": "02bd63b9f6daddfabb7be1b35f23e163aa15bae136feeafc9ce6ff52c30b7fa271"
+        }
+      ]
+    },
+    {
+      "height": 3,
+      "txs": [
+        {
+          "txid": "c38a9540988d3eacfd04f00d49960015ebbf3fe5228467ee70694b839f8bdfbd",
+          "hex": "0200000000010118b6267d304512006a5d528aaf5328113e461d40b2343a32a654be0b8240bc980100000000ffffffff0220cb000000000000225120700b5026c981f02facb369e15cd552cdc7e34b569d647f13bcb0ce95c641ac96a84ef40500000000160014bfcac6afc5863a157520e29f9d480dfc5d8894030247304402203b8eff6c6803a4bf66fd81ba34b701866975db2af93bbcc83d7cd67c81ef99f702205cd687bf281f620e96d58b79a07353f94015612678fa5226d708d28dc61972f80121032156667d313d3ec6b12384855a1718e0f632532b2b775cf612b864b1e322f94a00000000",
+          "prevouts": [
+            {
+              "outpoint": "98bc40820bbe54a6323a34b2401d463e112853af8a525d6a001245307d26b618:1",
+              "value_sats": 99949000,
+              "script_pubkey": "0014dde5bccf279ebfbfa10e2566f58b8928ea6f615c"
+            }
+          ],
+          "go_tweak": "02f440aa019b1ffa527b3ea293f2e4b38700c26223f04caee9d97069c30592b459"
+        }
+      ]
+    },
+    {
+      "height": 4,
+      "txs": [
+        {
+          "txid": "60e218fe0c1838c1aefd2216ad7b4436de7f50b0ac9871ecbf4791d460e0fde2",
+          "hex": "02000000000101bddf8b9f834b6970ee678422e53fbfeb150096490df004fdac3e8d9840958ac30100000000ffffffff0308cf00000000000022512050db5d5cbdecb268b63d3e43597a58007b4e09e71b9ee54722cfa9a580ff606ef0d200000000000022512074add2036fcb36ef0de13a2278a24a0b4f24c67317d9750f25bd169f1283b8aab0acf20500000000160014f381bcd1e8b99f0132ca5a940aa62d0c0d6fa4a502483045022100dadc09826388436ec2b1a31feac73c675e2bc24482241150981ff0798c4be86a02204dbb8cd0239e9216d34e7ef0389a097408a67b25415a183a2e99e736d09a070601210223aff986eeee8ea76cbb00f585dca543609cc9ae2c8c5e8aead8b51d5271d34a00000000",
+          "prevouts": [
+            {
+              "outpoint": "c38a9540988d3eacfd04f00d49960015ebbf3fe5228467ee70694b839f8bdfbd:1",
+              "value_sats": 99897000,
+              "script_pubkey": "0014bfcac6afc5863a157520e29f9d480dfc5d889403"
+            }
+          ],
+          "go_tweak": "0315c7fec3a50198149a222e3b58b355a007ff632af1ef1f90f9fc6773e39b34e5"
+        }
+      ]
+    },
+    {
+      "height": 5,
+      "txs": [
+        {
+          "txid": "53996bc46312c22425e6d8539d4216dbc116fbd2a28837d2a4b070af48c92e54",
+          "hex": "0200000000010118b6267d304512006a5d528aaf5328113e461d40b2343a32a654be0b8240bc980000000000ffffffff0138c700000000000016001495b5de34b11452e814e16197867d4119efba9881014076c5ac12c0eb96b9ffae2e56918578133d0830a4a6e3c60860090be89dd09de2861353a2183a8366548dd0ce394a63af22f9d9965480ec163434f6964824e0cc00000000",
+          "prevouts": [
+            {
+              "outpoint": "98bc40820bbe54a6323a34b2401d463e112853af8a525d6a001245307d26b618:0",
+              "value_sats": 51000,
+              "script_pubkey": "5120db6ac3688f2f287163a5ff48845f78b68bb8874692ad64d563197f9a9e72c93f"
+            }
+          ],
+          "go_tweak": null
+        }
+      ]
+    },
+    {
+      "height": 6,
+      "txs": [
+        {
+          "txid": "bcae57bbf494b94bb95dad52a3edd3c1bb6cc4deaebfd9d427bf900575c20b66",
+          "hex": "02000000000101e2fde060d49147bfec7198acb0507fde36447bad1622fdaec138180cfe18e2600200000000ffffffff02d8d6000000000000225120a27220903c6794e41af689a207e419cbb043d7f3970b1ca1d052f9dd46ca0832d8d5f105000000001600148f932fe236236761e63e7f604a11cd73a2a235240247304402206a0e7a881d97c4332e2f06211ab56ac6af982bcb4212cf6fb3482cdfe3b33ffa022017571c2d798742bf8aeba511ba95442fe677362fc43f772c060be48d42c13195012102fb9034f573b3b35d7e18abc72e473fa71f51d3ab990806683786a8afbf21b86800000000",
+          "prevouts": [
+            {
+              "outpoint": "60e218fe0c1838c1aefd2216ad7b4436de7f50b0ac9871ecbf4791d460e0fde2:2",
+              "value_sats": 99790000,
+              "script_pubkey": "0014f381bcd1e8b99f0132ca5a940aa62d0c0d6fa4a5"
+            }
+          ],
+          "go_tweak": "03f17e97eda696ef7e6840b62323b28afc20343a2a21b72c7e26b053b341d94f99"
+        }
+      ]
+    }
+  ],
+  "expected": [
+    {
+      "ref": "paid-then-spent",
+      "wallet": "bob",
+      "outpoint": "98bc40820bbe54a6323a34b2401d463e112853af8a525d6a001245307d26b618:0",
+      "amount_sats": 51000,
+      "label": null,
+      "spent": true,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "labelled",
+      "wallet": "bob",
+      "outpoint": "c38a9540988d3eacfd04f00d49960015ebbf3fe5228467ee70694b839f8bdfbd:0",
+      "amount_sats": 52000,
+      "label": 3,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "multi-bob",
+      "wallet": "bob",
+      "outpoint": "60e218fe0c1838c1aefd2216ad7b4436de7f50b0ac9871ecbf4791d460e0fde2:0",
+      "amount_sats": 53000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "multi-carol",
+      "wallet": "carol",
+      "outpoint": "60e218fe0c1838c1aefd2216ad7b4436de7f50b0ac9871ecbf4791d460e0fde2:1",
+      "amount_sats": 54000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    },
+    {
+      "ref": "after-restart",
+      "wallet": "carol",
+      "outpoint": "bcae57bbf494b94bb95dad52a3edd3c1bb6cc4deaebfd9d427bf900575c20b66:0",
+      "amount_sats": 55000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    }
+  ]
+}
