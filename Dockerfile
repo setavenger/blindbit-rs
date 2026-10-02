@@ -31,6 +31,7 @@ USER friglet
 WORKDIR /data
 VOLUME /data
 ENV FRIGLET_CONTROL_SOCKET=/data/friglet.sock \
+    FRIGLET_LOG_FILE=/data/friglet.log \
     FRIGLET_HTTP_ADDR=0.0.0.0:8080 \
     FRIGLET_ELECTRUM_ADDR=0.0.0.0:50001
 

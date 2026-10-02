@@ -13,6 +13,9 @@ tonic-prost-build = "0.14.2"
 [[example]]
 name = "stream_oracle"
 
+[[example]]
+name = "fetch_block"
+
 [dependencies]
 # bitcoin = "0.32.7"
 # bitcoin = { version = "0.32.7", features = ["secp256k1"] }
@@ -49,3 +52,5 @@ serde_json = "1.0"
 # Tokio runtime in scope to build the (never-connected) oracle channel. Declared
 # explicitly so the tests do not depend on tonic's transitive feature selection.
 tokio = { version = "1.48.0", features = ["rt", "time", "net"] }
+# Log output for the `fetch_block` example.
+tracing-subscriber = { workspace = true }

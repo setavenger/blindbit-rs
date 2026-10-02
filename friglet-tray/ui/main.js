@@ -12,12 +12,30 @@ function setText(id, value) {
 // ---------------------------------------------------------------------------
 
 let daemonReachable = false;
+// The daemon view's state (`running`, `starting`, `reconnecting`, ...).
+let daemonState = "starting";
+
+// Local time of a unix timestamp; the date too when it is not today.
+function when(unix) {
+  if (unix == null) return "";
+  const d = new Date(unix * 1000);
+  const today = new Date().toDateString() === d.toDateString();
+  return today ? d.toLocaleTimeString() : d.toLocaleString();
+}
+
+function setPill(id, label, tone) {
+  const pill = $(id);
+  pill.textContent = label;
+  pill.className = `pill pill-${tone}`;
+}
 
 // Crash / restart state of a tray-supervised daemon.
-function renderHealth(daemon, reachable) {
+function renderHealth(daemon, reachable, daemonView) {
   const card = $("daemon-health");
   const pending = daemon?.restart_in_secs != null;
-  const show = daemon && (daemon.last_exit || daemon.last_error || pending);
+  // A daemon stopped on purpose is not a crash, whatever happened before.
+  const show = daemon && daemonView.state !== "stopped" &&
+    (daemon.last_exit || daemon.last_error || pending);
   card.hidden = !show;
   if (!show) return;
 
@@ -37,10 +55,8 @@ function renderHealth(daemon, reachable) {
 
   const parts = [];
   if (daemon.last_exit) {
-    const when = daemon.last_exit_at
-      ? new Date(daemon.last_exit_at * 1000).toLocaleTimeString()
-      : "";
-    parts.push(`Last crash${when ? ` at ${when}` : ""}: ${daemon.last_exit}.`);
+    const at = daemon.last_exit_at ? ` at ${when(daemon.last_exit_at)}` : "";
+    parts.push(`Last crash${at}: ${daemon.last_exit}.`);
   }
   if (daemon.restarts > 0) {
     parts.push(`Restarted automatically ${daemon.restarts}× this session.`);
@@ -51,12 +67,70 @@ function renderHealth(daemon, reachable) {
   setText("health-output", daemon.last_output ?? "");
 }
 
-function render({ reachable, status, daemon }) {
+function errorItem(entry) {
+  const li = document.createElement("li");
+  li.className = entry.active ? "active" : entry.resolved_unix ? "resolved" : "";
+  const at = document.createElement("span");
+  at.className = "when";
+  at.textContent = entry.active ? `since ${when(entry.since_unix)}` : when(entry.since_unix);
+  const msg = document.createElement("span");
+  msg.className = "msg";
+  let text = entry.message;
+  if (entry.count > 1) text += ` (×${entry.count}, last ${when(entry.last_unix)})`;
+  if (entry.resolved_unix) text += ` — resolved ${when(entry.resolved_unix)}`;
+  msg.textContent = text;
+  li.append(at, msg);
+  return li;
+}
+
+let lastErrorsKey = null;
+
+// Active errors stay on top until resolved; every error of the session
+// stays in the Recent errors list.
+function renderErrors(errors) {
+  const key = JSON.stringify(errors);
+  if (key === lastErrorsKey) return;
+  lastErrorsKey = key;
+  const active = errors.filter((e) => e.active);
+  $("problems").hidden = active.length === 0;
+  $("problem-list").replaceChildren(...active.map(errorItem));
+  $("recent-list").replaceChildren(...errors.map(errorItem));
+  $("no-recent-errors").hidden = errors.length > 0;
+  setText("recent-count", errors.length ? `(${errors.length})` : "");
+}
+
+let actionBusy = false;
+
+function render(payload) {
+  const { reachable, status, daemon, daemon_view: dv, scan_view: sv, errors, logs } = payload;
   daemonReachable = reachable;
-  renderHealth(daemon, reachable);
-  const pill = $("reachable");
-  pill.textContent = reachable ? "connected" : "unreachable";
-  pill.className = `pill ${reachable ? "pill-good" : "pill-bad"}`;
+  daemonState = dv.state;
+  renderHealth(daemon, reachable, dv);
+  renderErrors(errors);
+  setPill("daemon-pill", dv.state === "setup" ? dv.label : `daemon ${dv.label}`, dv.tone);
+  setText("daemon-state", dv.label);
+  setText(
+    "daemon-detail",
+    dv.since_unix != null ? `${dv.detail} (at ${when(dv.since_unix)})` : dv.detail,
+  );
+  // The figures below are the last snapshot while the daemon is not
+  // answering: dim them so they do not read as live.
+  for (const card of document.querySelectorAll(".live")) {
+    card.classList.toggle("stale", !reachable);
+  }
+  $("start-daemon-btn").disabled = actionBusy || !dv.can_start;
+  $("stop-daemon-btn").disabled = actionBusy || !dv.can_stop;
+
+  setPill("scan-pill", sv.label, sv.tone);
+  let detail = sv.detail ?? "";
+  if (sv.since_unix != null) detail += ` (since ${when(sv.since_unix)})`;
+  setText("scan-detail", detail);
+  $("start-btn").disabled = actionBusy || !sv.can_start;
+  $("stop-btn").disabled = actionBusy || !sv.can_stop;
+
+  setText("daemon-log-path", logs.daemon_log ?? "– (not written)");
+  setText("tray-log-path", logs.tray_log ?? "– (not written)");
+
   updateSettingsAvailability();
   // Load the settings form on the first poll that finds the daemon up
   // (retried at poll cadence while loading fails).
@@ -65,7 +139,6 @@ function render({ reachable, status, daemon }) {
   renderWallet(reachable ? status : null);
   if (!status) return; // nothing known yet; keep placeholders
 
-  setText("scanning", status.scanning ? "running" : "stopped");
   setText("scanned-height", status.scanned_height.toLocaleString());
   setText("tip-height", status.tip_height != null ? status.tip_height.toLocaleString() : "?");
 
@@ -78,28 +151,12 @@ function render({ reachable, status, daemon }) {
   setText("oracle", status.oracle_connected ? "connected" : "disconnected");
   setText("version", status.version);
   setText("sp-address", status.sp_address ?? "–");
-
-  $("error-block").hidden = !status.last_error;
-  setText("last-error", status.last_error ?? "");
-  renderScanHealth(status.scan_health ?? {});
-
-  $("start-btn").disabled = !reachable || status.scanning;
-  $("stop-btn").disabled = !reachable || !status.scanning;
+  renderScanNotes(status.scan_health ?? {});
 }
 
-// Why the scan is stuck, and where it started (the daemon's `scan_health`;
-// absent from older daemons).
-function renderScanHealth(health) {
-  const stall = health.stall;
-  $("stall-block").hidden = !stall;
-  setText(
-    "stall",
-    stall
-      ? `at height ${stall.height.toLocaleString()} since ` +
-          `${new Date(stall.since_unix * 1000).toLocaleString()}: ${stall.reason}`
-      : "",
-  );
-
+// Where the scan started and one-off rescans (the daemon's `scan_health`;
+// a stall is part of the scan state above).
+function renderScanNotes(health) {
   const notes = [];
   const start = health.start_adjusted;
   if (start) {
@@ -142,18 +199,45 @@ async function refresh() {
   }
 }
 
-async function action(command) {
-  $("action-error").textContent = "";
-  try {
-    await invoke(command);
-    await refresh();
-  } catch (e) {
-    $("action-error").textContent = String(e);
-  }
+function actionMessage(id, text, kind) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = `small ${kind ?? ""}`;
 }
 
-$("start-btn").addEventListener("click", () => action("start_scanning"));
-$("stop-btn").addEventListener("click", () => action("stop_scanning"));
+// Run a button's command. Failures stay visible with their time until the
+// next action (they are in the log and the Recent errors list too); a note
+// from the daemon (e.g. "stopping: …") is shown as information.
+async function action(command, label, msgId, busyText) {
+  actionBusy = true;
+  actionMessage(msgId, busyText ?? "", "muted");
+  await refresh();
+  try {
+    const note = await invoke(command);
+    actionMessage(msgId, typeof note === "string" ? note : "", "muted");
+  } catch (e) {
+    actionMessage(msgId, `${when(Date.now() / 1000)} — ${label} failed: ${e}`, "error");
+  }
+  actionBusy = false;
+  await refresh();
+}
+
+$("start-btn").addEventListener("click", () =>
+  action("start_scanning", "Start scanning", "scan-action-msg", "Starting…"));
+$("stop-btn").addEventListener("click", () =>
+  action("stop_scanning", "Stop scanning", "scan-action-msg", "Stopping…"));
+$("start-daemon-btn").addEventListener("click", () =>
+  action("start_daemon", "Start daemon", "daemon-action-msg", "Starting the daemon…"));
+$("stop-daemon-btn").addEventListener("click", () =>
+  action("stop_daemon", "Stop daemon", "daemon-action-msg", "Stopping the daemon…"));
+$("open-logs-btn").addEventListener("click", async () => {
+  try {
+    const dir = await invoke("open_log_folder");
+    actionMessage("logs-msg", `Opened ${dir}`, "muted");
+  } catch (e) {
+    actionMessage("logs-msg", `${when(Date.now() / 1000)} — ${e}`, "error");
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Wallet view
@@ -265,7 +349,17 @@ let networkDefaults = { hosted_oracles: {}, default_ports: {} };
 
 function updateSettingsAvailability() {
   $("setup-banner").hidden = !setupMode;
-  $("settings-unreachable").hidden = daemonReachable || setupMode;
+  // Briefly unreachable (starting, a settings restart, a slow answer) is
+  // not an error; say so only once the daemon is really down.
+  const unavailable = $("settings-unreachable");
+  unavailable.hidden = daemonReachable || setupMode;
+  const waiting = ["starting", "reconnecting", "stopping"].includes(daemonState);
+  unavailable.textContent = waiting
+    ? "Waiting for the daemon — settings can be changed once it answers."
+    : daemonState === "stopped"
+      ? "The daemon is stopped — start it on the Status tab to change settings."
+      : "Daemon unreachable — settings cannot be loaded or changed.";
+  unavailable.className = `small ${waiting || daemonState === "stopped" ? "muted" : "error"}`;
   $("settings-fields").disabled = setupMode
     ? false
     : !daemonReachable || loadedConfig === null;

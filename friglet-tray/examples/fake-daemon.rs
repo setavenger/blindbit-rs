@@ -7,7 +7,7 @@
 //!
 //! Usage: `cargo run -p friglet-tray --example fake-daemon`
 
-use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, StatusInfo};
+use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, ScanState, StatusInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -84,6 +84,15 @@ async fn main() -> std::io::Result<()> {
                         version: "fake-0.0.0".to_string(),
                         spawned_by_tray: false,
                         scan_health: Default::default(),
+                        scan_state: Some(if scanning.load(Ordering::Relaxed) {
+                            ScanState::Running
+                        } else {
+                            ScanState::Paused
+                        }),
+                        pid: Some(std::process::id()),
+                        log_file: None,
+                        oracle_error: None,
+                        oracle_down_since_unix: None,
                     }),
                     Request::Start => {
                         scanning.store(true, Ordering::Relaxed);

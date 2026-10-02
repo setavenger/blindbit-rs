@@ -43,6 +43,7 @@ fn dummy_status() -> StatusInfo {
         version: "test".to_string(),
         spawned_by_tray: false,
         scan_health: Default::default(),
+        ..Default::default()
     }
 }
 
