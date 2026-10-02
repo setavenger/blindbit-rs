@@ -41,7 +41,10 @@ const ORACLE_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 /// The oracle counts as connected while its last good answer is this recent.
 const ORACLE_STALE_AFTER: Duration = Duration::from_secs(30);
 /// How long `Stop` waits for the scan task to end before answering that it
-/// is still stopping (it then finishes in the background).
+/// is still stopping (it then finishes in the background). The scan stops
+/// within milliseconds, and is dropped after the supervisor's
+/// `CANCEL_GRACE` at the latest, so this only covers a task that blocks a
+/// worker thread.
 const STOP_WAIT: Duration = Duration::from_secs(3);
 
 /// The oracle's reachability and chain tip, kept current by
@@ -274,10 +277,9 @@ impl ControlCtx {
                     }
                     StartOutcome::AlreadyRunning => Response::Ok,
                     StartOutcome::StillStopping => {
-                        let message = "scanning is still stopping: the scanner is finishing \
-                                       a blocking step (such as a block download from the P2P \
-                                       node) and pauses when it returns; start it again once \
-                                       the status says paused";
+                        let message = "scanning is still stopping: the scanner pauses as soon \
+                                       as its current step returns; start it again once the \
+                                       status says paused";
                         tracing::warn!("start refused: {message}");
                         Response::Error(message.to_string())
                     }
@@ -298,11 +300,12 @@ impl ControlCtx {
         }
     }
 
-    /// `Stop`: pause scanning. The scan task usually ends within
-    /// milliseconds; when it is inside a blocking step (a P2P block
-    /// download) it ends once that returns. Either way the answer comes
-    /// within [`STOP_WAIT`] and the status reports `stopping` until the task
-    /// has really ended, then `paused`.
+    /// `Stop`: pause scanning. The scan task ends within milliseconds, also
+    /// in the middle of a P2P block download (the download is cancelled and
+    /// the block is scanned again on the next start). Should it not have
+    /// ended within [`STOP_WAIT`], the answer says it is still stopping and
+    /// the status reports `stopping` until the task has really ended, then
+    /// `paused`.
     async fn pause_scanning(&self) -> Response {
         let _guard = self.apply_lock.lock().await;
         if !self.supervisor.request_stop() {
@@ -315,8 +318,7 @@ impl ControlCtx {
             return Response::Ok;
         }
         tracing::warn!(
-            "scan task is inside a blocking step (such as a block download from the P2P node); \
-             scanning pauses as soon as it returns"
+            "scan task has not stopped yet; scanning pauses as soon as its current step returns"
         );
         let supervisor = self.supervisor.clone();
         let scanner = self.scanner.clone();
@@ -327,9 +329,7 @@ impl ControlCtx {
             save_scanner_state(&scanner, &state_file).await;
         });
         Response::OkWithNote(
-            "stopping: the scanner is finishing a blocking step (such as a block download \
-             from the P2P node) and pauses as soon as it returns"
-                .to_string(),
+            "stopping: the scanner pauses as soon as its current step returns".to_string(),
         )
     }
 
@@ -686,18 +686,20 @@ mod tests {
 
     /// A full `ControlCtx` wired against a temp dir, with an offline scanner.
     fn test_ctx(dir: &Path) -> Arc<ControlCtx> {
-        test_ctx_with_scan(dir, || {
-            Box::pin(async {
-                std::future::pending::<()>().await;
+        test_ctx_with_scan(dir, |cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
                 Ok(())
             })
         })
     }
 
-    /// [`test_ctx`] with a custom scan task.
+    /// [`test_ctx`] with a custom scan task, given the token that stops it.
     fn test_ctx_with_scan(
         dir: &Path,
-        scan: impl Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        scan: impl Fn(
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -900,19 +902,21 @@ mod tests {
         );
     }
 
-    /// The scan task blocks a worker thread (as blindbit-lib's synchronous
-    /// P2P block download does): Stop answers within its wait budget with a
-    /// note, the status says `stopping` (not stopped) until the task really
-    /// ended, Start is refused meanwhile, and the pause lands afterwards.
+    /// A step that blocks a worker thread cannot be interrupted (the scan
+    /// has none left; this covers one that slips in): Stop answers within
+    /// its wait budget with a note, the status says `stopping` (not
+    /// stopped) until the task really ended, Start is refused meanwhile,
+    /// and the pause lands afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_during_a_blocking_scan_step_reports_stopping_then_paused() {
         let dir = temp_dir("status-stopping");
-        let ctx = test_ctx_with_scan(&dir, || {
-            Box::pin(async {
-                loop {
+        let ctx = test_ctx_with_scan(&dir, |cancel| {
+            Box::pin(async move {
+                while !cancel.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(4500));
                     tokio::task::yield_now().await;
                 }
+                Ok(())
             })
         });
         ctx.supervisor.start();
@@ -942,6 +946,59 @@ mod tests {
             ctx.status().await.scan_state,
             Some(friglet_ipc::ScanState::Paused)
         );
+    }
+
+    /// Stop while the scan downloads a block from a P2P node that has gone
+    /// silent (it accepted the connection and sends nothing; blindbit-lib
+    /// would wait 30 s per read and retry 5 times): the real
+    /// `BlockFetcher`, under the real supervisor, gives way to the stop
+    /// token, so Stop answers plainly and the status is `paused` well
+    /// within a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_a_stalled_p2p_download_pauses_within_a_second() {
+        use bitcoin::hashes::Hash;
+        use blindbit_lib::scanner::{BlockFetcher, FetchFailure};
+
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let node_addr = node.local_addr().unwrap();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = node.accept() {
+                held.push(stream); // never answers, never closes
+                let _ = accepted_tx.send(());
+            }
+        });
+        let dir = temp_dir("status-stalled-download");
+        let ctx = test_ctx_with_scan(&dir, move |cancel| {
+            Box::pin(async move {
+                let hash = bitcoin::BlockHash::from_byte_array([7; 32]);
+                let fetched = BlockFetcher::new(node_addr, bitcoin_rev::Network::Regtest)
+                    .with_cancel(cancel)
+                    .fetch(hash, 1)
+                    .await;
+                match fetched {
+                    Err(e) if e.failure == FetchFailure::Cancelled => Ok(()),
+                    other => Err(format!("download ended without a stop: {other:?}")),
+                }
+            })
+        });
+        ctx.supervisor.start();
+        tokio::task::spawn_blocking(move || accepted.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the scan connected to the node");
+        tokio::time::sleep(Duration::from_millis(200)).await; // waiting on the node
+
+        let began = Instant::now();
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(1), "Stop took {took:?}");
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(!status.scanning);
+        assert_eq!(ctx.supervisor.last_error(), None);
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
     }
 
     #[tokio::test]

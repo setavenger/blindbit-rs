@@ -283,6 +283,48 @@ fn wallet_txs_stored_without_witnesses_get_them_back() {
     });
 }
 
+/// A stop during the download that restores witness data ends it at once
+/// and changes nothing, and the restore is not put off for 5 minutes: it
+/// runs again as soon as scanning resumes.
+#[test]
+fn a_stop_during_a_witness_restore_retries_it_when_scanning_resumes() {
+    run(async {
+        let (block, payment, message) = taproot_payment_block(0x96);
+        let txid = payment.compute_txid();
+        serve(&stripped(&block));
+        let (mut scanner, _state) = scanner("witness-restore-stop", "http://127.0.0.1:1");
+        assert!(!scanner.watch_step(1, OneBlock(message)).await);
+        unserve(&block.block_hash());
+        let node = Node::serving(&block, vec![Conn::StallMidBlock, Conn::Serve]);
+        scanner.p2p_peer = node.addr;
+        let due = scanner.witness_restore_due.expect("due");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        scanner.cancel = cancel.clone();
+        let stop = async {
+            while node.stalled().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+            std::time::Instant::now()
+        };
+        let ((), stopped) = tokio::join!(scanner.restore_missing_witnesses_when_due(), stop);
+        assert!(stopped.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(scanner.witness_restore_due, Some(due), "not put off");
+        assert!(lacks_witness(
+            &scanner.internal_indexer.graph().get_tx(txid).unwrap()
+        ));
+
+        scanner.cancel = tokio_util::sync::CancellationToken::new();
+        scanner.restore_missing_witnesses_when_due().await;
+        assert_eq!(scanner.witness_restore_due, None, "done");
+        assert!(!lacks_witness(
+            &scanner.internal_indexer.graph().get_tx(txid).unwrap()
+        ));
+        assert_eq!(node.connections(), 2);
+    });
+}
+
 #[test]
 fn only_transactions_that_need_a_witness_count_as_missing_one() {
     let (block, payment, _) = taproot_payment_block(0x95);

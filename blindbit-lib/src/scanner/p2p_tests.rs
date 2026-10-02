@@ -5,9 +5,9 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash};
@@ -37,6 +37,9 @@ pub(super) enum Conn {
     CloseAfterHandshake,
     /// Start sending the block and close halfway through it.
     CloseMidBlock,
+    /// Start sending the block and go silent halfway through it, keeping
+    /// the connection open until the client hangs up (or 10 s pass).
+    StallMidBlock,
     /// Serve the block as Bitcoin Core does: with its witnesses for
     /// `MSG_WITNESS_BLOCK`, without them for `MSG_BLOCK`.
     Serve,
@@ -56,6 +59,8 @@ pub(super) enum Conn {
 pub(super) struct Node {
     pub(super) addr: SocketAddr,
     connections: Arc<AtomicUsize>,
+    /// When a [`Conn::StallMidBlock`] connection went silent.
+    stalled: Arc<Mutex<Option<Instant>>>,
 }
 
 /// The block a node serves, as it goes on the wire with and without its
@@ -111,19 +116,25 @@ impl Node {
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = connections.clone();
+        let stalled = Arc::new(Mutex::new(None));
+        let stalled_at = stalled.clone();
         std::thread::spawn(move || {
             for conn in script {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                let _ = serve(stream, conn, services, height, &served);
+                let _ = serve(stream, conn, services, height, &served, &stalled_at);
             }
         });
-        Node { addr, connections }
+        Node {
+            addr,
+            connections,
+            stalled,
+        }
     }
 
-    fn full(height: i32, script: Vec<Conn>) -> Self {
+    pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
         Self::spawn(
             ServiceFlags::NETWORK | ServiceFlags::WITNESS,
             height,
@@ -133,6 +144,11 @@ impl Node {
 
     pub(super) fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// When the node went silent in the middle of the block, if it did.
+    pub(super) fn stalled(&self) -> Option<Instant> {
+        *self.stalled.lock().unwrap()
     }
 }
 
@@ -190,6 +206,7 @@ fn serve(
     services: ServiceFlags,
     height: i32,
     served: &Served,
+    stalled: &Mutex<Option<Instant>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
@@ -259,6 +276,15 @@ fn serve(
             ));
             wire.stream.write_all(&bytes[..bytes.len() / 2])?;
             wire.stream.shutdown(Shutdown::Write)?;
+        }
+        Conn::StallMidBlock => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            wire.stream.write_all(&bytes[..bytes.len() / 2])?;
+            wire.stream.flush()?;
+            *stalled.lock().unwrap() = Some(Instant::now());
         }
         _ => {}
     }

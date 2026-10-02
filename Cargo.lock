@@ -734,6 +734,7 @@ dependencies = [
  "serde_json",
  "silentpayments",
  "tokio",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

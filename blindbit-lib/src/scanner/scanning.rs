@@ -8,6 +8,7 @@ use indexer::bdk_chain::bdk_core::Merge;
 use indexer::bdk_chain::local_chain::LocalChain;
 use indexer::bdk_chain::{BlockId, CanonicalizationParams};
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 
 use crate::oracle_grpc::{
     BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
@@ -15,7 +16,7 @@ use crate::oracle_grpc::{
 };
 
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
-use super::health::ScanStopped;
+use super::health::{ScanCancelled, ScanStopped};
 use super::p2p;
 use super::health::OracleProbe;
 use super::reorg::{
@@ -144,6 +145,30 @@ async fn next_block<S: BlockScanDataStream>(
     })
 }
 
+/// `future`, unless `cancel` is cancelled first: then [`ScanCancelled`].
+///
+/// Only for steps that change nothing (oracle lookups and stream reads), so
+/// abandoning one leaves the scanner exactly as it was.
+async fn unless_cancelled<T>(
+    cancel: &CancellationToken,
+    future: impl Future<Output = Result<T, ScannerError>>,
+) -> Result<T, ScannerError> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(Box::new(ScanCancelled)),
+        result = future => result,
+    }
+}
+
+/// Sleep for `duration`; `false` when `cancel` was cancelled first.
+async fn sleep_unless_cancelled(cancel: &CancellationToken, duration: time::Duration) -> bool {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        () = time::sleep(duration) => true,
+    }
+}
+
 /// A block message is only scannable if it is the next height in the range
 /// and carries a real block hash. An oracle answers a height it has not
 /// indexed with an empty hash and no data; treating that as an empty block
@@ -209,25 +234,29 @@ impl Scanner {
         end: u64,
         mut source: Src,
     ) -> Result<(), ScannerError> {
+        // Lookups and stream opens change nothing, so a cancellation may
+        // abandon them.
+        let cancel = self.cancel.clone();
         let mut start = start;
         // The block below `start` is checked with a hash lookup instead of
         // being streamed again.
         let mut first = start;
         if let Some(prev) = start.checked_sub(1).filter(|prev| *prev > 0)
-            && self.oracle_view(&mut source, prev).await? == OracleView::Different
+            && unless_cancelled(&cancel, self.oracle_view(&mut source, prev)).await?
+                == OracleView::Different
         {
             tracing::warn!(
                 height = prev,
                 "chain reorganisation detected; locating the fork point"
             );
-            first = self.locate_fork(&mut source, prev).await?;
+            first = unless_cancelled(&cancel, self.locate_fork(&mut source, prev)).await?;
         }
         let mut restarts = 0;
         loop {
             if first > end {
                 return Ok(());
             }
-            let stream = source.open(first, end).await?;
+            let stream = unless_cancelled(&cancel, source.open(first, end)).await?;
             match self.scan_block_stream_from(first, start, end, stream).await {
                 Err(e) => {
                     let Some(reorg) = e.downcast_ref::<ReorgBelowStreamStart>() else {
@@ -262,7 +291,9 @@ impl Scanner {
                         .max(1);
                     let mut disagreeing = None;
                     for height in check_from..=end {
-                        if self.oracle_view(&mut source, height).await? == OracleView::Different {
+                        if unless_cancelled(&cancel, self.oracle_view(&mut source, height)).await?
+                            == OracleView::Different
+                        {
                             disagreeing = Some(height);
                             break;
                         }
@@ -282,7 +313,8 @@ impl Scanner {
                         height,
                         "chain reorganisation while scanning; locating the fork point"
                     );
-                    first = self.locate_fork(&mut source, height).await?;
+                    first =
+                        unless_cancelled(&cancel, self.locate_fork(&mut source, height)).await?;
                     start = self.last_scanned_block_height + 1;
                 }
             }
@@ -353,8 +385,16 @@ impl Scanner {
         let mut have_prior_block = false;
         // Whether anything was scanned or rolled back (worth a save).
         let mut changed = false;
+        // A cancellation stops the scan only between blocks or while a
+        // block's data or its P2P download is awaited, never part way
+        // through applying a block: every block up to
+        // `last_scanned_block_height` is complete and nothing above it is
+        // kept, so the next scan resumes at the block after it.
+        let cancel = self.cancel.clone();
 
-        while let Some(block_scan_data) = next_block(&mut stream, expected_height).await? {
+        while let Some(block_scan_data) =
+            unless_cancelled(&cancel, next_block(&mut stream, expected_height)).await?
+        {
             let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -742,7 +782,8 @@ impl Scanner {
     /// When every attempt fails the error is a [`p2p::BlockFetchError`]
     /// whose message says what the node did and what the user can do;
     /// `watch_chain` then retries the block on a growing interval
-    /// ([`p2p::FetchBackoff`]).
+    /// ([`p2p::FetchBackoff`]). A cancelled scan ends the download at once
+    /// with [`ScanCancelled`], before anything of the block is applied.
     pub(crate) async fn fetch_block_with_retry(
         &self,
         block_hash: BlockHash,
@@ -758,9 +799,16 @@ impl Scanner {
         // tried again.
         p2p::BlockFetcher::new(self.p2p_peer, self.network)
             .with_policy(self.p2p_retry)
+            .with_cancel(self.cancel.clone())
             .fetch(block_hash, height)
             .await
-            .map_err(|e| -> ScannerError { e })
+            .map_err(|e| -> ScannerError {
+                if e.failure == p2p::FetchFailure::Cancelled {
+                    Box::new(ScanCancelled)
+                } else {
+                    e
+                }
+            })
     }
 
     /// Update Electrum tip height and scan progress after each scanned block.
@@ -801,14 +849,49 @@ impl Scanner {
     /// height lies below the oracle's first indexed block, scanning starts at
     /// that block instead (see
     /// [`Scanner::start_at_oracle_floor_if_below`]).
+    ///
+    /// Runs until an error it cannot retry; see [`Self::watch_chain_until`]
+    /// to stop it.
     pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
-        loop {
+        self.watch_chain_until(CancellationToken::new()).await
+    }
+
+    /// [`Self::watch_chain`] until `cancel` is cancelled; then it returns
+    /// `Ok(())` promptly, without waiting for the poll interval, a retry
+    /// wait, the oracle or a P2P block download to finish.
+    ///
+    /// It stops only at a safe point (see [`ScanCancelled`]): between
+    /// blocks, or while it waits. A block whose download is cancelled is not
+    /// applied at all; the scanned height stays below it and the next run
+    /// resumes there. Callers save the state once it returned (the scan
+    /// itself saves at checkpoints).
+    pub async fn watch_chain_until(
+        &mut self,
+        cancel: CancellationToken,
+    ) -> Result<(), ScannerError> {
+        self.cancel = cancel;
+        let result = self.watch_loop().await;
+        if self.cancel.is_cancelled() {
+            tracing::info!(
+                height = self.last_scanned_block_height,
+                "scan stopped; it resumes after the last scanned height"
+            );
+        }
+        // Later scans on this scanner (a range scan) run uncancelled again.
+        self.cancel = CancellationToken::new();
+        result
+    }
+
+    async fn watch_loop(&mut self) -> Result<(), ScannerError> {
+        let cancel = self.cancel.clone();
+        while !cancel.is_cancelled() {
             self.restore_missing_witnesses_when_due().await;
-            let oracle_tip = match self
-                .client
-                .get_info(tonic::Request::new(()))
-                .await
-            {
+            let get_info = self.client.get_info(tonic::Request::new(()));
+            let oracle_tip = match tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(()),
+                info = get_info => info,
+            } {
                 Ok(resp) => resp.into_inner().height,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to reach oracle, will retry");
@@ -817,7 +900,7 @@ impl Scanner {
                         format!("cannot reach the oracle: {e}"),
                     )
                     .await;
-                    time::sleep(time::Duration::from_secs(10)).await;
+                    sleep_unless_cancelled(&cancel, time::Duration::from_secs(10)).await;
                     continue;
                 }
             };
@@ -828,9 +911,10 @@ impl Scanner {
                 // growing interval (the stall message says when).
                 let poll = time::Duration::from_secs(10);
                 let wait = self.fetch_backoff.take_wait().map_or(poll, |w| w.max(poll));
-                time::sleep(wait).await;
+                sleep_unless_cancelled(&cancel, wait).await;
             }
         }
+        Ok(())
     }
 
     /// One poll of [`Self::watch_chain`], once the oracle's tip is known:
@@ -857,6 +941,9 @@ impl Scanner {
                 self.clear_stall().await;
                 false
             }
+            // Stopped on request: not a failure of the oracle or the node,
+            // so no stall and no backoff.
+            Err(e) if e.is::<ScanCancelled>() => false,
             Err(mut e) => {
                 if from <= to
                     && self

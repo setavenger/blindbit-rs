@@ -48,10 +48,12 @@ enum RunOutcome {
 /// How long a restart waits for the previous run's tasks to wind down.
 const RESTART_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an exiting daemon waits for the scan task to end so it can save
-/// the state. The task can be stuck in a blocking P2P block download (up to
-/// 90 s); the process then exits without the final save — the scan loop's
-/// last checkpoint stays on disk, written atomically.
-const EXIT_SCAN_WAIT: Duration = Duration::from_secs(10);
+/// the state. The scan stops within milliseconds, even in the middle of a
+/// P2P block download, and the supervisor drops it after
+/// [`supervisor::CANCEL_GRACE`] at the latest; only a task blocking a worker
+/// thread could take longer. The process then exits without the final save:
+/// the scan loop's last checkpoint stays on disk, written atomically.
+const EXIT_SCAN_WAIT: Duration = Duration::from_secs(3);
 
 fn main() {
     let cli = Cli::parse();
@@ -327,15 +329,20 @@ async fn run(
 
     // The scan task lives in a supervisor so it can be stopped/started via
     // the control socket.  watch_chain polls the oracle for new blocks and
-    // runs indefinitely — no end_height needed.
+    // runs indefinitely — no end_height needed — until the supervisor
+    // cancels its token.
     let supervisor = Arc::new(ScanSupervisor::new(
         {
             let scanner = scanner_instance.clone();
-            move || {
+            move |cancel: CancellationToken| {
                 let scanner = scanner.clone();
                 Box::pin(async move {
-                    let mut s = scanner.lock().await;
-                    s.watch_chain().await.map_err(|e| e.to_string())
+                    let mut s = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Ok(()),
+                        s = scanner.lock() => s,
+                    };
+                    s.watch_chain_until(cancel).await.map_err(|e| e.to_string())
                 })
             }
         },
@@ -457,11 +464,6 @@ async fn run(
     let restarting = failure.is_none() && control_ctx.restart_requested();
     if supervisor.cancel() {
         let limit = (!restarting).then_some(EXIT_SCAN_WAIT);
-        if !supervisor.wait_stopped(Some(Duration::from_secs(2))).await {
-            tracing::info!(
-                "waiting for the scan task to finish a blocking step (such as a P2P block download)"
-            );
-        }
         if supervisor.wait_stopped(limit).await {
             control_ctx.save_state().await;
         } else {
