@@ -156,10 +156,11 @@ greyed out while a scan runs, Stop daemon while none is running).
 - **Stop scanning** pauses the scan loop; the status says *paused* and the
   height stays where it is until **Start scanning**. The pause lasts until
   you press Start (it also survives a settings save, which restarts the
-  daemon in-process), but not a restart of the daemon process. If the scan
-  is in the middle of downloading a block from the P2P node, it can only
-  stop once that download returns: the status says *stopping…* until then,
-  never *paused* early.
+  daemon in-process), but not a restart of the daemon process. The scan
+  stops within about a second, also in the middle of downloading a block
+  from the P2P node: the download is abandoned, nothing of that block is
+  kept, and Start scanning picks it up again. The status says *stopping…*
+  until the scan has really ended, never *paused* early.
 - **Stop daemon** stops the daemon process whoever started it — this tray,
   an earlier tray session, or something else (a terminal, a service, an
   autostart entry); the Status tab says which one it is and what Quit will
