@@ -5,10 +5,12 @@
 
 pub mod lifecycle;
 pub mod setup;
+pub mod view;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use friglet_ipc::{Client, DaemonConfig, Request, Response, StatusInfo};
 use serde::Serialize;
@@ -18,12 +20,17 @@ use tauri::{AppHandle, Manager, State, WindowEvent};
 use tauri_plugin_autostart::ManagerExt;
 use tokio::process::Child;
 
-use lifecycle::{Attachment, ExitReport, RecentOutput, Supervision};
+use lifecycle::{Attachment, ExitReport, RecentOutput, StopOutcome, Supervision};
+use view::{
+    Condition, DaemonFacts, DaemonView, ErrorBook, ErrorEntry, Ownership, ScanView, Stopped,
+};
 
 /// How often the background task polls `GetStatus`.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// Per-poll probe timeout; shorter than the interval so polls don't pile up.
-const POLL_TIMEOUT: Duration = Duration::from_millis(900);
+/// Per-poll probe timeout. A status answer never waits on the network in
+/// current daemons; older ones fetched the oracle tip inline (up to 2 s), so
+/// leave room for that rather than calling the daemon unreachable.
+const POLL_TIMEOUT: Duration = Duration::from_millis(2500);
 /// A tray-owned daemon we hold no process handle for (spawned by an earlier
 /// tray session) is presumed dead after this long without answering.
 const UNHANDLED_DAEMON_DEAD_AFTER: Duration = Duration::from_secs(15);
@@ -38,6 +45,15 @@ struct StatusState {
     reachable: bool,
     /// Kept even while unreachable so the window can show the last snapshot.
     last: Option<StatusInfo>,
+    /// Who started the daemon, refreshed by the poller.
+    ownership: Option<Ownership>,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Who owns the daemon. Single boolean policy, no PID files.
@@ -65,6 +81,17 @@ struct AppState {
     supervision: Mutex<Supervision>,
     /// Since when the daemon has not answered polls.
     unreachable_since: Mutex<Option<Instant>>,
+    /// An attach/spawn is in progress (the window says "starting…").
+    starting: AtomicBool,
+    /// Stop daemon is in progress.
+    stopping: AtomicBool,
+    /// The daemon was stopped on purpose (Stop daemon, or it exited
+    /// normally): the supervisor leaves it stopped until Start daemon.
+    stopped: Mutex<Option<Stopped>>,
+    /// Errors shown in the window: active conditions and recent ones.
+    errors: Mutex<ErrorBook>,
+    /// The tray's own log file, when it could be opened.
+    tray_log: Option<PathBuf>,
 }
 
 impl AppState {
@@ -78,7 +105,74 @@ impl AppState {
             quitting: AtomicBool::new(false),
             supervision: Mutex::new(Supervision::default()),
             unreachable_since: Mutex::new(None),
+            starting: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            stopped: Mutex::new(None),
+            errors: Mutex::new(ErrorBook::default()),
+            tray_log: None,
         }
+    }
+
+    /// Record a one-off error for the window, and log it.
+    fn error_event(&self, key: &str, message: String) {
+        tracing::error!(kind = key, "{message}");
+        self.errors.lock().unwrap().event(key, message, unix_now());
+    }
+
+    /// Everything the views are computed from.
+    fn daemon_facts(&self) -> DaemonFacts {
+        let (reachable, pid, ownership) = {
+            let s = self.status.lock().unwrap();
+            (
+                s.reachable,
+                s.last.as_ref().and_then(|l| l.pid),
+                s.ownership,
+            )
+        };
+        let now = Instant::now();
+        let sup = self.supervision.lock().unwrap();
+        DaemonFacts {
+            reachable,
+            unreachable_for_secs: self
+                .unreachable_since
+                .lock()
+                .unwrap()
+                .map(|since| now.duration_since(since).as_secs()),
+            setup_needed: self.setup_needed.load(Ordering::SeqCst),
+            starting: self.starting.load(Ordering::SeqCst),
+            stopping: self.stopping.load(Ordering::SeqCst),
+            stopped: self.stopped.lock().unwrap().clone(),
+            restart_in_secs: sup
+                .next_restart_at
+                .filter(|_| self.supervise.load(Ordering::SeqCst))
+                .map(|at| at.saturating_duration_since(now).as_secs_f64().ceil() as u64),
+            ownership: reachable.then_some(ownership).flatten(),
+            pid: reachable.then_some(pid).flatten(),
+            quit_stops_daemon: ownership.is_some_and(|o| o != Ownership::External),
+        }
+    }
+
+    fn views(&self) -> (DaemonView, ScanView) {
+        let facts = self.daemon_facts();
+        let s = self.status.lock().unwrap();
+        (
+            view::daemon_view(&facts),
+            view::scan_view(s.last.as_ref(), s.reachable, unix_now()),
+        )
+    }
+}
+
+/// Holds an [`AtomicBool`] raised for the guard's lifetime.
+struct Flag<'a>(&'a AtomicBool);
+impl<'a> Flag<'a> {
+    fn raise(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::SeqCst);
+        Self(flag)
+    }
+}
+impl Drop for Flag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -125,33 +219,203 @@ fn daemon_health(state: &AppState) -> DaemonHealth {
     }
 }
 
+/// Where the logs are, for the Status tab.
+#[derive(Serialize)]
+struct LogsInfo {
+    /// The daemon's log file (as the daemon reports it, else the default).
+    daemon_log: Option<String>,
+    /// The tray's own log file.
+    tray_log: Option<String>,
+}
+
 /// Payload for the `get_status` command.
 #[derive(Serialize)]
 struct StatusPayload {
     reachable: bool,
     status: Option<StatusInfo>,
     daemon: DaemonHealth,
+    daemon_view: DaemonView,
+    scan_view: ScanView,
+    /// Active errors first, then recent ones; newest first.
+    errors: Vec<ErrorEntry>,
+    logs: LogsInfo,
+}
+
+fn daemon_log_path(state: &AppState) -> Option<PathBuf> {
+    let reported = state
+        .status
+        .lock()
+        .unwrap()
+        .last
+        .as_ref()
+        .and_then(|s| s.log_file.clone());
+    reported
+        .map(PathBuf::from)
+        .or_else(friglet_ipc::logfile::daemon_log_file)
 }
 
 #[tauri::command]
 async fn get_status(state: State<'_, Arc<AppState>>) -> Result<StatusPayload, String> {
     let daemon = daemon_health(&state);
+    let (daemon_view, scan_view) = state.views();
+    let mut errors = state.errors.lock().unwrap().entries();
+    errors.sort_by_key(|e| !e.active);
+    let logs = LogsInfo {
+        daemon_log: daemon_log_path(&state).map(|p| p.display().to_string()),
+        tray_log: state.tray_log.as_ref().map(|p| p.display().to_string()),
+    };
     let s = state.status.lock().unwrap();
     Ok(StatusPayload {
         reachable: s.reachable,
         status: s.last.clone(),
         daemon,
+        daemon_view,
+        scan_view,
+        errors,
+        logs,
     })
 }
 
-#[tauri::command]
-async fn start_scanning(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    send_simple(&state.socket_path, Request::Start).await
+/// Start/Stop scanning (window buttons and tray menu). A failure is logged
+/// and kept in the window's error list. `Ok(Some(note))`: e.g. "stopping:
+/// ..." while the scanner finishes a blocking step.
+async fn scan_control(state: &AppState, req: Request) -> Result<Option<String>, String> {
+    let what = if req == Request::Start {
+        "Start scanning"
+    } else {
+        "Stop scanning"
+    };
+    tracing::info!("{what} requested");
+    let result = send_with_note(&state.socket_path, req).await;
+    match &result {
+        Ok(Some(note)) => tracing::info!("{what}: {note}"),
+        Ok(None) => {}
+        Err(e) => state.error_event("action", format!("{what} failed: {e}")),
+    }
+    result
 }
 
 #[tauri::command]
-async fn stop_scanning(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    send_simple(&state.socket_path, Request::Stop).await
+async fn start_scanning(state: State<'_, Arc<AppState>>) -> Result<Option<String>, String> {
+    scan_control(&state, Request::Start).await
+}
+
+#[tauri::command]
+async fn stop_scanning(state: State<'_, Arc<AppState>>) -> Result<Option<String>, String> {
+    scan_control(&state, Request::Stop).await
+}
+
+/// Stop the daemon, whoever started it, and keep it stopped: the
+/// supervisor does not restart it until Start daemon. Returns what happened.
+async fn stop_daemon_now(state: &AppState) -> Result<String, String> {
+    let _flag = Flag::raise(&state.stopping);
+    let mut lc = state.lifecycle.lock().await;
+    // From here on the supervisor must not undo the stop.
+    state.supervise.store(false, Ordering::SeqCst);
+    state.supervision.lock().unwrap().reset();
+    let pid = state
+        .status
+        .lock()
+        .unwrap()
+        .last
+        .as_ref()
+        .and_then(|s| s.pid);
+    *state.stopped.lock().unwrap() = Some(Stopped {
+        at_unix: unix_now(),
+        by_user: true,
+        detail: String::new(),
+        pid,
+    });
+    tracing::info!(?pid, "Stop daemon requested");
+    let outcome = lifecycle::stop_daemon(&state.socket_path, lc.child.take(), pid).await;
+    lc.spawned_by_tray = false;
+    lc.recent_output = None;
+    drop(lc);
+    match outcome {
+        StopOutcome::Stopped(how) => {
+            tracing::info!(%how, "daemon stopped");
+            Ok(format!("Daemon stopped ({how})."))
+        }
+        StopOutcome::Killed => {
+            let msg = format!(
+                "The daemon did not exit within {}s after the shutdown request and was killed.",
+                lifecycle::STOP_DAEMON_TIMEOUT.as_secs()
+            );
+            tracing::warn!("{msg}");
+            Ok(msg)
+        }
+        StopOutcome::NotRunning => Ok("No daemon was running.".to_string()),
+        StopOutcome::StillRunning(why) => {
+            *state.stopped.lock().unwrap() = None;
+            let msg = format!("Stop daemon: {why}");
+            state.error_event("action", msg.clone());
+            Err(msg)
+        }
+    }
+}
+
+/// Start the daemon (or attach to one that is already running) and let the
+/// supervisor keep a tray-started one running again.
+async fn start_daemon_now(state: &AppState) -> Result<(), String> {
+    tracing::info!("Start daemon requested");
+    *state.stopped.lock().unwrap() = None;
+    state.supervision.lock().unwrap().reset();
+    match attach_and_record(state).await {
+        None => Ok(()),
+        Some(reason) => Err(reason),
+    }
+}
+
+#[tauri::command]
+async fn stop_daemon(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    stop_daemon_now(&state).await
+}
+
+#[tauri::command]
+async fn start_daemon(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    let result = start_daemon_now(&state).await;
+    if state.setup_needed.load(Ordering::SeqCst) {
+        show_settings_window(&app);
+    }
+    result
+}
+
+/// Open the folder holding the daemon's log in the file manager.
+#[tauri::command]
+fn open_log_folder(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let dir = daemon_log_path(&state)
+        .and_then(|p| p.parent().map(PathBuf::from))
+        .or_else(friglet_ipc::logfile::default_log_dir)
+        .ok_or("cannot determine the log folder on this system")?;
+    let _ = std::fs::create_dir_all(&dir);
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    match std::process::Command::new(opener)
+        .arg(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap it in the background; the file manager outlives it.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            tracing::info!(dir = %dir.display(), "opened the log folder");
+            Ok(dir.display().to_string())
+        }
+        Err(e) => {
+            let msg = format!("cannot open {} with {opener}: {e}", dir.display());
+            state.error_event("action", msg.clone());
+            Err(msg)
+        }
+    }
 }
 
 /// Fetch the daemon's effective configuration (never contains the scan
@@ -360,11 +624,6 @@ async fn save_local_config(
     Ok(attach_and_record(&state).await)
 }
 
-/// Send a request that is expected to answer `Ok`.
-async fn send_simple(socket_path: &str, req: Request) -> Result<(), String> {
-    send_with_note(socket_path, req).await.map(|_| ())
-}
-
 /// Send a request answering `Ok` or `OkWithNote`; the note is passed through
 /// so the UI can surface it.
 async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String>, String> {
@@ -387,7 +646,7 @@ async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String
 /// `setup_needed` flag. Returns the failure reason when the daemon stayed
 /// unreachable despite being configured (spawn failed / socket never came up).
 ///
-/// Runs at startup, from the "Retry / Start daemon" menu item and after a
+/// Runs at startup, from Start daemon (menu and window) and after a
 /// first-run setup save. Holds the lifecycle lock for the whole attempt so
 /// concurrent retriggers queue up instead of spawning multiple daemons.
 async fn attach_and_record(state: &AppState) -> Option<String> {
@@ -406,9 +665,10 @@ where
     C: FnOnce() -> bool,
 {
     let mut lc = state.lifecycle.lock().await;
+    let _starting = Flag::raise(&state.starting);
 
     // Reap a previously spawned child that has exited.
-    if let Some(report) = reap_exited(&mut lc) {
+    if let Some((report, _)) = reap_exited(&mut lc) {
         tracing::warn!(status = %report.status, "previously spawned daemon exited");
     }
 
@@ -459,18 +719,28 @@ where
                 .supervise
                 .store(status.spawned_by_tray, Ordering::SeqCst);
             state.setup_needed.store(false, Ordering::SeqCst);
+            *state.stopped.lock().unwrap() = None;
+            record_reachable(state, *status);
             None
         }
         Attachment::Spawned(child, recent_output) => {
             tracing::info!("spawned daemon and connected");
+            *state.stopped.lock().unwrap() = None;
             lc.spawned_by_tray = true;
             lc.child = Some(child);
             lc.recent_output = Some(recent_output);
             state.supervise.store(true, Ordering::SeqCst);
             state.setup_needed.store(false, Ordering::SeqCst);
-            let mut sup = state.supervision.lock().unwrap();
-            sup.next_restart_at = None;
-            sup.last_spawn_error = None;
+            {
+                let mut sup = state.supervision.lock().unwrap();
+                sup.next_restart_at = None;
+                sup.last_spawn_error = None;
+            }
+            if let Some(status) =
+                lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT).await
+            {
+                record_reachable(state, status);
+            }
             None
         }
         Attachment::SetupRequired => {
@@ -480,7 +750,7 @@ where
             None
         }
         Attachment::Unreachable { reason } => {
-            tracing::warn!(%reason, "daemon unreachable");
+            state.error_event("start", format!("Starting the daemon failed: {reason}"));
             // The tray tried to start a configured daemon: keep trying,
             // with backoff (whether this was startup, Save, Retry or an
             // automatic restart).
@@ -496,12 +766,27 @@ where
     }
 }
 
-/// Reap the spawned child if it has exited, returning how it ended.
-fn reap_exited(lc: &mut LifecycleState) -> Option<ExitReport> {
-    let status = match lc.child.as_mut()?.try_wait() {
+/// Publish a status answer right away instead of on the next poll: the
+/// window refreshes as soon as an attach/spawn returns, and a stale
+/// "unreachable" from before (e.g. the whole first-run setup) would flash an
+/// error at the user although the daemon is up.
+fn record_reachable(state: &AppState, status: StatusInfo) {
+    {
+        let mut s = state.status.lock().unwrap();
+        s.reachable = true;
+        s.last = Some(status);
+    }
+    *state.unreachable_since.lock().unwrap() = None;
+}
+
+/// Reap the spawned child if it has exited, returning how it ended and
+/// whether it exited normally (status 0: it was asked to stop — a Shutdown
+/// request or SIGTERM — since a failing daemon exits non-zero).
+fn reap_exited(lc: &mut LifecycleState) -> Option<(ExitReport, bool)> {
+    let (status, success) = match lc.child.as_mut()?.try_wait() {
         Ok(None) => return None,
-        Ok(Some(status)) => status.to_string(),
-        Err(e) => format!("unknown ({e})"),
+        Ok(Some(status)) => (status.to_string(), status.success()),
+        Err(e) => (format!("unknown ({e})"), false),
     };
     lc.child = None;
     lc.spawned_by_tray = false;
@@ -510,11 +795,14 @@ fn reap_exited(lc: &mut LifecycleState) -> Option<ExitReport> {
         .take()
         .map(|o| lifecycle::recent_output_tail(&o))
         .unwrap_or_default();
-    Some(ExitReport {
-        at: SystemTime::now(),
-        status,
-        output,
-    })
+    Some((
+        ExitReport {
+            at: SystemTime::now(),
+            status,
+            output,
+        },
+        success,
+    ))
 }
 
 /// One supervision step, run by the poller after each status probe: notice
@@ -559,20 +847,36 @@ where
             sup.on_unreachable();
         }
     }
-    if !state.supervise.load(Ordering::SeqCst) || state.setup_needed.load(Ordering::SeqCst) {
+    if !state.supervise.load(Ordering::SeqCst)
+        || state.setup_needed.load(Ordering::SeqCst)
+        || state.stopped.lock().unwrap().is_some()
+    {
         return;
     }
 
-    // Skip the tick while an attach/spawn/quit holds the lifecycle lock.
+    // Skip the tick while an attach/spawn/stop/quit holds the lifecycle lock.
     let Ok(mut lc) = state.lifecycle.try_lock() else {
         return;
     };
-    if let Some(report) = reap_exited(&mut lc) {
-        tracing::warn!(
-            status = %report.status,
-            output = %report.output,
-            "daemon exited unexpectedly; restarting it"
-        );
+    if let Some((report, success)) = reap_exited(&mut lc) {
+        if success {
+            // Asked to stop from outside the tray: respect that.
+            tracing::info!(status = %report.status, "daemon exited normally; not restarting it");
+            *state.stopped.lock().unwrap() = Some(Stopped {
+                at_unix: unix_now(),
+                by_user: false,
+                detail: "It exited normally (a shutdown request or SIGTERM from outside the \
+                         tray), so it is not restarted."
+                    .to_string(),
+                pid: None,
+            });
+            return;
+        }
+        let mut message = format!("The daemon exited unexpectedly ({})", report.status);
+        if !report.output.is_empty() {
+            message.push_str(&format!(". Last output: {}", report.output));
+        }
+        state.error_event("crash", format!("{message}. Restarting it."));
         state.supervision.lock().unwrap().on_exit(report, now);
     } else if !reachable {
         let unreachable_for = unreachable_for.unwrap_or_default();
@@ -591,7 +895,7 @@ where
         if let Some(status) = presumed
             && !pending
         {
-            tracing::warn!(status, "daemon presumed dead; restarting it");
+            state.error_event("crash", format!("The daemon {status}."));
             lc.spawned_by_tray = false;
             state.supervision.lock().unwrap().on_exit(
                 ExitReport {
@@ -687,39 +991,130 @@ fn show_on_start_env() -> Option<&'static str> {
     }
 }
 
-fn tray_label(status: Option<&StatusInfo>, setup_needed: bool, restarting: bool) -> String {
-    match status {
-        Some(s) => format!("Daemon: reachable (height {})", s.scanned_height),
-        None if setup_needed => "Setup required — open window".to_string(),
-        None if restarting => "Daemon: crashed — restarting".to_string(),
-        None => "Daemon: unreachable".to_string(),
+fn tray_label(daemon: &DaemonView, scan: &ScanView, status: Option<&StatusInfo>) -> String {
+    match (daemon.state, status) {
+        ("running", Some(s)) => format!("Scan: {} (height {})", scan.label, s.scanned_height),
+        ("setup", _) => "Setup required — open window".to_string(),
+        _ => format!("Daemon: {}", daemon.label),
     }
 }
 
 /// Label for the Quit menu item, so its consequence (shuts the daemon down
 /// vs. leaves it running) is visible without reading the README.
-fn quit_label(spawned_by_tray: bool) -> &'static str {
-    if spawned_by_tray {
-        "Quit (stops daemon)"
-    } else {
-        "Quit (keeps daemon running)"
+fn quit_label(daemon_running: bool, spawned_by_tray: bool) -> &'static str {
+    match (daemon_running, spawned_by_tray) {
+        (false, _) => "Quit",
+        (true, true) => "Quit (stops daemon)",
+        (true, false) => "Quit (keeps daemon running)",
     }
 }
 
-fn tray_tooltip(status: Option<&StatusInfo>, setup_needed: bool, restarting: bool) -> String {
-    match status {
-        Some(s) => {
+fn tray_tooltip(daemon: &DaemonView, scan: &ScanView, status: Option<&StatusInfo>) -> String {
+    match (daemon.state, status) {
+        ("running", Some(s)) => {
             let tip = s
                 .tip_height
                 .map(|t| t.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let activity = if s.scanning { "scanning" } else { "idle" };
-            format!("Friglet: {activity}, height {}/{tip}", s.scanned_height)
+            format!("Friglet: {}, height {}/{tip}", scan.label, s.scanned_height)
         }
-        None if setup_needed => "Friglet: first-time setup required".to_string(),
-        None if restarting => "Friglet: daemon crashed, restarting".to_string(),
-        None => "Friglet: daemon unreachable".to_string(),
+        ("setup", _) => "Friglet: first-time setup required".to_string(),
+        _ => format!("Friglet: daemon {}", daemon.label),
     }
+}
+
+/// Error conditions that hold right now, from the current views.
+fn conditions(
+    state: &AppState,
+    daemon: &DaemonView,
+    scan: &ScanView,
+    now_unix: u64,
+) -> Vec<Condition> {
+    let mut out = Vec::new();
+    if scan.state == "error" {
+        out.push(Condition {
+            key: "scan".to_string(),
+            message: scan.problem.clone().unwrap_or_else(|| scan.label.clone()),
+            since_unix: scan.since_unix.unwrap_or(now_unix),
+        });
+    }
+    // A crash shows at once in the crash card and the Recent errors list;
+    // "the daemon is down" becomes an active problem only after the grace.
+    let down_for = state
+        .unreachable_since
+        .lock()
+        .unwrap()
+        .map(|since| since.elapsed().as_secs());
+    if matches!(daemon.state, "unreachable" | "restarting")
+        && down_for.is_some_and(|secs| secs >= view::UNREACHABLE_GRACE_SECS)
+    {
+        let mut message = format!(
+            "The daemon is not running or not answering on {}",
+            state.socket_path
+        );
+        if let Some(reason) = state
+            .supervision
+            .lock()
+            .unwrap()
+            .last_spawn_error
+            .as_deref()
+        {
+            message.push_str(&format!(" — last start attempt: {reason}"));
+        }
+        out.push(Condition {
+            key: "daemon".to_string(),
+            message,
+            since_unix: now_unix,
+        });
+    }
+    out
+}
+
+/// One poll's bookkeeping: who owns the daemon, the error book (logging
+/// what was raised or resolved), and the views.
+fn refresh(state: &AppState, info: Option<&StatusInfo>) -> (DaemonView, ScanView, bool) {
+    if let Some(info) = info {
+        // A daemon answers again: whatever stopped it is over — unless it
+        // is the stopped daemon itself, answering while it shuts down.
+        let mut stopped = state.stopped.lock().unwrap();
+        let shutting_down = state.stopping.load(Ordering::SeqCst)
+            || stopped
+                .as_ref()
+                .is_some_and(|s| s.pid.is_some() && s.pid == info.pid);
+        if !shutting_down {
+            *stopped = None;
+        }
+    }
+    let spawned_by_tray = match state.lifecycle.try_lock() {
+        Ok(lc) => {
+            let ownership = info.map(|i| {
+                if lc.child.is_some() {
+                    Ownership::ThisTray
+                } else if i.spawned_by_tray {
+                    Ownership::EarlierTray
+                } else {
+                    Ownership::External
+                }
+            });
+            state.status.lock().unwrap().ownership = ownership;
+            Some(lc.spawned_by_tray)
+        }
+        Err(_) => None,
+    };
+    let (daemon, scan) = state.views();
+    let now = unix_now();
+    let changes = state
+        .errors
+        .lock()
+        .unwrap()
+        .update(&conditions(state, &daemon, &scan, now), now);
+    for raised in changes.raised {
+        tracing::error!(kind = %raised.key, "{}", raised.message);
+    }
+    for resolved in changes.resolved {
+        tracing::info!(kind = %resolved.key, "resolved: {}", resolved.message);
+    }
+    (daemon, scan, spawned_by_tray.unwrap_or(false))
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -728,7 +1123,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let status_item = MenuItem::with_id(
         handle,
         "status-label",
-        tray_label(None, false, false),
+        "Daemon: starting…",
         false,
         None::<&str>,
     )?;
@@ -739,16 +1134,15 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         true,
         None::<&str>,
     )?;
-    let start_item = MenuItem::with_id(handle, "start-scan", "Start scanning", true, None::<&str>)?;
-    let stop_item = MenuItem::with_id(handle, "stop-scan", "Stop scanning", true, None::<&str>)?;
-    let retry_item = MenuItem::with_id(
-        handle,
-        "retry-daemon",
-        "Retry / Start daemon",
-        true,
-        None::<&str>,
-    )?;
-    let quit_item = MenuItem::with_id(handle, "quit", quit_label(false), true, None::<&str>)?;
+    let start_item =
+        MenuItem::with_id(handle, "start-scan", "Start scanning", false, None::<&str>)?;
+    let stop_item = MenuItem::with_id(handle, "stop-scan", "Stop scanning", false, None::<&str>)?;
+    let start_daemon_item =
+        MenuItem::with_id(handle, "start-daemon", "Start daemon", false, None::<&str>)?;
+    let stop_daemon_item =
+        MenuItem::with_id(handle, "stop-daemon", "Stop daemon", false, None::<&str>)?;
+    let quit_item =
+        MenuItem::with_id(handle, "quit", quit_label(false, false), true, None::<&str>)?;
 
     let menu = Menu::with_items(
         handle,
@@ -759,7 +1153,8 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             &start_item,
             &stop_item,
             &PredefinedMenuItem::separator(handle)?,
-            &retry_item,
+            &start_daemon_item,
+            &stop_daemon_item,
             &PredefinedMenuItem::separator(handle)?,
             &quit_item,
         ],
@@ -774,46 +1169,48 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .tooltip("Friglet")
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "open-window" => show_status_window(app),
-            "start-scan" | "stop-scan" => {
-                let req = if event.id().as_ref() == "start-scan" {
-                    Request::Start
-                } else {
-                    Request::Stop
-                };
-                let state = app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = send_simple(&state.socket_path, req).await {
-                        tracing::warn!(error = %e, "start/stop via tray menu failed");
-                    }
-                });
+        .on_menu_event(|app, event| {
+            let state = app.state::<Arc<AppState>>().inner().clone();
+            match event.id().as_ref() {
+                "open-window" => show_status_window(app),
+                "start-scan" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = scan_control(&state, Request::Start).await;
+                    });
+                }
+                "stop-scan" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = scan_control(&state, Request::Stop).await;
+                    });
+                }
+                "start-daemon" => {
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = start_daemon_now(&state).await;
+                        // An unconfigured daemon lands in setup mode
+                        // instead of a spawn-fail loop; take the user there.
+                        if state.setup_needed.load(Ordering::SeqCst) {
+                            show_settings_window(&app);
+                        }
+                    });
+                }
+                "stop-daemon" => {
+                    tauri::async_runtime::spawn(async move {
+                        let _ = stop_daemon_now(&state).await;
+                    });
+                }
+                "quit" => quit(app),
+                _ => {}
             }
-            "retry-daemon" => {
-                let state = app.state::<Arc<AppState>>().inner().clone();
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    // Manual retry: now, with a fresh backoff.
-                    state.supervision.lock().unwrap().reset();
-                    let _ = attach_and_record(&state).await;
-                    // Retry with an unconfigured daemon lands in setup mode
-                    // instead of a spawn-fail loop; take the user there.
-                    if state.setup_needed.load(Ordering::SeqCst) {
-                        show_settings_window(&app);
-                    }
-                });
-            }
-            "quit" => quit(app),
-            _ => {}
         })
         .build(app)?;
 
     // Background poller: refresh shared status every second and update the
-    // tray label / tooltip / start-stop enablement when something changed.
+    // tray label / tooltip / item enablement when something changed.
     let state = app.state::<Arc<AppState>>().inner().clone();
     tauri::async_runtime::spawn(async move {
         let mut last_label = String::new();
-        let mut last_enablement: Option<(bool, bool)> = None;
+        let mut last_enablement: Option<[bool; 4]> = None;
         let mut last_quit_label: Option<&'static str> = None;
         loop {
             let info = lifecycle::probe(&state.socket_path, POLL_TIMEOUT).await;
@@ -829,37 +1226,34 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 state.setup_needed.store(false, Ordering::SeqCst);
             }
             supervise_tick(&state, info.is_some()).await;
-            let setup_needed = state.setup_needed.load(Ordering::SeqCst);
-            let restarting = state.supervision.lock().unwrap().next_restart_at.is_some();
+            let (daemon, scan, spawned_by_tray) = refresh(&state, info.as_ref());
 
-            let label = tray_label(info.as_ref(), setup_needed, restarting);
+            let label = tray_label(&daemon, &scan, info.as_ref());
             if label != last_label {
                 tracing::info!(%label, "tray status label updated");
                 let _ = status_item.set_text(&label);
-                let _ =
-                    tray.set_tooltip(Some(tray_tooltip(info.as_ref(), setup_needed, restarting)));
+                let _ = tray.set_tooltip(Some(tray_tooltip(&daemon, &scan, info.as_ref())));
                 last_label = label;
             }
 
-            let enablement = (
-                info.is_some() && !info.as_ref().is_some_and(|i| i.scanning),
-                info.as_ref().is_some_and(|i| i.scanning),
-            );
+            let enablement = [
+                scan.can_start,
+                scan.can_stop,
+                daemon.can_start,
+                daemon.can_stop,
+            ];
             if last_enablement != Some(enablement) {
-                let _ = start_item.set_enabled(enablement.0);
-                let _ = stop_item.set_enabled(enablement.1);
+                let _ = start_item.set_enabled(enablement[0]);
+                let _ = stop_item.set_enabled(enablement[1]);
+                let _ = start_daemon_item.set_enabled(enablement[2]);
+                let _ = stop_daemon_item.set_enabled(enablement[3]);
                 last_enablement = Some(enablement);
             }
 
-            // Non-blocking: the lifecycle lock is only briefly held during
-            // attach/spawn/quit, so a lock held elsewhere just skips this
-            // poll tick's Quit-label refresh rather than stalling the poller.
-            if let Ok(lc) = state.lifecycle.try_lock() {
-                let label = quit_label(lc.spawned_by_tray);
-                if last_quit_label != Some(label) {
-                    let _ = quit_item.set_text(label);
-                    last_quit_label = Some(label);
-                }
+            let label = quit_label(info.is_some(), spawned_by_tray);
+            if last_quit_label != Some(label) {
+                let _ = quit_item.set_text(label);
+                last_quit_label = Some(label);
             }
 
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -869,14 +1263,52 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+/// Log to stderr and to the tray's log file
+/// (`friglet_ipc::logfile::tray_log_file`). The daemon's forwarded output
+/// (target `friglet-daemon`) goes to stderr only: the daemon writes its own
+/// log file. Returns the tray log's path when it could be opened.
+fn init_logging() -> Option<PathBuf> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let path = friglet_ipc::logfile::tray_log_file();
+    let opened = path.as_deref().map(friglet_ipc::logfile::RotatingLog::open);
+    let (file, file_error) = match opened {
+        Some(Ok(log)) => (Some(log), None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
+    let file_layer = file.clone().map(|log| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || log.clone())
+            .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+                meta.target() != "friglet-daemon"
+            }))
+    });
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(file_layer)
         .init();
+    if let (Some(path), Some(e)) = (&path, file_error) {
+        tracing::warn!(path = %path.display(), error = %e, "cannot write the tray log file");
+    }
+    file.map(|log| log.path())
+}
 
-    let state = Arc::new(AppState::new(friglet_ipc::default_socket_path()));
+pub fn run() {
+    let tray_log = init_logging();
+    if let Some(path) = &tray_log {
+        tracing::info!(path = %path.display(), "friglet-tray starting; logging to file");
+    }
+
+    let mut state = AppState::new(friglet_ipc::default_socket_path());
+    state.tray_log = tray_log;
+    let state = Arc::new(state);
 
     tauri::Builder::default()
         // Must be the first plugin registered (tauri-plugin-single-instance
@@ -911,7 +1343,10 @@ pub fn run() {
             apply_settings,
             network_defaults,
             get_autostart,
-            set_autostart
+            set_autostart,
+            start_daemon,
+            stop_daemon,
+            open_log_folder
         ])
         .on_window_event(|window, event| {
             // Tray-only app: closing the status window hides it.
@@ -1017,6 +1452,7 @@ mod tests {
                                 version: "test".to_string(),
                                 spawned_by_tray,
                                 scan_health: Default::default(),
+                                ..Default::default()
                             }),
                             _ => Response::Ok,
                         };
@@ -1232,18 +1668,274 @@ mod tests {
     }
 
     #[test]
-    fn tray_labels_reflect_setup_mode() {
-        assert_eq!(tray_label(None, false, false), "Daemon: unreachable");
-        assert_eq!(
-            tray_label(None, true, false),
-            "Setup required — open window"
+    fn tray_labels_reflect_daemon_and_scan_state() {
+        let label = |facts: DaemonFacts, status: Option<&StatusInfo>| {
+            let daemon = view::daemon_view(&facts);
+            let scan = view::scan_view(status, facts.reachable, unix_now());
+            (
+                tray_label(&daemon, &scan, status),
+                tray_tooltip(&daemon, &scan, status),
+            )
+        };
+        let gone = DaemonFacts {
+            unreachable_for_secs: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(label(gone.clone(), None).0, "Daemon: not running");
+        let (setup, setup_tip) = label(
+            DaemonFacts {
+                setup_needed: true,
+                ..gone.clone()
+            },
+            None,
         );
-        assert_eq!(
-            tray_label(None, false, true),
-            "Daemon: crashed — restarting"
+        assert_eq!(setup, "Setup required — open window");
+        assert!(setup_tip.contains("setup required"));
+        let (crashed, crashed_tip) = label(
+            DaemonFacts {
+                restart_in_secs: Some(2),
+                ..gone.clone()
+            },
+            None,
         );
-        assert!(tray_tooltip(None, true, false).contains("setup required"));
-        assert!(tray_tooltip(None, false, true).contains("restarting"));
+        assert_eq!(crashed, "Daemon: crashed — restarting");
+        assert!(crashed_tip.contains("restarting"));
+        let paused = StatusInfo {
+            scanned_height: 7,
+            tip_height: Some(7),
+            scan_state: Some(friglet_ipc::ScanState::Paused),
+            ..Default::default()
+        };
+        let (running, _) = label(
+            DaemonFacts {
+                reachable: true,
+                ..Default::default()
+            },
+            Some(&paused),
+        );
+        assert_eq!(running, "Scan: paused (height 7)");
+    }
+
+    /// A fake daemon that answers GetStatus with `pid` and stops listening
+    /// (removing its socket) on Shutdown, like the real one.
+    fn spawn_stoppable_fake_daemon(path: String, spawned_by_tray: bool, pid: u32) {
+        tokio::spawn(async move {
+            let _ = std::fs::remove_file(&path);
+            let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            loop {
+                let mut conn = tokio::select! {
+                    conn = friglet_ipc::accept(&listener) => match conn {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    },
+                    _ = stop_rx.changed() => break,
+                };
+                let stop_tx = stop_tx.clone();
+                tokio::spawn(async move {
+                    while let Ok(Some(req)) = conn.next_request().await {
+                        let shutdown = req == Request::Shutdown;
+                        let resp = match req {
+                            Request::GetStatus => Response::Status(StatusInfo {
+                                spawned_by_tray,
+                                pid: Some(pid),
+                                scan_state: Some(friglet_ipc::ScanState::Running),
+                                ..Default::default()
+                            }),
+                            _ => Response::Ok,
+                        };
+                        if conn.respond(&resp).await.is_err() {
+                            break;
+                        }
+                        if shutdown {
+                            let _ = stop_tx.send(true);
+                        }
+                    }
+                });
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
+
+    /// The poller's view of the daemon, without the poller.
+    async fn poll_once(state: &AppState) -> (DaemonView, ScanView) {
+        let info = lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT).await;
+        {
+            let mut s = state.status.lock().unwrap();
+            s.reachable = info.is_some();
+            if info.is_some() {
+                s.last = info.clone();
+            }
+        }
+        let (daemon, scan, _) = refresh(state, info.as_ref());
+        (daemon, scan)
+    }
+
+    /// A poll that still reaches the daemon being stopped (it answers while
+    /// it shuts down) must not cancel the stop; another daemon answering
+    /// (started from a terminal, say) does end it.
+    #[tokio::test]
+    async fn a_poll_of_the_stopping_daemon_keeps_it_stopped() {
+        let path = test_socket_path("stop-race");
+        spawn_stoppable_fake_daemon(path.clone(), false, 5000);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state = test_state(path.clone());
+        *state.stopped.lock().unwrap() = Some(Stopped {
+            at_unix: unix_now(),
+            by_user: true,
+            detail: String::new(),
+            pid: Some(5000),
+        });
+        poll_once(&state).await;
+        assert!(
+            state.stopped.lock().unwrap().is_some(),
+            "same PID: still stopping"
+        );
+
+        state.stopped.lock().unwrap().as_mut().unwrap().pid = Some(4999);
+        let (daemon, _) = poll_once(&state).await;
+        assert!(state.stopped.lock().unwrap().is_none(), "a new daemon runs");
+        assert_eq!(daemon.state, "running");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_stops_an_attached_external_daemon_for_good() {
+        let path = test_socket_path("stop-external");
+        spawn_stoppable_fake_daemon(path.clone(), false, 4711);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state = test_state(path.clone());
+        attach_and_record_with(&state, || panic!("must attach"), || false).await;
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.state, "running");
+        assert_eq!(daemon.ownership, Some(Ownership::External));
+        assert!(
+            daemon.detail.contains("Started outside the tray"),
+            "{}",
+            daemon.detail
+        );
+        assert!(daemon.detail.contains("PID 4711"));
+        assert!(daemon.can_stop);
+
+        let message = stop_daemon_now(&state).await.expect("stopped");
+        assert!(message.contains("PID 4711 exited"), "{message}");
+        assert!(
+            lifecycle::probe(&path, lifecycle::PROBE_TIMEOUT)
+                .await
+                .is_none()
+        );
+
+        // Even with supervision on and the daemon silent for long, nothing
+        // restarts it, and nothing counts as an error.
+        state.supervise.store(true, Ordering::SeqCst);
+        *state.unreachable_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(600));
+        for _ in 0..3 {
+            supervise_tick_with(
+                &state,
+                false,
+                || panic!("must not restart a stopped daemon"),
+                || false,
+            )
+            .await;
+        }
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!((daemon.state, daemon.can_start), ("stopped", true));
+        assert!(
+            daemon.detail.starts_with("Stopped by you"),
+            "{}",
+            daemon.detail
+        );
+        assert!(
+            state.errors.lock().unwrap().entries().is_empty(),
+            "a stop on request is not an error"
+        );
+
+        // Start daemon brings one back (here: attaches to a new one).
+        spawn_stoppable_fake_daemon(path.clone(), false, 4712);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        start_daemon_now(&state).await.expect("started");
+        assert!(state.stopped.lock().unwrap().is_none());
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.state, "running");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_on_a_tray_spawned_daemon_is_not_undone_by_the_supervisor() {
+        let path = test_socket_path("stop-spawned");
+        spawn_stoppable_fake_daemon(path.clone(), true, 4800);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let state = test_state(path.clone());
+        state.supervise.store(true, Ordering::SeqCst);
+        {
+            // Stands in for the spawned daemon process: exits by itself
+            // shortly, like the real one after the Shutdown request.
+            let mut lc = state.lifecycle.lock().await;
+            lc.child = Some(
+                tokio::process::Command::new("sleep")
+                    .arg("0.3")
+                    .spawn()
+                    .expect("spawn"),
+            );
+            lc.spawned_by_tray = true;
+        }
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.ownership, Some(Ownership::ThisTray));
+        assert!(daemon.detail.contains("Quit stops it"));
+
+        let message = stop_daemon_now(&state).await.expect("stopped");
+        assert!(message.contains("exit status: 0"), "{message}");
+        assert!(!state.supervise.load(Ordering::SeqCst));
+        state.supervise.store(true, Ordering::SeqCst); // even if re-enabled
+        supervise_tick_with(&state, false, || panic!("must not restart"), || false).await;
+        assert_eq!(daemon_health(&state).restart_in_secs, None);
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.state, "stopped");
+    }
+
+    #[tokio::test]
+    async fn a_daemon_exiting_normally_is_left_stopped() {
+        let path = test_socket_path("clean-exit");
+        let _ = std::fs::remove_file(&path);
+        let state = test_state(path);
+        state.supervise.store(true, Ordering::SeqCst);
+        {
+            let mut lc = state.lifecycle.lock().await;
+            let mut child = tokio::process::Command::new("true").spawn().expect("spawn");
+            let _ = child.wait().await;
+            lc.child = Some(child);
+            lc.spawned_by_tray = true;
+        }
+        supervise_tick_with(&state, false, || panic!("must not restart"), || false).await;
+        assert_eq!(daemon_health(&state).restart_in_secs, None);
+        let stopped = state
+            .stopped
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("recorded as stopped");
+        assert!(!stopped.by_user);
+        assert!(state.errors.lock().unwrap().entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dead_daemon_becomes_an_error_only_after_the_grace_and_is_logged_in_the_book() {
+        let path = test_socket_path("grace");
+        let _ = std::fs::remove_file(&path);
+        let state = test_state(path);
+        *state.unreachable_since.lock().unwrap() = Some(Instant::now());
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.state, "reconnecting");
+        assert!(state.errors.lock().unwrap().entries().is_empty());
+
+        *state.unreachable_since.lock().unwrap() =
+            Some(Instant::now() - Duration::from_secs(view::UNREACHABLE_GRACE_SECS));
+        let (daemon, _) = poll_once(&state).await;
+        assert_eq!(daemon.state, "unreachable");
+        let entries = state.errors.lock().unwrap().entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].active);
+        assert!(entries[0].message.contains("not running or not answering"));
     }
 
     #[tokio::test]
@@ -1366,7 +2058,8 @@ mod tests {
 
     #[test]
     fn quit_label_reflects_ownership() {
-        assert_eq!(quit_label(true), "Quit (stops daemon)");
-        assert_eq!(quit_label(false), "Quit (keeps daemon running)");
+        assert_eq!(quit_label(true, true), "Quit (stops daemon)");
+        assert_eq!(quit_label(true, false), "Quit (keeps daemon running)");
+        assert_eq!(quit_label(false, true), "Quit", "nothing to stop or keep");
     }
 }

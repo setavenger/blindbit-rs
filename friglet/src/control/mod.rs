@@ -17,11 +17,11 @@
 //! - Unchanged input answers `Ok` without a restart.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bdk_sp::encoding::SilentPaymentCode;
 use bitcoin::Network as BitcoinNetwork;
@@ -32,25 +32,107 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::config;
-use crate::supervisor::ScanSupervisor;
+use crate::supervisor::{ScanSupervisor, StartOutcome};
 
-/// How long a cached oracle tip is considered fresh.
-const ORACLE_TIP_TTL: Duration = Duration::from_secs(10);
-/// Cap how long `GetStatus` waits on a slow/unreachable oracle.
-const ORACLE_TIP_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the background poller asks the oracle for its tip.
+const ORACLE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Cap on one oracle tip poll (connect + `GetInfo`).
+const ORACLE_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The oracle counts as connected while its last good answer is this recent.
+const ORACLE_STALE_AFTER: Duration = Duration::from_secs(30);
+/// How long `Stop` waits for the scan task to end before answering that it
+/// is still stopping (it then finishes in the background).
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
-/// Cached BlindBit oracle chain tip for [`ControlCtx::status`].
+/// The oracle's reachability and chain tip, kept current by
+/// [`spawn_oracle_poller`] so `GetStatus` never waits on the network (a slow
+/// or unreachable oracle used to make every status request take ~2 s, longer
+/// than the tray's poll timeout, so the tray took the daemon for dead).
 #[derive(Debug, Default, Clone)]
-pub struct OracleTipCache {
+pub struct OracleStatus {
     tip: Option<u64>,
-    fetched_at: Option<Instant>,
+    last_ok: Option<Instant>,
+    error: Option<String>,
+    down_since_unix: Option<u64>,
 }
 
-impl OracleTipCache {
-    fn is_fresh(&self) -> bool {
-        self.fetched_at
-            .is_some_and(|at| at.elapsed() < ORACLE_TIP_TTL)
+impl OracleStatus {
+    pub fn record_ok(&mut self, tip: u64) {
+        self.tip = Some(tip);
+        self.last_ok = Some(Instant::now());
+        self.error = None;
+        self.down_since_unix = None;
     }
+
+    pub fn record_error(&mut self, error: String) {
+        self.error = Some(error);
+        self.down_since_unix.get_or_insert_with(unix_now);
+    }
+
+    fn connected(&self) -> bool {
+        self.error.is_none()
+            && self
+                .last_ok
+                .is_some_and(|at| at.elapsed() < ORACLE_STALE_AFTER)
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Poll the oracle's tip every [`ORACLE_POLL_INTERVAL`] into `status`,
+/// logging when it becomes unreachable and when it recovers.
+pub fn spawn_oracle_poller(url: String, status: Arc<std::sync::Mutex<OracleStatus>>) {
+    tokio::spawn(async move {
+        let mut client: Option<blindbit_lib::OracleServiceClient<tonic::transport::Channel>> = None;
+        loop {
+            let poll = async {
+                if client.is_none() {
+                    client = Some(
+                        blindbit_lib::OracleServiceClient::connect(url.clone())
+                            .await
+                            .map_err(|e| format!("cannot connect: {e}"))?,
+                    );
+                }
+                let response = client
+                    .as_mut()
+                    .expect("connected above")
+                    .get_info(tonic::Request::new(()))
+                    .await
+                    .map_err(|e| format!("GetInfo failed: {}", e.message()))?;
+                Ok::<u64, String>(response.into_inner().height)
+            };
+            let result = match tokio::time::timeout(ORACLE_POLL_TIMEOUT, poll).await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "no answer within {}s",
+                    ORACLE_POLL_TIMEOUT.as_secs()
+                )),
+            };
+            match result {
+                Ok(tip) => {
+                    let mut s = status.lock().unwrap();
+                    if s.error.is_some() {
+                        tracing::info!(tip, "oracle reachable again");
+                    }
+                    s.record_ok(tip);
+                }
+                Err(e) => {
+                    client = None;
+                    let mut s = status.lock().unwrap();
+                    if s.error.is_none() {
+                        tracing::warn!(url = %url, error = %e, "oracle unreachable; retrying");
+                    }
+                    s.record_error(format!("oracle {url}: {e}"));
+                }
+            }
+            tokio::time::sleep(ORACLE_POLL_INTERVAL).await;
+        }
+    });
 }
 
 /// Prefer the oracle tip when known; else the last scanned (electrum) tip.
@@ -163,9 +245,10 @@ pub struct ControlCtx {
     /// Serializes `SetConfig` / `SetScanKey` / `Start` / `Stop` so lifecycle
     /// verbs cannot interleave with persisting new settings.
     pub apply_lock: Mutex<()>,
-    /// Cached oracle chain tip so `GetStatus` does not hit the network every
-    /// poll (TTL ≈ 10s).
-    pub oracle_tip_cache: std::sync::Mutex<OracleTipCache>,
+    /// Oracle tip and reachability, updated by [`spawn_oracle_poller`].
+    pub oracle: Arc<std::sync::Mutex<OracleStatus>>,
+    /// The log file this daemon writes, if any.
+    pub log_file: Option<PathBuf>,
     pub shutdown: CancellationToken,
     /// Set (together with cancelling `shutdown`) when new settings were
     /// saved: the run ends and `main` starts the next one.
@@ -184,19 +267,23 @@ impl ControlCtx {
                 // Serialize with SetConfig/SetScanKey so the old scanner
                 // cannot be started in the middle of a rebuild + swap.
                 let _guard = self.apply_lock.lock().await;
-                if self.supervisor.start() {
-                    tracing::info!("scan task started via control socket");
+                match self.supervisor.start() {
+                    StartOutcome::Started => {
+                        tracing::info!("scanning started via control socket");
+                        Response::Ok
+                    }
+                    StartOutcome::AlreadyRunning => Response::Ok,
+                    StartOutcome::StillStopping => {
+                        let message = "scanning is still stopping: the scanner is finishing \
+                                       a blocking step (such as a block download from the P2P \
+                                       node) and pauses when it returns; start it again once \
+                                       the status says paused";
+                        tracing::warn!("start refused: {message}");
+                        Response::Error(message.to_string())
+                    }
                 }
-                Response::Ok
             }
-            Request::Stop => {
-                let _guard = self.apply_lock.lock().await;
-                if self.supervisor.stop().await {
-                    tracing::info!("scan task stopped via control socket");
-                    self.save_state().await;
-                }
-                Response::Ok
-            }
+            Request::Stop => self.pause_scanning().await,
             Request::GetConfig => Response::Config(self.settings.lock().unwrap().clone()),
             Request::SetConfig(new_cfg) => self.apply(Some(*new_cfg), None).await,
             Request::SetScanKey(hex) => self.apply(None, Some(&hex)).await,
@@ -211,62 +298,79 @@ impl ControlCtx {
         }
     }
 
-    /// Poll the BlindBit oracle for the real chain tip, with a short TTL
-    /// cache. Failures return the stale cache (if any) and never break
-    /// `GetStatus`.
-    async fn fetch_oracle_tip(&self) -> Option<u64> {
-        {
-            let cache = self.oracle_tip_cache.lock().unwrap();
-            if cache.is_fresh() {
-                return cache.tip;
-            }
+    /// `Stop`: pause scanning. The scan task usually ends within
+    /// milliseconds; when it is inside a blocking step (a P2P block
+    /// download) it ends once that returns. Either way the answer comes
+    /// within [`STOP_WAIT`] and the status reports `stopping` until the task
+    /// has really ended, then `paused`.
+    async fn pause_scanning(&self) -> Response {
+        let _guard = self.apply_lock.lock().await;
+        if !self.supervisor.request_stop() {
+            return Response::Ok;
         }
-
-        let url = self.settings.lock().unwrap().oracle_url.clone();
-        let stale = self.oracle_tip_cache.lock().unwrap().tip;
-
-        let fetch = async {
-            let mut client = blindbit_lib::OracleServiceClient::connect(url).await.ok()?;
-            let resp = client.get_info(tonic::Request::new(())).await.ok()?;
-            Some(resp.into_inner().height)
-        };
-
-        match tokio::time::timeout(ORACLE_TIP_FETCH_TIMEOUT, fetch).await {
-            Ok(Some(height)) => {
-                let mut cache = self.oracle_tip_cache.lock().unwrap();
-                cache.tip = Some(height);
-                cache.fetched_at = Some(Instant::now());
-                Some(height)
-            }
-            _ => stale,
+        tracing::info!("stop requested via control socket");
+        if self.supervisor.wait_stopped(Some(STOP_WAIT)).await {
+            tracing::info!("scanning paused");
+            save_scanner_state(&self.scanner, &self.state_file).await;
+            return Response::Ok;
         }
+        tracing::warn!(
+            "scan task is inside a blocking step (such as a block download from the P2P node); \
+             scanning pauses as soon as it returns"
+        );
+        let supervisor = self.supervisor.clone();
+        let scanner = self.scanner.clone();
+        let state_file = self.state_file.clone();
+        tokio::spawn(async move {
+            supervisor.wait_stopped(None).await;
+            tracing::info!("scanning paused");
+            save_scanner_state(&scanner, &state_file).await;
+        });
+        Response::OkWithNote(
+            "stopping: the scanner is finishing a blocking step (such as a block download \
+             from the P2P node) and pauses as soon as it returns"
+                .to_string(),
+        )
     }
 
     async fn status(&self) -> StatusInfo {
         let index = self.electrum_index.lock().unwrap().clone();
-        let (electrum_tip, scan_progress, sp_address, tx_count) = {
+        let (electrum_tip, scan_progress, sp_address, tx_count, start_height) = {
             let idx = index.lock().await;
             let tip = idx.tip.as_ref().map(|(h, _)| u64::from(*h));
             let addr = (!idx.sp_address.is_empty()).then(|| idx.sp_address.clone());
-            (tip, idx.scan_progress, addr, idx.sp_history.len() as u64)
+            (
+                tip,
+                idx.scan_progress,
+                addr,
+                idx.sp_history.len() as u64,
+                idx.sp_start_height,
+            )
         };
-        let scan_health = scan_health_info(&index.lock().await.scan_health);
+        let mut scan_health = scan_health_info(&index.lock().await.scan_health);
+        let scan_state = self.supervisor.state();
+        // A stall describes the scan loop retrying; a paused or stopping
+        // scan is not retrying anything.
+        if scan_state != friglet_ipc::ScanState::Running {
+            scan_health.stall = None;
+        }
 
         // While the scan task runs it holds the scanner mutex, so fall back
         // to the electrum index tip (which the scanner advances per scanned
-        // block) when the lock is unavailable.
+        // block) when the lock is unavailable — and before the first block
+        // of a new wallet is scanned, to the block below its start height
+        // rather than 0.
         let scanned_height = match self.scanner.try_lock() {
             Ok(s) => s.get_last_scanned_block_height(),
-            Err(_) => electrum_tip.unwrap_or(0),
+            Err(_) => electrum_tip.unwrap_or(start_height.saturating_sub(1)),
         };
 
-        let oracle_tip = self.fetch_oracle_tip().await;
-        let tip_height = pick_tip(oracle_tip, electrum_tip);
+        let oracle = self.oracle.lock().unwrap().clone();
+        let tip_height = pick_tip(oracle.tip, electrum_tip);
 
         let scanning = self.supervisor.is_running();
         let last_error = self.supervisor.last_error();
         let network = self.settings.lock().unwrap().network.clone();
-        let oracle_connected = self.oracle_tip_cache.lock().unwrap().is_fresh();
 
         StatusInfo {
             scanning,
@@ -275,7 +379,7 @@ impl ControlCtx {
             scan_progress,
             network,
             electrum_clients: self.electrum_clients.load(Ordering::Relaxed),
-            oracle_connected,
+            oracle_connected: oracle.connected(),
             last_error,
             sp_address,
             tx_count,
@@ -284,6 +388,11 @@ impl ControlCtx {
             version: env!("CARGO_PKG_VERSION").to_string(),
             spawned_by_tray: self.spawned_by_tray,
             scan_health,
+            scan_state: Some(scan_state),
+            pid: Some(std::process::id()),
+            log_file: self.log_file.as_ref().map(|p| p.display().to_string()),
+            oracle_error: oracle.error,
+            oracle_down_since_unix: oracle.down_since_unix,
         }
     }
 
@@ -309,17 +418,7 @@ impl ControlCtx {
     }
 
     pub async fn save_state(&self) {
-        let state_file = self.state_file.clone();
-        let scanner = self.scanner.lock().await;
-        if let Err(e) = scanner.save_to_file(&state_file) {
-            tracing::warn!(error = %e, "failed to save scanner state");
-        } else {
-            tracing::debug!("scanner state saved");
-        }
-        // The state JSON contains the scan secret (written by blindbit-lib);
-        // keep it owner-only. Files created by the scan loop's own
-        // checkpoints get tightened here and on the next startup.
-        crate::config::tighten_state_file_perms(&state_file);
+        save_scanner_state(&self.scanner, &self.state_file).await;
     }
 
     /// Validate → persist → restart. `new_cfg = None` keeps the current
@@ -392,6 +491,20 @@ impl ControlCtx {
         self.stop_soon();
         Response::OkWithNote(notes.join(". "))
     }
+}
+
+/// Save the scanner's state to `state_file` (waits for the scanner lock).
+async fn save_scanner_state(scanner: &Mutex<Scanner>, state_file: &Path) {
+    let scanner = scanner.lock().await;
+    if let Err(e) = scanner.save_to_file(state_file) {
+        tracing::warn!(error = %e, "failed to save scanner state");
+    } else {
+        tracing::debug!("scanner state saved");
+    }
+    // The state JSON contains the scan secret (written by blindbit-lib);
+    // keep it owner-only. Files created by the scan loop's own
+    // checkpoints get tightened here and on the next startup.
+    crate::config::tighten_state_file_perms(state_file);
 }
 
 /// A warning note when `FRIGLET_SCAN_SECRET` is set to a key other than
@@ -573,6 +686,22 @@ mod tests {
 
     /// A full `ControlCtx` wired against a temp dir, with an offline scanner.
     fn test_ctx(dir: &Path) -> Arc<ControlCtx> {
+        test_ctx_with_scan(dir, || {
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        })
+    }
+
+    /// [`test_ctx`] with a custom scan task.
+    fn test_ctx_with_scan(
+        dir: &Path,
+        scan: impl Fn() -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<ControlCtx> {
         let cfg = test_config(dir);
         config::replace_scan_key(&dir.join("scan.key"), SECRET_HEX).unwrap();
         let config_path = dir.join("config.toml");
@@ -593,12 +722,7 @@ mod tests {
         let electrum_index = scanner_instance.electrum_index();
         let scanner_arc = Arc::new(Mutex::new(scanner_instance));
 
-        let supervisor = Arc::new(ScanSupervisor::new(|| {
-            Box::pin(async {
-                std::future::pending::<()>().await;
-                Ok(())
-            })
-        }));
+        let supervisor = Arc::new(ScanSupervisor::new(scan, Arc::default()));
 
         Arc::new(ControlCtx {
             supervisor,
@@ -616,7 +740,8 @@ mod tests {
             settings: std::sync::Mutex::new(cfg),
             config_path: Some(config_path),
             apply_lock: Mutex::new(()),
-            oracle_tip_cache: std::sync::Mutex::new(OracleTipCache::default()),
+            oracle: Arc::default(),
+            log_file: None,
             shutdown: CancellationToken::new(),
             restart_requested: AtomicBool::new(false),
             spawned_by_tray: false,
@@ -658,6 +783,7 @@ mod tests {
             version: "test".to_string(),
             spawned_by_tray: false,
             scan_health: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -678,10 +804,7 @@ mod tests {
                 tweak_hex: "03".repeat(33),
             },
         ]);
-        {
-            let mut cache = ctx.oracle_tip_cache.lock().unwrap();
-            cache.fetched_at = Some(Instant::now());
-        }
+        ctx.oracle.lock().unwrap().record_ok(10);
 
         assert_eq!(ctx.status().await.tx_count, 2);
     }
@@ -690,6 +813,7 @@ mod tests {
     async fn status_reports_a_stalled_scan_and_an_adjusted_start() {
         let dir = temp_dir("status-scan-health");
         let ctx = test_ctx(&dir);
+        ctx.supervisor.start();
         assert_eq!(
             ctx.status().await.scan_health,
             friglet_ipc::ScanHealthInfo::default()
@@ -744,6 +868,103 @@ mod tests {
                 error: "Failed to parse JSON".to_string(),
             })
         );
+
+        // Paused, nothing is retrying: the stall is not reported.
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(status.scan_health.stall.is_none());
+        assert!(status.scan_health.start_adjusted.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_pauses_and_start_resumes_in_status() {
+        let dir = temp_dir("status-pause");
+        let ctx = test_ctx(&dir);
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
+        let status = ctx.status().await;
+        assert!(status.scanning);
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Running));
+        assert_eq!(status.pid, Some(std::process::id()));
+
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        assert!(!status.scanning);
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(ctx.supervisor.is_paused());
+
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
+        assert_eq!(
+            ctx.status().await.scan_state,
+            Some(friglet_ipc::ScanState::Running)
+        );
+    }
+
+    /// The scan task blocks a worker thread (as blindbit-lib's synchronous
+    /// P2P block download does): Stop answers within its wait budget with a
+    /// note, the status says `stopping` (not stopped) until the task really
+    /// ended, Start is refused meanwhile, and the pause lands afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_a_blocking_scan_step_reports_stopping_then_paused() {
+        let dir = temp_dir("status-stopping");
+        let ctx = test_ctx_with_scan(&dir, || {
+            Box::pin(async {
+                loop {
+                    std::thread::sleep(Duration::from_millis(4500));
+                    tokio::task::yield_now().await;
+                }
+            })
+        });
+        ctx.supervisor.start();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let began = Instant::now();
+        let answer = ctx.handle(Request::Stop).await;
+        assert!(
+            matches!(&answer, Response::OkWithNote(note) if note.starts_with("stopping")),
+            "{answer:?}"
+        );
+        assert!(began.elapsed() < STOP_WAIT + Duration::from_secs(1));
+        let status = ctx.status().await;
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Stopping));
+        assert!(status.scanning, "the task is still alive");
+        assert!(matches!(
+            ctx.handle(Request::Start).await,
+            Response::Error(e) if e.contains("still stopping")
+        ));
+
+        assert!(
+            ctx.supervisor
+                .wait_stopped(Some(Duration::from_secs(10)))
+                .await
+        );
+        assert_eq!(
+            ctx.status().await.scan_state,
+            Some(friglet_ipc::ScanState::Paused)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_an_unreachable_oracle_without_waiting_for_it() {
+        let dir = temp_dir("status-oracle-down");
+        let ctx = test_ctx(&dir);
+        ctx.oracle
+            .lock()
+            .unwrap()
+            .record_error("oracle http://127.0.0.1:9: no answer within 5s".to_string());
+        let began = Instant::now();
+        let status = ctx.status().await;
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(!status.oracle_connected);
+        assert!(status.oracle_error.unwrap().contains("no answer"));
+        assert!(status.oracle_down_since_unix.is_some());
+
+        ctx.oracle.lock().unwrap().record_ok(1234);
+        let status = ctx.status().await;
+        assert!(status.oracle_connected);
+        assert_eq!(status.tip_height, Some(1234));
+        assert_eq!(status.oracle_error, None);
+        assert_eq!(status.oracle_down_since_unix, None);
     }
 
     #[tokio::test]

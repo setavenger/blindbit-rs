@@ -27,6 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 pub use interprocess::local_socket::tokio::Listener;
 
 pub mod descriptor;
+pub mod logfile;
 pub mod network;
 
 /// Daemon configuration as exchanged over IPC and layered from
@@ -141,7 +142,7 @@ pub enum Response {
 }
 
 /// Snapshot of the daemon's state, returned for [`Request::GetStatus`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatusInfo {
     /// Whether the scan task is currently running.
     pub scanning: bool,
@@ -182,6 +183,37 @@ pub struct StatusInfo {
     /// whether it started above the configured start height.
     #[serde(default)]
     pub scan_health: ScanHealthInfo,
+    /// What the scan task is doing. `None` from daemons predating it; fall
+    /// back to [`StatusInfo::scanning`] then.
+    #[serde(default)]
+    pub scan_state: Option<ScanState>,
+    /// The daemon's process id.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// The log file the daemon writes, when it writes one.
+    #[serde(default)]
+    pub log_file: Option<String>,
+    /// Why the last oracle tip poll failed, while the oracle is unreachable.
+    #[serde(default)]
+    pub oracle_error: Option<String>,
+    /// Unix seconds since when the oracle has been unreachable.
+    #[serde(default)]
+    pub oracle_down_since_unix: Option<u64>,
+}
+
+/// The scan task's state (see [`StatusInfo::scan_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    /// Scanning or watching for new blocks.
+    Running,
+    /// Stop was requested; the scan task ends at its next suspension point
+    /// (e.g. once a block download from the P2P node returns).
+    Stopping,
+    /// Stopped on request: nothing is scanned until `Start`.
+    Paused,
+    /// The scan task ended with an error ([`StatusInfo::last_error`]).
+    Failed,
 }
 
 /// Scan conditions the user should see (see [`StatusInfo::scan_health`]).
@@ -554,6 +586,11 @@ mod tests {
                     error: "Failed to parse JSON".to_string(),
                 }),
             },
+            scan_state: Some(ScanState::Stopping),
+            pid: Some(4242),
+            log_file: Some("/home/u/.local/state/friglet/friglet.log".to_string()),
+            oracle_error: Some("timed out".to_string()),
+            oracle_down_since_unix: Some(1_790_000_100),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);

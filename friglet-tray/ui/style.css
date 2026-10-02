@@ -35,6 +35,9 @@ h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
 }
 .pill-good { background: rgba(52, 192, 122, 0.15); color: var(--good); }
 .pill-bad { background: rgba(224, 85, 85, 0.15); color: var(--bad); }
+.pill-neutral { background: rgba(139, 152, 171, 0.15); color: var(--muted); }
+.muted { color: var(--muted); }
+.stale { opacity: 0.5; }
 
 .card {
   background: var(--card);
@@ -87,6 +90,14 @@ code {
 }
 .banner strong { color: var(--accent); }
 .health { border-color: var(--bad); }
+.problems { border-color: var(--bad); }
+.problem-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.problem-list li { font-size: 12px; user-select: text; word-break: break-word; }
+.problem-list .when { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+.problem-list .active .msg { color: var(--bad); }
+.problem-list .resolved { color: var(--muted); }
+.recent-errors summary { cursor: pointer; }
+.recent-errors[open] summary { margin-bottom: 6px; }
 .health.recovered { border-color: var(--border); }
 #health-output { max-height: 96px; overflow-y: auto; white-space: pre-wrap; }
 .banner-path {
@@ -219,7 +230,15 @@ button {
   cursor: pointer;
 }
 button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
-button:disabled { opacity: 0.4; cursor: default; }
+/* Disabled must not look pressable (an orange "Start scanning" at reduced
+   opacity still read as available). */
+button:disabled {
+  background: var(--card);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  opacity: 0.55;
+  cursor: default;
+}
 button:not(:disabled):hover { filter: brightness(1.1); }
 
 @media (prefers-reduced-motion: reduce) {

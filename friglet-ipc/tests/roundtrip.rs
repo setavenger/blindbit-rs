@@ -38,6 +38,7 @@ async fn get_status_roundtrip() {
         version: "0.1.0".to_string(),
         spawned_by_tray: true,
         scan_health: Default::default(),
+        ..Default::default()
     };
     let expected = status.clone();
 

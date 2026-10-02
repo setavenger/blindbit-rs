@@ -62,7 +62,7 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
 
 ### First-run setup mode (no config file yet)
 
-- On startup (and on "Retry / Start daemon") the tray probes the socket;
+- On startup (and on "Start daemon") the tray probes the socket;
   when unreachable it checks whether the daemon is plausibly configured
   BEFORE spawning (`friglet-tray/src/setup.rs::is_configured`): the default
   config file (`friglet_ipc::default_config_path()`, i.e.
@@ -276,6 +276,32 @@ dbus-run-session -- bash -c '
   `AppState.supervise` is off for external daemons and in setup mode;
   `quitting` stops it during Quit. `get_status` carries `daemon`
   (`DaemonHealth`) for the Status tab's crash card.
+- Stop daemon / Start daemon (SNB-658): `stop_daemon_now` sets
+  `AppState.stopped` and turns supervision off *before* sending `Shutdown`,
+  so the supervisor never undoes it; a reaped child with exit status 0 is
+  recorded as stopped too (not restarted). Works for attached external
+  daemons (waits for the socket to go quiet, then checks no service manager
+  started a new one). `start_daemon_now` clears `stopped` and reruns
+  attach-or-spawn.
+- What the window and menu show is computed in `friglet-tray/src/view.rs`
+  (pure, unit-tested): `scan_view` (scanning / up to date / waiting /
+  stopping / paused / error), `daemon_view` (running / starting / stopping /
+  stopped / reconnecting / unreachable / restarting / setup, plus who started
+  it) and the `ErrorBook` (active errors until resolved + recent list, each
+  raised/resolved error logged). Stalls and oracle outages are "waiting" for
+  `STALL_GRACE_SECS` (120 s), an unanswering daemon "reconnecting" for
+  `UNREACHABLE_GRACE_SECS` (10 s), then errors.
+- Daemon scan pause (SNB-658): `ScanSupervisor` keeps the task entry until
+  the task has really ended (`ScanState::Stopping` while blindbit-lib's
+  blocking P2P block download finishes), `Stop` answers within 3 s
+  (`OkWithNote("stopping: ...")` when still winding down), `Start` during
+  stopping is refused, and the pause flag survives an in-process restart.
+  `GetStatus` never touches the network: the oracle tip comes from a
+  background poller (`control::spawn_oracle_poller`).
+- Logs: `friglet_ipc::logfile` (`RotatingLog`, 10 MiB cap, 2 rotations);
+  daemon `friglet.log` (`FRIGLET_LOG_FILE` override / `off`), tray
+  `friglet-tray.log`, both in `$XDG_STATE_HOME/friglet` (macOS
+  `~/Library/Logs/friglet`, Windows `%LOCALAPPDATA%\friglet\logs`).
 - Autostart: `tauri-plugin-autostart` (XDG autostart `.desktop` /
   LaunchAgent / Run key), commands `get_autostart`/`set_autostart`; first-run
   setup passes `autostart` to `save_local_config` (default ticked).
@@ -311,7 +337,9 @@ daemon itself only emits ANSI when stderr is a TTY. If you see
 `spawned daemon exited immediately (exit status: 2)` with no further detail,
 you're looking at a build that predates this fix, or a release binary with
 stdio still swallowed — rebuild `friglet-tray` and check the captured reason
-text (also logged at `debug` level, target `friglet-daemon`) before guessing
+text (the daemon's lines are forwarded to the tray's stderr at their own
+level, target `friglet-daemon`, and the daemon also writes
+`~/.local/state/friglet/friglet.log`) before guessing
 at the cause. Exit code 2 from a Rust CLI built with `clap` almost always
 means clap itself rejected the arguments (rare here, since the daemon runs
 with zero args) or — far more likely in practice — a stale
