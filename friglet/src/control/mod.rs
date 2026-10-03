@@ -46,6 +46,8 @@ const ORACLE_STALE_AFTER: Duration = Duration::from_secs(30);
 /// `CANCEL_GRACE` at the latest, so this only covers a task that blocks a
 /// worker thread.
 const STOP_WAIT: Duration = Duration::from_secs(3);
+/// Settings validation includes a blocking DNS lookup; match the tray's cap.
+const SETTINGS_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The oracle's reachability and chain tip, kept current by
 /// [`spawn_oracle_poller`] so `GetStatus` never waits on the network (a slow
@@ -500,8 +502,28 @@ impl ControlCtx {
 async fn prepare(mut cfg: DaemonConfig) -> Result<(DaemonConfig, config::ResolvedConfig), String> {
     // New wallet → pin the birthday to the oracle tip before persisting.
     config::resolve_start_at_tip(&mut cfg).await?;
-    let resolved = config::validate_daemon_config(&cfg)?;
+    let resolved = validate_settings(
+        cfg.clone(),
+        SETTINGS_VALIDATION_TIMEOUT,
+        config::validate_daemon_config,
+    )
+    .await?;
     Ok((cfg, resolved))
+}
+
+/// Keep the system resolver off the async runtime, and bound how long a
+/// settings request waits for it. A timed-out resolver may finish on the
+/// blocking pool later; validation only reads its private config copy.
+async fn validate_settings(
+    cfg: DaemonConfig,
+    timeout: Duration,
+    validate: impl FnOnce(&DaemonConfig) -> Result<config::ResolvedConfig, String> + Send + 'static,
+) -> Result<config::ResolvedConfig, String> {
+    let validation = tokio::task::spawn_blocking(move || validate(&cfg));
+    tokio::time::timeout(timeout, validation)
+        .await
+        .map_err(|_| "settings validation timed out resolving the P2P node".to_string())?
+        .map_err(|e| format!("settings validation task failed: {e}"))?
 }
 
 /// Save the scanner's state to `state_file` (waits for the scanner lock).
@@ -1372,6 +1394,47 @@ mod tests {
             began.elapsed() < Duration::from_secs(1),
             "{:?}",
             began.elapsed()
+        );
+    }
+
+    /// With only one async worker, a slow system resolver still leaves
+    /// status and scan controls responsive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_settings_validation_keeps_control_requests_responsive() {
+        let dir = temp_dir("slow-settings-validation");
+        let ctx = test_ctx(&dir);
+        let cfg = test_config(&dir);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let began = Instant::now();
+        let validating = tokio::spawn(validate_settings(cfg, Duration::from_secs(5), move |cfg| {
+            let _ = entered.send(());
+            std::thread::sleep(Duration::from_secs(1));
+            config::validate_daemon_config(cfg)
+        }));
+        started.await.unwrap();
+        assert!(matches!(
+            ctx.handle(Request::GetStatus).await,
+            Response::Status(_)
+        ));
+        assert_stop_and_start_answer_promptly(&ctx).await;
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(!validating.is_finished());
+        validating.await.unwrap().unwrap();
+    }
+
+    /// A resolver that outlives the deadline returns an error; its late
+    /// result cannot reach the persist/restart part of an apply.
+    #[tokio::test]
+    async fn settings_validation_has_a_deadline() {
+        let dir = temp_dir("settings-validation-deadline");
+        let result = validate_settings(test_config(&dir), Duration::from_millis(30), |cfg| {
+            std::thread::sleep(Duration::from_millis(200));
+            config::validate_daemon_config(cfg)
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "settings validation timed out resolving the P2P node"
         );
     }
 
