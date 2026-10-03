@@ -333,11 +333,10 @@ fn labelled_receive_records_its_label() {
 #[cfg(feature = "serde")]
 #[test]
 fn owned_outputs_labels_and_spends_survive_restart() {
-    let tag = "restart";
-    let path = state_file(tag);
+    let path = state_file("restart");
     let _ = std::fs::remove_file(&path);
 
-    let mut scanner = scanner_at(state_file(tag), 2);
+    let mut scanner = scanner_at(path.clone(), 2);
     let tweak = served_tweak(0x35);
     let change_key = sp_output_key(&tweak, Some(0));
     let label_key = sp_output_key(&tweak, Some(2));
