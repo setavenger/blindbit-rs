@@ -607,16 +607,28 @@ mod tests {
             std::fs::write(&path, state).unwrap();
         }
         // load_scanner connects first; an oracle that accepts is enough.
+        // A runtime-owned task drops its listener and sockets on abort.
+        let oracle = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oracle_url = format!("http://{}", oracle.local_addr().unwrap());
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = oracle.accept().await {
+                held.push(stream);
+            }
+        });
+        let wallet: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
         let config = scanner::ScannerConfig::new(
-            silent_oracle(),
+            oracle_url,
             "127.0.0.1:1".parse().unwrap(),
-            SecretKey::from_str(SECRET_HEX).unwrap(),
-            PublicKey::from_str(SPEND_PK).unwrap(),
+            SecretKey::from_str(wallet["secret_scan_hex"].as_str().unwrap()).unwrap(),
+            PublicKey::from_str(wallet["public_spend_hex"].as_str().unwrap()).unwrap(),
             0,
             path,
             bitcoin_rev::Network::Regtest,
         );
-        owned_outputs_count(&scanner::load_scanner(&config).await.unwrap())
+        let scanner = scanner::load_scanner(&config).await.unwrap();
+        accept.abort();
+        owned_outputs_count(&scanner)
     }
 
     /// The startup count never makes startup depend on the state file and
