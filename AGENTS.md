@@ -1,56 +1,64 @@
 # AGENTS.md
 
-## Cursor Cloud specific instructions
-
 Rust Cargo workspace (edition 2024) for BlindBit BIP-352 Silent Payments. Crates: `blindbit-lib` (core scanner + gRPC oracle client), `friglet` (daemon: scanner + HTTP + Electrum + control socket), `friglet-ipc` (control-socket protocol, shared by daemon and tray), `friglet-tray` (Tauri v2 tray UI), `blindbit-cli` (one-shot range scan, no servers). See `README.md` for full flags/usage.
 
-### Toolchain / build
-- Needs Rust **stable >= 1.85** (edition 2024). Default toolchain is set to `stable`; the preinstalled `1.83.0` is too old and fails to compile.
-- `protoc` is a hard build requirement: `blindbit-lib/build.rs` compiles `blindbit-lib/proto/*.proto` via `tonic-prost-build`. Build fails with no protoc on PATH.
+## Toolchain and system packages
 
-### System dependencies (baked into the VM snapshot)
-This env needs heavy system setup beyond the current tree because the repo also has a **Tauri v2 tray app** (`friglet-tray`) that requires GTK/WebKit/appindicator to build, plus Windows cross-compile + headless-GUI test tooling. These are already installed in the VM snapshot from a setup session, so future agents should NOT need to reinstall them; if a fresh env is missing them, install via apt (needs `sudo`):
-
-- Tauri build: `libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libgtk-3-dev libssl-dev pkg-config patchelf`
-- Proto codegen: `protobuf-compiler libprotobuf-dev`
-- Headless GUI test / automation: `xvfb xdotool libxdo-dev`
-- Windows cross-compile: `mingw-w64` + `rustup target add x86_64-pc-windows-gnu`
-- Containers: `docker.io`
-- Rust components: `clippy` + `rustfmt`
-
-If a future env keeps losing these, regenerate the environment config via the env setup agent at `cursor.com/onboard` rather than relying on the startup update script (which is kept minimal to `cargo fetch`).
-- Standard commands from repo root: `cargo build --workspace`, `cargo clippy --workspace`, `cargo fmt --all -- --check`, `cargo test --workspace`.
-- `blindbit-lib`/`blindbit-cli` have no in-repo tests and no committed clippy/rustfmt config; their clippy warnings (e.g. `collapsible_if`) and `cargo fmt --check` diffs are pre-existing — do not "fix" pre-existing style in those crates unless asked. `friglet`, `friglet-ipc`, and `friglet-tray` DO have real test suites (unit + integration) — see below; scope `cargo fmt` with `-p` to those crates to avoid touching `blindbit-lib`.
-
-### Running / end-to-end
-- Run commands are in `README.md`. E2E needs two **external** services: a BlindBit Oracle (signet: `https://signet.oracle.setor.dev`) and a Bitcoin P2P peer (signet example `152.53.151.148:38333`). Both are reachable from the VM. No DB.
-- Keys are BIP-352 hex: `--scan-secret` (32-byte secp256k1 secret), `--spend-pubkey` (33-byte compressed pubkey). For smoke tests any valid keypair works, e.g. secret `0000...0001` and pubkey `0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798` (finds no UTXOs, balance 0).
-- `friglet scan` from `--start-height 274010` to signet tip is ~40k blocks (~10 min at ~100 blk/s). For a fast check use `blindbit-cli` with a small `--end-height` range (e.g. 274010..274060 finishes in ~1s).
-- State persists to a JSON file (`--state-file`); tests use the gitignored `blindbit-test/` dir.
-
-### Non-obvious gotcha (friglet HTTP)
-- `friglet`'s HTTP endpoints `/height` and `/subscribe` **block while a scan is actively running**: `watch_chain()` holds the scanner `Mutex` while scanning, so the HTTP handlers can't acquire it until the scan supervisor is stopped (or between scan iterations). This is pre-existing app behavior, not an env issue.
-- The **Electrum TCP server works** (it uses a separate index mutex). To verify a running scanner, query Electrum, e.g. send `{"id":1,"method":"server.version","params":["x","1.4"]}` and `{"id":2,"method":"blockchain.headers.subscribe","params":[]}` to `127.0.0.1:50001`; it returns `["Friglet","1.4"]` and the latest scanned height. The control socket's `GetStatus` (see below) is unaffected by the lock and is the preferred way to check status while scanning.
+- Rust **stable >= 1.90**: friglet-tray's Tauri crates declare `rust-version = "1.90"`, and friglet uses let-chains (stable since 1.88). In the Cursor VM the default toolchain is `stable`; its preinstalled `1.83.0` cannot build this.
+- `protoc` is required: `blindbit-lib/build.rs` compiles `blindbit-lib/proto/*.proto` with `tonic-prost-build`; `libprotobuf-dev` provides the `google/protobuf/*.proto` files they import.
+- apt packages (need `sudo`; the Cursor VM snapshot already has them):
+  - Build and test the workspace: `libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config protobuf-compiler libprotobuf-dev`
+  - Release bundles (`tauri build`, see Packaging): `release.yml` additionally installs `libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf xdg-utils`
+  - Headless tray screenshots: `xvfb xdotool` (plus the tools listed in the recipe below)
+  - Windows cross-check: `mingw-w64` + `rustup target add x86_64-pc-windows-gnu`
+  - Containers: `docker.io`; Rust components: `clippy`, `rustfmt`
+- If a fresh Cursor env lacks these, regenerate its environment config via the env setup agent at `cursor.com/onboard`; the startup update script only runs `cargo fetch`.
 
 ## Build & test
 
 ```bash
 cargo build --workspace            # all crates, incl. friglet-tray (Tauri v2)
 cargo test --workspace
-cargo clippy -p friglet -p friglet-ipc -p friglet-tray --all-targets
-cargo fmt -p friglet -p friglet-ipc -p friglet-tray   # see fmt caveat above
+cargo clippy --no-deps -p friglet -p friglet-ipc -p friglet-tray --all-targets -- -D warnings   # CI's lint
+cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
 ```
 
-Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
-`libayatana-appindicator3-dev`, `librsvg2-dev`, `libgtk-3-dev`, `patchelf`,
-`xdotool`, `libxdo-dev`.
+- CI (`.github/workflows/ci.yml`) runs the test and clippy lines.
+- `blindbit-lib` has unit tests in `src/scanner/` (some need its `serde` feature, which `cargo test --workspace` turns on through friglet). `blindbit-cli` has none. `friglet`, `friglet-ipc` and `friglet-tray` have unit and integration tests.
+- `blindbit-lib` is not clippy- or fmt-clean and there is no clippy/rustfmt config: do not fix its pre-existing style unless asked; scope `cargo fmt`/`clippy` with `-p` as above.
+
+## Running against signet
+
+- E2E needs two **external** services: a BlindBit Oracle (signet: `https://signet.oracle.setor.dev`) and a Bitcoin P2P peer (signet: `152.53.151.148:38333`). Both are reachable from the VM. No DB.
+- Keys are BIP-352 hex: `--scan-secret` (32-byte secp256k1 secret), `--spend-pubkey` (33-byte compressed pubkey). For smoke tests any valid pair works, e.g. secret `0000...0001` and pubkey `0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798` (no outputs, balance 0).
+- Fast check, ~1 s for 50 blocks:
+  ```bash
+  cargo run -p blindbit-cli -- scan --network signet \
+    --scan-secret 0000000000000000000000000000000000000000000000000000000000000001 \
+    --spend-pubkey 0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798 \
+    --start-height 274010 --end-height 274060 \
+    --p2p-node-addr 152.53.151.148:38333 \
+    --oracle-url https://signet.oracle.setor.dev \
+    --state-file blindbit-test/cli-state.json
+  ```
+  `--end-height` is required; `--p2p-node-addr` must be `ip:port` (no hostnames); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
+- `friglet scan` from `--start-height 274010` to the signet tip is ~50k blocks (minutes); use blindbit-cli for quick checks.
+- State persists to a JSON file (`--state-file`); tests use the gitignored `blindbit-test/` dir.
+
+### Checking a running daemon
+
+- Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): `printf '"GetStatus"\n' | nc -U -w 2 "$XDG_RUNTIME_DIR/friglet.sock"` (or the `FRIGLET_CONTROL_SOCKET` path). `GetStatus` never waits on the network.
+- Electrum (`127.0.0.1:50001` by default): `printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001` returns `["Friglet","1.4"]`; `blockchain.headers.subscribe` returns the latest scanned height.
+- HTTP `/height` and `/subscribe` **do not answer while scanning is enabled**: the scan task holds the scanner `Mutex` for its whole `watch_chain_until` loop, including while it waits for new blocks (`friglet/src/main.rs` scan task, `friglet/src/server/mod.rs`). They answer only while scanning is stopped (`Stop` / paused). Never use them as a health check; give any `curl` a timeout (`-m 5`).
 
 ## Running friglet-tray
 
 - `cargo run -p friglet-tray` — no npm/frontend build step; the UI is plain
   static HTML/CSS/JS in `friglet-tray/ui/` (tauri.conf.json `frontendDist`).
-  The status window has a Settings tab (GetConfig/SetConfig/SetScanKey over
-  the control socket); the fake daemon answers all of these in memory.
+  The status window's Settings tab loads with `GetConfig` and saves with
+  `ApplySettings` (config and optional scan key in one request) over the
+  control socket; the fake daemon answers `GetConfig`, `SetConfig`,
+  `SetScanKey` and `ApplySettings` in memory.
 - Fake daemon for manual testing (speaks the `friglet-ipc` protocol on the
   default control socket): `cargo run -p friglet-tray --example fake-daemon`.
 - Useful env vars: `FRIGLET_CONTROL_SOCKET` (socket path override),
@@ -94,7 +102,7 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
   `HOME` (and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_RUNTIME_DIR` unset)
   and no `FRIGLET_*` env — no fake daemon, no
   `FRIGLET_TRAY_SHOW_ON_START`. The window must appear by itself on the
-  Settings tab with the banner (verified in this VM; window screenshot via
+  Settings tab with the banner (window screenshot via
   `import -window "$(xdotool search --name "Friglet Status" | head -1)"`).
   Unit/e2e coverage: `friglet-tray/src/setup.rs` tests, the
   `setup_required_*` cases in `friglet-tray/tests/lifecycle_e2e.rs`, and
@@ -105,7 +113,7 @@ Linux system deps for `friglet-tray` (Tauri v2): `libwebkit2gtk-4.1-dev`,
 
 ## Tray testing under headless / computer-use environments
 
-Verified in this repo's cloud VM (Xvfb + fluxbox + StatusNotifier host):
+Works in this repo's cloud VM (Xvfb + fluxbox + StatusNotifier host):
 
 ### Screenshot the status/settings window (and tray icon)
 
@@ -149,8 +157,8 @@ dbus-run-session -- bash -c '
   init is flaky. The tray and `gtk-sni-tray-standalone` must share that bus.
 - Tray icon: bare Xvfb has no StatusNotifierWatcher. With
   `gtk-sni-tray-standalone -w` (package `haskell-gtk-sni-tray-utils`) under
-  fluxbox the friglet SNI icon renders. Since SNB-656 the Linux tray is
-  tray-icon's KSNI backend (feature `ksni` in `friglet-tray/Cargo.toml`), not
+  fluxbox the friglet SNI icon renders. The Linux tray uses tray-icon's KSNI
+  backend (feature `ksni` in `friglet-tray/Cargo.toml`), not
   libayatana: bus name `org.kde.StatusNotifierItem-<pid>-<n>`, object
   `/StatusNotifierItem`, `ItemIsMenu=false`, menu at `/MenuBar`. A host's
   left click is `Activate` (toggles the window), right click opens the menu;
@@ -194,34 +202,31 @@ dbus-run-session -- bash -c '
   which would break plain `cargo build/test --workspace` on fresh clones.
   The sidecar file needs the target-triple suffix or the build fails with
   "resource path ... doesn't exist". Both deb and AppImage place `friglet`
-  next to `friglet-tray` in `usr/bin/`, which the existing lifecycle search
-  order (env → exe dir → PATH) already covers — no lifecycle changes were
-  needed.
-- Verified in this repo's cloud VM: the installed `.deb`'s tray, run under
-  `xvfb-run -a dbus-run-session`, attaches to a fake daemon AND spawns the
-  bundled `/usr/bin/friglet` sidecar (which scanned signet blocks live).
-  Same attach smoke test passes for the AppImage with
-  `--appimage-extract-and-run` (plain AppImage mount needs FUSE).
+  next to `friglet-tray` in `usr/bin/`, which the lifecycle search order
+  (env → exe dir → PATH) covers.
+- Smoke-testing a bundle headless: run the installed `.deb`'s tray under
+  `xvfb-run -a dbus-run-session`; run the AppImage with
+  `--appimage-extract-and-run` (a plain AppImage mount needs FUSE).
 - AppImage bundling downloads linuxdeploy/appimagetool at build time —
   needs network; the deb target has no such dependency.
 - Docker: root `Dockerfile` (multi-stage; builder needs `protobuf-compiler`
-  AND `libprotobuf-dev` — the latter provides the `google/protobuf/*.proto`
-  well-known types blindbit-lib's protos import) + `docs/docker.md`. All
-  state under a `/data` volume; image presets
+  AND `libprotobuf-dev`) + `docs/docker.md`. The image presets
   `FRIGLET_HTTP_ADDR`/`FRIGLET_ELECTRUM_ADDR` to `0.0.0.0` binds (env beats
-  config file, loses to flags). Verified in this VM (dockerd with
-  `--storage-driver=vfs`; overlayfs fails in the nested container): image
-  builds (~91 MB), container scans signet, control socket works. Note a
-  pre-existing daemon behavior: the scan task holds the scanner mutex, so
-  HTTP `/height`/`/subscribe` block while a scan is actively running.
-- Windows status: `cargo check -p friglet-ipc -p friglet -p friglet-tray
-  --target x86_64-pc-windows-gnu` passes cleanly (mingw-w64 installed).
-  The `x86_64-pc-windows-msvc` target cannot be checked from Linux — the
-  `ring` and `secp256k1-sys` build scripts need MSVC's `lib.exe` — that is
-  an environment limitation, not a code problem. On a real MSVC host
-  (`windows-2025` in release.yml) the daemon and tray compile, link and
-  bundle (msi + nsis), and the MSI's `friglet.exe --help` runs; the tray
-  itself (named-pipe control, tray icon, spawning) is still unverified.
+  config file, loses to flags) and puts the config, key file, control
+  socket and log under the `/data` volume. The scanner state is NOT under
+  `/data` by default (SNB-635): the default lands in
+  `/home/friglet/.config/friglet/` inside the container. Workaround: an
+  absolute `state_file = "/data/scanner_state.json"` in `config.toml`.
+  Building images in the nested VM container needs dockerd with
+  `--storage-driver=vfs` (overlayfs fails there).
+- Windows: `cargo check -p friglet-ipc -p friglet -p friglet-tray
+  --target x86_64-pc-windows-gnu` (needs mingw-w64) is the compile check
+  from Linux. The `x86_64-pc-windows-msvc` target cannot be checked from
+  Linux — the `ring` and `secp256k1-sys` build scripts need MSVC's
+  `lib.exe`. On a real MSVC host (`windows-2025` in release.yml) the daemon
+  and tray compile, link and bundle (msi + nsis), and the MSI's
+  `friglet.exe --help` runs; the tray itself (named-pipe control, tray
+  icon, spawning) is unverified.
 
 ## SP descriptor onboarding (SNB-623)
 
@@ -238,9 +243,9 @@ dbus-run-session -- bash -c '
 - Spend-secret (`spspend`) descriptors: tray paste → public key derived,
   secret dropped, field replaced with the watch-only form; config file →
   refused (the secret would sit on disk).
-- `start_at_tip`: resolved from the oracle tip at daemon start (and in
-  `SetConfig`), then persisted as `start_height` by patching only that key
-  in the config file (`config::persist_start_height`).
+- `start_at_tip`: resolved from the oracle tip at daemon start (and when
+  `SetConfig`/`ApplySettings` is applied), then persisted as `start_height`
+  by patching only that key in the config file (`config::persist_start_height`).
 - `oracle_url` follows `network` when no layer sets it; a hosted oracle URL
   of another network is rejected. `p2p_node_addr` accepts hostnames (DNS at
   start, IPv4 preferred) and bare hosts (network default port).
@@ -259,22 +264,26 @@ dbus-run-session -- bash -c '
   child handle stays valid. Unchanged input → plain `Ok`, no restart.
 - `ApplySettings { config, scan_key }` = SetConfig + SetScanKey with one
   validation and one restart; the tray's settings save uses it.
-- Wallet-keyed state (`config::wallet_state_file`): the default state path
-  becomes `scanner_state-<network>-<sha256(scan_pub‖spend_pub)[..4]>.json`
-  (a legacy `scanner_state.json` of the same wallet is renamed into place);
-  an explicit `state_file` holding another wallet's keys is refused at
+- State file (`config::wallet_state_file`): the default is
+  `<config dir>/friglet/scanner_state-<network>-<sha256(scan_pub‖spend_pub)[..4]>.json`
+  (config dir: Linux `~/.config` or `$XDG_CONFIG_HOME`, macOS
+  `~/Library/Application Support`, Windows `%APPDATA%`); a legacy
+  `scanner_state.json` of the same wallet is renamed into place. A bare
+  `state_file = "scanner_state.json"` counts as the default. Override with
+  `--state-file` / `FRIGLET_STATE_FILE` / `state_file`; an explicit path is
+  used as given, and one holding another wallet's keys is refused at
   startup (blindbit-lib would otherwise silently restore the old keys).
 - Birthday rescans (`config::reconcile_birthday`): `<state>.birthday.json`
   records the lowest start height the state covers; a lower `start_height`
   moves the state to `*.json.bak` and scans from scratch.
-- A server dying (HTTP/Electrum/control bind failure) now ends the process
-  with exit code 1 instead of 0, and a control socket that failed to bind
-  (another daemon) is no longer deleted on the way out.
+- A dead Electrum or control-socket server (e.g. bind failure) ends the
+  process with exit code 1; a control socket that failed to bind (another
+  daemon owns it) is left in place. An HTTP bind failure panics instead
+  (exit 101; abort in release builds).
 - Control-socket tests live in `friglet/src/control/mod.rs` (friglet is a
   bin crate); they build offline `Scanner`s via a lazy tonic channel and
   assert the restart via `ControlCtx::restart_requested` + the cancelled
-  shutdown token. `GetStatus` uses tonic to poll the oracle tip (cached
-  ~10s) for `tip_height`.
+  shutdown token.
 
 ## Tray supervision + autostart (SNB-624, SNB-52)
 
@@ -307,11 +316,14 @@ dbus-run-session -- bash -c '
   (`OkWithNote("stopping: ...")` when still winding down), `Start` during
   stopping is refused, and the pause flag survives an in-process restart.
   `GetStatus` never touches the network: the oracle tip comes from a
-  background poller (`control::spawn_oracle_poller`).
+  background poller (`control::spawn_oracle_poller`, every 10 s).
 - Logs: `friglet_ipc::logfile` (`RotatingLog`, 10 MiB cap, 2 rotations);
   daemon `friglet.log` (`FRIGLET_LOG_FILE` override / `off`), tray
   `friglet-tray.log`, both in `$XDG_STATE_HOME/friglet` (macOS
   `~/Library/Logs/friglet`, Windows `%LOCALAPPDATA%\friglet\logs`).
+  Console output goes to stdout for both: the daemon colours it when stderr
+  is a terminal; the tray also prints the daemon output it forwards
+  (target `friglet-daemon`), which is not written to `friglet-tray.log`.
 - Autostart: `tauri-plugin-autostart` (XDG autostart `.desktop` /
   LaunchAgent / Run key), commands `get_autostart`/`set_autostart`; first-run
   setup passes `autostart` to `save_local_config` (default ticked).
@@ -331,42 +343,19 @@ dbus-run-session -- bash -c '
 
 ## Daemon spawn diagnostics (tray lifecycle)
 
-`friglet-tray/src/lifecycle.rs`'s `spawn_daemon` pipes (rather than
-`Stdio::null()`s) the spawned `friglet` child's stdout/stderr and drains them
-continuously in a background task — both to avoid the daemon blocking once
-it logs enough to fill an unread pipe buffer, and so that a daemon that
-exits immediately after spawning (stale binary predating the current CLI,
-missing config/key file, bad address, ...) surfaces its actual error message
-in the "Daemon: unreachable" reason instead of a bare, undiagnosable exit
-code. Captured lines are ANSI-stripped before logging (`friglet-daemon`
-target) and before inclusion in spawn-failure reasons. The tray does **not**
-inherit its own `RUST_LOG` into the child: set `FRIGLET_DAEMON_RUST_LOG` to
-control daemon verbosity when spawned by the tray; otherwise `RUST_LOG` is
-cleared so the daemon uses its config `log_level` (info by default). The
-daemon itself only emits ANSI when stderr is a TTY. If you see
-`spawned daemon exited immediately (exit status: 2)` with no further detail,
-you're looking at a build that predates this fix, or a release binary with
-stdio still swallowed — rebuild `friglet-tray` and check the captured reason
-text (the daemon's lines are forwarded to the tray's stderr at their own
-level, target `friglet-daemon`, and the daemon also writes
-`~/.local/state/friglet/friglet.log`) before guessing
-at the cause. Exit code 2 from a Rust CLI built with `clap` almost always
-means clap itself rejected the arguments (rare here, since the daemon runs
-with zero args) or — far more likely in practice — a stale
-`target/release/friglet` predating this branch's optional-subcommand/config-file
-support; run `cargo build --release --workspace` (or at least `-p friglet`)
-after pulling changes that touch the daemon's CLI.
-
-### Default state file
-
-Scanner state defaults to `<platform config dir>/friglet/scanner_state.json`
-(same directory as `config.toml` / `scan.key`), not a CWD-relative path:
-- Linux: `~/.config/friglet/scanner_state.json` (or `$XDG_CONFIG_HOME/...`)
-- macOS: `~/Library/Application Support/friglet/scanner_state.json`
-- Windows: `%APPDATA%\friglet\scanner_state.json`
-
-Override with `--state-file` / `FRIGLET_STATE_FILE` / `state_file` in the
-config TOML.
+- `friglet-tray/src/lifecycle.rs`'s `spawn_daemon` pipes the child's
+  stdout/stderr and drains them continuously, so the daemon never blocks on
+  a full pipe and a daemon that exits right after spawning shows its own
+  error in the "Daemon: unreachable" reason. Lines are ANSI-stripped and
+  re-logged at their own level under target `friglet-daemon`; the daemon
+  also writes its own `friglet.log`.
+- The tray does **not** pass its `RUST_LOG` to the child: set
+  `FRIGLET_DAEMON_RUST_LOG` to control daemon verbosity; otherwise the
+  daemon uses its config `log_level` (info by default).
+- An immediate exit with status 2 is clap rejecting the arguments, most
+  likely a stale `friglet` binary (search order: `FRIGLET_DAEMON_BIN` →
+  next to the tray → `PATH`); rebuild it after pulling changes to the
+  daemon's CLI.
 
 ## Rules
 
