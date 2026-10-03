@@ -23,7 +23,7 @@ use super::health::{OracleProbe, indexed_block_hash};
 use super::reorg::{
     BlockCheck, OracleView, POST_STREAM_CHECK, ReorgBelowStreamStart, ReorgTooDeep,
 };
-use super::scanner::{Scanner, genesis_hash};
+use super::scanner::Scanner;
 use super::types::ProbableMatch;
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
 use super::ScannerError;
@@ -357,11 +357,6 @@ impl Scanner {
             }
         }
 
-        let mut last_block_id: BlockId = BlockId {
-            height: 0,
-            hash: genesis_hash(),
-        };
-
         let mut expected_height = first;
         // Blocks from here on are scanned; below it they are only checked.
         let mut scan_from = start;
@@ -457,7 +452,6 @@ impl Scanner {
                     height: block_height_u32,
                     hash: block_hash,
                 };
-                last_block_id = block_id;
 
                 // Add this block as a checkpoint since we found something in it
                 self.block_checkpoints.insert(block_height_u32, block_hash);
@@ -657,7 +651,13 @@ impl Scanner {
             return Ok(());
         }
 
-        let balance = self.balance_at(last_block_id);
+        // Counted up to the highest checkpoint, so outputs found in earlier
+        // ranges stay confirmed when nothing in this range paid the wallet.
+        let (&height, &hash) = self
+            .block_checkpoints
+            .last_key_value()
+            .expect("the genesis checkpoint is never removed");
+        let balance = self.balance_at(BlockId { height, hash });
         tracing::info!(
             total = %balance.total(),
             confirmed = %balance.confirmed,
