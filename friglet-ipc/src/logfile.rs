@@ -8,9 +8,9 @@
 //!
 //! The daemon writes `friglet.log` there (`FRIGLET_LOG_FILE` overrides the
 //! path, `FRIGLET_LOG_FILE=off` turns the file off) and the tray writes
-//! `friglet-tray.log`. Each file is capped at [`MAX_LOG_BYTES`]: when a write
-//! would exceed it, the file is renamed to `<name>.1` (the previous `.1`
-//! becomes `.2`, and an older `.2` is dropped) and a fresh file is started.
+//! `friglet-tray.log`. Each file is capped at 10 MiB: when a write would
+//! exceed it, the file is renamed to `<name>.1` (the previous `.1` becomes
+//! `.2`, and an older `.2` is dropped) and a fresh file is started.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -18,14 +18,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Size at which a log file is rotated.
-pub const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 /// Rotated files kept besides the live one (`.1`, `.2`).
-pub const KEPT_ROTATIONS: u32 = 2;
+const KEPT_ROTATIONS: u32 = 2;
 
 /// File name of the daemon's log in [`default_log_dir`].
-pub const DAEMON_LOG_NAME: &str = "friglet.log";
+const DAEMON_LOG_NAME: &str = "friglet.log";
 /// File name of the tray's log in [`default_log_dir`].
-pub const TRAY_LOG_NAME: &str = "friglet-tray.log";
+const TRAY_LOG_NAME: &str = "friglet-tray.log";
 
 /// The platform's directory for friglet's log files.
 pub fn default_log_dir() -> Option<PathBuf> {
@@ -87,7 +87,7 @@ impl RotatingLog {
     }
 
     /// [`RotatingLog::open`] with a custom size cap (tests).
-    pub fn with_limit(path: &Path, max_bytes: u64) -> io::Result<Self> {
+    fn with_limit(path: &Path, max_bytes: u64) -> io::Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
