@@ -47,7 +47,7 @@ cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
 
 ### Checking a running daemon
 
-- Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): `printf '"GetStatus"\n' | nc -U -w 2 "$XDG_RUNTIME_DIR/friglet.sock"` (or the `FRIGLET_CONTROL_SOCKET` path). `GetStatus` never waits on the network.
+- Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): set `FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"`, then `printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"`. This selects the usual Linux default even without `XDG_RUNTIME_DIR`; use the daemon's configured path for a socket override. `GetStatus` never waits on the network.
 - Electrum (`127.0.0.1:50001` by default): `printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001` returns `["Friglet","1.4"]`; `blockchain.headers.subscribe` returns the latest scanned height.
 - HTTP `/height` and `/subscribe` **do not answer while scanning is enabled**: the scan task holds the scanner `Mutex` for its whole `watch_chain_until` loop, including while it waits for new blocks (`friglet/src/main.rs` scan task, `friglet/src/server/mod.rs`). They answer only while scanning is stopped (`Stop` / paused). Never use them as a health check; give any `curl` a timeout (`-m 5`).
 

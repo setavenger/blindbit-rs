@@ -102,7 +102,8 @@ the command line. Note: the scanner state file also contains the secret
 
 While running, the daemon serves a control socket (newline-delimited JSON,
 see the `friglet-ipc` crate) for status, start/stop scanning, and shutdown.
-Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux),
+Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux), falling back to
+`${XDG_DATA_HOME:-$HOME/.local/share}/friglet/friglet.sock`, then `/tmp/friglet.sock`,
 `~/Library/Application Support/friglet/friglet.sock` (macOS),
 `\\.\pipe\friglet` (Windows); override with `FRIGLET_CONTROL_SOCKET`.
 
@@ -121,8 +122,13 @@ answer only while scanning is stopped (**Stop scanning**, or `Stop` over the
 control socket). To check on a running daemon, ask the control socket for
 `GetStatus` or send the Electrum server a `server.version` request:
 
+For the control query, set `FRIGLET_SOCKET` to the daemon's socket path.
+This example selects the usual Linux default, including the data-directory
+fallback; use the configured path if the daemon uses a socket override.
+
 ```bash
-printf '"GetStatus"\n' | nc -U -w 2 "$XDG_RUNTIME_DIR/friglet.sock"
+FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"
+printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"
 printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001
 # -> {"jsonrpc":"2.0","id":1,"result":["Friglet","1.4"]}
 ```
@@ -510,4 +516,3 @@ cargo run --release --package blindbit-cli scan \
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)
 - `--max-label-num`: Maximum label number (default: `0`)
 - `--log-level`: `trace|debug|info|warn|error`; `RUST_LOG` overrides it (default: `info`)
-
