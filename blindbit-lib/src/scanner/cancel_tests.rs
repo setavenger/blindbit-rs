@@ -168,7 +168,7 @@ fn a_stop_during_a_stalled_block_download_ends_the_scan_at_once_and_it_resumes_t
 #[test]
 fn a_stop_ends_the_wait_between_download_attempts() {
     run(async {
-        let node = Node::full(1_000, vec![Conn::CloseAfterHandshake, Conn::Serve]);
+        let node = Node::full(1_000, vec![Conn::CloseAfterRequest, Conn::Serve]);
         let cancel = CancellationToken::new();
         let fetcher = BlockFetcher::new(node.addr, Network::Regtest)
             .with_policy(RetryPolicy {

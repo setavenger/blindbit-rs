@@ -33,9 +33,9 @@ use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 /// What the node does on one connection.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Conn {
-    /// Close right after the handshake, as a node that evicts, bans or
-    /// disconnects friglet does.
-    CloseAfterHandshake,
+    /// Close after receiving the block request, as a node that evicts, bans
+    /// or disconnects friglet does.
+    CloseAfterRequest,
     /// Start sending the block and close halfway through it.
     CloseMidBlock,
     /// Start sending the block and go silent halfway through it, keeping
@@ -245,9 +245,6 @@ fn serve(
     wire.send(NetworkMessage::Verack)?;
     while !matches!(wire.recv()?, NetworkMessage::Verack) {}
     wire.send(NetworkMessage::Ping(1))?;
-    if let Conn::CloseAfterHandshake = conn {
-        return Ok(());
-    }
     let items = loop {
         if let NetworkMessage::GetData(items) = wire.recv()? {
             break items;
@@ -260,6 +257,7 @@ fn serve(
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(InventoryPayload(items.0)))?,
+        Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(
                 magic,
@@ -307,7 +305,7 @@ fn fetch(node: &Node, policy: RetryPolicy, height: u64) -> Result<Block, Box<Blo
 fn a_dropped_connection_is_retried_on_a_fresh_one() {
     let node = Node::full(
         200,
-        vec![Conn::CloseMidBlock, Conn::CloseAfterHandshake, Conn::Serve],
+        vec![Conn::CloseMidBlock, Conn::CloseAfterRequest, Conn::Serve],
     );
     let got = fetch(&node, fast(5), 0).expect("third connection serves the block");
     assert_eq!(got.block_hash(), block().block_hash());
@@ -318,7 +316,7 @@ fn a_dropped_connection_is_retried_on_a_fresh_one() {
 fn a_node_that_drops_every_connection_says_how_to_fix_it() {
     // The mainnet failure: the node accepts each connection and closes it
     // again before the block arrives.
-    let node = Node::full(50_000, vec![Conn::CloseAfterHandshake; 3]);
+    let node = Node::full(50_000, vec![Conn::CloseAfterRequest; 3]);
     let err = fetch(&node, fast(3), 2_000).expect_err("never served");
     assert_eq!(node.connections(), 3, "every attempt is a fresh connection");
     assert_eq!(err.attempts, 3);
@@ -417,7 +415,7 @@ fn a_mainnet_scan_pointed_at_a_signet_port_is_told_so() {
 
 #[test]
 fn a_recent_block_does_not_blame_the_upload_limit() {
-    let node = Node::full(1_000, vec![Conn::CloseAfterHandshake; 2]);
+    let node = Node::full(1_000, vec![Conn::CloseAfterRequest; 2]);
     let message = fetch(&node, fast(2), 990)
         .expect_err("never served")
         .to_string();
@@ -431,7 +429,7 @@ fn a_pruned_node_is_named_as_pruned() {
         ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
         10_000,
         &block(),
-        vec![Conn::CloseAfterHandshake; 2],
+        vec![Conn::CloseAfterRequest; 2],
     );
     let message = fetch(&node, fast(2), 100)
         .expect_err("never served")
@@ -614,7 +612,7 @@ impl OracleProbe for OneBlock {
 fn the_daemon_publishes_an_actionable_stall_with_its_next_try_and_backs_off() {
     run(async {
         let (mut scanner, _state) = scanner("p2p-stall");
-        let node = Node::full(1_000, vec![Conn::CloseAfterHandshake; 4]);
+        let node = Node::full(1_000, vec![Conn::CloseAfterRequest; 4]);
         scanner.p2p_peer = node.addr;
         scanner.p2p_retry = fast(2);
         // A payment to the wallet, in a block nobody serves in-process: the
