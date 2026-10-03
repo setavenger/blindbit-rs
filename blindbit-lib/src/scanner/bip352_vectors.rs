@@ -33,7 +33,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -51,9 +50,9 @@ use bdk_sp::receive::{SpOut, compute_tweak_data, extract_pubkey, get_silentpayme
 use bitcoin_rev::Network;
 use indexer::v2::SpIndexerV2;
 use serde::Deserialize;
-use tonic::transport::Channel;
 
 use crate::oracle_grpc::{FullTxItem, UtxoItemLight};
+use crate::scanner::test_support::{oracle_client, state_file};
 
 use super::{BIP352_K_MAX, Scanner};
 
@@ -100,9 +99,9 @@ const OUTPUT_BASE_SAT: u64 = 100_000;
 #[serde(deny_unknown_fields)]
 struct TestCase {
     comment: String,
-    /// Parsed but unused: blindbit-lib is receive-only. Modelled so that an
-    /// upstream change to the sending half is caught instead of ignored.
-    #[allow(dead_code)]
+    /// Only checked for presence: blindbit-lib is receive-only. Modelled so
+    /// that an upstream change to the sending half is caught instead of
+    /// ignored.
     sending: Vec<SendingCase>,
     receiving: Vec<ReceivingCase>,
 }
@@ -604,50 +603,17 @@ fn full_item(tx: &Transaction, tweak: PublicKey) -> FullTxItem {
     }
 }
 
-/// Per-test scanner state path.
-///
-/// `AGENTS.md` reserves the gitignored `blindbit-test/` directory for test state.
-/// Nothing in this module actually persists (`scan_transaction_full` never writes
-/// the state file), but the path is still made unique per test so that parallel
-/// tests cannot collide on it.
-fn state_file(tag: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("blindbit-test")
-        .join(format!("bip352-vectors-{tag}-state.json"))
-}
-
-/// A never-connected oracle client.
-///
-/// `Channel::connect_lazy` builds a hyper client that installs a Tokio timer, so
-/// it needs a runtime in scope even though it performs no I/O and these tests
-/// never talk to an oracle. `Scanner::scan_transaction_full` is itself
-/// synchronous, so the tests stay plain `#[test]`s and only the client
-/// construction is entered into a runtime. The runtime is kept alive for the
-/// process so the channel's captured handle stays valid.
-fn oracle_client() -> crate::OracleServiceClient<Channel> {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime for the lazy tonic channel")
-    });
-    let _guard = runtime.enter();
-    crate::OracleServiceClient::new(Channel::from_static("http://[::1]:50051").connect_lazy())
-}
-
 /// A scanner exactly as `Scanner::new` builds it, i.e. with the change label
 /// `m = 0` always registered.
 fn default_scanner(scan_sk: SecretKey, spend_pk: PublicKey, tag: &str) -> Scanner {
-    let client = oracle_client();
     let socket: SocketAddr = "127.0.0.1:8333".parse().expect("socket address");
     Scanner::new(
-        client,
+        oracle_client(),
         socket,
         scan_sk,
         spend_pk,
         0,
-        state_file(tag),
+        state_file(&format!("bip352-vectors-{tag}")),
         Network::Bitcoin,
     )
 }

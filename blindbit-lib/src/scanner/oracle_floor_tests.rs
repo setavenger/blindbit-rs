@@ -12,9 +12,8 @@ use bitcoin::hashes::Hash;
 use super::ScannerError;
 use super::health::{OracleProbe, ScanStopped, find_oracle_floor};
 use super::scanner::Scanner;
-use super::stream_safety_tests::{
-    TestStream, owned_outputs, payment_block, run, scanner, unindexed_message,
-};
+use super::stream_safety_tests::{TestStream, owned_outputs, payment_block, unindexed_message};
+use super::test_support::{run, scanner};
 
 /// `GetBlockHashByHeight` over fixed runs of indexed heights.
 struct FakeOracle {
@@ -202,7 +201,7 @@ async fn set_wallet_start(scanner: &mut Scanner, start: u64) {
 #[test]
 fn wallet_start_below_the_floor_starts_at_the_floor_and_says_so() {
     run(async {
-        let (mut scanner, state) = scanner("floor-start", "http://127.0.0.1:1");
+        let (mut scanner, state) = scanner("floor-start");
         set_wallet_start(&mut scanner, 50).await;
         let paid = payment_block(1_000);
         let mut oracle = FakeOracle::contiguous(1_000, 1_005);
@@ -258,7 +257,7 @@ fn wallet_start_below_the_floor_starts_at_the_floor_and_says_so() {
 #[test]
 fn unindexed_height_after_the_wallet_start_is_never_skipped() {
     run(async {
-        let (mut scanner, _state) = scanner("floor-gap", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("floor-gap");
         set_wallet_start(&mut scanner, 1_000).await;
         scanner.update_last_scanned_block_height(1_499);
         // Even an oracle that has nothing below 1 600 does not justify it.
@@ -277,7 +276,7 @@ fn unindexed_height_after_the_wallet_start_is_never_skipped() {
 #[test]
 fn only_a_not_indexed_stop_at_the_start_moves_the_start() {
     run(async {
-        let (mut scanner, _state) = scanner("floor-other", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("floor-other");
         set_wallet_start(&mut scanner, 50).await;
         let mut oracle = FakeOracle::contiguous(1_000, 1_005);
         let unavailable: ScannerError = Box::new(ScanStopped {
@@ -309,7 +308,7 @@ fn only_a_not_indexed_stop_at_the_start_moves_the_start() {
 #[test]
 fn a_stall_keeps_its_start_time_until_the_height_changes_and_clears_on_progress() {
     run(async {
-        let (scanner, _state) = scanner("stall", "http://127.0.0.1:1");
+        let (scanner, _state) = scanner("stall");
         scanner.report_stall(1_500, "first".into()).await;
         let first = scanner.scan_health().await.stall.expect("stall");
         {
