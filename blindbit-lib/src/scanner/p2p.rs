@@ -22,83 +22,6 @@ use bitcoin_rev::consensus::encode;
 use bitcoin_rev::{Network, TestnetVersion};
 use tokio_util::sync::CancellationToken;
 
-use super::ScannerError;
-
-/// Broadcast a raw transaction to a P2P peer.
-///
-/// Opens a fresh P2P connection, completes the handshake, sends the raw `tx`
-/// message, then reads back up to `MAX_READBACK` messages before closing.
-/// Reading back is important: it keeps the connection open long enough for the
-/// peer to fully process the payload, and surfaces any `reject` or other
-/// diagnostic messages that would otherwise be silently discarded.
-///
-/// Returns the txid hex string on success.  Returns an error if the peer sends
-/// a `reject`-equivalent response or if any I/O step fails.
-pub fn broadcast_tx(
-    p2p_peer: SocketAddr,
-    network: Network,
-    raw_tx_hex: &str,
-) -> Result<String, ScannerError> {
-    let tx_bytes = hex::decode(raw_tx_hex)?;
-
-    // Parse with the standard bitcoin crate to compute the txid.
-    let bitcoin_tx: bitcoin::Transaction =
-        bitcoin::consensus::encode::deserialize(&tx_bytes)?;
-    let txid = bitcoin_tx.compute_txid().to_string();
-
-    // Re-parse with bitcoin_rev (the commit that bitcoin-p2p expects).
-    let prim_tx: bitcoin_rev::Transaction = encode::deserialize(&tx_bytes)?;
-
-    tracing::debug!(peer = %p2p_peer, "connecting to P2P peer for broadcast");
-
-    let connection_config = ConnectionConfig::new().change_network(network);
-    let (writer, mut reader, metadata) =
-        connection_config.open_connection(p2p_peer, TimeoutParams::default())?;
-
-    tracing::debug!(
-        peer_height = metadata.feeler_data().reported_height,
-        services = %metadata.feeler_data().services,
-        "P2P handshake complete"
-    );
-
-    writer.send_message(NetworkMessage::Tx(prim_tx))?;
-    tracing::info!(txid = %txid, peer = %p2p_peer, "transaction sent to P2P peer");
-
-    // Drain the immediate post-handshake messages the peer sends right after
-    // the connection is established (sendcmpct / sendheaders / feefilter /
-    // ping).  Reading these:
-    //   1. Keeps the TCP socket open long enough for the peer to receive the Tx
-    //   2. Surfaces any immediate rejection the peer might send
-    //
-    // We stop after a small fixed count because after those 3-4 quick setup
-    // messages the peer only sends keepalive pings every ~30 s — waiting for
-    // them would block the caller for minutes.  Any rejection arrives within
-    // the first few messages (BIP-61 reject, if enabled, follows the tx almost
-    // immediately).
-    const MAX_READBACK: usize = 3;
-    let mut n = 0;
-    loop {
-        match reader.read_message() {
-            Ok(Some(msg)) => {
-                let cmd = msg.command();
-                tracing::debug!(command = %cmd, "received P2P message after broadcast");
-                n += 1;
-                if n >= MAX_READBACK {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::debug!(error = %e, "P2P read ended after broadcast (expected)");
-                break;
-            }
-        }
-    }
-
-    tracing::info!(txid = %txid, "broadcast complete");
-    Ok(txid)
-}
-
 // ---------------------------------------------------------------------------
 // Full-block fetch
 // ---------------------------------------------------------------------------
@@ -111,11 +34,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// This is a per-syscall socket timeout, NOT a per-message budget.  It needs to
 /// be generous: after we send `getdata`, the peer may take a moment to load a
 /// large block off disk, and during a multi-megabyte transfer there can be
-/// short gaps between TCP segments.  A too-short value (the previous code used
-/// 1 second) risks firing in the *middle* of a block payload, which makes the
-/// library's `read_exact` abort after partially consuming the message and
-/// permanently desyncs the stream.  30 s is far longer than any healthy gap but
-/// still bounds a dead connection.
+/// short gaps between TCP segments.  A too-short value risks firing in the
+/// *middle* of a block payload, which makes the library's `read_exact` abort
+/// after partially consuming the message and permanently desyncs the stream.
+/// 30 s is far longer than any healthy gap but still bounds a dead connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bitcoin Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`: a pruned node serves
@@ -566,9 +488,10 @@ impl BlockFetcher {
     /// Every attempt opens a fresh connection and closes it afterwards, so a
     /// connection the node dropped is never reused and no connection idles
     /// between fetches (where it would miss the node's pings). Failures that
-    /// may go away by themselves (no connection, connection closed or
-    /// broken) are retried after 1, 2, 4, 8 s; the others end the call at
-    /// once, since asking again right away cannot change the answer.
+    /// another connection may not repeat (see `FetchFailure::is_transient`)
+    /// are retried after the policy's waits (1, 2, 4, 8 s by default); the
+    /// others end the call at once, since asking again right away cannot
+    /// change the answer.
     ///
     /// The connection's I/O is blocking and runs on a thread of its own, so
     /// it never blocks the async runtime and the call stays cancellable:
@@ -739,14 +662,11 @@ impl Drop for ShutdownOnDrop {
 
 /// One open, handshaken P2P connection used for a single block fetch.
 ///
-/// Note: the previous "post-handshake drain" has been removed.  It existed on
-/// the false premise that the post-`verack` message flood (`sendcmpct`,
-/// `feefilter`, `wtxidrelay`, `sendaddrv2`, …) would corrupt later reads.  In
-/// fact unrecognised messages decode to `NetworkMessage::Unknown` and every
-/// message is read as an exact, checksummed frame, so the stream never desyncs.
-/// `fetch_block` simply skips any non-block message while it waits, which makes
-/// the drain redundant (and it was the cause of multi-minute startup stalls,
-/// since it blocked reading the peer's 30 s keepalive pongs).
+/// The messages a node sends after `verack` (`sendcmpct`, `feefilter`,
+/// `wtxidrelay`, `sendaddrv2`, …) need no draining: unrecognised messages
+/// decode to `NetworkMessage::Unknown`, every message is read as an exact,
+/// checksummed frame, and `fetch_block` skips any non-block message while it
+/// waits.
 struct P2pConnection {
     writer: ConnectionWriter,
     reader: ConnectionReader,
@@ -771,12 +691,11 @@ impl P2pConnection {
             stream.set_nodelay(true)
         };
         configure(&stream).map_err(|e| FetchFailure::Broken(e.to_string()))?;
-        let mut timeout_params = TimeoutParams::new();
-        timeout_params.read_timeout(read_timeout);
-        timeout_params.write_timeout(READ_TIMEOUT);
+        // `handshake` takes only the ping interval from `TimeoutParams`; the
+        // socket timeouts are the ones `configure` set above.
         let (writer, reader, metadata) = ConnectionConfig::new()
             .change_network(network)
-            .handshake(stream, timeout_params)
+            .handshake(stream, TimeoutParams::default())
             .map_err(|e| handshake_failure(e, opened))?;
         let feeler = metadata.feeler_data();
         tracing::debug!(
