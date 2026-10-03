@@ -1,5 +1,3 @@
-// todo: make scanner data pulling engine flexible
-
 #[cfg(test)]
 mod cancel_tests;
 mod changeset;

@@ -101,7 +101,6 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    // TODO: create a config with defaults instead of a long list of args
     pub fn new(
         client: OracleServiceClient<Channel>,
         p2p_socket_addr: SocketAddr,

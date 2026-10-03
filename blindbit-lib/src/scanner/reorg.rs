@@ -41,7 +41,6 @@
 
 use std::collections::BTreeSet;
 
-use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Txid};
 use indexer::bdk_chain::ConfirmationBlockTime;
 
@@ -110,13 +109,6 @@ impl std::fmt::Display for ReorgBelowStreamStart {
 }
 
 impl std::error::Error for ReorgBelowStreamStart {}
-
-/// The oracle serves block hashes in display order.
-pub(crate) fn block_hash_from_oracle(display_order: &[u8]) -> Option<BlockHash> {
-    let mut bytes: [u8; 32] = display_order.try_into().ok()?;
-    bytes.reverse();
-    Some(BlockHash::from_byte_array(bytes))
-}
 
 /// A remembered block compared with the block the oracle serves now at the
 /// same height.

@@ -107,15 +107,11 @@ pub fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
     }
 }
 
-/// Convert a byte array to a Txid, handling byte order reversal
+/// The `Txid` of a txid the oracle serves in display order (reversed).
 pub fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
-    // Ensure we have exactly 32 bytes
-    let mut reversed_txid_slice = *txid;
-    reversed_txid_slice.reverse();
-    let txid_array: [u8; 32] = reversed_txid_slice;
-
-    // Construct Txid directly from the byte array (preserves byte order)
-    Txid::from_byte_array(txid_array)
+    let mut bytes = *txid;
+    bytes.reverse();
+    Txid::from_byte_array(bytes)
 }
 
 #[cfg(test)]

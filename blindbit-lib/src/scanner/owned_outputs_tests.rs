@@ -23,8 +23,7 @@ use bitcoin::{
     Witness, XOnlyPublicKey,
 };
 use bitcoin_rev::Network;
-use indexer::bdk_chain::local_chain::LocalChain;
-use indexer::bdk_chain::{BlockId, CanonicalizationParams};
+use indexer::bdk_chain::BlockId;
 use tonic::transport::Channel;
 
 use super::Scanner;
@@ -216,31 +215,16 @@ fn process_block(
     true
 }
 
-/// The confirmed balance exactly as `scan_block_range` computes it.
+/// The confirmed balance as `scan_block_range` logs it, at the highest
+/// checkpoint.
 fn balance(scanner: &Scanner) -> u64 {
     let (&height, &hash) = scanner
         .block_checkpoints
         .iter()
         .next_back()
         .expect("genesis checkpoint");
-    let outpoints: Vec<(u32, OutPoint)> = scanner
-        .internal_indexer
-        .index()
-        .by_shared_secret
-        .keys()
-        .map(|op| (op.vout, *op))
-        .collect();
-    let chain = LocalChain::from_blocks(scanner.block_checkpoints.clone()).expect("chain");
     scanner
-        .internal_indexer
-        .graph()
-        .balance(
-            &chain,
-            BlockId { height, hash },
-            CanonicalizationParams::default(),
-            outpoints,
-            |_, _| true,
-        )
+        .balance_at(BlockId { height, hash })
         .confirmed
         .to_sat()
 }
