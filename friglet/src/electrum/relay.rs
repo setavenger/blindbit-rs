@@ -32,7 +32,7 @@ use bitcoin_p2p::p2p_message_types::message_blockdata::Inventory;
 use bitcoin_rev::Network;
 use bitcoin_rev::consensus::encode;
 
-use super::p2p::{P2pError, Peer, inventory_matches};
+use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bitcoin Core requests an announced transaction after 2 s from an inbound
@@ -70,6 +70,12 @@ impl Candidate {
             tx,
             fee: None,
         })
+    }
+
+    /// The transaction as the P2P library's type.
+    fn wire_tx(&self) -> Result<bitcoin_rev::Transaction, P2pError> {
+        encode::deserialize(&self.raw)
+            .map_err(|error| P2pError::Protocol(format!("transaction re-encoding failed: {error}")))
     }
 
     fn fee_rate_note(&self) -> String {
@@ -178,6 +184,34 @@ impl Signals {
         }
         Ok(())
     }
+
+    /// Announce the transaction with `inv` and hand it over if the peer asks
+    /// for it before `deadline`.
+    fn announce(
+        &mut self,
+        peer: &mut Peer,
+        wire_tx: &bitcoin_rev::Transaction,
+        txid: Txid,
+        wtxid: Wtxid,
+        deadline: Instant,
+    ) -> Result<(), P2pError> {
+        let inventory = peer.tx_inventory(txid, wtxid);
+        peer.send(NetworkMessage::Inv(InventoryPayload(vec![inventory])))?;
+        while !self.sent {
+            match peer.recv_until(deadline)? {
+                Some(message) => self.observe(peer, message, wire_tx, txid, wtxid)?,
+                None => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Connect with transaction relay on and wait for the peer to settle.
+fn connect_settled(addr: SocketAddr, network: Network) -> Result<Peer, P2pError> {
+    let mut peer = Peer::connect(addr, network, true, CONNECT_TIMEOUT)?;
+    peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
+    Ok(peer)
 }
 
 /// Broadcast `candidate` to the peer and wait up to `budget` for it to show
@@ -191,10 +225,8 @@ pub fn broadcast(
     budget: Duration,
 ) -> Result<(Outcome, Option<u64>), P2pError> {
     let deadline = Instant::now() + budget;
-    let wire_tx: bitcoin_rev::Transaction = encode::deserialize(&candidate.raw)
-        .map_err(|error| P2pError::Protocol(format!("transaction re-encoding failed: {error}")))?;
-
-    let mut peer = Peer::connect(addr, network, true, CONNECT_TIMEOUT)?;
+    let wire_tx = candidate.wire_tx()?;
+    let mut peer = connect_settled(addr, network)?;
     let mut signals = Signals::default();
     let outcome = match drive(&mut peer, &mut signals, candidate, &wire_tx, deadline) {
         Ok(Some(outcome)) => outcome,
@@ -219,7 +251,6 @@ fn drive(
     deadline: Instant,
 ) -> Result<Option<Outcome>, P2pError> {
     let (txid, wtxid) = (candidate.txid, candidate.wtxid);
-    peer.wait_until_settled(Instant::now() + Duration::from_secs(2))?;
 
     // A resubmission (or a retry after a client timeout) finds it already
     // there.
@@ -230,15 +261,8 @@ fn drive(
         return Ok(Some(Outcome::InMempool));
     }
 
-    let inventory = peer.tx_inventory(txid, wtxid);
-    peer.send(NetworkMessage::Inv(InventoryPayload(vec![inventory])))?;
     let ask_deadline = deadline.min(Instant::now() + ANNOUNCE_WAIT);
-    while !signals.sent {
-        match peer.recv_until(ask_deadline)? {
-            Some(message) => signals.observe(peer, message, wire_tx, txid, wtxid)?,
-            None => break,
-        }
-    }
+    signals.announce(peer, wire_tx, txid, wtxid, ask_deadline)?;
     if !signals.sent {
         // No request: the peer knows the transaction already (it is not in
         // its mempool, so it rejected or confirmed it recently) or ignores
@@ -279,8 +303,7 @@ pub fn in_mempool(
     network: Network,
     candidate: &Candidate,
 ) -> Result<bool, P2pError> {
-    let mut peer = Peer::connect(addr, network, true, CONNECT_TIMEOUT)?;
-    peer.wait_until_settled(Instant::now() + Duration::from_secs(2))?;
+    let mut peer = connect_settled(addr, network)?;
     peer.mempool_has(
         candidate.txid,
         candidate.wtxid,
@@ -297,14 +320,10 @@ pub fn recheck(
     network: Network,
     candidates: &[Candidate],
 ) -> Result<(Vec<bool>, Option<u64>), P2pError> {
-    let mut peer = Peer::connect(addr, network, true, CONNECT_TIMEOUT)?;
-    peer.wait_until_settled(Instant::now() + Duration::from_secs(2))?;
+    let mut peer = connect_settled(addr, network)?;
     let mut present = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let wire_tx: bitcoin_rev::Transaction =
-            encode::deserialize(&candidate.raw).map_err(|error| {
-                P2pError::Protocol(format!("transaction re-encoding failed: {error}"))
-            })?;
+        let wire_tx = candidate.wire_tx()?;
         let (txid, wtxid) = (candidate.txid, candidate.wtxid);
         let mut signals = Signals::default();
         let in_mempool =
@@ -312,15 +331,8 @@ pub fn recheck(
                 signals.observe(p, m, &wire_tx, txid, wtxid)
             })?;
         if !in_mempool {
-            let inventory = peer.tx_inventory(txid, wtxid);
-            peer.send(NetworkMessage::Inv(InventoryPayload(vec![inventory])))?;
             let ask_deadline = Instant::now() + ANNOUNCE_WAIT;
-            while !signals.sent {
-                match peer.recv_until(ask_deadline)? {
-                    Some(message) => signals.observe(&mut peer, message, &wire_tx, txid, wtxid)?,
-                    None => break,
-                }
-            }
+            signals.announce(&mut peer, &wire_tx, txid, wtxid, ask_deadline)?;
             if signals.sent {
                 peer.flush(Instant::now() + ANNOUNCE_WAIT)?;
             }
