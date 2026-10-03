@@ -22,7 +22,6 @@ body {
 
 main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 #view-status, #view-settings, #view-wallet { display: flex; flex-direction: column; gap: 12px; }
-#view-status[hidden], #view-settings[hidden], #view-wallet[hidden] { display: none; }
 
 header { display: flex; align-items: center; justify-content: space-between; }
 h1 { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
@@ -76,8 +75,6 @@ code {
   color: var(--text);
 }
 .error { color: var(--bad); }
-/* `.col` sets display: flex, which would override the `hidden` attribute. */
-.col[hidden] { display: none; }
 #scan-notes { font-size: 13px; white-space: pre-line; }
 .small { font-size: 12px; min-height: 18px; }
 
@@ -159,7 +156,6 @@ fieldset:disabled { opacity: 0.5; }
 .hint.ok { color: var(--good); }
 .hint.warn { color: var(--accent); }
 .hint.error { color: var(--bad); }
-.hint code { font-size: 11px; }
 .choice { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; cursor: pointer; }
 .choice input { margin-top: 3px; accent-color: var(--accent); }
 .indented { margin-left: 22px; }
