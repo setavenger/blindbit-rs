@@ -13,8 +13,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use bdk_sp::bitcoin::key::Secp256k1;
@@ -23,17 +21,14 @@ use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::hashes::Hash;
 use bitcoin::key::TweakedPublicKey;
-use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Txid, Witness,
 };
-use bitcoin_rev::Network;
-use tonic::transport::Channel;
-
 use super::Scanner;
 use super::scanning::BlockScanDataStream;
+use super::test_support::{keys, run, scanner, secret};
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
 static SERVED_BLOCKS: Mutex<Option<HashMap<BlockHash, Block>>> = Mutex::new(None);
@@ -78,52 +73,6 @@ impl BlockScanDataStream for TestStream {
     {
         std::future::ready(self.0.pop_front().transpose())
     }
-}
-
-pub(super) fn run<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
-}
-
-pub(super) fn secret(byte: u8) -> SecretKey {
-    SecretKey::from_slice(&[byte; 32]).expect("valid secret")
-}
-
-pub(super) fn keys() -> (SecretKey, PublicKey) {
-    (secret(0x11), secret(0x22).public_key(&Secp256k1::new()))
-}
-
-pub(super) struct TempState(pub(super) PathBuf);
-
-impl Drop for TempState {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// A scanner whose oracle client points at `oracle` (never contacted unless a
-/// test calls `scan_block_range`). Must be called inside a Tokio runtime.
-pub(super) fn scanner(tag: &str, oracle: &'static str) -> (Scanner, TempState) {
-    let (scan_sk, spend_pk) = keys();
-    let state = std::env::temp_dir().join(format!(
-        "blindbit-stream-safety-{tag}-{}.json",
-        std::process::id()
-    ));
-    let client = crate::OracleServiceClient::new(Channel::from_static(oracle).connect_lazy());
-    let socket: SocketAddr = "127.0.0.1:1".parse().expect("socket address");
-    let scanner = Scanner::new(
-        client,
-        socket,
-        scan_sk,
-        spend_pk,
-        0,
-        state.clone(),
-        Network::Regtest,
-    );
-    (scanner, TempState(state))
 }
 
 /// One block at `height` holding a single silent payment to the test wallet,
@@ -234,7 +183,7 @@ pub(super) fn owned_outputs(scanner: &Scanner) -> usize {
 #[test]
 fn empty_hash_block_mid_range_stops_scan_and_next_scan_finds_its_outputs() {
     run(async {
-        let (mut scanner, _state) = scanner("empty-hash", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("empty-hash");
         let a = payment_block(1100);
         let b = payment_block(1101);
         let c = payment_block(1102);
@@ -276,7 +225,7 @@ fn empty_hash_block_mid_range_stops_scan_and_next_scan_finds_its_outputs() {
 #[test]
 fn malformed_block_hash_stops_scan() {
     run(async {
-        let (mut scanner, _state) = scanner("short-hash", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("short-hash");
         let a = payment_block(1200);
         let mut bad = payment_block(1201).message;
         bad.block_identifier
@@ -301,7 +250,7 @@ fn malformed_block_hash_stops_scan() {
 #[test]
 fn skipped_height_stops_scan() {
     run(async {
-        let (mut scanner, _state) = scanner("skipped", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("skipped");
         let a = payment_block(1300);
         let c = payment_block(1302);
         let stream = TestStream::new(vec![Ok(a.message.clone()), Ok(c.message.clone())]);
@@ -325,7 +274,7 @@ fn skipped_height_stops_scan() {
 #[test]
 fn stream_starting_at_wrong_height_stops_scan() {
     run(async {
-        let (mut scanner, _state) = scanner("wrong-start", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("wrong-start");
         scanner.update_last_scanned_block_height(1399);
         let b = payment_block(1401);
         let stream = TestStream::new(vec![Ok(b.message.clone())]);
@@ -350,7 +299,7 @@ fn error_status_mid_stream_is_a_clean_error() {
         ];
         for (i, status) in statuses.into_iter().enumerate() {
             let code = status.code();
-            let (mut scanner, _state) = scanner(&format!("status-{i}"), "http://127.0.0.1:1");
+            let (mut scanner, _state) = scanner(&format!("status-{i}"));
             let a = payment_block(1500);
             let stream = TestStream::new(vec![Ok(a.message.clone()), Err(status)]);
             let err = scanner
@@ -375,7 +324,7 @@ fn error_status_mid_stream_is_a_clean_error() {
 #[test]
 fn stream_ending_before_requested_end_is_an_error() {
     run(async {
-        let (mut scanner, _state) = scanner("short-stream", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("short-stream");
         let a = payment_block(1600);
         let stream = TestStream::new(vec![Ok(a.message.clone())]);
         let err = scanner
@@ -394,7 +343,7 @@ fn stream_ending_before_requested_end_is_an_error() {
 #[test]
 fn unreachable_oracle_is_a_clean_error() {
     run(async {
-        let (mut scanner, _state) = scanner("unreachable", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("unreachable");
         scanner.update_last_scanned_block_height(1699);
         scanner
             .scan_block_range(1700, 1710)

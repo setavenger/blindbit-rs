@@ -6,10 +6,6 @@
 //! `apply_matched_block` + `sync_owned_outputs` and becomes a checkpoint. The
 //! P2P fetch is the only step replaced (the block is handed in directly).
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::hashes::get_label_tweak;
 use bdk_sp::receive::get_silentpayment_pubkey;
@@ -22,58 +18,17 @@ use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness, XOnlyPublicKey,
 };
-use bitcoin_rev::Network;
 use indexer::bdk_chain::BlockId;
-use tonic::transport::Channel;
 
 use super::Scanner;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 use crate::scanner::OwnedOutputRecord;
+#[cfg(feature = "serde")]
+use crate::scanner::test_support::{restore_from, run};
+use crate::scanner::test_support::{keys, scanner_at, secret, state_file};
 
 const RECEIVE_HEIGHT: u32 = 100;
 const SPEND_HEIGHT: u32 = 200;
-
-fn oracle_client() -> crate::OracleServiceClient<Channel> {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime for the lazy tonic channel")
-    });
-    let _guard = runtime.enter();
-    crate::OracleServiceClient::new(Channel::from_static("http://[::1]:50051").connect_lazy())
-}
-
-fn state_file(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "blindbit-owned-outputs-{tag}-{}.json",
-        std::process::id()
-    ))
-}
-
-fn secret(byte: u8) -> SecretKey {
-    SecretKey::from_slice(&[byte; 32]).expect("valid secret")
-}
-
-fn keys() -> (SecretKey, PublicKey) {
-    let secp = Secp256k1::new();
-    (secret(0x11), secret(0x22).public_key(&secp))
-}
-
-fn scanner(tag: &str, max_label_num: u32) -> Scanner {
-    let (scan_sk, spend_pk) = keys();
-    let socket: SocketAddr = "127.0.0.1:8333".parse().expect("socket address");
-    Scanner::new(
-        oracle_client(),
-        socket,
-        scan_sk,
-        spend_pk,
-        max_label_num,
-        state_file(tag),
-        Network::Regtest,
-    )
-}
 
 /// The tweak (`input_hash * A`) the oracle would serve for a payment. Any
 /// point works: the receiver only ever sees this value.
@@ -264,7 +219,7 @@ fn spend_of(outpoint: OutPoint) -> Transaction {
 
 #[test]
 fn spend_in_later_block_marks_output_spent_and_balance_drops() {
-    let mut scanner = scanner("spend", 0);
+    let mut scanner = scanner_at(state_file("spend"), 0);
     let (outpoint, key) = receive(&mut scanner);
 
     let rec = record(&scanner, outpoint);
@@ -309,7 +264,7 @@ fn spend_in_later_block_marks_output_spent_and_balance_drops() {
 
 #[test]
 fn foreign_output_with_colliding_prefix_marks_nothing() {
-    let mut scanner = scanner("collision", 0);
+    let mut scanner = scanner_at(state_file("collision"), 0);
     let (outpoint, key) = receive(&mut scanner);
 
     // Someone else's output shares our key's 8-byte prefix and is spent: the
@@ -337,7 +292,7 @@ fn foreign_output_with_colliding_prefix_marks_nothing() {
 
 #[test]
 fn labelled_receive_records_its_label() {
-    let mut scanner = scanner("labels", 5);
+    let mut scanner = scanner_at(state_file("labels"), 5);
     let tweak = served_tweak(0x34);
     let unlabelled = sp_output_key(&tweak, None);
     let change = sp_output_key(&tweak, Some(0));
@@ -382,7 +337,7 @@ fn owned_outputs_labels_and_spends_survive_restart() {
     let path = state_file(tag);
     let _ = std::fs::remove_file(&path);
 
-    let mut scanner = scanner(tag, 2);
+    let mut scanner = scanner_at(state_file(tag), 2);
     let tweak = served_tweak(0x35);
     let change_key = sp_output_key(&tweak, Some(0));
     let label_key = sp_output_key(&tweak, Some(2));
@@ -434,16 +389,7 @@ fn owned_outputs_labels_and_spends_survive_restart() {
     assert_eq!(label_entry["label"], 2);
     assert_eq!(label_entry["pubkey"], label_key.to_string());
 
-    let changeset = Scanner::load_from_file(&path).expect("load state");
-    let socket: SocketAddr = "127.0.0.1:8333".parse().unwrap();
-    let mut restored = Scanner::from_changeset(
-        oracle_client(),
-        socket,
-        changeset,
-        path.clone(),
-        Network::Regtest,
-    )
-    .expect("restore");
+    let mut restored = restore_from(&path);
     let _ = std::fs::remove_file(&path);
 
     let after: Vec<_> = restored.owned_outputs().cloned().collect();
@@ -474,29 +420,10 @@ fn owned_outputs_labels_and_spends_survive_restart() {
 const STATE_BEFORE_OWNED_OUTPUTS: &str = include_str!("testdata/state_before_owned_outputs.json");
 
 #[cfg(feature = "serde")]
-fn restore(tag: &str, json: &str) -> (Scanner, PathBuf) {
+fn restore(tag: &str, json: &str) -> (Scanner, std::path::PathBuf) {
     let path = state_file(tag);
     std::fs::write(&path, json).expect("write state file");
-    let changeset = Scanner::load_from_file(&path).expect("load state");
-    let socket: SocketAddr = "127.0.0.1:8333".parse().unwrap();
-    let scanner = Scanner::from_changeset(
-        oracle_client(),
-        socket,
-        changeset,
-        path.clone(),
-        Network::Regtest,
-    )
-    .expect("restore");
-    (scanner, path)
-}
-
-#[cfg(feature = "serde")]
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
+    (restore_from(&path), path)
 }
 
 /// An old state file still loads, and because its spends of owned outputs
@@ -541,7 +468,7 @@ fn state_file_from_before_owned_outputs_rescans_for_missed_spends() {
 
         // Rewound to just below the oldest unspent output, and says so.
         assert_eq!(scanner.get_last_scanned_block_height(), 99, "{case}");
-        let health = block_on(scanner.scan_health());
+        let health = run(scanner.scan_health());
         assert_eq!(
             health.state_rescan,
             Some(crate::scanner::StateRescan {
@@ -551,8 +478,8 @@ fn state_file_from_before_owned_outputs_rescans_for_missed_spends() {
             "{case}"
         );
         // Electrum clients keep seeing the old tip while the rescan runs.
-        block_on(scanner.rebuild_electrum_index_from_graph(1));
-        let tip = block_on(scanner.electrum_index().lock()).tip.clone();
+        run(scanner.rebuild_electrum_index_from_graph(1));
+        let tip = run(scanner.electrum_index().lock()).tip.clone();
         assert_eq!(tip.map(|(height, _)| height), Some(300), "{case}");
 
         // The rescan reaches block 200; with the output recorded, the oracle's
@@ -572,8 +499,8 @@ fn state_file_from_before_owned_outputs_rescans_for_missed_spends() {
         );
         assert_eq!(balance(&scanner), 20_000, "{case}");
         scanner.update_last_scanned_block_height(300);
-        block_on(scanner.clear_stall());
-        assert_eq!(block_on(scanner.scan_health()).state_rescan, None);
+        run(scanner.clear_stall());
+        assert_eq!(run(scanner.scan_health()).state_rescan, None);
 
         // Saved in the current format, it restores without another rewind.
         scanner.save_to_file(&path).expect("save");
@@ -583,10 +510,10 @@ fn state_file_from_before_owned_outputs_rescans_for_missed_spends() {
             saved["format_version"],
             crate::scanner::STATE_FORMAT_VERSION
         );
-        let (again, path) = restore("pre-records", &serde_json::to_string(&saved).unwrap());
+        let again = restore_from(&path);
         let _ = std::fs::remove_file(&path);
         assert_eq!(again.get_last_scanned_block_height(), 300, "{case}");
-        assert_eq!(block_on(again.scan_health()).state_rescan, None, "{case}");
+        assert_eq!(run(again.scan_health()).state_rescan, None, "{case}");
         assert_eq!(balance(&again), 20_000, "{case}");
     }
 }
@@ -599,7 +526,7 @@ fn state_file_from_before_owned_outputs_without_unspent_outputs_is_not_rescanned
     let mut old: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
     // The same wallet before anything was found.
     let fresh = {
-        let scanner = scanner("pre-records-empty-src", 1);
+        let scanner = scanner_at(state_file("pre-records-empty-src"), 1);
         let mut json = serde_json::to_value(&scanner.stage).unwrap();
         json.as_object_mut().unwrap().remove("format_version");
         json
@@ -610,7 +537,7 @@ fn state_file_from_before_owned_outputs_without_unspent_outputs_is_not_rescanned
     let (scanner, path) = restore("pre-records-empty", &old.to_string());
     assert_eq!(scanner.owned_outputs().count(), 0);
     assert_eq!(scanner.get_last_scanned_block_height(), 300);
-    assert_eq!(block_on(scanner.scan_health()).state_rescan, None);
+    assert_eq!(run(scanner.scan_health()).state_rescan, None);
     scanner.save_to_file(&path).expect("save");
     let saved: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

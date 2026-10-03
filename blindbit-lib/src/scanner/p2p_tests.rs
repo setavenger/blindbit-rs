@@ -26,7 +26,8 @@ use super::ScannerError;
 use super::health::OracleProbe;
 use super::p2p::{BlockFetchError, BlockFetcher, FetchBackoff, FetchFailure, RetryPolicy};
 use super::scanning::BlockStreamSource;
-use super::stream_safety_tests::{TestStream, payment_block, run, scanner};
+use super::stream_safety_tests::{TestStream, payment_block};
+use super::test_support::{run, scanner};
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
@@ -72,45 +73,42 @@ struct Served {
 
 impl Served {
     fn new(block: &Block) -> Self {
-        let mut stripped = block.clone();
-        for tx in &mut stripped.txdata {
-            for input in &mut tx.input {
-                input.witness.clear();
-            }
-        }
         let wire = |block: &Block| -> bitcoin_rev::Block {
             encode::deserialize(&bitcoin::consensus::encode::serialize(block)).unwrap()
         };
         Self {
             full: wire(block),
-            stripped: wire(&stripped),
+            stripped: wire(&stripped(block)),
         }
     }
 }
 
+/// `block` with every input's witness removed.
+pub(super) fn stripped(block: &Block) -> Block {
+    let mut block = block.clone();
+    for tx in &mut block.txdata {
+        for input in &mut tx.input {
+            input.witness.clear();
+        }
+    }
+    block
+}
+
 impl Node {
-    /// A node advertising `services` and `height` that handles one
-    /// connection after another as `script` says, then stops listening.
-    fn spawn(services: ServiceFlags, height: i32, script: Vec<Conn>) -> Self {
-        Self::spawn_serving(services, height, &block(), script)
+    /// A full node at `height` serving the default block.
+    pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
+        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, height, &block(), script)
     }
 
     /// A full node at height 1,000 serving `block`.
     pub(super) fn serving(block: &Block, script: Vec<Conn>) -> Self {
-        Self::spawn_serving(
-            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            1_000,
-            block,
-            script,
-        )
+        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, 1_000, block, script)
     }
 
-    fn spawn_serving(
-        services: ServiceFlags,
-        height: i32,
-        block: &Block,
-        script: Vec<Conn>,
-    ) -> Self {
+    /// A node advertising `services` and `height` and serving `block` that
+    /// handles one connection after another as `script` says, then stops
+    /// listening.
+    fn spawn(services: ServiceFlags, height: i32, block: &Block, script: Vec<Conn>) -> Self {
         let served = Served::new(block);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -132,14 +130,6 @@ impl Node {
             connections,
             stalled,
         }
-    }
-
-    pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
-        Self::spawn(
-            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            height,
-            script,
-        )
     }
 
     pub(super) fn connections(&self) -> usize {
@@ -434,6 +424,7 @@ fn a_pruned_node_is_named_as_pruned() {
     let node = Node::spawn(
         ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
         10_000,
+        &block(),
         vec![Conn::CloseAfterHandshake; 2],
     );
     let message = fetch(&node, fast(2), 100)
@@ -573,7 +564,7 @@ impl OracleProbe for OneBlock {
 #[test]
 fn the_daemon_publishes_an_actionable_stall_with_its_next_try_and_backs_off() {
     run(async {
-        let (mut scanner, _state) = scanner("p2p-stall", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("p2p-stall");
         let node = Node::full(1_000, vec![Conn::CloseAfterHandshake; 4]);
         scanner.p2p_peer = node.addr;
         scanner.p2p_retry = fast(2);
