@@ -156,7 +156,7 @@ fn init_logging(log_level: &str) {
         (Some(path), Some(e)) => tracing::warn!(
             path = %path.display(),
             error = %e,
-            "cannot write the log file; logging to stderr only"
+            "cannot write the log file; logging to stdout only"
         ),
         (Some(path), None) => tracing::info!(path = %path.display(), "logging to file"),
         (None, _) => {}
