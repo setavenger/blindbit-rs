@@ -8,7 +8,7 @@
 //!
 //! - Before a range scan continues the scanned chain, the last scanned block
 //!   is checked with one `GetBlockHashByHeight` lookup (a few dozen bytes)
-//!   instead of being streamed again. `watch_chain` runs the same check when
+//!   instead of being streamed again. `watch_chain_until` runs the same check when
 //!   the oracle has no new block, which catches a same-height tip
 //!   replacement without downloading anything else.
 //! - When that block disagrees, the fork is somewhere below it. A binary
