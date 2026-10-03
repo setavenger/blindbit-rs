@@ -120,6 +120,49 @@ impl JsonRpcResponse {
     }
 }
 
+/// A server-to-client notification line.
+fn notification(method: &str, params: Value) -> String {
+    let notification = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+    serde_json::to_string(&notification).expect("serialisation infallible") + "\n"
+}
+
+/// The answer to a request whose first parameter is missing or of the wrong
+/// type.
+fn invalid_param(req: &JsonRpcRequest, missing: &str, wrong_type: &str) -> String {
+    let message = if req.params.is_empty() {
+        missing
+    } else {
+        wrong_type
+    };
+    JsonRpcResponse::error(req.id.clone(), -32602, message).into_line()
+}
+
+/// The wallet's `blockchain.silentpayments.subscribe` subscription object,
+/// and the notification with its scan progress and SP history.
+fn sp_subscription(index: &WalletElectrumIndex) -> (Value, String) {
+    let subscription = json!({
+        "address": index.sp_address,
+        "start_height": index.sp_start_height,
+        "labels": index.sp_labels,
+    });
+    let history: Vec<Value> = index
+        .sp_history
+        .iter()
+        .map(|e| {
+            json!({
+                "height": e.height,
+                "tx_hash": e.tx_hash,
+                "tweak_key": e.tweak_hex,
+            })
+        })
+        .collect();
+    let line = notification(
+        "blockchain.silentpayments.subscribe",
+        json!([subscription, index.scan_progress, history]),
+    );
+    (subscription, line)
+}
+
 // ---------------------------------------------------------------------------
 // Server state — shared across all client connections
 // ---------------------------------------------------------------------------
@@ -318,44 +361,18 @@ async fn push_notifications(state: &ElectrumServerState) -> bool {
     if index.scan_progress >= 1.0 {
         for (scripthash, history) in &index.scripthash_history {
             let status = electrum_status(history);
-            let notification = json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scripthash.subscribe",
-                "params": [scripthash, status]
-            });
-            let _ = state
-                .push_tx
-                .send(serde_json::to_string(&notification).unwrap() + "\n");
+            let _ = state.push_tx.send(notification(
+                "blockchain.scripthash.subscribe",
+                json!([scripthash, status]),
+            ));
         }
     }
 
     // blockchain.silentpayments.subscribe
     // All data comes from the index — no scanner lock required, so this fires
     // even during an ongoing scan_block_range.
-    let sp_subscription = json!({
-        "address": index.sp_address,
-        "start_height": index.sp_start_height,
-        "labels": index.sp_labels,
-    });
-    let sp_history: Vec<Value> = index
-        .sp_history
-        .iter()
-        .map(|e| {
-            json!({
-                "height": e.height,
-                "tx_hash": e.tx_hash,
-                "tweak_key": e.tweak_hex,
-            })
-        })
-        .collect();
-    let notification = json!({
-        "jsonrpc": "2.0",
-        "method": "blockchain.silentpayments.subscribe",
-        "params": [sp_subscription, index.scan_progress, sp_history]
-    });
-    let _ = state
-        .push_tx
-        .send(serde_json::to_string(&notification).unwrap() + "\n");
+    let (_, line) = sp_subscription(&index);
+    let _ = state.push_tx.send(line);
     tip_announced
 }
 
@@ -369,14 +386,10 @@ async fn push_tip(state: &ElectrumServerState) -> bool {
         Ok((hash, hex)) => {
             let mut last = state.last_tip_sent.lock().await;
             if *last != Some((height, hash)) {
-                let notification = json!({
-                    "jsonrpc": "2.0",
-                    "method": "blockchain.headers.subscribe",
-                    "params": [{ "height": height, "hex": hex }]
-                });
-                let _ = state
-                    .push_tx
-                    .send(serde_json::to_string(&notification).unwrap() + "\n");
+                let _ = state.push_tx.send(notification(
+                    "blockchain.headers.subscribe",
+                    json!([{ "height": height, "hex": hex }]),
+                ));
                 *last = Some((height, hash));
             }
             true
@@ -452,15 +465,33 @@ async fn forget_blocks_above(state: &ElectrumServerState, fork: u32) {
         fork,
         "chain reorganisation: dropped cached headers above the fork point"
     );
+    save_header_sidecar(
+        state,
+        headers,
+        "failed to rewrite block-header sidecar after reorg",
+    )
+    .await;
+}
+
+/// Write `headers` to the header sidecar; a failure is logged as `failure`.
+async fn save_header_sidecar(
+    state: &ElectrumServerState,
+    headers: HashMap<u32, String>,
+    failure: &str,
+) {
     let sidecar = state.header_sidecar.clone();
     match tokio::task::spawn_blocking(move || blockheader::save_headers(&sidecar, &headers)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::warn!(
             path = %state.header_sidecar.display(),
             error = %error,
-            "failed to rewrite block-header sidecar after reorg"
+            "{failure}"
         ),
-        Err(error) => tracing::warn!(error = %error, "block-header sidecar write task failed"),
+        Err(error) => tracing::warn!(
+            path = %state.header_sidecar.display(),
+            error = %error,
+            "block-header sidecar write task failed"
+        ),
     }
 }
 
@@ -486,45 +517,16 @@ async fn backfill_header(state: &ElectrumServerState, height: u32) -> Result<Str
         return Ok(hex);
     }
 
-    let expected_hash = resolve_block_hash(state, height).await?;
-    let header = state.chain.header(expected_hash).await?;
-
-    // ChainSource::header already validates this before returning. Keep the
-    // check here at the trust boundary so a future fetch implementation cannot
-    // serve the wrong block under the requested height.
-    let actual_hash = header.block_hash();
-    if actual_hash != expected_hash {
-        return Err(format!(
-            "fetched header hash {actual_hash} does not match expected {expected_hash}"
-        ));
-    }
-
+    let hash = resolve_block_hash(state, height).await?;
+    // ChainSource::header returns only a header with exactly this hash.
+    let header = state.chain.header(hash).await?;
     let header_hex = blockheader::header_hex(&header);
     let headers = {
         let mut index = state.index.lock().await;
         index.headers.insert(height, header_hex.clone());
         index.headers.clone()
     };
-
-    let sidecar = state.header_sidecar.clone();
-    match tokio::task::spawn_blocking(move || blockheader::save_headers(&sidecar, &headers)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(
-                path = %state.header_sidecar.display(),
-                error = %error,
-                "failed to persist block-header sidecar"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                path = %state.header_sidecar.display(),
-                error = %error,
-                "block-header sidecar write task failed"
-            );
-        }
-    }
-
+    save_header_sidecar(state, headers, "failed to persist block-header sidecar").await;
     Ok(header_hex)
 }
 
@@ -698,14 +700,11 @@ async fn index_unconfirmed_tx(index: &Arc<Mutex<WalletElectrumIndex>>, raw_hex: 
     let mut added = 0usize;
     for sh in &affected {
         let history = idx.scripthash_history.entry(sh.clone()).or_default();
-        match history.iter().position(|e| e.tx_hash == txid) {
-            Some(pos) if history[pos].height == 0 => {} // already unconfirmed, no-op
-            Some(_) => {}                               // already confirmed, leave it
-            None => {
-                history.push(entry.clone());
-                history.sort_by_key(|e| e.height);
-                added += 1;
-            }
+        // Already there, unconfirmed or confirmed: leave it.
+        if !history.iter().any(|e| e.tx_hash == txid) {
+            history.push(entry.clone());
+            history.sort_by_key(|e| e.height);
+            added += 1;
         }
     }
 
@@ -1091,14 +1090,10 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
         },
 
         "blockchain.block.header" => {
-            let Some(height_val) = req.params.first() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "missing height param")
-                    .into_line();
+            let Some(height) = req.params.first().and_then(Value::as_u64) else {
+                return invalid_param(req, "missing height param", "height must be integer");
             };
-            let Some(height) = height_val.as_u64().map(|h| h as u32) else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "height must be integer")
-                    .into_line();
-            };
+            let height = height as u32;
             if let Some(hex) = state.index.lock().await.headers.get(&height).cloned() {
                 return JsonRpcResponse::success(req.id.clone(), Value::String(hex)).into_line();
             }
@@ -1123,13 +1118,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
 
         // ---- Scripthash --------------------------------------------------
         "blockchain.scripthash.subscribe" => {
-            let Some(sh_val) = req.params.first() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "missing scripthash")
-                    .into_line();
-            };
-            let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
-                    .into_line();
+            let Some(scripthash) = req.params.first().and_then(Value::as_str) else {
+                return invalid_param(req, "missing scripthash", "scripthash must be string");
             };
             let index = state.index.lock().await;
             let status = index
@@ -1147,13 +1137,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
         }
 
         "blockchain.scripthash.get_history" => {
-            let Some(sh_val) = req.params.first() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "missing scripthash")
-                    .into_line();
-            };
-            let Some(scripthash) = sh_val.as_str() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "scripthash must be string")
-                    .into_line();
+            let Some(scripthash) = req.params.first().and_then(Value::as_str) else {
+                return invalid_param(req, "missing scripthash", "scripthash must be string");
             };
             let index = state.index.lock().await;
             let history: Vec<Value> = index
@@ -1175,12 +1160,8 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
 
         // ---- Transaction -------------------------------------------------
         "blockchain.transaction.get" => {
-            let Some(txid_val) = req.params.first() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "missing txid").into_line();
-            };
-            let Some(txid) = txid_val.as_str() else {
-                return JsonRpcResponse::error(req.id.clone(), -32602, "txid must be string")
-                    .into_line();
+            let Some(txid) = req.params.first().and_then(Value::as_str) else {
+                return invalid_param(req, "missing txid", "txid must be string");
             };
             let index = state.index.lock().await;
             match index.txs.get(txid) {
@@ -1216,41 +1197,10 @@ async fn handle_request(req: &JsonRpcRequest, state: &ElectrumServerState) -> St
         "blockchain.silentpayments.subscribe" => {
             // All data is read from the index — scanner lock NOT required.
             // This means the handler is never blocked by an ongoing scan.
-            let index = state.index.lock().await;
-
-            let sp_subscription = json!({
-                "address": index.sp_address,
-                "start_height": index.sp_start_height,
-                "labels": index.sp_labels,
-            });
-            let sp_history: Vec<Value> = index
-                .sp_history
-                .iter()
-                .map(|e| {
-                    json!({
-                        "height": e.height,
-                        "tx_hash": e.tx_hash,
-                        "tweak_key": e.tweak_hex,
-                    })
-                })
-                .collect();
-            let progress = index.scan_progress;
-            drop(index);
-
-            // RPC response: the subscription descriptor object.
-            let rpc_resp =
-                JsonRpcResponse::success(req.id.clone(), sp_subscription.clone()).into_line();
-
-            // Immediate notification: current scan state.
-            let notification = json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.silentpayments.subscribe",
-                "params": [sp_subscription, progress, sp_history]
-            });
-            let notify_line =
-                serde_json::to_string(&notification).expect("serialisation infallible") + "\n";
-
-            // Both lines are concatenated; the writer task flushes them together.
+            let (subscription, notify_line) = sp_subscription(&*state.index.lock().await);
+            // The subscription object, then right away a notification with
+            // the current scan state; the writer task flushes them together.
+            let rpc_resp = JsonRpcResponse::success(req.id.clone(), subscription).into_line();
             format!("{rpc_resp}{notify_line}")
         }
 
@@ -1376,14 +1326,7 @@ mod tests {
         assert!(tip_notifications(&mut rx).is_empty());
 
         // The request path answers the same.
-        let request = JsonRpcRequest {
-            jsonrpc: None,
-            id: json!(1),
-            method: "blockchain.headers.subscribe".into(),
-            params: vec![],
-        };
-        let response: Value =
-            serde_json::from_str(&handle_request(&request, &state).await).unwrap();
+        let response = call(&state, "blockchain.headers.subscribe", vec![]).await;
         assert_eq!(response["result"], json!({ "height": 105, "hex": current }));
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1405,14 +1348,7 @@ mod tests {
         );
         assert!(tip_notifications(&mut rx).is_empty());
 
-        let request = JsonRpcRequest {
-            jsonrpc: None,
-            id: json!(1),
-            method: "blockchain.headers.subscribe".into(),
-            params: vec![],
-        };
-        let response: Value =
-            serde_json::from_str(&handle_request(&request, &state).await).unwrap();
+        let response = call(&state, "blockchain.headers.subscribe", vec![]).await;
         assert!(response["result"].is_null());
         assert!(
             response["error"]["message"]
