@@ -46,6 +46,7 @@ mod relay;
 
 use self::chain::ChainSource;
 use self::pending::PendingStore;
+pub(crate) use self::pending::now_secs;
 use self::relay::{Candidate, Outcome};
 
 /// How long a broadcast may wait for the peer to accept the transaction.
@@ -198,8 +199,9 @@ struct ElectrumServerState {
 
 /// Run the Electrum TCP server.
 ///
-/// `index` and `found_rx` must be obtained from the scanner before spawning
-/// `scan_block_range`, so this server never contends for the scanner mutex.
+/// `index`, `found_rx` and `reorg_rx` must be obtained from the scanner
+/// before the scan task starts: it holds the scanner mutex while it runs, and
+/// this server never takes that mutex.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     index: Arc<Mutex<WalletElectrumIndex>>,
