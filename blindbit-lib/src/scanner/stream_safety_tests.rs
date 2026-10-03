@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::receive::get_silentpayment_pubkey;
@@ -26,6 +26,8 @@ use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Txid, Witness,
 };
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use super::Scanner;
 use super::scanning::BlockScanDataStream;
 use super::test_support::{keys, run, scanner, secret};
@@ -351,4 +353,88 @@ fn unreachable_oracle_is_a_clean_error() {
             .expect_err("an unreachable oracle must be an error, not a panic");
         assert_eq!(scanner.get_last_scanned_block_height(), 1699);
     });
+}
+
+/// An oracle message for a block at `height` that pays nobody: a valid hash
+/// and no transactions, so the scan checks it and fetches nothing.
+fn empty_block_message(height: u64) -> BlockScanDataShortResponse {
+    let mut block_hash = vec![0xe0; 32];
+    block_hash[..8].copy_from_slice(&height.to_le_bytes());
+    BlockScanDataShortResponse {
+        block_identifier: Some(BlockIdentifier {
+            block_hash,
+            block_height: height,
+        }),
+        comp_index: vec![],
+        spent_outputs: vec![],
+    }
+}
+
+/// The fields of each "balance after scan" event, as the log formats them.
+#[derive(Clone, Default)]
+struct BalanceLogs(Arc<Mutex<Vec<HashMap<&'static str, String>>>>);
+
+#[derive(Default)]
+struct EventFields(HashMap<&'static str, String>);
+
+impl Visit for EventFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name(), format!("{value:?}"));
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for BalanceLogs {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
+        if fields.0.get("message").map(String::as_str) == Some("balance after scan") {
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+/// friglet-ui reads the wallet's balance from the "balance after scan" line.
+/// A range in which no block pays the wallet (every range while the daemon
+/// follows the tip, as a rule) must still log the outputs found earlier as
+/// confirmed, not as pending.
+#[test]
+fn balance_after_scan_counts_earlier_outputs_as_confirmed() {
+    let logs = BalanceLogs::default();
+    let subscriber = tracing_subscriber::registry().with(logs.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        run(async {
+            let (mut scanner, _state) = scanner("balance-log");
+            let paid = payment_block(1800);
+            scanner
+                .scan_block_stream(
+                    paid.height,
+                    paid.height,
+                    TestStream::new(vec![Ok(paid.message.clone())]),
+                )
+                .await
+                .expect("scan of the paying block");
+            let next = paid.height + 1;
+            scanner
+                .scan_block_stream(
+                    next,
+                    next,
+                    TestStream::new(vec![Ok(empty_block_message(next))]),
+                )
+                .await
+                .expect("scan of a block that pays nobody");
+        })
+    });
+
+    let logs = logs.0.lock().unwrap();
+    assert_eq!(logs.len(), 2, "one line per range: {logs:?}");
+    let paid = Amount::from_sat(10_000 + 1800).to_string();
+    for (range, log) in ["paying block", "empty block"].iter().zip(logs.iter()) {
+        assert_eq!(log["total"], paid, "{range}: {log:?}");
+        assert_eq!(log["confirmed"], paid, "{range}: {log:?}");
+        assert_eq!(
+            log["trusted_pending"],
+            Amount::ZERO.to_string(),
+            "{range}: {log:?}"
+        );
+    }
 }
