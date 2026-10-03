@@ -3,11 +3,6 @@ name = "blindbit-cli"
 version = "0.1.0"
 edition = "2024"
 
-# Default binary (main.rs)
-[[bin]]
-name = "blindbit-cli"
-path = "src/main.rs"
-
 [dependencies]
 blindbit-lib = { path = "../blindbit-lib", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
