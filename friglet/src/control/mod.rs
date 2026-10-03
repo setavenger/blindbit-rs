@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bdk_sp::encoding::SilentPaymentCode;
 use bitcoin::Network as BitcoinNetwork;
@@ -69,7 +69,8 @@ impl OracleStatus {
 
     pub fn record_error(&mut self, error: String) {
         self.error = Some(error);
-        self.down_since_unix.get_or_insert_with(unix_now);
+        self.down_since_unix
+            .get_or_insert_with(crate::electrum::now_secs);
     }
 
     fn connected(&self) -> bool {
@@ -78,13 +79,6 @@ impl OracleStatus {
                 .last_ok
                 .is_some_and(|at| at.elapsed() < ORACLE_STALE_AFTER)
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Poll the oracle's tip every [`ORACLE_POLL_INTERVAL`] into `status`,
@@ -136,11 +130,6 @@ pub fn spawn_oracle_poller(url: String, status: Arc<std::sync::Mutex<OracleStatu
             tokio::time::sleep(ORACLE_POLL_INTERVAL).await;
         }
     });
-}
-
-/// Prefer the oracle tip when known; else the last scanned (electrum) tip.
-fn pick_tip(oracle: Option<u64>, electrum: Option<u64>) -> Option<u64> {
-    oracle.or(electrum)
 }
 
 /// Count persisted wallet-owned outputs without making daemon startup depend
@@ -229,14 +218,14 @@ pub struct ControlCtx {
     pub supervisor: Arc<ScanSupervisor>,
     pub scanner: Arc<Mutex<Scanner>>,
     /// The scanner's Electrum index, used for status reporting.
-    pub electrum_index: std::sync::Mutex<Arc<Mutex<WalletElectrumIndex>>>,
+    pub electrum_index: Arc<Mutex<WalletElectrumIndex>>,
     pub electrum_clients: Arc<AtomicU64>,
     /// Cumulative wallet-owned output count, seeded from persisted state and
     /// updated from scanner notifications.
     pub outputs_found: Arc<AtomicU64>,
     /// Label addresses derived from the scan secret. Never sent separately
     /// from the status snapshot.
-    pub label_addresses: std::sync::Mutex<Vec<LabelAddress>>,
+    pub label_addresses: Vec<LabelAddress>,
     /// Current effective configuration, updated by `SetConfig`.
     pub settings: std::sync::Mutex<DaemonConfig>,
     /// The wallet's state file this run uses (`settings.state_file` is the
@@ -267,8 +256,7 @@ impl ControlCtx {
         match req {
             Request::GetStatus => Response::Status(self.status().await),
             Request::Start => {
-                // Serialize with SetConfig/SetScanKey so the old scanner
-                // cannot be started in the middle of a rebuild + swap.
+                // Serialized with persisting new settings (see `apply_lock`).
                 let _guard = self.apply_lock.lock().await;
                 match self.supervisor.start() {
                     StartOutcome::Started => {
@@ -334,7 +322,7 @@ impl ControlCtx {
     }
 
     async fn status(&self) -> StatusInfo {
-        let index = self.electrum_index.lock().unwrap().clone();
+        let index = &self.electrum_index;
         let (electrum_tip, scan_progress, sp_address, tx_count, start_height) = {
             let idx = index.lock().await;
             let tip = idx.tip.as_ref().map(|(h, _)| u64::from(*h));
@@ -365,8 +353,9 @@ impl ControlCtx {
             Err(_) => electrum_tip.unwrap_or(start_height.saturating_sub(1)),
         };
 
+        // Prefer the oracle tip when known; else the last scanned tip.
         let oracle = self.oracle.lock().unwrap().clone();
-        let tip_height = pick_tip(oracle.tip, electrum_tip);
+        let tip_height = oracle.tip.or(electrum_tip);
 
         let scanning = self.supervisor.is_running();
         let last_error = self.supervisor.last_error();
@@ -384,7 +373,7 @@ impl ControlCtx {
             sp_address,
             tx_count,
             outputs_found: self.outputs_found.load(Ordering::Relaxed),
-            label_addresses: self.label_addresses.lock().unwrap().clone(),
+            label_addresses: self.label_addresses.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             spawned_by_tray: self.spawned_by_tray,
             scan_health,
@@ -460,7 +449,7 @@ impl ControlCtx {
         }
 
         if config_changed {
-            if let Err(e) = config::write_config_file(config_path, &new_cfg) {
+            if let Err(e) = friglet_ipc::write_config_toml(config_path, &new_cfg) {
                 return Response::Error(e);
             }
             tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
@@ -473,7 +462,7 @@ impl ControlCtx {
         ];
         if let Some(secret) = new_secret.filter(|_| key_changed) {
             let hex = hex::encode(secret.secret_bytes());
-            if let Err(e) = config::replace_scan_key(&resolved.key_file, &hex) {
+            if let Err(e) = friglet_ipc::write_key_file(&resolved.key_file, &hex, true) {
                 return Response::Error(if config_changed {
                     format!("config saved, but writing the scan key failed: {e}")
                 } else {
@@ -527,24 +516,17 @@ fn scan_secret_env_shadows(new_secret: &SecretKey) -> Option<String> {
 }
 
 /// Serve control requests on `socket_path` until the future is dropped.
-///
-/// Generic over the handler so tests can use a stub instead of a full
-/// [`ControlCtx`].
-pub async fn run<H, Fut>(socket_path: String, handler: H) -> io::Result<()>
-where
-    H: Fn(Request) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Response> + Send,
-{
+pub async fn run(socket_path: String, ctx: Arc<ControlCtx>) -> io::Result<()> {
     let listener = bind_with_stale_cleanup(&socket_path).await?;
     tracing::info!(path = %socket_path, "control socket listening");
 
     loop {
         match friglet_ipc::accept(&listener).await {
             Ok(mut conn) => {
-                let handler = handler.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
                     while let Ok(Some(req)) = conn.next_request().await {
-                        let resp = handler(req).await;
+                        let resp = ctx.handle(req).await;
                         if conn.respond(&resp).await.is_err() {
                             break;
                         }
@@ -588,13 +570,6 @@ mod tests {
     const OTHER_SECRET_HEX: &str =
         "0000000000000000000000000000000000000000000000000000000000000002";
     const SPEND_PK: &str = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
-
-    #[test]
-    fn pick_tip_prefers_oracle_then_electrum() {
-        assert_eq!(pick_tip(Some(300), Some(200)), Some(300));
-        assert_eq!(pick_tip(None, Some(200)), Some(200));
-        assert_eq!(pick_tip(None, None), None);
-    }
 
     #[test]
     fn owned_outputs_count_tolerates_state_file_variants() {
@@ -705,18 +680,18 @@ mod tests {
         + 'static,
     ) -> Arc<ControlCtx> {
         let cfg = test_config(dir);
-        config::replace_scan_key(&dir.join("scan.key"), SECRET_HEX).unwrap();
+        friglet_ipc::write_key_file(&dir.join("scan.key"), SECRET_HEX, true).unwrap();
         let config_path = dir.join("config.toml");
-        config::write_config_file(&config_path, &cfg).unwrap();
+        friglet_ipc::write_config_toml(&config_path, &cfg).unwrap();
 
         let resolved = config::validate_daemon_config(&cfg).unwrap();
         let secret = config::resolve_scan_secret(None, &resolved.key_file).unwrap();
         let scanner_config = scanner::ScannerConfig::new(
-            resolved.oracle_url.clone(),
+            resolved.raw.oracle_url.clone(),
             resolved.p2p_addr,
             secret,
             resolved.spend_pubkey,
-            resolved.max_label_num,
+            resolved.raw.max_label_num,
             resolved.state_file.clone(),
             resolved.network,
         );
@@ -729,15 +704,15 @@ mod tests {
         Arc::new(ControlCtx {
             supervisor,
             scanner: scanner_arc,
-            electrum_index: std::sync::Mutex::new(electrum_index),
+            electrum_index,
             electrum_clients: Arc::new(AtomicU64::new(0)),
             outputs_found: Arc::new(AtomicU64::new(0)),
-            label_addresses: std::sync::Mutex::new(derive_label_addresses(
+            label_addresses: derive_label_addresses(
                 secret,
                 resolved.spend_pubkey,
                 wallet_network(resolved.network),
-                resolved.max_label_num,
-            )),
+                resolved.raw.max_label_num,
+            ),
             state_file: resolved.state_file.clone(),
             settings: std::sync::Mutex::new(cfg),
             config_path: Some(config_path),
@@ -768,32 +743,11 @@ mod tests {
         panic!("control socket did not come up at {path}");
     }
 
-    fn dummy_status() -> StatusInfo {
-        StatusInfo {
-            scanning: false,
-            scanned_height: 42,
-            tip_height: None,
-            scan_progress: 0.0,
-            network: "regtest".to_string(),
-            electrum_clients: 0,
-            oracle_connected: false,
-            last_error: None,
-            sp_address: None,
-            tx_count: 0,
-            outputs_found: 0,
-            label_addresses: Vec::new(),
-            version: "test".to_string(),
-            spawned_by_tray: false,
-            scan_health: Default::default(),
-            ..Default::default()
-        }
-    }
-
     #[tokio::test]
     async fn status_reports_silent_payment_transaction_count() {
         let dir = temp_dir("status-tx-count");
         let ctx = test_ctx(&dir);
-        let index = ctx.electrum_index.lock().unwrap().clone();
+        let index = ctx.electrum_index.clone();
         index.lock().await.sp_history.extend([
             blindbit_lib::scanner::SpHistoryEntry {
                 tx_hash: "11".repeat(32),
@@ -821,7 +775,7 @@ mod tests {
             friglet_ipc::ScanHealthInfo::default()
         );
 
-        let index = ctx.electrum_index.lock().unwrap().clone();
+        let index = ctx.electrum_index.clone();
         {
             let mut idx = index.lock().await;
             idx.scan_health.stall = Some(scanner::ScanStall {
@@ -1024,43 +978,6 @@ mod tests {
         assert_eq!(status.oracle_down_since_unix, None);
     }
 
-    #[tokio::test]
-    async fn get_status_roundtrip_over_control_socket() {
-        #[cfg(windows)]
-        let path = format!(r"\\.\pipe\friglet-control-test-{}", std::process::id());
-        #[cfg(not(windows))]
-        let path = std::env::temp_dir()
-            .join(format!("friglet-control-test-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
-
-        let server_path = path.clone();
-        tokio::spawn(run(server_path, |req| async move {
-            match req {
-                Request::GetStatus => Response::Status(dummy_status()),
-                _ => Response::Ok,
-            }
-        }));
-
-        let mut client = None;
-        for _ in 0..50 {
-            match Client::connect(&path).await {
-                Ok(c) => {
-                    client = Some(c);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-        let mut client = client.expect("control socket did not come up");
-
-        let resp = client.request(&Request::GetStatus).await.unwrap();
-        assert_eq!(resp, Response::Status(dummy_status()));
-
-        #[cfg(not(windows))]
-        let _ = std::fs::remove_file(&path);
-    }
-
     fn test_socket_path(tag: &str) -> String {
         #[cfg(windows)]
         {
@@ -1086,10 +1003,7 @@ mod tests {
         let path = test_socket_path(tag);
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(&path);
-        tokio::spawn(run(path.clone(), move |req| {
-            let ctx = ctx.clone();
-            async move { ctx.handle(req).await }
-        }));
+        tokio::spawn(run(path.clone(), ctx));
         connect_with_retry(&path).await
     }
 
