@@ -91,7 +91,7 @@ fn main() {
             }
             Err(e) => {
                 if LOG_FILE.get().is_some() {
-                    // Goes to stderr and the log file.
+                    // Goes to stdout and the log file.
                     tracing::error!("friglet exited with an error: {e}");
                 } else {
                     eprintln!("Error: {e}");
@@ -112,9 +112,9 @@ static LOG_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Set up logging once per process; later calls (after the config is read,
 /// and on in-process restarts) only swap the filter so `log_level` takes
-/// effect. `RUST_LOG` takes precedence over `log_level`. Lines go to stderr
-/// — colour only when it is a TTY, so a tray-piped daemon never emits ANSI
-/// into the capture pipe — and to the log file
+/// effect. `RUST_LOG` takes precedence over `log_level`. Lines go to stdout
+/// — colour only when stdout is a TTY, so a tray-piped or redirected daemon
+/// never writes ANSI escapes into the pipe or file — and to the log file
 /// (`friglet_ipc::logfile::daemon_log_file`).
 fn init_logging(log_level: &str) {
     use tracing_subscriber::layer::SubscriberExt;
@@ -145,7 +145,8 @@ fn init_logging(log_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+                .with_writer(std::io::stdout),
         )
         .with(file_layer)
         .init();
@@ -155,7 +156,7 @@ fn init_logging(log_level: &str) {
         (Some(path), Some(e)) => tracing::warn!(
             path = %path.display(),
             error = %e,
-            "cannot write the log file; logging to stderr only"
+            "cannot write the log file; logging to stdout only"
         ),
         (Some(path), None) => tracing::info!(path = %path.display(), "logging to file"),
         (None, _) => {}
@@ -173,7 +174,7 @@ async fn run(
     } = config::load(&args)?;
     // Where SetConfig persists changes: the file we loaded, or the default
     // location when the daemon started without one.
-    let config_path = config_file.or_else(config::default_config_path);
+    let config_path = config_file.or_else(friglet_ipc::default_config_path);
 
     if args.print_config {
         print!("{}", toml::to_string_pretty(&merged)?);
@@ -238,18 +239,14 @@ async fn run(
         secret_scan,
         cfg.spend_pubkey,
         control::wallet_network(cfg.network),
-        cfg.max_label_num,
+        cfg.raw.max_label_num,
     );
-    let outputs_found = Arc::new(AtomicU64::new(control::owned_outputs_count(
-        &cfg.state_file,
-    )));
-
     // blindbit-lib persists the scan secret inside the state JSON (see
     // config::tighten_state_file_perms), so keep the file owner-only.
     config::tighten_state_file_perms(&cfg.state_file);
 
     tracing::info!(
-        oracle_url = %cfg.oracle_url,
+        oracle_url = %cfg.raw.oracle_url,
         p2p_peer = %cfg.p2p_addr,
         network = %cfg.network,
         start_height = cfg.start_height,
@@ -258,16 +255,19 @@ async fn run(
     );
 
     let scanner_config = scanner::ScannerConfig::new(
-        cfg.oracle_url.clone(),
+        cfg.raw.oracle_url.clone(),
         cfg.p2p_addr,
         secret_scan,
         cfg.spend_pubkey,
-        cfg.max_label_num,
+        cfg.raw.max_label_num,
         cfg.state_file.clone(),
         cfg.network,
     );
 
     let loaded_scanner = scanner::load_scanner(&scanner_config).await?;
+    let outputs_found = Arc::new(AtomicU64::new(control::owned_outputs_count(
+        &loaded_scanner,
+    )));
 
     // Pre-populate the Electrum index from the persisted BDK graph so that
     // Sparrow can immediately fetch wallet history after a restart.
@@ -297,11 +297,7 @@ async fn run(
     let (electrum_index, found_utxos_rx, mut outputs_found_rx, reorg_rx) = {
         let s = scanner_instance.lock().await;
         let index = s.electrum_index();
-        {
-            let mut idx = index.lock().await;
-            idx.sp_start_height = cfg.start_height;
-            idx.headers.extend(persisted_headers);
-        }
+        index.lock().await.headers.extend(persisted_headers);
         (
             index,
             s.subscribe_to_found_utxos(),
@@ -357,7 +353,7 @@ async fn run(
     }
 
     let oracle_status = Arc::new(std::sync::Mutex::new(control::OracleStatus::default()));
-    control::spawn_oracle_poller(cfg.oracle_url.clone(), oracle_status.clone());
+    control::spawn_oracle_poller(cfg.raw.oracle_url.clone(), oracle_status.clone());
 
     let shutdown_token = CancellationToken::new();
     let electrum_clients = Arc::new(AtomicU64::new(0));
@@ -365,10 +361,10 @@ async fn run(
     let control_ctx = Arc::new(control::ControlCtx {
         supervisor: supervisor.clone(),
         scanner: scanner_instance.clone(),
-        electrum_index: std::sync::Mutex::new(electrum_index.clone()),
+        electrum_index: electrum_index.clone(),
         electrum_clients: electrum_clients.clone(),
         outputs_found,
-        label_addresses: std::sync::Mutex::new(label_addresses),
+        label_addresses,
         settings: std::sync::Mutex::new(cfg.raw.clone()),
         state_file: cfg.state_file.clone(),
         config_path,
@@ -379,13 +375,7 @@ async fn run(
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         spawned_by_tray: control::ControlCtx::spawned_by_tray_from_env(),
     });
-    let control_server = control::run(cfg.control_socket.clone(), {
-        let ctx = control_ctx.clone();
-        move |req| {
-            let ctx = ctx.clone();
-            async move { ctx.handle(req).await }
-        }
-    });
+    let control_server = control::run(cfg.control_socket.clone(), control_ctx.clone());
 
     let app = Router::new()
         .route("/height", get(server::get_height))
@@ -393,7 +383,7 @@ async fn run(
         .layer(Extension(server::ScanStartHeight(cfg.start_height)))
         .layer(Extension(scanner_instance.clone()));
 
-    let http_addr = cfg.http_addr.clone();
+    let http_addr = cfg.raw.http_addr.clone();
     let http_server = async move {
         let listener = tokio::net::TcpListener::bind(&http_addr)
             .await
@@ -405,11 +395,11 @@ async fn run(
     };
 
     let electrum_server = {
-        let electrum_addr = cfg.electrum_addr.clone();
+        let electrum_addr = cfg.raw.electrum_addr.clone();
         let electrum_clients = electrum_clients.clone();
         let p2p_addr = cfg.p2p_addr;
         let network = cfg.network;
-        let oracle_url = cfg.oracle_url.clone();
+        let oracle_url = cfg.raw.oracle_url.clone();
         async move {
             if let Err(e) = electrum::run(
                 electrum_index,
