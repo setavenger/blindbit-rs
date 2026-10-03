@@ -1519,7 +1519,6 @@ mod tests {
     async fn retry_keeps_child_when_socket_reachable() {
         let path = test_socket_path("retry-reachable");
         spawn_stoppable_fake_daemon(path.clone(), false, 4100);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let state = test_state(path.clone());
         {
@@ -1587,7 +1586,6 @@ mod tests {
     async fn retry_reattaches_after_child_exited() {
         let path = test_socket_path("retry-exited");
         spawn_stoppable_fake_daemon(path.clone(), false, 4200);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let state = test_state(path.clone());
         {
@@ -1618,7 +1616,6 @@ mod tests {
     async fn attach_adopts_daemons_self_reported_ownership() {
         let path = test_socket_path("adopt-ownership");
         spawn_stoppable_fake_daemon(path.clone(), true, 4300);
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let state = test_state(path.clone());
         attach_and_record_with(
@@ -1715,11 +1712,12 @@ mod tests {
 
     /// A fake daemon answering GetStatus with the given `spawned_by_tray`
     /// self-report and `pid`. On Shutdown it stops listening and removes its
-    /// socket, like the real one.
+    /// socket, like the real one. The socket is bound before this returns, so
+    /// a test can connect right away.
     fn spawn_stoppable_fake_daemon(path: String, spawned_by_tray: bool, pid: u32) {
+        let _ = std::fs::remove_file(&path);
+        let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
         tokio::spawn(async move {
-            let _ = std::fs::remove_file(&path);
-            let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
             let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
             loop {
                 let mut conn = tokio::select! {
@@ -1770,7 +1768,6 @@ mod tests {
     async fn a_poll_of_the_stopping_daemon_keeps_it_stopped() {
         let path = test_socket_path("stop-race");
         spawn_stoppable_fake_daemon(path.clone(), false, 5000);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         *state.stopped.lock().unwrap() = Some(Stopped {
             at_unix: unix_now(),
@@ -1795,7 +1792,6 @@ mod tests {
     async fn stop_daemon_stops_an_attached_external_daemon_for_good() {
         let path = test_socket_path("stop-external");
         spawn_stoppable_fake_daemon(path.clone(), false, 4711);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         attach_and_record_with(&state, || panic!("must attach"), || false).await;
         let (daemon, _) = poll_once(&state).await;
@@ -1844,7 +1840,6 @@ mod tests {
 
         // Start daemon brings one back (here: attaches to a new one).
         spawn_stoppable_fake_daemon(path.clone(), false, 4712);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         start_daemon_now(&state).await.expect("started");
         assert!(state.stopped.lock().unwrap().is_none());
         let (daemon, _) = poll_once(&state).await;
@@ -1856,7 +1851,6 @@ mod tests {
     async fn stop_daemon_on_a_tray_spawned_daemon_is_not_undone_by_the_supervisor() {
         let path = test_socket_path("stop-spawned");
         spawn_stoppable_fake_daemon(path.clone(), true, 4800);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         state.supervise.store(true, Ordering::SeqCst);
         {
@@ -1970,7 +1964,6 @@ mod tests {
         // Once due, the restart attaches to whatever answers now (here a fake
         // daemon), clearing the pending restart.
         spawn_stoppable_fake_daemon(path.clone(), false, 4400);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         state.supervision.lock().unwrap().next_restart_at = Some(Instant::now());
         supervise_tick_with(&state, false, || panic!("must attach, not spawn"), || false).await;
         let health = daemon_health(&state);
