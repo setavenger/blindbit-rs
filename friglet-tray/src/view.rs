@@ -5,7 +5,7 @@
 //! Transient conditions — the oracle has not indexed the newest block yet, a
 //! short oracle or daemon reconnect — are shown as a neutral "waiting" state.
 //! They become errors only when they last longer than a grace period
-//! ([`STALL_GRACE`], [`UNREACHABLE_GRACE`]). Errors are kept in an
+//! ([`STALL_GRACE_SECS`], [`UNREACHABLE_GRACE_SECS`]). Errors are kept in an
 //! [`ErrorBook`]: active ones stay on screen with the time they began until
 //! they are resolved, and the most recent ones stay in a list afterwards.
 
@@ -462,9 +462,8 @@ impl ErrorBook {
     }
 
     /// Record a one-off error (a failed action, a crash). A repeat of the
-    /// newest entry's message only bumps its count. Returns whether it was
-    /// new (and should be logged).
-    pub fn event(&mut self, key: &str, message: String, now_unix: u64) -> bool {
+    /// newest entry's message only bumps its count.
+    pub fn event(&mut self, key: &str, message: String, now_unix: u64) {
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -473,7 +472,7 @@ impl ErrorBook {
         {
             entry.count += 1;
             entry.last_unix = now_unix;
-            return false;
+            return;
         }
         self.push(ErrorEntry {
             key: key.to_string(),
@@ -484,7 +483,6 @@ impl ErrorBook {
             active: false,
             resolved_unix: None,
         });
-        true
     }
 
     fn push(&mut self, entry: ErrorEntry) {
@@ -717,10 +715,12 @@ mod tests {
     #[test]
     fn error_book_events_dedupe_and_cap() {
         let mut book = ErrorBook::default();
-        assert!(book.event("spawn", "socket never came up".into(), NOW));
-        assert!(!book.event("spawn", "socket never came up".into(), NOW + 5));
+        book.event("spawn", "socket never came up".into(), NOW);
+        book.event("spawn", "socket never came up".into(), NOW + 5);
+        assert_eq!(book.entries().len(), 1, "a repeat is not a new entry");
         assert_eq!(book.entries()[0].count, 2);
-        assert!(book.event("spawn", "exited immediately".into(), NOW + 6));
+        book.event("spawn", "exited immediately".into(), NOW + 6);
+        assert_eq!(book.entries().len(), 2, "another message is a new entry");
 
         book.update(&[cond("stall", "stuck", NOW)], NOW);
         for i in 0..(RECENT_ERRORS as u64 + 5) {
