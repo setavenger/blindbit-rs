@@ -104,7 +104,9 @@ pub fn is_configured_from_env() -> bool {
 /// environment listens on, in the daemon's own order (its env layer is merged
 /// over the file): `FRIGLET_CONTROL_SOCKET`, then the file's
 /// `control_socket`, then [`friglet_ipc::default_socket_path`]. A file that
-/// is missing or does not parse counts as not setting it.
+/// is missing or does not parse counts as not setting it. Only the first
+/// step uses `env`: the final fallback, `default_socket_path`, reads the real
+/// `FRIGLET_CONTROL_SOCKET` again.
 pub fn control_socket_path(
     config_path: Option<&Path>,
     env: &dyn Fn(&str) -> Option<String>,
