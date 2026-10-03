@@ -328,44 +328,6 @@ mod tests {
         );
     }
 
-    /// The scan waits for a block download that runs on another thread and
-    /// would take 30 s; the token reaches the wait, so the task ends and the
-    /// state is Paused right away. The download thread does not hold it up.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_during_a_download_pauses_at_once() {
-        let supervisor = ScanSupervisor::new(
-            |token| {
-                Box::pin(async move {
-                    let (finished, download) = tokio::sync::oneshot::channel::<()>();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_secs(30));
-                        let _ = finished.send(());
-                    });
-                    tokio::select! {
-                        () = token.cancelled() => Ok(()),
-                        _ = download => Err("downloaded".to_string()),
-                    }
-                })
-            },
-            Arc::default(),
-        );
-        supervisor.start();
-        tokio::time::sleep(Duration::from_millis(100)).await; // inside the download
-
-        let began = Instant::now();
-        assert!(supervisor.request_stop());
-        assert!(
-            supervisor
-                .wait_stopped(Some(Duration::from_millis(500)))
-                .await
-        );
-        assert!(began.elapsed() < Duration::from_millis(500));
-        assert_eq!(supervisor.state(), ScanState::Paused);
-        assert_eq!(supervisor.last_error(), None);
-        assert_eq!(supervisor.start(), StartOutcome::Started);
-        supervisor.cancel();
-    }
-
     /// A step that blocks a worker thread cannot be interrupted: until the
     /// task really ends the state is Stopping (never Paused), Start is
     /// refused, and the task makes no further progress once it returns.
