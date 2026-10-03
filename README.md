@@ -105,7 +105,8 @@ see the `friglet-ipc` crate) for status, start/stop scanning, and shutdown.
 Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux), falling back to
 `${XDG_DATA_HOME:-$HOME/.local/share}/friglet/friglet.sock`, then `/tmp/friglet.sock`,
 `~/Library/Application Support/friglet/friglet.sock` (macOS),
-`\\.\pipe\friglet` (Windows); override with `FRIGLET_CONTROL_SOCKET`.
+`\\.\pipe\friglet` (Windows); override with the config key
+`control_socket` or `FRIGLET_CONTROL_SOCKET` (the environment wins).
 
 #### HTTP API
 
@@ -123,8 +124,9 @@ control socket). To check on a running daemon, ask the control socket for
 `GetStatus` or send the Electrum server a `server.version` request:
 
 For the control query, set `FRIGLET_SOCKET` to the daemon's socket path.
-This example selects the usual Linux default, including the data-directory
-fallback; use the configured path if the daemon uses a socket override.
+This example honors `FRIGLET_CONTROL_SOCKET` and selects the usual Linux
+default, including the data-directory fallback. If `control_socket` in the
+config file overrides that path, set `FRIGLET_SOCKET` to its value instead.
 
 ```bash
 FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"
@@ -402,8 +404,8 @@ sidecar binary.
 Artifacts land under `target/release/bundle/`:
 
 - `deb/friglet-tray_<version>_amd64.deb` — installs `friglet-tray` **and**
-  `friglet` into `/usr/bin/`; declares `libwebkit2gtk-4.1-0` and
-  `libayatana-appindicator3-1` as dependencies.
+  `friglet` into `/usr/bin/`; declares `libayatana-appindicator3-1`,
+  `libwebkit2gtk-4.1-0` and `libgtk-3-0` as dependencies.
 - `appimage/friglet-tray_<version>_amd64.AppImage` — self-contained; both
   binaries in the embedded `usr/bin/`.
 - `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
