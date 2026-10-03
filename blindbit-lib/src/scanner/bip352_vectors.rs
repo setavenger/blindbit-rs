@@ -606,7 +606,8 @@ fn full_item(tx: &Transaction, tweak: PublicKey) -> FullTxItem {
 /// A scanner exactly as `Scanner::new` builds it, i.e. with the change label
 /// `m = 0` always registered.
 fn default_scanner(scan_sk: SecretKey, spend_pk: PublicKey, tag: &str) -> Scanner {
-    let socket: SocketAddr = "127.0.0.1:8333".parse().expect("socket address");
+    // Never contacted: nothing listens on port 1.
+    let socket: SocketAddr = "127.0.0.1:1".parse().expect("socket address");
     Scanner::new(
         oracle_client(),
         socket,
