@@ -125,7 +125,7 @@ impl SpDescriptor {
         }
     }
 
-    pub fn scan_pubkey(&self) -> PublicKey {
+    fn scan_pubkey(&self) -> PublicKey {
         PublicKey::from_secret_key(&Secp256k1::signing_only(), &self.scan_secret)
     }
 
@@ -342,7 +342,7 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 /// BIP-380 descriptor checksum of `desc` (everything before `#`), or `None`
 /// when `desc` has a character outside the descriptor character set.
-pub fn descriptor_checksum(desc: &str) -> Option<String> {
+fn descriptor_checksum(desc: &str) -> Option<String> {
     const INPUT_CHARSET: &str = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
     const CHECKSUM_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
