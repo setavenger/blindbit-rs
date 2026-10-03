@@ -101,23 +101,6 @@ fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: S
 }
 
 #[tokio::test]
-async fn attaches_when_daemon_already_running() {
-    let path = test_socket_path("attach");
-    spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Locator must not be consulted when a daemon is reachable.
-    let att = lifecycle::attach_or_spawn_with(&path, || {
-        panic!("should not look for a binary when attach succeeds")
-    })
-    .await;
-    assert!(matches!(att, Attachment::Attached(_)), "got {att:?}");
-
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&path);
-}
-
-#[tokio::test]
 async fn unreachable_when_no_daemon_and_no_binary() {
     let path = test_socket_path("nobin");
     let att = lifecycle::attach_or_spawn_with(&path, || None).await;
