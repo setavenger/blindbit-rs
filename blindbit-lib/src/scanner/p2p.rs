@@ -104,7 +104,8 @@ pub enum FetchFailure {
     },
     /// The node answered `notfound`.
     NotFound,
-    /// The node sent no block within the deadline and gave no reason.
+    /// The node sent no block within the deadline and gave no reason,
+    /// though it answered the ping sent after the request.
     NoAnswer(Duration),
     /// The connection broke some other way (I/O error, undecodable data, a
     /// `reject`).
@@ -132,6 +133,32 @@ impl FetchFailure {
                 | Self::WitnessStripped
                 | Self::BadBlock(_)
         )
+    }
+}
+
+/// A quiet deadline is kept distinct inside one fetch so it gets one fresh
+/// connection without spending the full retry budget on repeated 90 s waits.
+/// It is still exposed to callers as a broken connection.
+enum AttemptFailure {
+    Regular(FetchFailure),
+    QuietDeadline(Duration),
+}
+
+impl AttemptFailure {
+    fn into_fetch_failure(self) -> FetchFailure {
+        match self {
+            Self::Regular(failure) => failure,
+            Self::QuietDeadline(waited) => FetchFailure::Broken(format!(
+                "the node went quiet: no block and no answer to a ping in {}",
+                human_duration(waited)
+            )),
+        }
+    }
+}
+
+impl From<FetchFailure> for AttemptFailure {
+    fn from(failure: FetchFailure) -> Self {
+        Self::Regular(failure)
     }
 }
 
@@ -328,8 +355,8 @@ impl fmt::Display for BlockFetchError {
             FetchFailure::NoAnswer(waited) => {
                 write!(
                     f,
-                    "the node sent nothing for {} and gave no reason, which is what Bitcoin Core \
-                     does for a block it does not have. ",
+                    "the node did not send the block within {} and gave no reason, which is what \
+                     Bitcoin Core does for a block it does not have. ",
                     human_duration(*waited)
                 )?;
                 self.missing_block_advice(f)?;
@@ -491,7 +518,10 @@ impl BlockFetcher {
     /// another connection may not repeat (see `FetchFailure::is_transient`)
     /// are retried after the policy's waits (1, 2, 4, 8 s by default); the
     /// others end the call at once, since asking again right away cannot
-    /// change the answer.
+    /// change the answer. When the policy permits another attempt, a connection
+    /// that stays quiet through the full block deadline gets one fresh
+    /// connection, then ends the round instead of spending the full retry
+    /// budget on repeated long waits.
     ///
     /// The connection's I/O is blocking and runs on a thread of its own, so
     /// it never blocks the async runtime and the call stays cancellable:
@@ -509,6 +539,7 @@ impl BlockFetcher {
         let mut local_ip = None;
         let mut tried = 0;
         let mut last = None;
+        let mut quiet_timeouts = 0;
         for attempt in 1..=attempts {
             if attempt > 1 {
                 tokio::select! {
@@ -537,11 +568,13 @@ impl BlockFetcher {
                     }
                     return Ok(block);
                 }
-                Err(FetchFailure::Cancelled) => {
+                Err(AttemptFailure::Regular(FetchFailure::Cancelled)) => {
                     last = Some(FetchFailure::Cancelled);
                     break;
                 }
-                Err(failure) => {
+                Err(attempt_failure) => {
+                    let quiet = matches!(&attempt_failure, AttemptFailure::QuietDeadline(_));
+                    let failure = attempt_failure.into_fetch_failure();
                     tracing::warn!(
                         peer = %self.peer,
                         height,
@@ -551,7 +584,12 @@ impl BlockFetcher {
                         failure = %failure,
                         "block fetch attempt failed"
                     );
-                    let again = failure.is_transient();
+                    let again = if quiet {
+                        quiet_timeouts += 1;
+                        quiet_timeouts == 1
+                    } else {
+                        failure.is_transient()
+                    };
                     last = Some(failure);
                     if !again {
                         break;
@@ -590,18 +628,20 @@ impl BlockFetcher {
         read_timeout: Duration,
         peer_info: &mut Option<PeerInfo>,
         local_ip: &mut Option<IpAddr>,
-    ) -> Result<Block, FetchFailure> {
+    ) -> Result<Block, AttemptFailure> {
         tracing::debug!(peer = %self.peer, "opening P2P connection for a block fetch");
         let opened = Instant::now();
         let connect =
             tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(self.peer));
         let stream = tokio::select! {
             biased;
-            () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled),
+            () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled.into()),
             connected = connect => match connected {
                 Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => return Err(FetchFailure::Connect(e.to_string())),
-                Err(_) => return Err(FetchFailure::Connect("connection timed out".to_string())),
+                Ok(Err(e)) => return Err(FetchFailure::Connect(e.to_string()).into()),
+                Err(_) => {
+                    return Err(FetchFailure::Connect("connection timed out".to_string()).into());
+                }
             },
         };
         let stream = stream
@@ -625,6 +665,7 @@ impl BlockFetcher {
             .spawn(move || {
                 let mut info = None;
                 let result = P2pConnection::handshake(stream, peer, network, read_timeout, opened)
+                    .map_err(AttemptFailure::from)
                     .and_then(|mut connection| {
                         info = Some(connection.info);
                         connection.fetch_block(block_hash, deadline, &cancel)
@@ -635,7 +676,7 @@ impl BlockFetcher {
 
         tokio::select! {
             biased;
-            () = self.cancel.cancelled() => Err(FetchFailure::Cancelled),
+            () = self.cancel.cancelled() => Err(FetchFailure::Cancelled.into()),
             answered = answered => {
                 let (info, result) = answered.map_err(|_| {
                     FetchFailure::Broken("the download ended without an answer".to_string())
@@ -728,7 +769,7 @@ impl P2pConnection {
         block_hash: BlockHash,
         deadline: Duration,
         cancel: &CancellationToken,
-    ) -> Result<Block, FetchFailure> {
+    ) -> Result<Block, AttemptFailure> {
         let primitives_block_hash =
             PrimitivesBlockHash::from_byte_array(*block_hash.as_byte_array());
         // With witnesses: the wallet stores these transactions and the
@@ -743,6 +784,18 @@ impl P2pConnection {
             .send_message(net_msg)
             .map_err(|_| self.closed())?;
         tracing::debug!(peer = %self.peer, block_hash = %block_hash, "sent getdata for block");
+        // A node handles a peer's messages in order, so it answers this
+        // ping once it has sent the block or decided not to. If the block
+        // has not come by the deadline, a pong means the node does not
+        // serve it; no pong means the node went quiet, perhaps part way
+        // through the block, whose partly read bytes are lost with the
+        // read that timed out.
+        let ping_nonce =
+            u64::from_le_bytes(block_hash.as_byte_array()[..8].try_into().expect("8 bytes"));
+        self.writer
+            .send_message(NetworkMessage::Ping(ping_nonce))
+            .map_err(|_| self.closed())?;
+        let mut ping_answered = false;
 
         let started = Instant::now();
         let mut last_idle_log = 0u64;
@@ -752,10 +805,13 @@ impl P2pConnection {
             // checked here too in case a platform's shutdown does not wake
             // a blocked read.
             if cancel.is_cancelled() {
-                return Err(FetchFailure::Cancelled);
+                return Err(FetchFailure::Cancelled.into());
             }
             if started.elapsed() > deadline {
-                return Err(FetchFailure::NoAnswer(started.elapsed()));
+                if ping_answered {
+                    return Err(FetchFailure::NoAnswer(started.elapsed()).into());
+                }
+                return Err(AttemptFailure::QuietDeadline(started.elapsed()));
             }
 
             match self.reader.read_message() {
@@ -778,12 +834,18 @@ impl P2pConnection {
                     // while it's still preparing/streaming the block.
                     let _ = self.writer.send_message(NetworkMessage::Pong(nonce));
                 }
+                Ok(Some(NetworkMessage::Pong(nonce))) if nonce == ping_nonce => {
+                    ping_answered = true;
+                }
                 // The peer explicitly told us it does not have/serve this block.
-                Ok(Some(NetworkMessage::NotFound(_))) => return Err(FetchFailure::NotFound),
+                Ok(Some(NetworkMessage::NotFound(_))) => {
+                    return Err(FetchFailure::NotFound.into());
+                }
                 Ok(Some(NetworkMessage::Reject(reject))) => {
                     return Err(FetchFailure::Broken(format!(
                         "the node rejected the request: {reject:?}"
-                    )));
+                    ))
+                    .into());
                 }
                 Ok(Some(msg)) => {
                     tracing::trace!(
@@ -809,9 +871,11 @@ impl P2pConnection {
                 }
                 // EOF ("failed to fill whole buffer") or a reset: the peer
                 // closed the connection.
-                Err(P2pNetError::Io(e)) if is_closed(&e) => return Err(self.closed()),
+                Err(P2pNetError::Io(e)) if is_closed(&e) => {
+                    return Err(self.closed().into());
+                }
                 // Anything else means the framed stream is unusable.
-                Err(e) => return Err(FetchFailure::Broken(e.to_string())),
+                Err(e) => return Err(FetchFailure::Broken(e.to_string()).into()),
             }
         }
     }

@@ -47,7 +47,8 @@ pub(super) enum Conn {
     /// Serve the block without its witnesses whatever was asked.
     ServeStripped,
     NotFound,
-    /// Never answer the request.
+    /// Never answer the request (pings still get their pong, as from
+    /// Bitcoin Core).
     Ignore,
     /// Answer in another network's P2P protocol.
     Magic(Network),
@@ -276,6 +277,11 @@ fn serve(
             wire.stream.flush()?;
             *stalled.lock().unwrap() = Some(Instant::now());
         }
+        Conn::Ignore => loop {
+            if let NetworkMessage::Ping(nonce) = wire.recv()? {
+                wire.send(NetworkMessage::Pong(nonce))?;
+            }
+        },
         _ => {}
     }
     wire.drain()
@@ -469,11 +475,54 @@ fn a_silent_node_behind_the_block_is_reported_as_syncing() {
     );
     assert_eq!(err.attempts, 1);
     let message = err.to_string();
-    assert!(message.contains("sent nothing"), "{message}");
+    assert!(message.contains("did not send the block"), "{message}");
+    assert!(!message.contains("sent nothing"), "{message}");
     assert!(
         message.contains("reports height 50: it is still syncing"),
         "{message}"
     );
+}
+
+/// A node that goes quiet part way through the block has not said it lacks
+/// the block: the transfer stalled. That is tried again on a fresh
+/// connection, not reported as a node without the block.
+#[test]
+fn a_transfer_that_stalls_mid_block_is_retried_on_a_fresh_connection() {
+    let node = Node::full(200, vec![Conn::StallMidBlock, Conn::Serve]);
+    let policy = RetryPolicy {
+        block_deadline: Duration::from_millis(300),
+        ..fast(5)
+    };
+    let got = fetch(&node, policy, 100).expect("the second connection serves the block");
+    assert_eq!(got.block_hash(), block().block_hash());
+    assert_eq!(node.connections(), 2);
+}
+
+#[test]
+fn a_transfer_that_keeps_stalling_gets_one_fresh_retry_then_ends_the_round() {
+    let node = Node::full(200, vec![Conn::StallMidBlock; 2]);
+    let policy = RetryPolicy {
+        block_deadline: Duration::from_millis(300),
+        ..fast(5)
+    };
+    let err = fetch(&node, policy, 100).expect_err("never served whole");
+    let message = err.to_string();
+    assert!(!message.contains("sent nothing"), "{message}");
+    assert!(!message.contains("pruned"), "{message}");
+    assert!(
+        message.contains("went quiet: no block and no answer to a ping"),
+        "{message}"
+    );
+    assert!(
+        matches!(err.failure, FetchFailure::Broken(_)),
+        "{:?}",
+        err.failure
+    );
+    assert_eq!(
+        err.attempts, 2,
+        "one fresh connection, not all five expensive attempts"
+    );
+    assert_eq!(node.connections(), 2);
 }
 
 #[test]
