@@ -1352,7 +1352,14 @@ pub fn run() {
         tracing::info!(path = %path.display(), "friglet-tray starting; logging to file");
     }
 
-    let mut state = AppState::new(friglet_ipc::default_socket_path());
+    // Where the daemon listens: the tray probes, and a daemon it spawns binds,
+    // the same path (that daemon reads the same config file and inherits this
+    // environment).
+    let socket_path =
+        setup::control_socket_path(friglet_ipc::default_config_path().as_deref(), &|key| {
+            std::env::var(key).ok()
+        });
+    let mut state = AppState::new(socket_path);
     state.tray_log = tray_log;
     let state = Arc::new(state);
 
