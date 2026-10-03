@@ -10,8 +10,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,19 +18,20 @@ use bdk_sp::receive::get_silentpayment_pubkey;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::key::TweakedPublicKey;
-use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::transaction::Version;
 use bitcoin::{
     Amount, Block, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
     Witness, XOnlyPublicKey,
 };
-use bitcoin_rev::Network;
-use tonic::transport::Channel;
 
 use super::health::{OracleProbe, indexed_block_hash};
 use super::reorg::ReorgTooDeep;
 use super::scanning::{BlockScanDataStream, BlockStreamSource};
 use super::stream_safety_tests::serve;
+#[cfg(feature = "serde")]
+use super::test_support::restore_from;
+use super::test_support::{keys, run, scanner, secret};
 use super::{REORG_LOOKBACK, Scanner, ScannerError};
 use crate::oracle_grpc::{
     BlockHashResponse, BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem,
@@ -258,65 +257,6 @@ fn full_block(branch: u8, height: u64, txs: Vec<Transaction>) -> Block {
 // Wallet
 // ---------------------------------------------------------------------------
 
-fn secret(byte: u8) -> SecretKey {
-    SecretKey::from_slice(&[byte; 32]).expect("valid secret")
-}
-
-fn keys() -> (SecretKey, PublicKey) {
-    (secret(0x11), secret(0x22).public_key(&Secp256k1::new()))
-}
-
-fn state_file(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("blindbit-reorg-{tag}-{}.json", std::process::id()))
-}
-
-struct TempState(PathBuf);
-
-impl Drop for TempState {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn client() -> crate::OracleServiceClient<Channel> {
-    crate::OracleServiceClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy())
-}
-
-fn socket() -> SocketAddr {
-    "127.0.0.1:1".parse().expect("socket address")
-}
-
-/// A fresh wallet. Must be called inside a Tokio runtime.
-fn wallet(tag: &str) -> (Scanner, TempState) {
-    let (scan_sk, spend_pk) = keys();
-    let path = state_file(tag);
-    let _ = std::fs::remove_file(&path);
-    let scanner = Scanner::new(
-        client(),
-        socket(),
-        scan_sk,
-        spend_pk,
-        0,
-        path.clone(),
-        Network::Regtest,
-    );
-    (scanner, TempState(path))
-}
-
-/// The wallet as a restarted daemon loads it from its state file.
-#[cfg(feature = "serde")]
-fn restart(path: &std::path::Path) -> Scanner {
-    let changeset = Scanner::load_from_file(path).expect("load state");
-    Scanner::from_changeset(
-        client(),
-        socket(),
-        changeset,
-        path.to_path_buf(),
-        Network::Regtest,
-    )
-    .expect("restore")
-}
-
 /// A payment of `sat` to the wallet's unlabelled address; the tweak the
 /// oracle serves for it and the paid outpoint.
 fn payment(seed: u8, sat: u64) -> (Transaction, PublicKey, OutPoint, XOnlyPublicKey) {
@@ -370,15 +310,7 @@ fn p2tr(key: XOnlyPublicKey) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key))
 }
 
-fn run<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(future)
-}
-
-/// One `watch_chain` iteration against `oracle`.
+/// One `watch_chain_until` iteration against `oracle`.
 async fn watch_step(scanner: &mut Scanner, oracle: &Oracle) -> Result<(), ScannerError> {
     let tip = oracle.tip();
     let last = scanner.get_last_scanned_block_height();
@@ -485,7 +417,7 @@ async fn scan_old_chain(scanner: &mut Scanner, s: &Scenario) {
 #[test]
 fn reorg_evicting_a_payment_drops_its_output_and_balance() {
     run(async {
-        let (mut scanner, _state) = wallet("evict");
+        let (mut scanner, _state) = scanner("evict");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
 
@@ -524,7 +456,7 @@ fn reorg_evicting_a_payment_drops_its_output_and_balance() {
 #[test]
 fn reorg_reconfirming_a_payment_keeps_it_at_its_new_height() {
     run(async {
-        let (mut scanner, _state) = wallet("reconfirm");
+        let (mut scanner, _state) = scanner("reconfirm");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
         assert_eq!(owned_height(&scanner, s.reconfirmed), Some(105));
@@ -550,7 +482,7 @@ fn reorg_reconfirming_a_payment_keeps_it_at_its_new_height() {
 #[test]
 fn same_height_tip_replacement_is_detected_without_a_new_block() {
     run(async {
-        let (mut scanner, _state) = wallet("same-height");
+        let (mut scanner, _state) = scanner("same-height");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
 
@@ -571,7 +503,7 @@ fn same_height_tip_replacement_is_detected_without_a_new_block() {
 #[test]
 fn reorg_disconnecting_a_spend_makes_the_output_unspent_again() {
     run(async {
-        let (mut scanner, _state) = wallet("unspend");
+        let (mut scanner, _state) = scanner("unspend");
         let (recv_tx, tweak, outpoint, key) = payment(0x41, 50_000);
         let mut old = Oracle::default();
         old.block(0xa, 101, vec![(recv_tx, Some(tweak))], &[]);
@@ -621,7 +553,7 @@ fn reorg_disconnecting_a_spend_makes_the_output_unspent_again() {
 #[test]
 fn rollback_is_persisted_and_restart_mid_rescan_is_safe() {
     run(async {
-        let (mut scanner, state) = wallet("restart");
+        let (mut scanner, state) = scanner("restart");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
         drop(scanner);
@@ -636,7 +568,7 @@ fn rollback_is_persisted_and_restart_mid_rescan_is_safe() {
 
         // Restart after the reorg. The scan locates the fork, rolls back,
         // scans 105' and then its stream dies before 106'.
-        let mut restarted = restart(&state.0);
+        let mut restarted = restore_from(&state.0);
         let mut flaky = s.new.clone();
         flaky.fail_at = Some(106);
         watch_step(&mut restarted, &flaky)
@@ -646,7 +578,7 @@ fn rollback_is_persisted_and_restart_mid_rescan_is_safe() {
 
         // The rollback to the fork point is on disk; 105' was scanned but
         // not yet saved, so it is simply scanned again.
-        let mut resumed = restart(&state.0);
+        let mut resumed = restore_from(&state.0);
         assert_eq!(resumed.get_last_scanned_block_height(), FORK);
         assert_eq!(
             owned_height(&resumed, s.evicted),
@@ -666,7 +598,7 @@ fn rollback_is_persisted_and_restart_mid_rescan_is_safe() {
         assert_eq!(balance(&resumed), 80_000);
         assert_eq!(resumed.get_last_scanned_block_height(), 107);
 
-        let resumed_again = restart(&state.0);
+        let resumed_again = restore_from(&state.0);
         assert_eq!(balance(&resumed_again), 80_000, "final state is persisted");
     });
 }
@@ -677,7 +609,7 @@ fn rollback_is_persisted_and_restart_mid_rescan_is_safe() {
 #[test]
 fn reorg_deeper_than_the_lookback_is_a_loud_error_and_changes_nothing() {
     run(async {
-        let (mut scanner, state) = wallet("too-deep");
+        let (mut scanner, state) = scanner("too-deep");
         let (recv_tx, tweak, outpoint, _) = payment(0x51, 50_000);
         let tip = 101 + u64::from(REORG_LOOKBACK) + 10;
         let mut old = Oracle::default();
@@ -737,7 +669,7 @@ fn reorg_deeper_than_the_lookback_is_a_loud_error_and_changes_nothing() {
 #[test]
 fn unchanged_chain_passes_the_check() {
     run(async {
-        let (mut scanner, _state) = wallet("unchanged");
+        let (mut scanner, _state) = scanner("unchanged");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
 
@@ -807,7 +739,7 @@ impl OracleProbe for SwitchingOracle {
 #[test]
 fn idle_poll_is_one_hash_lookup_and_a_new_block_is_streamed_once() {
     run(async {
-        let (mut scanner, _state) = wallet("poll-cost");
+        let (mut scanner, _state) = scanner("poll-cost");
         let s = scenario();
         scan_old_chain(&mut scanner, &s).await;
         let tip_block = s.old.chain[&s.old.tip()].encoded_len() + 5;
@@ -840,7 +772,7 @@ fn idle_poll_is_one_hash_lookup_and_a_new_block_is_streamed_once() {
 #[test]
 fn tip_reorg_streams_from_the_fork_point_only() {
     run(async {
-        let (mut scanner, _state) = wallet("locate-cheap");
+        let (mut scanner, _state) = scanner("locate-cheap");
         let (recv_tx, tweak, outpoint, _) = payment(0x61, 40_000);
         let tip = 101 + u64::from(REORG_LOOKBACK) + 10;
         let mut old = Oracle::default();
@@ -874,7 +806,7 @@ fn tip_reorg_streams_from_the_fork_point_only() {
 #[test]
 fn oracle_switching_branches_mid_stream_is_rolled_back() {
     run(async {
-        let (mut scanner, _state) = wallet("mid-stream");
+        let (mut scanner, _state) = scanner("mid-stream");
         let s = scenario();
         let mut upto_fork = s.old.branch_at(FORK);
         upto_fork.traffic = Arc::default();
@@ -923,7 +855,7 @@ fn oracle_switching_branches_mid_stream_is_rolled_back() {
 #[test]
 fn too_deep_reorg_is_a_stall_and_polls_stay_cheap() {
     run(async {
-        let (mut scanner, _state) = wallet("too-deep-stall");
+        let (mut scanner, _state) = scanner("too-deep-stall");
         let tip = 101 + u64::from(REORG_LOOKBACK) + 10;
         let mut old = Oracle::default();
         for h in 101..=tip {
