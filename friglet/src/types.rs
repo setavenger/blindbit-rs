@@ -1,7 +1,5 @@
-//! Shared types for Frigate protocol
-//!
-//! These types are used by both the HTTP server and the Electrum TCP server
-//! to ensure consistency with the Frigate Electrum Server protocol.
+//! Response types of the HTTP server's `/subscribe` endpoint, in the shape
+//! of the Frigate Electrum Server protocol.
 
 use bitcoin::Txid;
 use bitcoin::secp256k1::PublicKey;
