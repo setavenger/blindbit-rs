@@ -3,15 +3,12 @@
 
 use std::path::{Path, PathBuf};
 
-use bdk_sp::bitcoin::key::Secp256k1;
-use bitcoin::secp256k1::SecretKey;
 use bitcoin_rev::Network;
-use tonic::transport::Channel;
 
 use super::Scanner;
 use super::config::ScannerConfig;
 use super::load::restore_or_create;
-use super::stream_safety_tests::run;
+use super::test_support::{keys, oracle_client, run, scanner_at};
 
 struct TempDir(PathBuf);
 
@@ -41,10 +38,7 @@ impl Drop for TempDir {
 }
 
 fn config(state_file: &Path) -> ScannerConfig {
-    let secret = SecretKey::from_slice(&[0x11; 32]).unwrap();
-    let spend = SecretKey::from_slice(&[0x22; 32])
-        .unwrap()
-        .public_key(&Secp256k1::new());
+    let (secret, spend) = keys();
     ScannerConfig::new(
         "http://127.0.0.1:1".to_string(),
         "127.0.0.1:1".parse().unwrap(),
@@ -53,23 +47,6 @@ fn config(state_file: &Path) -> ScannerConfig {
         0,
         state_file.to_path_buf(),
         Network::Regtest,
-    )
-}
-
-fn client() -> crate::OracleServiceClient<Channel> {
-    crate::OracleServiceClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy())
-}
-
-fn new_scanner(state_file: &Path) -> Scanner {
-    let config = config(state_file);
-    Scanner::new(
-        client(),
-        config.p2p_socket_addr,
-        config.secret_scan,
-        config.public_spend,
-        config.max_label_num,
-        config.state_file.clone(),
-        config.network,
     )
 }
 
@@ -90,7 +67,7 @@ fn save_replaces_the_file_atomically_and_owner_only() {
             }
         }
 
-        let mut scanner = new_scanner(&path);
+        let mut scanner = scanner_at(path.clone(), 0);
         scanner.update_last_scanned_block_height(4_242);
         scanner.save_to_file(&path).expect("save");
 
@@ -116,7 +93,7 @@ fn failed_save_leaves_the_previous_file_intact() {
     run(async {
         let dir = TempDir::new("failed-save");
         let path = dir.0.join("scanner_state.json");
-        let mut scanner = new_scanner(&path);
+        let mut scanner = scanner_at(path.clone(), 0);
         scanner.update_last_scanned_block_height(100);
         scanner.save_to_file(&path).expect("first save");
         let before = std::fs::read(&path).unwrap();
@@ -143,7 +120,7 @@ fn unparseable_state_file_is_moved_aside_and_reported() {
         let garbage = b"{\"block_checkpoints\": {\"0\": \"00";
         std::fs::write(&path, garbage).unwrap();
 
-        let scanner = restore_or_create(&config(&path), client()).expect("starts over");
+        let scanner = restore_or_create(&config(&path), oracle_client()).expect("starts over");
         assert_eq!(scanner.get_last_scanned_block_height(), 0, "a new scan");
         let reset = scanner
             .scan_health()
@@ -172,7 +149,7 @@ fn state_file_from_a_newer_build_is_moved_aside() {
     run(async {
         let dir = TempDir::new("newer");
         let path = dir.0.join("scanner_state.json");
-        let mut scanner = new_scanner(&path);
+        let mut scanner = scanner_at(path.clone(), 0);
         scanner.update_last_scanned_block_height(500);
         scanner.save_to_file(&path).unwrap();
         let mut json: serde_json::Value =
@@ -180,7 +157,7 @@ fn state_file_from_a_newer_build_is_moved_aside() {
         json["format_version"] = serde_json::json!(super::STATE_FORMAT_VERSION + 1);
         std::fs::write(&path, json.to_string()).unwrap();
 
-        let scanner = restore_or_create(&config(&path), client()).expect("starts over");
+        let scanner = restore_or_create(&config(&path), oracle_client()).expect("starts over");
         assert_eq!(scanner.get_last_scanned_block_height(), 0);
         let reset = scanner.scan_health().await.state_file_reset.unwrap();
         assert!(reset.error.contains("newer build"), "{}", reset.error);
@@ -196,7 +173,7 @@ fn unreadable_state_path_is_an_error_and_nothing_moves() {
         let dir = TempDir::new("unreadable");
         let path = dir.0.join("scanner_state.json");
         std::fs::create_dir(&path).unwrap();
-        let err = restore_or_create(&config(&path), client())
+        let err = restore_or_create(&config(&path), oracle_client())
             .err()
             .expect("cannot read a directory as the state file");
         assert!(err.to_string().contains("cannot read state file"), "{err}");
@@ -209,13 +186,13 @@ fn valid_and_missing_state_files_behave_as_before() {
     run(async {
         let dir = TempDir::new("valid");
         let path = dir.0.join("scanner_state.json");
-        let fresh = restore_or_create(&config(&path), client()).expect("no file: new");
+        let fresh = restore_or_create(&config(&path), oracle_client()).expect("no file: new");
         assert_eq!(fresh.scan_health().await.state_file_reset, None);
         let mut fresh = fresh;
         fresh.update_last_scanned_block_height(321);
         fresh.save_to_file(&path).unwrap();
 
-        let restored = restore_or_create(&config(&path), client()).expect("restores");
+        let restored = restore_or_create(&config(&path), oracle_client()).expect("restores");
         assert_eq!(restored.get_last_scanned_block_height(), 321);
         assert_eq!(restored.scan_health().await.state_file_reset, None);
         assert_eq!(dir.entries(), vec!["scanner_state.json".to_string()]);
