@@ -475,7 +475,8 @@ fn a_silent_node_behind_the_block_is_reported_as_syncing() {
     );
     assert_eq!(err.attempts, 1);
     let message = err.to_string();
-    assert!(message.contains("sent nothing"), "{message}");
+    assert!(message.contains("did not send the block"), "{message}");
+    assert!(!message.contains("sent nothing"), "{message}");
     assert!(
         message.contains("reports height 50: it is still syncing"),
         "{message}"
@@ -498,11 +499,11 @@ fn a_transfer_that_stalls_mid_block_is_retried_on_a_fresh_connection() {
 }
 
 #[test]
-fn a_transfer_that_keeps_stalling_is_not_reported_as_a_missing_block() {
+fn a_transfer_that_keeps_stalling_gets_one_fresh_retry_then_ends_the_round() {
     let node = Node::full(200, vec![Conn::StallMidBlock; 2]);
     let policy = RetryPolicy {
         block_deadline: Duration::from_millis(300),
-        ..fast(2)
+        ..fast(5)
     };
     let err = fetch(&node, policy, 100).expect_err("never served whole");
     let message = err.to_string();
@@ -517,7 +518,11 @@ fn a_transfer_that_keeps_stalling_is_not_reported_as_a_missing_block() {
         "{:?}",
         err.failure
     );
-    assert_eq!(err.attempts, 2, "every stall gets a fresh connection");
+    assert_eq!(
+        err.attempts, 2,
+        "one fresh connection, not all five expensive attempts"
+    );
+    assert_eq!(node.connections(), 2);
 }
 
 #[test]
