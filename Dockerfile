@@ -25,9 +25,10 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/friglet /usr/local/bin/friglet
 
 USER friglet
-# All mutable state (config.toml, scan.key, scanner state file, control
-# socket) lives under /data; WORKDIR makes the relative state_file default
-# ("scanner_state.json") land there too.
+# config.toml, scan.key, the control socket and the log live under /data.
+# The scanner state file does not by default: friglet puts it in
+# /home/friglet/.config/friglet/ (SNB-635). Set state_file =
+# "/data/scanner_state.json" in config.toml to keep it in the volume.
 WORKDIR /data
 VOLUME /data
 ENV FRIGLET_CONTROL_SOCKET=/data/friglet.sock \
