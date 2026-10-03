@@ -104,7 +104,8 @@ pub enum FetchFailure {
     },
     /// The node answered `notfound`.
     NotFound,
-    /// The node sent no block within the deadline and gave no reason.
+    /// The node sent no block within the deadline and gave no reason,
+    /// though it answered the ping sent after the request.
     NoAnswer(Duration),
     /// The connection broke some other way (I/O error, undecodable data, a
     /// `reject`).
@@ -743,6 +744,18 @@ impl P2pConnection {
             .send_message(net_msg)
             .map_err(|_| self.closed())?;
         tracing::debug!(peer = %self.peer, block_hash = %block_hash, "sent getdata for block");
+        // A node handles a peer's messages in order, so it answers this
+        // ping once it has sent the block or decided not to. If the block
+        // has not come by the deadline, a pong means the node does not
+        // serve it; no pong means the node went quiet, perhaps part way
+        // through the block, whose partly read bytes are lost with the
+        // read that timed out.
+        let ping_nonce =
+            u64::from_le_bytes(block_hash.as_byte_array()[..8].try_into().expect("8 bytes"));
+        self.writer
+            .send_message(NetworkMessage::Ping(ping_nonce))
+            .map_err(|_| self.closed())?;
+        let mut ping_answered = false;
 
         let started = Instant::now();
         let mut last_idle_log = 0u64;
@@ -755,7 +768,13 @@ impl P2pConnection {
                 return Err(FetchFailure::Cancelled);
             }
             if started.elapsed() > deadline {
-                return Err(FetchFailure::NoAnswer(started.elapsed()));
+                if ping_answered {
+                    return Err(FetchFailure::NoAnswer(started.elapsed()));
+                }
+                return Err(FetchFailure::Broken(format!(
+                    "the node went quiet: no block and no answer to a ping in {}",
+                    human_duration(started.elapsed())
+                )));
             }
 
             match self.reader.read_message() {
@@ -777,6 +796,9 @@ impl P2pConnection {
                     // Pong inline so the peer doesn't drop us for inactivity
                     // while it's still preparing/streaming the block.
                     let _ = self.writer.send_message(NetworkMessage::Pong(nonce));
+                }
+                Ok(Some(NetworkMessage::Pong(nonce))) if nonce == ping_nonce => {
+                    ping_answered = true;
                 }
                 // The peer explicitly told us it does not have/serve this block.
                 Ok(Some(NetworkMessage::NotFound(_))) => return Err(FetchFailure::NotFound),
