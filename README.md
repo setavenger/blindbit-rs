@@ -59,6 +59,7 @@ cargo run --release --package friglet scan \
 | `--state-file` | Path to persist scanner state. The default is kept per wallet (`scanner_state-<network>-<id>.json` next to it), so new keys start a fresh scan; an explicit path holding another wallet's state is refused | `<config dir>/friglet/scanner_state.json` |
 | `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
+| `--log-level` | `trace\|debug\|info\|warn\|error`; `RUST_LOG` overrides it | `info` |
 
 #### Configuration
 
@@ -101,7 +102,8 @@ the command line. Note: the scanner state file also contains the secret
 
 While running, the daemon serves a control socket (newline-delimited JSON,
 see the `friglet-ipc` crate) for status, start/stop scanning, and shutdown.
-Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux),
+Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux), falling back to
+`${XDG_DATA_HOME:-$HOME/.local/share}/friglet/friglet.sock`, then `/tmp/friglet.sock`,
 `~/Library/Application Support/friglet/friglet.sock` (macOS),
 `\\.\pipe\friglet` (Windows); override with `FRIGLET_CONTROL_SOCKET`.
 
@@ -113,6 +115,23 @@ Once running, `friglet` exposes the following endpoints on `--http-addr`:
 |----------|-------------|
 | `GET /height` | Returns the last scanned block height as `{"height": <n>}` |
 | `GET /subscribe` | Returns the current scanner state in Frigate-compatible format |
+
+These endpoints do not answer while scanning is enabled: the scan holds the
+scanner for as long as it runs, including while it waits for new blocks. They
+answer only while scanning is stopped (**Stop scanning**, or `Stop` over the
+control socket). To check on a running daemon, ask the control socket for
+`GetStatus` or send the Electrum server a `server.version` request:
+
+For the control query, set `FRIGLET_SOCKET` to the daemon's socket path.
+This example selects the usual Linux default, including the data-directory
+fallback; use the configured path if the daemon uses a socket override.
+
+```bash
+FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"
+printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"
+printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001
+# -> {"jsonrpc":"2.0","id":1,"result":["Friglet","1.4"]}
+```
 
 #### Electrum Server
 
@@ -183,7 +202,7 @@ and stay there until they are resolved; every error of the session is also
 listed under **Recent errors** (with a count when it repeats), and written
 to the log.
 
-**Logs.** The daemon writes its log to a file as well as to stderr, and the
+**Logs.** The daemon writes its log to a file as well as to stdout, and the
 tray writes its own:
 
 | Platform | Folder | Files |
@@ -197,7 +216,7 @@ Each file is capped at 10 MiB: it is then renamed to `*.log.1` (the previous
 moves the daemon's log, `FRIGLET_LOG_FILE=off` turns the file off. The
 Status tab shows both paths and has an **Open log folder** button; a daemon
 started by the tray also has its output forwarded to the tray's own
-stderr (`friglet-daemon` lines) when the tray runs in a terminal.
+stdout (`friglet-daemon` lines) when the tray runs in a terminal.
 
 The window's **Settings** tab lets you view and edit all daemon settings —
 wallet descriptor, network, wallet birthday, Bitcoin node, oracle URL, and
@@ -268,8 +287,8 @@ o.window({ class = "^friglet-tray$", title = "^Friglet Status$" }, {
 ```
 
 ```bash
-# build (Linux needs the Tauri v2 system deps: libwebkit2gtk-4.1-dev,
-# libayatana-appindicator3-dev, librsvg2-dev, libgtk-3-dev)
+# build (Linux needs libwebkit2gtk-4.1-dev, libgtk-3-dev, pkg-config,
+# protobuf-compiler and libprotobuf-dev)
 cargo build --release -p friglet-tray
 
 # run
@@ -454,13 +473,15 @@ it with a config file (see [Configuration](#configuration)):
 ### Docker (headless daemon)
 
 A multi-stage `Dockerfile` at the repo root builds a slim headless daemon
-image. Config, key file, scanner state, and the control socket all live in a
-`/data` volume:
+image. Config, key file, control socket and log live in a `/data` volume.
+The scanner state does not by default: set `state_file =
+"/data/scanner_state.json"` in `config.toml`, or it is lost when the
+container is recreated.
 
 ```bash
 docker build -t friglet .
 docker run -d -p 8080:8080 -p 50001:50001 -v "$PWD/friglet-data:/data" friglet
-curl http://127.0.0.1:8080/height
+printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001
 ```
 
 See [docs/docker.md](docs/docker.md) for the config layout and details.
@@ -473,22 +494,25 @@ The `blindbit-cli` provides a minimal command-line interface for scanning blocks
 
 ```bash
 cargo run --release --package blindbit-cli scan \
+  --network signet \
   --scan-secret <32-byte-hex> \
   --spend-pubkey <33-byte-hex> \
-  --start-height <height> \
-  --p2p-node-addr <address> \
-  --oracle-url <url> \
+  --start-height 274010 \
+  --end-height 274060 \
+  --p2p-node-addr 152.53.151.148:38333 \
+  --oracle-url 'https://signet.oracle.setor.dev' \
   --state-file <path>
 ```
 
 #### Parameters
 
-- `--scan-secret`: 32-byte hex string representing the scan secret key
-- `--spend-pubkey`: 33-byte hex string representing the spend public key
-- `--start-height`: Block height to begin scanning from (wallet birthday)
-- `--p2p-node-addr`: Bitcoin P2P node address (`host:port`)
+- `--scan-secret`: 32-byte hex string representing the scan secret key (required)
+- `--spend-pubkey`: 33-byte hex string representing the spend public key (required)
+- `--start-height`: Block height to begin scanning from (wallet birthday; required)
+- `--end-height`: Last block height to scan (required)
+- `--p2p-node-addr`: Bitcoin P2P node as `ip:port`; hostnames are not accepted (required)
 - `--oracle-url`: Oracle service URL (default: `https://oracle.setor.dev`)
-- `--state-file`: Path for scanner state persistence (default: `<config dir>/friglet/scanner_state.json`)
+- `--state-file`: Path for scanner state, loaded at start and saved at the end; the given range is scanned either way (default: `scanner_state.json` in the working directory)
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)
 - `--max-label-num`: Maximum label number (default: `0`)
-
+- `--log-level`: `trace|debug|info|warn|error`; `RUST_LOG` overrides it (default: `info`)
