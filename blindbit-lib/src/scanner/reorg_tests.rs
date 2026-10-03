@@ -378,7 +378,7 @@ fn run<F: Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// One `watch_chain` iteration against `oracle`.
+/// One `watch_chain_until` iteration against `oracle`.
 async fn watch_step(scanner: &mut Scanner, oracle: &Oracle) -> Result<(), ScannerError> {
     let tip = oracle.tip();
     let last = scanner.get_last_scanned_block_height();

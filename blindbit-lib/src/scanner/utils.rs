@@ -21,20 +21,6 @@ pub fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> b
     false
 }
 
-#[allow(dead_code)]
-fn _match_short_pubkey_bytes(p_n: &[u8; 32], output_short_vector: &[u8]) -> bool {
-    let outputs_short_len = output_short_vector.len();
-    for i in 0..outputs_short_len / 8 {
-        let output_short = &output_short_vector[i * 8..(i + 1) * 8];
-        if p_n[..8] == *output_short {
-            // we only need to find the first match to assert a probable match
-            return true;
-        }
-    }
-
-    false
-}
-
 /// A stand-in `TxOut` for a vout the oracle did not serve.
 ///
 /// Its script is empty, so `bdk_sp::receive::scan_txouts`' `is_p2tr` filter
