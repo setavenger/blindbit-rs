@@ -132,19 +132,13 @@ pub fn spawn_oracle_poller(url: String, status: Arc<std::sync::Mutex<OracleStatu
     });
 }
 
-/// Count persisted wallet-owned outputs without making daemon startup depend
-/// on the state file being present or valid.
-pub(crate) fn owned_outputs_count(state_file: &std::path::Path) -> u64 {
-    std::fs::read(state_file)
-        .ok()
-        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok())
-        .and_then(|value| {
-            value
-                .get("owned_outputs")?
-                .as_array()
-                .map(|a| a.len() as u64)
-        })
-        .unwrap_or(0)
+/// The wallet-owned outputs (spent and unspent) of the restored scanner, the
+/// status count at startup. It does not depend on the state file being
+/// present, valid or current: restoring sets an unreadable file aside and
+/// starts empty, and rebuilds the records a state file written before they
+/// existed (or with bare-key entries) lacks.
+pub(crate) fn owned_outputs_count(scanner: &Scanner) -> u64 {
+    scanner.owned_outputs().count() as u64
 }
 
 /// Derive every configured label address. Label 0 is included because the
@@ -599,18 +593,50 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000002";
     const SPEND_PK: &str = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
 
-    #[test]
-    fn owned_outputs_count_tolerates_state_file_variants() {
-        let dir = temp_dir("owned-outputs");
-        let path = dir.join("state.json");
+    /// A state file written before owned outputs were recorded (format 0).
+    /// Its wallet received two outputs; the file has no records for them.
+    const STATE_BEFORE_OWNED_OUTPUTS: &str =
+        include_str!("../../../blindbit-lib/src/scanner/testdata/state_before_owned_outputs.json");
 
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, br#"{"other":[]}"#).unwrap();
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, br#"{"owned_outputs":["02aa","02bb"]}"#).unwrap();
-        assert_eq!(owned_outputs_count(&path), 2);
+    /// The startup count of owned outputs for a copy of `state` (`None`: no
+    /// file), restored the way the daemon does it at startup.
+    async fn startup_count(dir: &Path, state: Option<&[u8]>) -> u64 {
+        let path = dir.join("state.json");
+        let _ = std::fs::remove_file(&path);
+        if let Some(state) = state {
+            std::fs::write(&path, state).unwrap();
+        }
+        // load_scanner connects first; an oracle that accepts is enough.
+        let config = scanner::ScannerConfig::new(
+            silent_oracle(),
+            "127.0.0.1:1".parse().unwrap(),
+            SecretKey::from_str(SECRET_HEX).unwrap(),
+            PublicKey::from_str(SPEND_PK).unwrap(),
+            0,
+            path,
+            bitcoin_rev::Network::Regtest,
+        );
+        owned_outputs_count(&scanner::load_scanner(&config).await.unwrap())
+    }
+
+    /// The startup count never makes startup depend on the state file and
+    /// counts what the restored wallet holds, also for old state files.
+    #[tokio::test]
+    async fn owned_outputs_count_tolerates_state_file_variants() {
+        let dir = temp_dir("owned-outputs");
+
+        assert_eq!(startup_count(&dir, None).await, 0);
+        // Unreadable: set aside, the new scan starts empty.
+        assert_eq!(startup_count(&dir, Some(b"not json")).await, 0);
+        assert_eq!(startup_count(&dir, Some(br#"{"other":[]}"#)).await, 0);
+        // Format 0, no records: rebuilt on restore.
+        let old = STATE_BEFORE_OWNED_OUTPUTS.as_bytes();
+        assert_eq!(startup_count(&dir, Some(old)).await, 2);
+        // Bare-key entries of an older format: dropped, records rebuilt.
+        let mut bare_keys: serde_json::Value = serde_json::from_slice(old).unwrap();
+        bare_keys["owned_outputs"] = serde_json::json!(["02aa", "02bb", "02cc"]);
+        let bare_keys = serde_json::to_vec(&bare_keys).unwrap();
+        assert_eq!(startup_count(&dir, Some(&bare_keys)).await, 2);
     }
 
     #[test]
@@ -1307,8 +1333,9 @@ mod tests {
         );
     }
 
-    /// The URL of an oracle that accepts connections and never answers: a
-    /// new wallet's birthday lookup against it waits its full 15 s.
+    /// The URL of an oracle that accepts connections and never answers:
+    /// connecting succeeds, and a new wallet's birthday lookup against it
+    /// waits its full 15 s.
     fn silent_oracle() -> String {
         let oracle = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", oracle.local_addr().unwrap());
