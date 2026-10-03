@@ -6,11 +6,14 @@
 /// config key.
 pub const NETWORKS: [&str; 5] = ["bitcoin", "signet", "testnet", "testnet4", "regtest"];
 
+/// The hosted mainnet oracle, also the default `oracle_url`.
+pub(crate) const MAINNET_ORACLE_URL: &str = "https://oracle.setor.dev";
+
 /// The hosted BlindBit oracle for `network`, if one exists. Only mainnet
 /// and signet are hosted; other networks need a self-run oracle.
 pub fn hosted_oracle_url(network: &str) -> Option<&'static str> {
     match network {
-        "bitcoin" => Some("https://oracle.setor.dev"),
+        "bitcoin" => Some(MAINNET_ORACLE_URL),
         "signet" => Some("https://signet.oracle.setor.dev"),
         _ => None,
     }
