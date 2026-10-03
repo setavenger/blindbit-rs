@@ -967,20 +967,25 @@ impl Scanner {
         height: u32,
     ) {
         // Partial secrets only for the matched transactions in this block;
-        // each transaction's txid is computed once.
-        let matched: HashMap<Txid, PublicKey> = probable_match
-            .matched_txs
-            .iter()
-            .map(|(txid, tweak)| (byte_array_to_txid(txid), *tweak))
-            .collect();
-        let partial_secrets: HashMap<Txid, PublicKey> = block
-            .txdata
-            .iter()
-            .filter_map(|tx| {
-                let txid = tx.compute_txid();
-                matched.get(&txid).map(|tweak| (txid, *tweak))
-            })
-            .collect();
+        // each transaction's txid is computed once. A spend-only match has
+        // none, so nothing is hashed.
+        let partial_secrets: HashMap<Txid, PublicKey> = if probable_match.matched_txs.is_empty() {
+            HashMap::new()
+        } else {
+            let matched: HashMap<Txid, PublicKey> = probable_match
+                .matched_txs
+                .iter()
+                .map(|(txid, tweak)| (byte_array_to_txid(txid), *tweak))
+                .collect();
+            block
+                .txdata
+                .iter()
+                .filter_map(|tx| {
+                    let txid = tx.compute_txid();
+                    matched.get(&txid).map(|tweak| (txid, *tweak))
+                })
+                .collect()
+        };
         // Apply block to indexer and stage the changes
         let indexer_changes = self
             .internal_indexer
