@@ -6,7 +6,7 @@ authors.workspace = true
 description = "System tray companion app for the friglet daemon (Tauri v2)"
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = "2"
 
 [dependencies]
 friglet-ipc = { path = "../friglet-ipc" }
