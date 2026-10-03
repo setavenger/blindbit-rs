@@ -365,8 +365,10 @@ pub fn write_config_toml(path: &Path, cfg: &DaemonConfig) -> Result<(), String> 
 
 /// Write the scan-secret key file at `path` (0600 on Unix), creating parent
 /// directories as needed. With `overwrite = false` the call fails if the
-/// file already exists. Performs no validation of `secret_hex` itself —
-/// callers validate the key material.
+/// file already exists. With `overwrite = true` an existing key is replaced
+/// atomically (temp file + rename, like [`write_config_toml`]): a crash
+/// leaves the old key or the new one, never an empty file. Performs no
+/// validation of `secret_hex` itself — callers validate the key material.
 pub fn write_key_file(path: &Path, secret_hex: &str, overwrite: bool) -> Result<(), String> {
     let describe = |e: std::io::Error| format!("cannot write key file {}: {e}", path.display());
     if let Some(parent) = path.parent()
@@ -374,33 +376,46 @@ pub fn write_key_file(path: &Path, secret_hex: &str, overwrite: bool) -> Result<
     {
         std::fs::create_dir_all(parent).map_err(describe)?;
     }
+    let contents = format!("{secret_hex}\n");
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
+    if !overwrite {
+        let mut file =
+            open_key_file(path, std::fs::OpenOptions::new().create_new(true)).map_err(describe)?;
+        return file.write_all(contents.as_bytes()).map_err(describe);
     }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = open_key_file(
+        &tmp,
+        std::fs::OpenOptions::new().create(true).truncate(true),
+    )
+    .map_err(describe)?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(describe)?;
+    std::fs::rename(&tmp, path).map_err(describe)
+}
+
+/// Open a key file for writing, owner-only (0600) on Unix. On Windows the
+/// file inherits the profile directory's default ACL, which restricts access
+/// to the owning user — no tighter per-file ceiling is set.
+fn open_key_file(path: &Path, options: &mut std::fs::OpenOptions) -> io::Result<std::fs::File> {
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // On Windows the file inherits the profile directory's default ACL, which
-    // restricts access to the owning user — no tighter per-file ceiling is set.
-    let mut file = options.open(path).map_err(describe)?;
-    // `mode(0o600)` only applies on creation; enforce it when replacing a
-    // pre-existing key file too.
+    let file = options.open(path)?;
+    // `mode(0o600)` only applies on creation; enforce it on a file that was
+    // already there too (a temp file left by a crash).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(describe)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(secret_hex.as_bytes()).map_err(describe)?;
-    file.write_all(b"\n").map_err(describe)?;
-    Ok(())
+    Ok(file)
 }
 
 fn socket_name(path: &str) -> io::Result<Name<'_>> {
@@ -672,6 +687,46 @@ mod tests {
         assert!(write_key_file(&path, "bb", false).is_err());
         write_key_file(&path, "bb", true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "bb\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replacing the key never leaves the file empty or half written, which
+    /// is what a crash in the middle of a replace would leave behind: a
+    /// reader running alongside only ever sees the old key or the new one.
+    /// (POSIX rename; Windows does not promise it to concurrent readers.)
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_key_file_never_exposes_an_empty_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = temp_dir("key-file-atomic");
+        let path = dir.join("scan.key");
+        let (old, new) = ("aa".repeat(32), "bb".repeat(32));
+        write_key_file(&path, &old, false).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            let valid = [format!("{old}\n"), format!("{new}\n")];
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(valid.contains(&text), "a reader saw {text:?}");
+                }
+            })
+        };
+        for i in 0..200 {
+            write_key_file(&path, if i % 2 == 0 { &new } else { &old }, true).unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        reader.join().expect("the reader only saw whole keys");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{old}\n"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!dir.join("scan.key.tmp").exists(), "temp file renamed away");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
