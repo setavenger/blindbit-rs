@@ -67,22 +67,3 @@ impl ScannerConfig {
         Ok(())
     }
 }
-
-// impl Default for ScannerConfig {
-//     /// Default configuration with placeholder values
-//     ///
-//     /// Note: The crypto keys are placeholder values and should be set explicitly
-//     /// for real usage. This is primarily for testing and development.
-//     fn default() -> Self {
-//         Self {
-//             oracle_url: "https://oracle.setor.dev".to_string(),
-//             p2p_socket_addr: "127.0.0.1:8333".parse().unwrap(),
-//             // Placeholder values - should be set explicitly in real usage
-//             secret_scan: SecretKey::from_slice(&[1u8; 32]).unwrap(),
-//             public_spend: PublicKey::from_slice(&[2u8; 33]).unwrap(),
-//             max_label_num: 0,
-//             state_file: PathBuf::from("scanner_state.json"),
-//             network: Network::Bitcoin,
-//         }
-//     }
-// }
