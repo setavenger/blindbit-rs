@@ -52,7 +52,7 @@ const DAEMON_EXE: &str = if cfg!(windows) {
 /// The spawned daemon's most recent stdout/stderr lines (ANSI-stripped).
 pub type RecentOutput = Arc<StdMutex<VecDeque<String>>>;
 
-/// Outcome of [`attach_or_spawn`].
+/// Outcome of [`attach_spawn_or_setup_with`].
 #[derive(Debug)]
 pub enum Attachment {
     /// A daemon was already listening on the control socket; carries its
@@ -68,38 +68,6 @@ pub enum Attachment {
     SetupRequired,
     /// No daemon was reachable and we could not bring one up.
     Unreachable { reason: String },
-}
-
-/// The attach-vs-spawn decision, factored out for unit tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Attach,
-    Spawn,
-}
-
-pub fn decide(probe_succeeded: bool) -> Action {
-    if probe_succeeded {
-        Action::Attach
-    } else {
-        Action::Spawn
-    }
-}
-
-/// What Quit should do, given who started the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuitAction {
-    /// Tray spawned the daemon → shut it down before exiting.
-    ShutdownDaemon,
-    /// Tray attached to an externally started daemon → leave it running.
-    LeaveRunning,
-}
-
-pub fn quit_action(spawned_by_tray: bool) -> QuitAction {
-    if spawned_by_tray {
-        QuitAction::ShutdownDaemon
-    } else {
-        QuitAction::LeaveRunning
-    }
 }
 
 /// Try to connect to `socket_path` and get a `GetStatus` answer within
@@ -301,14 +269,8 @@ pub fn recent_output_tail(recent_output: &StdMutex<VecDeque<String>>) -> String 
         .join(" | ")
 }
 
-/// Attach to a running daemon, or spawn one and wait for its socket.
-///
-/// Uses the real environment to locate the binary; `attach_or_spawn_with`
-/// takes the locator as a parameter for tests.
-pub async fn attach_or_spawn(socket_path: &str) -> Attachment {
-    attach_or_spawn_with(socket_path, locate_daemon_binary_from_env).await
-}
-
+/// Attach to a running daemon, or spawn the binary `locate` finds and wait
+/// for its socket.
 pub async fn attach_or_spawn_with<F>(socket_path: &str, locate: F) -> Attachment
 where
     F: FnOnce() -> Option<PathBuf>,
@@ -492,7 +454,7 @@ pub async fn stop_daemon(
 /// Prefers a graceful `Shutdown` over the socket; falls back to killing the
 /// child process when the socket is dead but a child handle is still held.
 pub async fn perform_quit(socket_path: &str, spawned_by_tray: bool, child: Option<Child>) {
-    if quit_action(spawned_by_tray) == QuitAction::LeaveRunning {
+    if !spawned_by_tray {
         return;
     }
     let acked = shutdown_via_socket(socket_path, PROBE_TIMEOUT).await;
@@ -663,18 +625,6 @@ mod tests {
             std::env::temp_dir().join(format!("friglet-tray-test-{}-{tag}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn decide_attaches_when_probe_succeeds() {
-        assert_eq!(decide(true), Action::Attach);
-        assert_eq!(decide(false), Action::Spawn);
-    }
-
-    #[test]
-    fn quit_rule_single_boolean() {
-        assert_eq!(quit_action(true), QuitAction::ShutdownDaemon);
-        assert_eq!(quit_action(false), QuitAction::LeaveRunning);
     }
 
     #[test]
