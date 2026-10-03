@@ -23,6 +23,7 @@ const ENV_SPEND_PUBKEY: &str = "FRIGLET_SPEND_PUBKEY";
 const ENV_SCAN_SECRET: &str = "FRIGLET_SCAN_SECRET";
 const ENV_START_AT_TIP: &str = "FRIGLET_START_AT_TIP";
 const ENV_DESCRIPTOR: &str = "FRIGLET_DESCRIPTOR";
+const ENV_CONTROL_SOCKET: &str = "FRIGLET_CONTROL_SOCKET";
 
 /// Is the daemon plausibly configured, i.e. is spawning it likely to get
 /// past `missing required setting ...`? Conservative merged view:
@@ -97,6 +98,28 @@ pub fn is_configured_from_env() -> bool {
         friglet_ipc::default_key_file().as_deref(),
         &|key| std::env::var(key).ok(),
     )
+}
+
+/// The control socket a daemon started with this config file and
+/// environment listens on, in the daemon's own order (its env layer is merged
+/// over the file): `FRIGLET_CONTROL_SOCKET`, then the file's
+/// `control_socket`, then [`friglet_ipc::default_socket_path`]. A file that
+/// is missing or does not parse counts as not setting it. Only the first
+/// step uses `env`: the final fallback, `default_socket_path`, reads the real
+/// `FRIGLET_CONTROL_SOCKET` again.
+pub fn control_socket_path(
+    config_path: Option<&Path>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    env(ENV_CONTROL_SOCKET)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            config_path
+                .filter(|p| p.exists())
+                .and_then(|p| friglet_ipc::read_config_toml(p).ok())
+                .and_then(|cfg| cfg.control_socket)
+        })
+        .unwrap_or_else(friglet_ipc::default_socket_path)
 }
 
 /// What the tray shows after a descriptor is pasted: everything derived
@@ -703,5 +726,43 @@ mod tests {
 
         // The pair now passes the configured check.
         assert!(is_configured(Some(&config_path), None, &no_env));
+    }
+
+    #[test]
+    fn control_socket_follows_the_daemons_order() {
+        let dir = temp_dir("control-socket");
+        let config = dir.join("config.toml");
+
+        // No config file, no env: the platform default.
+        assert_eq!(
+            control_socket_path(Some(&config), &no_env),
+            friglet_ipc::default_socket_path()
+        );
+
+        // The config key, as the daemon would use it.
+        fs::write(&config, "control_socket = \"/tmp/from-config.sock\"\n").unwrap();
+        assert_eq!(
+            control_socket_path(Some(&config), &no_env),
+            "/tmp/from-config.sock"
+        );
+
+        // The env variable beats the config key, as in the daemon.
+        let env = |key: &str| (key == ENV_CONTROL_SOCKET).then(|| "/tmp/from-env.sock".to_string());
+        assert_eq!(
+            control_socket_path(Some(&config), &env),
+            "/tmp/from-env.sock"
+        );
+
+        // A config without the key, or one that does not parse: the default.
+        fs::write(&config, complete_toml()).unwrap();
+        assert_eq!(
+            control_socket_path(Some(&config), &no_env),
+            friglet_ipc::default_socket_path()
+        );
+        fs::write(&config, "control_socket = [").unwrap();
+        assert_eq!(
+            control_socket_path(Some(&config), &no_env),
+            friglet_ipc::default_socket_path()
+        );
     }
 }
