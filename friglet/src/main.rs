@@ -91,7 +91,7 @@ fn main() {
             }
             Err(e) => {
                 if LOG_FILE.get().is_some() {
-                    // Goes to stderr and the log file.
+                    // Goes to stdout and the log file.
                     tracing::error!("friglet exited with an error: {e}");
                 } else {
                     eprintln!("Error: {e}");
@@ -112,9 +112,9 @@ static LOG_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Set up logging once per process; later calls (after the config is read,
 /// and on in-process restarts) only swap the filter so `log_level` takes
-/// effect. `RUST_LOG` takes precedence over `log_level`. Lines go to stderr
-/// — colour only when it is a TTY, so a tray-piped daemon never emits ANSI
-/// into the capture pipe — and to the log file
+/// effect. `RUST_LOG` takes precedence over `log_level`. Lines go to stdout
+/// — colour only when stdout is a TTY, so a tray-piped or redirected daemon
+/// never writes ANSI escapes into the pipe or file — and to the log file
 /// (`friglet_ipc::logfile::daemon_log_file`).
 fn init_logging(log_level: &str) {
     use tracing_subscriber::layer::SubscriberExt;
@@ -145,7 +145,8 @@ fn init_logging(log_level: &str) {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+                .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+                .with_writer(std::io::stdout),
         )
         .with(file_layer)
         .init();
