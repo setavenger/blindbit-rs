@@ -23,7 +23,7 @@ use super::reorg::{
     BlockCheck, OracleView, POST_STREAM_CHECK, ReorgBelowStreamStart, ReorgTooDeep,
     block_hash_from_oracle,
 };
-use super::scanner::Scanner;
+use super::scanner::{Scanner, genesis_hash};
 use super::types::ProbableMatch;
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
 use super::ScannerError;
@@ -368,13 +368,9 @@ impl Scanner {
             }
         }
 
-        let genesis_hash = BlockHash::from_byte_array(
-            indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
-        );
-
         let mut last_block_id: BlockId = BlockId {
             height: 0,
-            hash: genesis_hash,
+            hash: genesis_hash(),
         };
 
         let mut expected_height = first;

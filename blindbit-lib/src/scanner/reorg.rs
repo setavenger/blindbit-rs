@@ -44,11 +44,10 @@ use std::collections::BTreeSet;
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Txid};
 use indexer::bdk_chain::ConfirmationBlockTime;
-use indexer::v2::SpIndexerV2;
 
 use super::ScannerError;
 use super::health::OracleProbe;
-use super::scanner::Scanner;
+use super::scanner::{Scanner, restored_indexer};
 
 /// How many of the most recent scanned heights keep their block hash, and so
 /// the deepest reorganisation the scanner can roll back by itself.
@@ -151,12 +150,15 @@ impl Scanner {
             .map(|height| u64::from(*height))
     }
 
+    /// The hash remembered for the block scanned at `height`, if any.
+    fn remembered_hash(&self, height: u64) -> Option<BlockHash> {
+        let height = u32::try_from(height).ok()?;
+        self.scanned_block_hashes.get(&height).copied()
+    }
+
     pub(crate) fn check_block_hash(&self, height: u64, hash: &BlockHash) -> BlockCheck {
-        match u32::try_from(height)
-            .ok()
-            .and_then(|height| self.scanned_block_hashes.get(&height))
-        {
-            Some(known) if known != hash => BlockCheck::Reorganised,
+        match self.remembered_hash(height) {
+            Some(known) if known != *hash => BlockCheck::Reorganised,
             _ => BlockCheck::Consistent,
         }
     }
@@ -191,11 +193,7 @@ impl Scanner {
         oracle: &mut P,
         height: u64,
     ) -> Result<OracleView, ScannerError> {
-        let Some(known) = u32::try_from(height)
-            .ok()
-            .and_then(|height| self.scanned_block_hashes.get(&height))
-            .copied()
-        else {
+        let Some(known) = self.remembered_hash(height) else {
             return Ok(OracleView::Unknown);
         };
         Ok(match oracle.block_hash_at(height).await? {
@@ -271,15 +269,8 @@ impl Scanner {
         let spend_pk = *self.internal_indexer.spend_pk();
         self.stage.indexer.scan_sk = Some(scan_sk);
         self.stage.indexer.spend_pk = Some(spend_pk);
-        let mut indexer = SpIndexerV2::<ConfirmationBlockTime>::new(scan_sk, spend_pk);
-        // Labels first: applying the changeset re-runs the BIP-352 scan of
-        // every stored transaction, which needs them (as on restore).
-        _ = indexer.add_label(0);
-        for m in 1..=self.max_label_num {
-            _ = indexer.add_label(m);
-        }
-        indexer.apply_changeset(self.stage.indexer.clone());
-        self.internal_indexer = indexer;
+        self.internal_indexer =
+            restored_indexer(scan_sk, spend_pk, self.max_label_num, self.stage.indexer.clone());
 
         // Owned-output records and spent marks are derived from the graph;
         // rebuild them so no record or spend from a disconnected block stays.
@@ -293,9 +284,8 @@ impl Scanner {
         self.scanned_block_hashes.split_off(&(fork + 1));
         self.last_scanned_block_height = self.last_scanned_block_height.min(fork_height);
         self.stage.last_scanned_block_height = self.last_scanned_block_height;
-        self.last_scanned_block_height_rescan =
-            self.last_scanned_block_height_rescan.min(fork_height);
-        self.stage.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
+        self.stage.last_scanned_block_height_rescan =
+            self.stage.last_scanned_block_height_rescan.min(fork_height);
 
         // Electrum view: history, SP history, raw txs and headers of the
         // disconnected blocks. Unconfirmed (height 0) entries stay.
