@@ -241,10 +241,6 @@ async fn run(
         control::wallet_network(cfg.network),
         cfg.raw.max_label_num,
     );
-    let outputs_found = Arc::new(AtomicU64::new(control::owned_outputs_count(
-        &cfg.state_file,
-    )));
-
     // blindbit-lib persists the scan secret inside the state JSON (see
     // config::tighten_state_file_perms), so keep the file owner-only.
     config::tighten_state_file_perms(&cfg.state_file);
@@ -269,6 +265,9 @@ async fn run(
     );
 
     let loaded_scanner = scanner::load_scanner(&scanner_config).await?;
+    let outputs_found = Arc::new(AtomicU64::new(control::owned_outputs_count(
+        &loaded_scanner,
+    )));
 
     // Pre-populate the Electrum index from the persisted BDK graph so that
     // Sparrow can immediately fetch wallet history after a restart.
