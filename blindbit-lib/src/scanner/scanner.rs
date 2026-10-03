@@ -22,7 +22,6 @@ use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
-use super::config::ScannerConfig;
 use super::types::OwnedOutputRecord;
 use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
 use super::ScannerError;
@@ -47,14 +46,6 @@ pub struct Scanner {
 
     /// sends notification when a new utxo is found
     pub(crate) notify_found_utxos: broadcast::Sender<usize>,
-
-    /// probabilistic matches found both used for found utxos and spent outpoints
-    /// send the txid of the transaction that is of interest
-    pub(crate) notify_probabilistic_matches: broadcast::Sender<[u8; 32]>,
-
-    /// sends notification when a pubkey was probably spent
-    /// contains the blockhash which needs to be verified to assert an actual match
-    pub(crate) notify_spent_outpoints: broadcast::Sender<[u8; 32]>,
 
     /// the last block height that was scanned
     pub(crate) last_scanned_block_height: u64,
@@ -100,7 +91,7 @@ pub struct Scanner {
     pub(crate) p2p_retry: p2p::RetryPolicy,
 
     /// Rounds of failed fetches of the block the scan is stuck on, across
-    /// `watch_chain` polls.
+    /// `watch_chain_until` polls.
     pub(crate) fetch_backoff: p2p::FetchBackoff,
 
     /// When to next try restoring the witness data of wallet transactions
@@ -172,9 +163,7 @@ impl Scanner {
             p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
             block_checkpoints,
-            notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
-            notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: 0,
             last_scanned_block_height_rescan: 0,
             owned_outputs: BTreeMap::new(),
@@ -198,35 +187,9 @@ impl Scanner {
         }
     }
 
-    /// Create a new Scanner from configuration
-    ///
-    /// This is a convenience constructor that takes a ScannerConfig instead of
-    /// individual parameters. The Oracle client will be created automatically.
-    pub async fn from_config(config: &ScannerConfig) -> Result<Self, ScannerError> {
-        // Validate configuration
-        config.validate()?;
-
-        // Connect to oracle service
-        let client = OracleServiceClient::connect(config.oracle_url.clone()).await?;
-
-        Ok(Self::new(
-            client,
-            config.p2p_socket_addr,
-            config.secret_scan,
-            config.public_spend,
-            config.max_label_num,
-            config.state_file.clone(),
-            config.network,
-        ))
-    }
-
     /// get the last block height that was scanned
     pub fn get_last_scanned_block_height(&self) -> u64 {
         self.last_scanned_block_height
-    }
-
-    pub fn get_last_scanned_block_height_rescan(&self) -> u64 {
-        self.last_scanned_block_height_rescan
     }
 
     pub fn get_scanner_sp_address(&self) -> String {
@@ -260,25 +223,6 @@ impl Scanner {
 
         txs
     }
-
-    // pub fn get_outputs(&self) -> Vec<OwnedOutput> {
-    //     let mut outputs: Vec<OwnedOutput> = Vec::new();
-    //     self.internal_indexer.index().index_spout(outpoint, spout);
-    //     self.internal_indexer.index().txid_to_partial_secret
-    //         outputs.push(OwnedOutput {
-    //             outpoint: OutPoint {
-    //                 txid: inner_tx.txid,
-    //                 vout: 0,
-    //             },
-    //             blockheight: Height::from_consensus(anchor.block_id.height).unwrap(),
-    //             tweak: shared_secret_tx.to_x_only_pubkey().serialize(),
-    //             amount: Amount::from_sat(0),
-    //             script: ScriptBuf::new(),
-    //             label: None,
-    //             spent: None,
-    //         });
-    //     outputs
-    // }
 
     /// Returns a cloned Arc to the wallet-scoped Electrum index.
     /// The Electrum TCP server holds this Arc and serves requests without
@@ -425,21 +369,11 @@ impl Scanner {
         self.notify_found_utxos.subscribe()
     }
 
-    /// subscribe to notifications when a new outpoint is spent
-    pub fn subscribe_to_spent_outpoints(&self) -> broadcast::Receiver<[u8; 32]> {
-        self.notify_spent_outpoints.subscribe()
-    }
-
     /// subscribe to chain reorganisations: each message is the fork height
     /// the wallet state was rolled back to (everything above it was dropped
     /// and is rescanned from the oracle's current chain)
     pub fn subscribe_to_reorgs(&self) -> broadcast::Receiver<u32> {
         self.notify_reorg.subscribe()
-    }
-
-    /// subscribe to notifications when a probabilistic match is found
-    pub fn subscribe_to_probabilistic_matches(&self) -> broadcast::Receiver<[u8; 32]> {
-        self.notify_probabilistic_matches.subscribe()
     }
 
     /// All wallet-owned outputs found so far (spent and unspent), in outpoint
@@ -600,36 +534,6 @@ impl Scanner {
         }
     }
 
-    /// Returns an optional mutable reference to the currently staged [`ChangeSet`].
-    ///
-    /// # Returns
-    ///
-    /// `Some(&mut ChangeSet)` if changes are staged, `None` otherwise.
-    pub fn staged_mut(&mut self) -> Option<&mut ChangeSet> {
-        if self.stage.is_empty() {
-            None
-        } else {
-            Some(&mut self.stage)
-        }
-    }
-
-    /// Takes ownership of the currently staged [`ChangeSet`], leaving an empty [`ChangeSet`] in its place.
-    ///
-    /// This is useful for atomically applying or persisting the staged changes.
-    ///
-    /// # Returns
-    ///
-    /// `Some(ChangeSet)` if changes were staged, `None` otherwise.
-    pub fn take_staged(&mut self) -> Option<ChangeSet> {
-        if self.stage.is_empty() {
-            None
-        } else {
-            let changes = self.stage.clone();
-            self.stage = ChangeSet::default();
-            Some(changes)
-        }
-    }
-
     /// Save the current staged changes to a file using JSON serialization.
     ///
     /// This saves the ChangeSet which contains all the indexer and chain state changes.
@@ -649,24 +553,9 @@ impl Scanner {
             }
         }
 
-        // Ensure we have the keys in the changeset for reconstruction
+        // The keys and `max_label_num` are in `stage` from construction on
+        // (`new` / `from_changeset`), and merging never clears them.
         let mut changeset = self.stage.clone();
-        if changeset.secret_scan_hex.is_none() {
-            let secret_scan_bytes: [u8; 32] = self.internal_indexer.scan_sk().secret_bytes();
-            changeset.secret_scan_hex = Some(hex::encode(secret_scan_bytes));
-        }
-        if changeset.public_spend_hex.is_none() {
-            let public_spend_bytes = self.internal_indexer.spend_pk().serialize();
-            changeset.public_spend_hex = Some(hex::encode(&public_spend_bytes));
-        }
-        if changeset.max_label_num == 0 {
-            let label_count = self.internal_indexer.index().label_lookup.len();
-            changeset.max_label_num = if label_count > 0 {
-                (label_count - 1) as u32
-            } else {
-                0
-            };
-        }
         changeset.last_scanned_block_height = self.last_scanned_block_height;
         changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
         changeset.owned_outputs = self.owned_outputs.values().cloned().collect();
@@ -795,9 +684,7 @@ impl Scanner {
             p2p_peer: p2p_socket_addr,
             internal_indexer: indexer,
             block_checkpoints,
-            notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
-            notify_spent_outpoints: broadcast::channel(100).0,
             last_scanned_block_height: changeset.last_scanned_block_height,
             last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
             owned_outputs,
