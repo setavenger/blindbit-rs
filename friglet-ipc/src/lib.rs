@@ -1,5 +1,5 @@
-//! IPC protocol shared between the friglet daemon and its clients (tray UI,
-//! `frigletctl`-style tools, tests).
+//! IPC protocol shared between the friglet daemon and its clients (the tray
+//! UI, tests).
 //!
 //! # Wire format
 //!
@@ -66,7 +66,10 @@ pub struct DaemonConfig {
     pub electrum_addr: String,
     /// Path for scanner state persistence. Defaults to
     /// [`default_state_file`] (`<platform config dir>/friglet/scanner_state.json`)
-    /// when a config dir exists, else the relative `scanner_state.json`.
+    /// when a config dir exists, else the relative `scanner_state.json`. With
+    /// the default, the daemon keeps one file per wallet beside it
+    /// (`scanner_state-<network>-<wallet id>.json`); any other path is used
+    /// as is.
     pub state_file: PathBuf,
     /// Default log level when RUST_LOG is not set.
     pub log_level: String,
@@ -81,7 +84,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             network: "bitcoin".to_string(),
-            oracle_url: "https://oracle.setor.dev".to_string(),
+            oracle_url: network::MAINNET_ORACLE_URL.to_string(),
             p2p_node_addr: None,
             start_height: None,
             start_at_tip: false,
@@ -135,7 +138,8 @@ pub enum Response {
     Status(StatusInfo),
     Ok,
     /// Success, plus a human-readable note the client should surface (e.g.
-    /// which changed settings need a daemon restart to take effect).
+    /// that the daemon restarts to apply new settings, or that scanning is
+    /// still stopping).
     OkWithNote(String),
     Config(DaemonConfig),
     Error(String),
@@ -155,7 +159,8 @@ pub struct StatusInfo {
     pub network: String,
     /// Number of currently connected Electrum clients.
     pub electrum_clients: u64,
-    /// True when an oracle tip was fetched successfully within the cache TTL.
+    /// True when the daemon's last oracle tip poll succeeded within the last
+    /// 30 s.
     pub oracle_connected: bool,
     pub last_error: Option<String>,
     /// Silent Payments address of the wallet, once known.
@@ -433,7 +438,7 @@ pub async fn connect_stream(path: &str) -> io::Result<Stream> {
 }
 
 /// Serialize `msg` as one JSON line and write it to `writer`.
-pub async fn write_message<W, T>(writer: &mut W, msg: &T) -> io::Result<()>
+async fn write_message<W, T>(writer: &mut W, msg: &T) -> io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
@@ -444,7 +449,7 @@ where
 }
 
 /// Read one JSON-line message from `reader`. Returns `None` on clean EOF.
-pub async fn read_message<R, T>(reader: &mut R) -> io::Result<Option<T>>
+async fn read_message<R, T>(reader: &mut R) -> io::Result<Option<T>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
     T: DeserializeOwned,
