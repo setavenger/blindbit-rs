@@ -68,7 +68,7 @@ impl Scanner {
     }
 
     /// Put back the witnesses of wallet transactions stored without them,
-    /// once: called on every `watch_chain` poll, it does nothing once a pass
+    /// once: called on every `watch_chain_until` poll, it does nothing once a pass
     /// has finished, and after a block could not be fetched it waits 5 min
     /// before trying again. A pass cut short by a stop is taken up again as
     /// soon as scanning resumes.

@@ -17,9 +17,10 @@ use bitcoin::{
 use bitcoin_rev::Network;
 
 use super::p2p::{BlockFetcher, FetchFailure};
-use super::p2p_tests::{Conn, Node, OneBlock, fast};
+use super::p2p_tests::{Conn, Node, OneBlock, fast, stripped};
 use super::scanner::Scanner;
-use super::stream_safety_tests::{keys, run, scanner, secret, serve, unserve};
+use super::stream_safety_tests::{serve, unserve};
+use super::test_support::{keys, run, scanner, secret};
 use super::witness::lacks_witness;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
@@ -111,16 +112,6 @@ fn taproot_payment_block(seed: u8) -> (Block, Transaction, BlockScanDataShortRes
     (block, payment, message)
 }
 
-fn stripped(block: &Block) -> Block {
-    let mut block = block.clone();
-    for tx in &mut block.txdata {
-        for input in &mut tx.input {
-            input.witness.clear();
-        }
-    }
-    block
-}
-
 /// The raw transaction `blockchain.transaction.get` would serve for `txid`.
 async fn served_raw(scanner: &Scanner, txid: Txid) -> Option<Vec<u8>> {
     scanner
@@ -136,32 +127,9 @@ async fn served_raw(scanner: &Scanner, txid: Txid) -> Option<Vec<u8>> {
 /// Electrum index rebuilt from the graph.
 #[cfg(feature = "serde")]
 async fn restart(path: &std::path::Path) -> Scanner {
-    let changeset = Scanner::load_from_file(path).expect("load state");
-    let restarted = Scanner::from_changeset(
-        crate::OracleServiceClient::new(
-            tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy(),
-        ),
-        "127.0.0.1:1".parse().unwrap(),
-        changeset,
-        path.to_path_buf(),
-        Network::Regtest,
-    )
-    .expect("restore");
+    let restarted = super::test_support::restore_from(path);
     restarted.rebuild_electrum_index_from_graph(1).await;
     restarted
-}
-
-#[test]
-fn a_fetched_block_keeps_its_witnesses() {
-    let (block, payment, _) = taproot_payment_block(0x91);
-    // The node serves witnesses only to a MSG_WITNESS_BLOCK request.
-    let node = Node::serving(&block, vec![Conn::Serve]);
-    let got = run(BlockFetcher::new(node.addr, Network::Regtest)
-        .with_policy(fast(1))
-        .fetch(block.block_hash(), 1))
-    .expect("served");
-    assert_eq!(got, block);
-    assert_eq!(got.txdata[1].compute_wtxid(), payment.compute_wtxid());
 }
 
 #[test]
@@ -194,7 +162,7 @@ fn a_served_taproot_tx_round_trips_with_its_witness() {
         let (block, payment, message) = taproot_payment_block(0x93);
         let txid = payment.compute_txid();
         let node = Node::serving(&block, vec![Conn::Serve]);
-        let (mut scanner, _state) = scanner("witness-roundtrip", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("witness-roundtrip");
         scanner.p2p_peer = node.addr;
         scanner.p2p_retry = fast(1);
 
@@ -230,7 +198,7 @@ fn wallet_txs_stored_without_witnesses_get_them_back() {
 
         // Scanned before friglet asked for witness blocks.
         serve(&without);
-        let (mut scanner, _state) = scanner("witness-restore", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("witness-restore");
         assert!(!scanner.watch_step(1, OneBlock(message)).await);
         unserve(&block.block_hash());
         let stored = scanner
@@ -292,7 +260,7 @@ fn a_stop_during_a_witness_restore_retries_it_when_scanning_resumes() {
         let (block, payment, message) = taproot_payment_block(0x96);
         let txid = payment.compute_txid();
         serve(&stripped(&block));
-        let (mut scanner, _state) = scanner("witness-restore-stop", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("witness-restore-stop");
         assert!(!scanner.watch_step(1, OneBlock(message)).await);
         unserve(&block.block_hash());
         let node = Node::serving(&block, vec![Conn::StallMidBlock, Conn::Serve]);

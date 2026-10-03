@@ -26,15 +26,16 @@ use super::ScannerError;
 use super::health::OracleProbe;
 use super::p2p::{BlockFetchError, BlockFetcher, FetchBackoff, FetchFailure, RetryPolicy};
 use super::scanning::BlockStreamSource;
-use super::stream_safety_tests::{TestStream, payment_block, run, scanner};
+use super::stream_safety_tests::{TestStream, payment_block};
+use super::test_support::{run, scanner};
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Conn {
-    /// Close right after the handshake, as a node that evicts, bans or
-    /// disconnects friglet does.
-    CloseAfterHandshake,
+    /// Close after receiving the block request, as a node that evicts, bans
+    /// or disconnects friglet does.
+    CloseAfterRequest,
     /// Start sending the block and close halfway through it.
     CloseMidBlock,
     /// Start sending the block and go silent halfway through it, keeping
@@ -46,7 +47,8 @@ pub(super) enum Conn {
     /// Serve the block without its witnesses whatever was asked.
     ServeStripped,
     NotFound,
-    /// Never answer the request.
+    /// Never answer the request (pings still get their pong, as from
+    /// Bitcoin Core).
     Ignore,
     /// Answer in another network's P2P protocol.
     Magic(Network),
@@ -72,45 +74,42 @@ struct Served {
 
 impl Served {
     fn new(block: &Block) -> Self {
-        let mut stripped = block.clone();
-        for tx in &mut stripped.txdata {
-            for input in &mut tx.input {
-                input.witness.clear();
-            }
-        }
         let wire = |block: &Block| -> bitcoin_rev::Block {
             encode::deserialize(&bitcoin::consensus::encode::serialize(block)).unwrap()
         };
         Self {
             full: wire(block),
-            stripped: wire(&stripped),
+            stripped: wire(&stripped(block)),
         }
     }
 }
 
+/// `block` with every input's witness removed.
+pub(super) fn stripped(block: &Block) -> Block {
+    let mut block = block.clone();
+    for tx in &mut block.txdata {
+        for input in &mut tx.input {
+            input.witness.clear();
+        }
+    }
+    block
+}
+
 impl Node {
-    /// A node advertising `services` and `height` that handles one
-    /// connection after another as `script` says, then stops listening.
-    fn spawn(services: ServiceFlags, height: i32, script: Vec<Conn>) -> Self {
-        Self::spawn_serving(services, height, &block(), script)
+    /// A full node at `height` serving the default block.
+    pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
+        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, height, &block(), script)
     }
 
     /// A full node at height 1,000 serving `block`.
     pub(super) fn serving(block: &Block, script: Vec<Conn>) -> Self {
-        Self::spawn_serving(
-            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            1_000,
-            block,
-            script,
-        )
+        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, 1_000, block, script)
     }
 
-    fn spawn_serving(
-        services: ServiceFlags,
-        height: i32,
-        block: &Block,
-        script: Vec<Conn>,
-    ) -> Self {
+    /// A node advertising `services` and `height` and serving `block` that
+    /// handles one connection after another as `script` says, then stops
+    /// listening.
+    fn spawn(services: ServiceFlags, height: i32, block: &Block, script: Vec<Conn>) -> Self {
         let served = Served::new(block);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -132,14 +131,6 @@ impl Node {
             connections,
             stalled,
         }
-    }
-
-    pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
-        Self::spawn(
-            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            height,
-            script,
-        )
     }
 
     pub(super) fn connections(&self) -> usize {
@@ -254,9 +245,6 @@ fn serve(
     wire.send(NetworkMessage::Verack)?;
     while !matches!(wire.recv()?, NetworkMessage::Verack) {}
     wire.send(NetworkMessage::Ping(1))?;
-    if let Conn::CloseAfterHandshake = conn {
-        return Ok(());
-    }
     let items = loop {
         if let NetworkMessage::GetData(items) = wire.recv()? {
             break items;
@@ -269,6 +257,7 @@ fn serve(
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(InventoryPayload(items.0)))?,
+        Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(
                 magic,
@@ -286,6 +275,11 @@ fn serve(
             wire.stream.flush()?;
             *stalled.lock().unwrap() = Some(Instant::now());
         }
+        Conn::Ignore => loop {
+            if let NetworkMessage::Ping(nonce) = wire.recv()? {
+                wire.send(NetworkMessage::Pong(nonce))?;
+            }
+        },
         _ => {}
     }
     wire.drain()
@@ -311,7 +305,7 @@ fn fetch(node: &Node, policy: RetryPolicy, height: u64) -> Result<Block, Box<Blo
 fn a_dropped_connection_is_retried_on_a_fresh_one() {
     let node = Node::full(
         200,
-        vec![Conn::CloseMidBlock, Conn::CloseAfterHandshake, Conn::Serve],
+        vec![Conn::CloseMidBlock, Conn::CloseAfterRequest, Conn::Serve],
     );
     let got = fetch(&node, fast(5), 0).expect("third connection serves the block");
     assert_eq!(got.block_hash(), block().block_hash());
@@ -322,7 +316,7 @@ fn a_dropped_connection_is_retried_on_a_fresh_one() {
 fn a_node_that_drops_every_connection_says_how_to_fix_it() {
     // The mainnet failure: the node accepts each connection and closes it
     // again before the block arrives.
-    let node = Node::full(50_000, vec![Conn::CloseAfterHandshake; 3]);
+    let node = Node::full(50_000, vec![Conn::CloseAfterRequest; 3]);
     let err = fetch(&node, fast(3), 2_000).expect_err("never served");
     assert_eq!(node.connections(), 3, "every attempt is a fresh connection");
     assert_eq!(err.attempts, 3);
@@ -421,7 +415,7 @@ fn a_mainnet_scan_pointed_at_a_signet_port_is_told_so() {
 
 #[test]
 fn a_recent_block_does_not_blame_the_upload_limit() {
-    let node = Node::full(1_000, vec![Conn::CloseAfterHandshake; 2]);
+    let node = Node::full(1_000, vec![Conn::CloseAfterRequest; 2]);
     let message = fetch(&node, fast(2), 990)
         .expect_err("never served")
         .to_string();
@@ -434,7 +428,8 @@ fn a_pruned_node_is_named_as_pruned() {
     let node = Node::spawn(
         ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
         10_000,
-        vec![Conn::CloseAfterHandshake; 2],
+        &block(),
+        vec![Conn::CloseAfterRequest; 2],
     );
     let message = fetch(&node, fast(2), 100)
         .expect_err("never served")
@@ -478,11 +473,54 @@ fn a_silent_node_behind_the_block_is_reported_as_syncing() {
     );
     assert_eq!(err.attempts, 1);
     let message = err.to_string();
-    assert!(message.contains("sent nothing"), "{message}");
+    assert!(message.contains("did not send the block"), "{message}");
+    assert!(!message.contains("sent nothing"), "{message}");
     assert!(
         message.contains("reports height 50: it is still syncing"),
         "{message}"
     );
+}
+
+/// A node that goes quiet part way through the block has not said it lacks
+/// the block: the transfer stalled. That is tried again on a fresh
+/// connection, not reported as a node without the block.
+#[test]
+fn a_transfer_that_stalls_mid_block_is_retried_on_a_fresh_connection() {
+    let node = Node::full(200, vec![Conn::StallMidBlock, Conn::Serve]);
+    let policy = RetryPolicy {
+        block_deadline: Duration::from_millis(300),
+        ..fast(5)
+    };
+    let got = fetch(&node, policy, 100).expect("the second connection serves the block");
+    assert_eq!(got.block_hash(), block().block_hash());
+    assert_eq!(node.connections(), 2);
+}
+
+#[test]
+fn a_transfer_that_keeps_stalling_gets_one_fresh_retry_then_ends_the_round() {
+    let node = Node::full(200, vec![Conn::StallMidBlock; 2]);
+    let policy = RetryPolicy {
+        block_deadline: Duration::from_millis(300),
+        ..fast(5)
+    };
+    let err = fetch(&node, policy, 100).expect_err("never served whole");
+    let message = err.to_string();
+    assert!(!message.contains("sent nothing"), "{message}");
+    assert!(!message.contains("pruned"), "{message}");
+    assert!(
+        message.contains("went quiet: no block and no answer to a ping"),
+        "{message}"
+    );
+    assert!(
+        matches!(err.failure, FetchFailure::Broken(_)),
+        "{:?}",
+        err.failure
+    );
+    assert_eq!(
+        err.attempts, 2,
+        "one fresh connection, not all five expensive attempts"
+    );
+    assert_eq!(node.connections(), 2);
 }
 
 #[test]
@@ -573,8 +611,8 @@ impl OracleProbe for OneBlock {
 #[test]
 fn the_daemon_publishes_an_actionable_stall_with_its_next_try_and_backs_off() {
     run(async {
-        let (mut scanner, _state) = scanner("p2p-stall", "http://127.0.0.1:1");
-        let node = Node::full(1_000, vec![Conn::CloseAfterHandshake; 4]);
+        let (mut scanner, _state) = scanner("p2p-stall");
+        let node = Node::full(1_000, vec![Conn::CloseAfterRequest; 4]);
         scanner.p2p_peer = node.addr;
         scanner.p2p_retry = fast(2);
         // A payment to the wallet, in a block nobody serves in-process: the

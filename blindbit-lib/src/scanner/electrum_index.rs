@@ -12,12 +12,13 @@ use super::health::ScanHealth;
 /// Lightweight Electrum-compatible index built from scanner state.
 #[derive(Default)]
 pub struct WalletElectrumIndex {
-    /// txid hex → consensus-serialized raw tx bytes.
-    /// Populated when the full block is fetched during scan_block_range.
+    /// txid hex → consensus-serialized raw tx bytes of wallet transactions:
+    /// added when a scanned block holds one, rebuilt from the wallet graph on
+    /// restore, and by friglet's broadcast handler.
     pub txs: HashMap<String, Vec<u8>>,
 
-    /// block height → 80-byte header hex.
-    /// Populated for every block that contained a confirmed match.
+    /// block height → 80-byte header hex: every block the scan fetched,
+    /// plus the headers friglet fetches or reloads from its header sidecar.
     pub headers: HashMap<u32, String>,
 
     /// Electrum scripthash hex → ordered history entries.
