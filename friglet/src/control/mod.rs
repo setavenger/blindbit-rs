@@ -235,7 +235,7 @@ pub struct ControlCtx {
     /// be determined (no config dir on this platform).
     pub config_path: Option<PathBuf>,
     /// Serializes `SetConfig` / `SetScanKey` / `Start` / `Stop` so lifecycle
-    /// verbs cannot interleave with persisting new settings. Not held while
+    /// verbs cannot interleave with persisting new settings. Never held while
     /// an apply waits on the network (see [`ControlCtx::apply`]).
     pub apply_lock: Mutex<()>,
     /// Oracle tip and reachability, updated by [`spawn_oracle_poller`].
@@ -415,17 +415,16 @@ impl ControlCtx {
     /// settings; `scan_key = None` keeps the current key.
     ///
     /// The steps that can wait on the network (a new wallet's birthday from
-    /// the oracle, the DNS lookup of the P2P host) run before `apply_lock` is
-    /// taken, so Start and Stop do not wait behind them. Comparing with and
-    /// persisting the settings happens under the lock.
+    /// the oracle, the DNS lookup of the P2P host) never run under
+    /// `apply_lock`, so Start and Stop do not wait behind them. Comparing with
+    /// and persisting the settings happens under the lock.
     async fn apply(&self, new_cfg: Option<DaemonConfig>, scan_key: Option<&str>) -> Response {
         let keep_config = new_cfg.is_none();
-        let current = self.settings.lock().unwrap().clone();
-        let (mut new_cfg, mut resolved) =
-            match prepare(new_cfg.unwrap_or_else(|| current.clone())).await {
-                Ok(prepared) => prepared,
-                Err(e) => return Response::Error(e),
-            };
+        let mut current = self.settings.lock().unwrap().clone();
+        let mut prepared = match prepare(new_cfg.unwrap_or_else(|| current.clone())).await {
+            Ok(prepared) => prepared,
+            Err(e) => return Response::Error(e),
+        };
         let new_secret = match scan_key.map(|k| SecretKey::from_str(k.trim())).transpose() {
             Ok(s) => s,
             Err(e) => {
@@ -442,16 +441,23 @@ impl ControlCtx {
             );
         };
 
-        let _guard = self.apply_lock.lock().await;
-        let old_cfg = self.settings.lock().unwrap().clone();
-        if keep_config && old_cfg != current {
-            // Another apply changed the settings meanwhile: keep them, as if
-            // the two had run one after the other.
-            (new_cfg, resolved) = match prepare(old_cfg.clone()).await {
+        // Without a config of its own the apply keeps the current settings.
+        // Should another apply have changed them meanwhile, prepare again from
+        // the new ones (outside the lock) and check again, as if the two had
+        // run one after the other.
+        let (_guard, old_cfg, (new_cfg, resolved)) = loop {
+            let guard = self.apply_lock.lock().await;
+            let old_cfg = self.settings.lock().unwrap().clone();
+            if !keep_config || old_cfg == current {
+                break (guard, old_cfg, prepared);
+            }
+            drop(guard);
+            prepared = match prepare(old_cfg.clone()).await {
                 Ok(prepared) => prepared,
                 Err(e) => return Response::Error(e),
             };
-        }
+            current = old_cfg;
+        };
         let config_changed = new_cfg != old_cfg;
         let key_changed = new_secret.is_some_and(|secret| {
             config::resolve_scan_secret(None, &resolved.key_file).ok() != Some(secret)
@@ -1301,19 +1307,40 @@ mod tests {
         );
     }
 
-    /// An apply waiting on the network (here a new wallet's birthday from an
-    /// oracle that accepts the connection and never answers; the lookup gives
-    /// up after 15 s) does not hold up Stop and Start.
-    #[tokio::test]
-    async fn stop_and_start_answer_while_an_apply_waits_for_the_oracle() {
+    /// The URL of an oracle that accepts connections and never answers: a
+    /// new wallet's birthday lookup against it waits its full 15 s.
+    fn silent_oracle() -> String {
         let oracle = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let oracle_url = format!("http://{}", oracle.local_addr().unwrap());
+        let url = format!("http://{}", oracle.local_addr().unwrap());
         std::thread::spawn(move || {
             let mut held = Vec::new();
             while let Ok((stream, _)) = oracle.accept() {
                 held.push(stream); // never answers, never closes
             }
         });
+        url
+    }
+
+    /// Stop and then Start, each within 2 s; together well within 1 s.
+    async fn assert_stop_and_start_answer_promptly(ctx: &ControlCtx) {
+        let began = Instant::now();
+        let answer = |request| tokio::time::timeout(Duration::from_secs(2), ctx.handle(request));
+        assert_eq!(answer(Request::Stop).await, Ok(Response::Ok));
+        assert!(!ctx.supervisor.is_running());
+        assert_eq!(answer(Request::Start).await, Ok(Response::Ok));
+        assert!(ctx.supervisor.is_running());
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    /// An apply waiting on the network (here a new wallet's birthday from an
+    /// oracle that never answers) does not hold up Stop and Start.
+    #[tokio::test]
+    async fn stop_and_start_answer_while_an_apply_waits_for_the_oracle() {
+        let oracle_url = silent_oracle();
         let dir = temp_dir("apply-waits-for-oracle");
         let ctx = test_ctx(&dir);
         ctx.supervisor.start();
@@ -1337,19 +1364,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!applying.is_finished(), "the apply waits for the oracle");
 
-        let began = Instant::now();
-        let answer = |request| tokio::time::timeout(Duration::from_secs(2), ctx.handle(request));
-        assert_eq!(answer(Request::Stop).await, Ok(Response::Ok));
-        assert!(!ctx.supervisor.is_running());
-        assert_eq!(answer(Request::Start).await, Ok(Response::Ok));
-        assert!(ctx.supervisor.is_running());
-        assert!(
-            began.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            began.elapsed()
-        );
+        assert_stop_and_start_answer_promptly(&ctx).await;
         assert!(!applying.is_finished(), "the apply is still waiting");
         applying.abort();
+    }
+
+    /// A SetScanKey whose settings were replaced while it waited for the
+    /// lock prepares again from the new ones, and that also happens outside
+    /// the lock. (The new settings here need the silent oracle; a slow DNS
+    /// lookup of the P2P host would wait the same way.)
+    #[tokio::test]
+    async fn preparing_again_after_a_concurrent_apply_does_not_hold_the_lock() {
+        let dir = temp_dir("setkey-prepares-again");
+        let ctx = test_ctx(&dir);
+        ctx.supervisor.start();
+
+        let guard = ctx.apply_lock.lock().await;
+        let setting_key = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.handle(Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        *ctx.settings.lock().unwrap() = DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            oracle_url: silent_oracle(),
+            ..test_config(&dir)
+        };
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!setting_key.is_finished(), "it prepares again");
+
+        assert_stop_and_start_answer_promptly(&ctx).await;
+        assert!(!setting_key.is_finished(), "still preparing");
+        setting_key.abort();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scan.key"))
+                .unwrap()
+                .trim(),
+            SECRET_HEX,
+            "nothing persisted"
+        );
     }
 
     /// A SetScanKey that prepared against settings another apply has
