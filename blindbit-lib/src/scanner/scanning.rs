@@ -23,8 +23,8 @@ use super::reorg::{
     BlockCheck, OracleView, POST_STREAM_CHECK, ReorgBelowStreamStart, ReorgTooDeep,
     block_hash_from_oracle,
 };
-use super::scanner::Scanner;
-use super::types::{BlockIdentifierDisplay, ProbableMatch};
+use super::scanner::{Scanner, genesis_hash};
+use super::types::ProbableMatch;
 use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
 use super::ScannerError;
 
@@ -131,7 +131,7 @@ impl BlockStreamSource for OracleStreams {
 /// that names the height the scan stopped at.
 ///
 /// There is no retry here: the scan stops at `height` and the caller rescans
-/// from there (`watch_chain` on its next poll, `blindbit-cli` on its next run).
+/// from there (`watch_chain_until` on its next poll, `blindbit-cli` on its next run).
 async fn next_block<S: BlockScanDataStream>(
     stream: &mut S,
     height: u64,
@@ -359,7 +359,7 @@ impl Scanner {
     ) -> Result<(), ScannerError> {
         // Stamp sp_start_height into the index so the Electrum server's
         // SP subscription response always uses the correct scan start key.
-        // Only set it on the first call; watch_chain increments start each
+        // Only set it on the first call; watch_chain_until increments start each
         // iteration, so we must not overwrite the original wallet birthday.
         {
             let mut idx = self.electrum_index.lock().await;
@@ -368,13 +368,9 @@ impl Scanner {
             }
         }
 
-        let genesis_hash = BlockHash::from_byte_array(
-            indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
-        );
-
         let mut last_block_id: BlockId = BlockId {
             height: 0,
-            hash: genesis_hash,
+            hash: genesis_hash(),
         };
 
         let mut expected_height = first;
@@ -430,8 +426,7 @@ impl Scanner {
             }
             have_prior_block = true;
             changed = true;
-            let block_id = BlockIdentifierDisplay(&block_identifier);
-            tracing::debug!(height = block_id.0.block_height, "received block data from oracle");
+            tracing::debug!(height, "received block data from oracle");
 
             if block_identifier.block_height % 100 == 0 {
                 let scanned = block_identifier.block_height.saturating_sub(start) + 1;
@@ -766,7 +761,7 @@ impl Scanner {
             "balance after scan"
         );
 
-        // With persistence enabled, save progress at the end of a scan range so watch_chain
+        // With persistence enabled, save progress at the end of a scan range so watch_chain_until
         // resumes from the correct height after a restart, even when no
         // wallet-relevant transactions were found in this range.
         #[cfg(feature = "serde")]
@@ -781,7 +776,7 @@ impl Scanner {
     /// fresh connection per attempt, exponential backoff between attempts).
     /// When every attempt fails the error is a [`p2p::BlockFetchError`]
     /// whose message says what the node did and what the user can do;
-    /// `watch_chain` then retries the block on a growing interval
+    /// `watch_chain_until` then retries the block on a growing interval
     /// ([`p2p::FetchBackoff`]). A cancelled scan ends the download at once
     /// with [`ScanCancelled`], before anything of the block is applied.
     pub(crate) async fn fetch_block_with_retry(
@@ -835,7 +830,7 @@ impl Scanner {
         let _ = self.notify_found_utxos.send(utxo_count);
     }
 
-    /// Watch the chain for new blocks indefinitely.
+    /// Watch the chain for new blocks until `cancel` is cancelled.
     ///
     /// Polls the oracle every 10 seconds via `GetInfo`.  Whenever the oracle
     /// height advances past `last_scanned_block_height`, the missing range is
@@ -850,15 +845,9 @@ impl Scanner {
     /// that block instead (see
     /// [`Scanner::start_at_oracle_floor_if_below`]).
     ///
-    /// Runs until an error it cannot retry; see [`Self::watch_chain_until`]
-    /// to stop it.
-    pub async fn watch_chain(&mut self) -> Result<(), ScannerError> {
-        self.watch_chain_until(CancellationToken::new()).await
-    }
-
-    /// [`Self::watch_chain`] until `cancel` is cancelled; then it returns
-    /// `Ok(())` promptly, without waiting for the poll interval, a retry
-    /// wait, the oracle or a P2P block download to finish.
+    /// Runs until an error it cannot retry, or until `cancel` is cancelled;
+    /// then it returns `Ok(())` promptly, without waiting for the poll
+    /// interval, a retry wait, the oracle or a P2P block download to finish.
     ///
     /// It stops only at a safe point (see [`ScanCancelled`]): between
     /// blocks, or while it waits. A block whose download is cancelled is not
@@ -917,7 +906,7 @@ impl Scanner {
         Ok(())
     }
 
-    /// One poll of [`Self::watch_chain`], once the oracle's tip is known:
+    /// One poll of [`Self::watch_chain_until`], once the oracle's tip is known:
     /// scan new blocks, or with none, check the scanned tip (or the oracle's,
     /// if it is behind) against the oracle, since a reorganisation can
     /// replace blocks without making the chain longer. Publishes a stall on
@@ -980,34 +969,10 @@ impl Scanner {
         // todo: first append to list then push notifications.
         //  We need to check for the actual match and not just a probablistic match.
 
-        let Some(block_id) = block_data.block_identifier else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "block identifier is missing",
-            )
-            .into());
+        let mut probable_match = ProbableMatch {
+            matched_txs: vec![],
+            spent: false,
         };
-
-        // If block_hash is missing or malformed, we can still run the probabilistic
-        // tx filter but must skip spent-output notifications (which need the hash).
-        let block_hash_opt: Option<[u8; 32]> = if block_id.block_hash.len() == 32 {
-            Some(
-                block_id
-                    .block_hash
-                    .clone()
-                    .try_into()
-                    .expect("length already checked to be 32"),
-            )
-        } else {
-            tracing::warn!(
-                height = block_id.block_height,
-                got_bytes = block_id.block_hash.len(),
-                "block has malformed block_hash; spent-output notifications will be skipped"
-            );
-            None
-        };
-
-        let mut probable_match = ProbableMatch::new(vec![], false);
 
         for item in block_data.comp_index {
             match self.probabilistic_match(&item) {
@@ -1025,48 +990,32 @@ impl Scanner {
                         .expect("tweak must be a valid secp256k1 public key");
 
                     probable_match.matched_txs.push((txid_array, tweak));
-
-                    if self.notify_probabilistic_matches.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self.notify_probabilistic_matches.send(txid_array) {
-                        tracing::warn!(error = ?e, "failed to send probabilistic match notification");
-                    }
                 }
                 Ok(false) => continue,
                 Err(e) => return Err(e),
             }
         }
 
-        // Spent-output check — only when we have a valid block_hash to report.
-        // The oracle serves the first 8 bytes of each spent taproot output's
-        // x-only key. A prefix hit on an unspent owned output only makes the
-        // block worth fetching; the spend is confirmed (by exact outpoint) when
-        // the block is applied, so a foreign key sharing the prefix marks
-        // nothing.
-        if let Some(block_hash) = block_hash_opt {
-            let spent_outputs_count = block_data.spent_outputs.len() / 8;
-            for i in 0..spent_outputs_count {
-                let prefix: [u8; 8] = block_data.spent_outputs[i * 8..(i + 1) * 8]
-                    .try_into()
-                    .expect("slice is 8 bytes");
-                let Some(candidates) = self.owned_prefixes.get(&prefix) else {
-                    continue;
-                };
-                probable_match.spent = true;
-                for outpoint in candidates {
-                    tracing::info!(
-                        outpoint = %outpoint,
-                        short_pubkey = %hex::encode(prefix),
-                        "possible spend of owned output; fetching block to confirm"
-                    );
-                    if self.notify_spent_outpoints.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self.notify_spent_outpoints.send(block_hash) {
-                        tracing::warn!(error = ?e, "failed to send spent output notification");
-                    }
-                }
+        // Spent-output check. The oracle serves the first 8 bytes of each
+        // spent taproot output's x-only key. A prefix hit on an unspent owned
+        // output only makes the block worth fetching; the spend is confirmed
+        // (by exact outpoint) when the block is applied, so a foreign key
+        // sharing the prefix marks nothing.
+        let spent_outputs_count = block_data.spent_outputs.len() / 8;
+        for i in 0..spent_outputs_count {
+            let prefix: [u8; 8] = block_data.spent_outputs[i * 8..(i + 1) * 8]
+                .try_into()
+                .expect("slice is 8 bytes");
+            let Some(candidates) = self.owned_prefixes.get(&prefix) else {
+                continue;
+            };
+            probable_match.spent = true;
+            for outpoint in candidates {
+                tracing::info!(
+                    outpoint = %outpoint,
+                    short_pubkey = %hex::encode(prefix),
+                    "possible spend of owned output; fetching block to confirm"
+                );
             }
         }
 
@@ -1182,7 +1131,7 @@ impl Scanner {
     }
 
     /// Scans a transaction for outputs which definitely belong to us
-    /// returns an array of '`OwnedOutput`'s
+    /// returns the matched outputs as `SpOut`s
     ///
     /// No production code calls this today: the daemon receives through
     /// [`Self::scan_transaction_short`] plus `apply_block_relevant` on the
