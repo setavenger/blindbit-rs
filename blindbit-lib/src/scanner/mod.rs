@@ -1,10 +1,8 @@
-// todo: make scanner data pulling engine flexible
-
 #[cfg(test)]
 mod cancel_tests;
 mod changeset;
 mod config;
-pub mod electrum_index;
+mod electrum_index;
 mod health;
 mod load;
 #[cfg(test)]
@@ -40,12 +38,10 @@ pub use health::{
     OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
     StateRescan,
 };
-pub use p2p::{
-    BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy, broadcast_tx,
-};
+pub use p2p::{BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy};
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
 pub use scanner::Scanner;
-pub use types::{BlockIdentifierDisplay, OwnedOutput, OwnedOutputRecord};
+pub use types::OwnedOutputRecord;
 
 // Re-export load_scanner function when serde feature is enabled
 #[cfg(feature = "serde")]
