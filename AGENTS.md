@@ -43,11 +43,11 @@ cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
   ```
   `--end-height` is required; `--p2p-node-addr` must be `ip:port` (no hostnames); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
 - `friglet scan` from `--start-height 274010` to the signet tip is ~50k blocks (minutes); use blindbit-cli for quick checks.
-- State persists to a JSON file (`--state-file`); tests use the gitignored `blindbit-test/` dir.
+- State persists to a JSON file (`--state-file`).
 
 ### Checking a running daemon
 
-- Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): set `FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"`, then `printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"`. This selects the usual Linux default even without `XDG_RUNTIME_DIR`; use the daemon's configured path for a socket override. `GetStatus` never waits on the network.
+- Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): set `FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"`, then `printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"`. This honors the environment override and selects the usual Linux default even without `XDG_RUNTIME_DIR`; when the config's `control_socket` key overrides that path, set `FRIGLET_SOCKET` to its value instead. `GetStatus` never waits on the network.
 - Electrum (`127.0.0.1:50001` by default): `printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001` returns `["Friglet","1.4"]`; `blockchain.headers.subscribe` returns the latest scanned height.
 - HTTP `/height` and `/subscribe` **do not answer while scanning is enabled**: the scan task holds the scanner `Mutex` for its whole `watch_chain_until` loop, including while it waits for new blocks (`friglet/src/main.rs` scan task, `friglet/src/server/mod.rs`). They answer only while scanning is stopped (`Stop` / paused). Never use them as a health check; give any `curl` a timeout (`-m 5`).
 
@@ -61,7 +61,8 @@ cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
   `SetScanKey` and `ApplySettings` in memory.
 - Fake daemon for manual testing (speaks the `friglet-ipc` protocol on the
   default control socket): `cargo run -p friglet-tray --example fake-daemon`.
-- Useful env vars: `FRIGLET_CONTROL_SOCKET` (socket path override),
+- Useful env vars: `FRIGLET_CONTROL_SOCKET` (socket path override; the
+  config-file equivalent is `control_socket`),
   `FRIGLET_DAEMON_BIN` (daemon binary the tray spawns when none is running),
   `FRIGLET_TRAY_SHOW_ON_START` (show the status window on startup:
   `1`/`true`/`yes`/`on`/`status` → Status tab;
@@ -321,7 +322,7 @@ dbus-run-session -- bash -c '
   daemon `friglet.log` (`FRIGLET_LOG_FILE` override / `off`), tray
   `friglet-tray.log`, both in `$XDG_STATE_HOME/friglet` (macOS
   `~/Library/Logs/friglet`, Windows `%LOCALAPPDATA%\friglet\logs`).
-  Console output goes to stdout for both: the daemon colours it when stderr
+  Console output goes to stdout for both: the daemon colours it when stdout
   is a terminal; the tray also prints the daemon output it forwards
   (target `friglet-daemon`), which is not written to `friglet-tray.log`.
 - Autostart: `tauri-plugin-autostart` (XDG autostart `.desktop` /
