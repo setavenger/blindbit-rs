@@ -21,6 +21,8 @@ mod state_file;
 mod state_file_tests;
 #[cfg(test)]
 mod stream_safety_tests;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod utils;
 mod witness;
