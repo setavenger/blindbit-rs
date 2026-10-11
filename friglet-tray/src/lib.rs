@@ -376,7 +376,7 @@ async fn stop_daemon(state: State<'_, Arc<AppState>>) -> Result<String, String> 
 async fn start_daemon(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     let result = start_daemon_now(&state).await;
     if state.setup_needed.load(Ordering::SeqCst) {
-        show_settings_window(&app);
+        show_window_tab(&app, "settings");
     }
     result
 }
@@ -424,38 +424,10 @@ fn open_log_folder(state: State<'_, Arc<AppState>>) -> Result<String, String> {
 /// disable itself.
 #[tauri::command]
 async fn get_config(state: State<'_, Arc<AppState>>) -> Result<DaemonConfig, String> {
-    let mut client = Client::connect(&state.socket_path)
-        .await
-        .map_err(|e| format!("daemon unreachable: {e}"))?;
-    match client
-        .request(&Request::GetConfig)
-        .await
-        .map_err(|e| format!("request failed: {e}"))?
-    {
+    match daemon_request(&state.socket_path, &Request::GetConfig).await? {
         Response::Config(cfg) => Ok(cfg),
-        Response::Error(e) => Err(e),
         other => Err(format!("unexpected response: {other:?}")),
     }
-}
-
-/// Send the full configuration to the daemon (validate → persist → apply).
-/// `Ok(None)` on plain success; `Ok(Some(note))` when the daemon reports a
-/// note (e.g. bind-address changes needing a daemon restart).
-#[tauri::command]
-async fn set_config(
-    state: State<'_, Arc<AppState>>,
-    config: DaemonConfig,
-) -> Result<Option<String>, String> {
-    send_with_note(&state.socket_path, Request::SetConfig(Box::new(config))).await
-}
-
-/// Replace the scan secret (hex 32 bytes); the daemon writes its key file.
-#[tauri::command]
-async fn set_scan_key(
-    state: State<'_, Arc<AppState>>,
-    key: String,
-) -> Result<Option<String>, String> {
-    send_with_note(&state.socket_path, Request::SetScanKey(key)).await
 }
 
 /// Per-network defaults for the settings form.
@@ -625,20 +597,28 @@ async fn save_local_config(
     Ok(attach_and_record(&state).await)
 }
 
-/// Send a request answering `Ok` or `OkWithNote`; the note is passed through
-/// so the UI can surface it.
-async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String>, String> {
+/// Send one request to the daemon. Connection and protocol failures, and
+/// the daemon's own `Error` answer, become the `Err` message.
+async fn daemon_request(socket_path: &str, req: &Request) -> Result<Response, String> {
     let mut client = Client::connect(socket_path)
         .await
         .map_err(|e| format!("daemon unreachable: {e}"))?;
     match client
-        .request(&req)
+        .request(req)
         .await
         .map_err(|e| format!("request failed: {e}"))?
     {
+        Response::Error(e) => Err(e),
+        other => Ok(other),
+    }
+}
+
+/// Send a request answering `Ok` or `OkWithNote`; the note is passed through
+/// so the UI can surface it.
+async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String>, String> {
+    match daemon_request(socket_path, &req).await? {
         Response::Ok => Ok(None),
         Response::OkWithNote(note) => Ok(Some(note)),
-        Response::Error(e) => Err(e),
         other => Err(format!("unexpected response: {other:?}")),
     }
 }
@@ -778,6 +758,16 @@ fn record_reachable(state: &AppState, status: StatusInfo) {
         s.last = Some(status);
     }
     *state.unreachable_since.lock().unwrap() = None;
+}
+
+/// Store one poll's answer: whether the daemon answered and, when it did, its
+/// status (the last snapshot is kept while it does not answer).
+fn record_poll(state: &AppState, info: Option<&StatusInfo>) {
+    let mut s = state.status.lock().unwrap();
+    s.reachable = info.is_some();
+    if let Some(info) = info {
+        s.last = Some(info.clone());
+    }
 }
 
 /// Reap the spawned child if it has exited, returning how it ended and
@@ -965,48 +955,33 @@ fn dismiss_window(window: tauri::WebviewWindow, popup: State<'_, Arc<popup::Popu
     popup.dismiss(&window);
 }
 
-/// Show the main window and switch it to the Settings tab once the UI has
-/// had a chance to load. Used for `FRIGLET_TRAY_SHOW_ON_START=settings` and
-/// for first-run setup mode. (Synthetic X11 clicks do not reach WebKitGTK
-/// reliably under Xvfb, so this eval is the supported headless path to the
-/// Settings form.)
-fn show_settings_window(app: &AppHandle) {
+/// Show the main window and switch it to `tab` (`settings` or `wallet`) once
+/// the UI has had a chance to load. Used for first-run setup mode (Settings)
+/// and for `FRIGLET_TRAY_SHOW_ON_START`. (Synthetic X11 clicks do not reach
+/// WebKitGTK reliably under Xvfb, so this eval is the supported headless path
+/// to the Settings form.)
+fn show_window_tab(app: &AppHandle, tab: &'static str) {
     show_status_window(app);
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(800)).await;
         if let Some(w) = handle.get_webview_window("main") {
-            let _ = w.eval("document.getElementById('tab-settings')?.click()");
+            let _ = w.eval(format!("document.getElementById('tab-{tab}')?.click()"));
         }
     });
 }
 
-/// Show the main window on the Wallet tab for screenshot testing.
-fn show_wallet_window(app: &AppHandle) {
-    show_status_window(app);
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        if let Some(w) = handle.get_webview_window("main") {
-            let _ = w.eval("document.getElementById('tab-wallet')?.click()");
-        }
-    });
-}
-
-/// Parse `FRIGLET_TRAY_SHOW_ON_START`:
-/// - unset / falsy → hide window (default)
-/// - `1` / `true` / `yes` / `on` / `status` → show status window
-/// - `settings` → show window and switch to the Settings tab (after the UI loads)
-/// - `wallet` → show window and switch to the Wallet tab (after the UI loads)
-fn show_on_start_env() -> Option<&'static str> {
-    match std::env::var("FRIGLET_TRAY_SHOW_ON_START") {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" | "status" => Some("status"),
-            "settings" => Some("settings"),
-            "wallet" => Some("wallet"),
-            _ => None,
-        },
-        Err(_) => None,
+/// Which tab a `FRIGLET_TRAY_SHOW_ON_START` value opens on startup:
+/// - unset / falsy → none, the window stays hidden (default)
+/// - `1` / `true` / `yes` / `on` / `status` → the Status tab
+/// - `settings` → the Settings tab (after the UI loads)
+/// - `wallet` → the Wallet tab (after the UI loads)
+fn show_on_start(value: Option<&str>) -> Option<&'static str> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "status" => Some("status"),
+        "settings" => Some("settings"),
+        "wallet" => Some("wallet"),
+        _ => None,
     }
 }
 
@@ -1188,7 +1163,7 @@ fn build_tray(app: &AppHandle, menu: &Menu<tauri::Wry>) -> tauri::Result<TrayIco
                         // An unconfigured daemon lands in setup mode
                         // instead of a spawn-fail loop; take the user there.
                         if state.setup_needed.load(Ordering::SeqCst) {
-                            show_settings_window(&app);
+                            show_window_tab(&app, "settings");
                         }
                     });
                 }
@@ -1282,13 +1257,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         let mut last_quit_label: Option<&'static str> = None;
         loop {
             let info = lifecycle::probe(&state.socket_path, POLL_TIMEOUT).await;
-            {
-                let mut s = state.status.lock().unwrap();
-                s.reachable = info.is_some();
-                if info.is_some() {
-                    s.last = info.clone();
-                }
-            }
+            record_poll(&state, info.as_ref());
             // A reachable daemon ends setup mode, whoever configured it.
             if info.is_some() {
                 state.setup_needed.store(false, Ordering::SeqCst);
@@ -1383,7 +1352,14 @@ pub fn run() {
         tracing::info!(path = %path.display(), "friglet-tray starting; logging to file");
     }
 
-    let mut state = AppState::new(friglet_ipc::default_socket_path());
+    // Where the daemon listens: the tray probes, and a daemon it spawns binds,
+    // the same path (that daemon reads the same config file and inherits this
+    // environment).
+    let socket_path =
+        setup::control_socket_path(friglet_ipc::default_config_path().as_deref(), &|key| {
+            std::env::var(key).ok()
+        });
+    let mut state = AppState::new(socket_path);
     state.tray_log = tray_log;
     let state = Arc::new(state);
 
@@ -1413,8 +1389,6 @@ pub fn run() {
             start_scanning,
             stop_scanning,
             get_config,
-            set_config,
-            set_scan_key,
             get_setup_state,
             save_local_config,
             inspect_descriptor,
@@ -1461,12 +1435,11 @@ pub fn run() {
             }
             setup_tray(app)?;
 
-            if let Some(tab) = show_on_start_env() {
-                match tab {
-                    "settings" => show_settings_window(app.handle()),
-                    "wallet" => show_wallet_window(app.handle()),
-                    _ => show_status_window(app.handle()),
-                }
+            let show_on_start_value = std::env::var("FRIGLET_TRAY_SHOW_ON_START").ok();
+            match show_on_start(show_on_start_value.as_deref()) {
+                Some("status") => show_status_window(app.handle()),
+                Some(tab) => show_window_tab(app.handle(), tab),
+                None => {}
             }
 
             // Attach to a running daemon, spawn one, or detect that
@@ -1479,7 +1452,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let _ = attach_and_record(&state).await;
                 if state.setup_needed.load(Ordering::SeqCst) {
-                    show_settings_window(&handle);
+                    show_window_tab(&handle, "settings");
                 }
             });
             Ok(())
@@ -1516,55 +1489,6 @@ mod tests {
         AppState::new(socket_path)
     }
 
-    /// Serve GetStatus on `path`, like a healthy daemon that was not
-    /// tray-spawned.
-    fn spawn_fake_daemon(path: String) {
-        spawn_fake_daemon_owned(path, false);
-    }
-
-    /// [`spawn_fake_daemon`] with a caller-chosen `spawned_by_tray` answer,
-    /// so tests can simulate re-attaching to a daemon that self-reports
-    /// having been tray-spawned (e.g. by a now-crashed/restarted tray).
-    fn spawn_fake_daemon_owned(path: String, spawned_by_tray: bool) {
-        tokio::spawn(async move {
-            let _ = std::fs::remove_file(&path);
-            let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
-            loop {
-                let Ok(mut conn) = friglet_ipc::accept(&listener).await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    while let Ok(Some(req)) = conn.next_request().await {
-                        let resp = match req {
-                            Request::GetStatus => Response::Status(StatusInfo {
-                                scanning: false,
-                                scanned_height: 1,
-                                tip_height: None,
-                                scan_progress: 0.0,
-                                network: "regtest".to_string(),
-                                electrum_clients: 0,
-                                oracle_connected: false,
-                                last_error: None,
-                                sp_address: None,
-                                tx_count: 0,
-                                outputs_found: 0,
-                                label_addresses: Vec::new(),
-                                version: "test".to_string(),
-                                spawned_by_tray,
-                                scan_health: Default::default(),
-                                ..Default::default()
-                            }),
-                            _ => Response::Ok,
-                        };
-                        if conn.respond(&resp).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-    }
-
     fn spawn_sleeper() -> Child {
         tokio::process::Command::new("sleep")
             .arg("30")
@@ -1582,47 +1506,26 @@ mod tests {
     }
 
     #[test]
-    fn show_on_start_env_values() {
-        // SAFETY: tests in this module run single-threaded on the env for
-        // this key; we restore afterward.
-        unsafe {
-            std::env::remove_var("FRIGLET_TRAY_SHOW_ON_START");
-        }
-        assert_eq!(show_on_start_env(), None);
+    fn show_on_start_values() {
+        assert_eq!(show_on_start(None), None);
         for v in ["1", "true", "TRUE", "yes", "on", " Yes ", "status"] {
-            unsafe {
-                std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", v);
-            }
             assert_eq!(
-                show_on_start_env(),
+                show_on_start(Some(v)),
                 Some("status"),
                 "expected status for {v:?}"
             );
         }
-        unsafe {
-            std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", "settings");
-        }
-        assert_eq!(show_on_start_env(), Some("settings"));
-        unsafe {
-            std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", "wallet");
-        }
-        assert_eq!(show_on_start_env(), Some("wallet"));
+        assert_eq!(show_on_start(Some("settings")), Some("settings"));
+        assert_eq!(show_on_start(Some("wallet")), Some("wallet"));
         for v in ["0", "false", "no", "off", "", "maybe"] {
-            unsafe {
-                std::env::set_var("FRIGLET_TRAY_SHOW_ON_START", v);
-            }
-            assert_eq!(show_on_start_env(), None, "expected unset for {v:?}");
-        }
-        unsafe {
-            std::env::remove_var("FRIGLET_TRAY_SHOW_ON_START");
+            assert_eq!(show_on_start(Some(v)), None, "expected unset for {v:?}");
         }
     }
 
     #[tokio::test]
     async fn retry_keeps_child_when_socket_reachable() {
         let path = test_socket_path("retry-reachable");
-        spawn_fake_daemon(path.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn_stoppable_fake_daemon(path.clone(), false, 4100);
 
         let state = test_state(path.clone());
         {
@@ -1689,8 +1592,7 @@ mod tests {
     #[tokio::test]
     async fn retry_reattaches_after_child_exited() {
         let path = test_socket_path("retry-exited");
-        spawn_fake_daemon(path.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn_stoppable_fake_daemon(path.clone(), false, 4200);
 
         let state = test_state(path.clone());
         {
@@ -1720,8 +1622,7 @@ mod tests {
     #[tokio::test]
     async fn attach_adopts_daemons_self_reported_ownership() {
         let path = test_socket_path("adopt-ownership");
-        spawn_fake_daemon_owned(path.clone(), true);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn_stoppable_fake_daemon(path.clone(), true, 4300);
 
         let state = test_state(path.clone());
         attach_and_record_with(
@@ -1816,12 +1717,14 @@ mod tests {
         assert_eq!(running, "Scan: paused (height 7)");
     }
 
-    /// A fake daemon that answers GetStatus with `pid` and stops listening
-    /// (removing its socket) on Shutdown, like the real one.
+    /// A fake daemon answering GetStatus with the given `spawned_by_tray`
+    /// self-report and `pid`. On Shutdown it stops listening and removes its
+    /// socket, like the real one. The socket is bound before this returns, so
+    /// a test can connect right away.
     fn spawn_stoppable_fake_daemon(path: String, spawned_by_tray: bool, pid: u32) {
+        let _ = std::fs::remove_file(&path);
+        let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
         tokio::spawn(async move {
-            let _ = std::fs::remove_file(&path);
-            let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
             let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
             loop {
                 let mut conn = tokio::select! {
@@ -1860,13 +1763,7 @@ mod tests {
     /// The poller's view of the daemon, without the poller.
     async fn poll_once(state: &AppState) -> (DaemonView, ScanView) {
         let info = lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT).await;
-        {
-            let mut s = state.status.lock().unwrap();
-            s.reachable = info.is_some();
-            if info.is_some() {
-                s.last = info.clone();
-            }
-        }
+        record_poll(state, info.as_ref());
         let (daemon, scan, _) = refresh(state, info.as_ref());
         (daemon, scan)
     }
@@ -1878,7 +1775,6 @@ mod tests {
     async fn a_poll_of_the_stopping_daemon_keeps_it_stopped() {
         let path = test_socket_path("stop-race");
         spawn_stoppable_fake_daemon(path.clone(), false, 5000);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         *state.stopped.lock().unwrap() = Some(Stopped {
             at_unix: unix_now(),
@@ -1903,7 +1799,6 @@ mod tests {
     async fn stop_daemon_stops_an_attached_external_daemon_for_good() {
         let path = test_socket_path("stop-external");
         spawn_stoppable_fake_daemon(path.clone(), false, 4711);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         attach_and_record_with(&state, || panic!("must attach"), || false).await;
         let (daemon, _) = poll_once(&state).await;
@@ -1952,7 +1847,6 @@ mod tests {
 
         // Start daemon brings one back (here: attaches to a new one).
         spawn_stoppable_fake_daemon(path.clone(), false, 4712);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         start_daemon_now(&state).await.expect("started");
         assert!(state.stopped.lock().unwrap().is_none());
         let (daemon, _) = poll_once(&state).await;
@@ -1964,7 +1858,6 @@ mod tests {
     async fn stop_daemon_on_a_tray_spawned_daemon_is_not_undone_by_the_supervisor() {
         let path = test_socket_path("stop-spawned");
         spawn_stoppable_fake_daemon(path.clone(), true, 4800);
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let state = test_state(path.clone());
         state.supervise.store(true, Ordering::SeqCst);
         {
@@ -2077,8 +1970,7 @@ mod tests {
 
         // Once due, the restart attaches to whatever answers now (here a fake
         // daemon), clearing the pending restart.
-        spawn_fake_daemon(path.clone());
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        spawn_stoppable_fake_daemon(path.clone(), false, 4400);
         state.supervision.lock().unwrap().next_restart_at = Some(Instant::now());
         supervise_tick_with(&state, false, || panic!("must attach, not spawn"), || false).await;
         let health = daemon_health(&state);

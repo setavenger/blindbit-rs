@@ -70,11 +70,12 @@ fn spawn_fake_daemon_with_status(path: String, status: StatusInfo) {
     spawn_fake_daemon_with(path, Arc::new(AtomicBool::new(false)), status);
 }
 
+/// The socket is bound before this returns, so a test can connect right away.
 fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: StatusInfo) {
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+    let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
     tokio::spawn(async move {
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&path);
-        let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
         loop {
             let Ok(mut conn) = friglet_ipc::accept(&listener).await else {
                 break;
@@ -98,23 +99,6 @@ fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: S
             });
         }
     });
-}
-
-#[tokio::test]
-async fn attaches_when_daemon_already_running() {
-    let path = test_socket_path("attach");
-    spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Locator must not be consulted when a daemon is reachable.
-    let att = lifecycle::attach_or_spawn_with(&path, || {
-        panic!("should not look for a binary when attach succeeds")
-    })
-    .await;
-    assert!(matches!(att, Attachment::Attached(_)), "got {att:?}");
-
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -150,7 +134,6 @@ async fn setup_required_instead_of_spawn_when_unconfigured() {
 async fn attach_beats_setup_check_when_daemon_reachable() {
     let path = test_socket_path("setup-attach");
     spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let att = lifecycle::attach_spawn_or_setup_with(
         &path,
@@ -175,7 +158,6 @@ async fn attach_carries_daemons_self_reported_ownership() {
     let mut status = dummy_status();
     status.spawned_by_tray = true;
     spawn_fake_daemon_with_status(path.clone(), status);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let att = lifecycle::attach_or_spawn_with(&path, || {
         panic!("should not look for a binary when attach succeeds")
@@ -271,7 +253,6 @@ async fn quit_shuts_daemon_down_only_when_spawned_by_tray() {
     let path = test_socket_path("quit");
     let saw_shutdown = Arc::new(AtomicBool::new(false));
     spawn_fake_daemon(path.clone(), saw_shutdown.clone());
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Attached daemon: quit must leave it alone.
     lifecycle::perform_quit(&path, false, None).await;

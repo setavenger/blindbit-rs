@@ -7,6 +7,7 @@
 //!
 //! Usage: `cargo run -p friglet-tray --example fake-daemon`
 
+use friglet_ipc::network::NETWORKS;
 use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, ScanState, StatusInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,6 @@ use std::sync::{Arc, Mutex};
 /// Rough imitation of the real daemon's SetConfig validation, so the tray's
 /// error surfacing can be exercised without a real daemon.
 fn check_config(cfg: &DaemonConfig) -> Result<(), String> {
-    const NETWORKS: [&str; 5] = ["bitcoin", "signet", "testnet", "testnet4", "regtest"];
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!("invalid network `{}`", cfg.network));
     }
@@ -28,6 +28,12 @@ fn check_config(cfg: &DaemonConfig) -> Result<(), String> {
         return Err("invalid start_height 0: must be at least 1".to_string());
     }
     Ok(())
+}
+
+/// The real daemon's scan key shape: 32 bytes as hex.
+fn valid_scan_key(key: &str) -> bool {
+    let key = key.trim();
+    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -123,8 +129,7 @@ async fn main() -> std::io::Result<()> {
                         Err(e) => Response::Error(e),
                     },
                     Request::SetScanKey(key) => {
-                        let key = key.trim();
-                        if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        if valid_scan_key(&key) {
                             eprintln!("fake daemon scan key updated");
                             Response::Ok
                         } else {
@@ -137,10 +142,7 @@ async fn main() -> std::io::Result<()> {
                         config: new_cfg,
                         scan_key,
                     } => {
-                        let key_ok = scan_key.as_deref().is_none_or(|k| {
-                            let k = k.trim();
-                            k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit())
-                        });
+                        let key_ok = scan_key.as_deref().is_none_or(valid_scan_key);
                         match check_config(&new_cfg) {
                             Err(e) => Response::Error(e),
                             Ok(()) if !key_ok => Response::Error(
