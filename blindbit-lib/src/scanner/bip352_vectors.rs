@@ -1311,6 +1311,78 @@ fn official_vectors_live_receive_step_finds_expected_outputs() {
     assert_eq!(labelled_outputs, 10, "labelled-output coverage changed");
 }
 
+/// The live receive step stores each output at its real vout when the
+/// transaction also pays non-taproot outputs: here a P2WPKH output sits in
+/// front of every vector output, so vector output `i` is at vout `2i + 1`.
+/// The external indexer numbers a transaction's outputs before it picks the
+/// taproot ones (`bdk_sp::receive::scan_txouts`), and the stored outpoint is
+/// what the wallet later spends. Every other receive test pays taproot
+/// outputs only, where numbering before or after the filter agrees.
+#[test]
+fn official_vectors_live_receive_step_keeps_vouts_among_non_taproot_outputs() {
+    let p2wpkh = TxOut {
+        value: Amount::from_sat(1_000),
+        script_pubkey: ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x42; 20]].concat()),
+    };
+    let mut exercised = 0usize;
+    let mut asserted_outputs = 0usize;
+
+    for (case_idx, case) in vectors().iter().enumerate() {
+        for (sub_idx, receiving) in case.receiving.iter().enumerate() {
+            let what = format!("case {} sub {sub_idx} ({})", case_idx + 1, case.comment);
+            let (given, expected) = (&receiving.given, &receiving.expected);
+            if expected.n_outputs.is_some() {
+                continue; // K_max: see the ignored SNB-540 test below.
+            }
+            let (mut tx, prevouts) = build_transaction(given);
+            tx.output = tx
+                .output
+                .into_iter()
+                .flat_map(|out| [p2wpkh.clone(), out])
+                .collect();
+            let Ok(tweak) = compute_tweak_data(&tx, &prevouts) else {
+                continue; // no wire tweak; classified in the short-path test
+            };
+
+            // `live_receive` reads each stored output's key at its stored
+            // vout, so a vout counted among taproot outputs only would land
+            // on a P2WPKH output (or another key) and fail here.
+            let (scanner, found) = live_receive(
+                given,
+                &given.labels,
+                &tx,
+                tweak,
+                &format!("live-vouts-{case_idx}-{sub_idx}"),
+            );
+            let found_tweaks: BTreeMap<XOnlyPublicKey, SecretKey> = found
+                .iter()
+                .map(|(key, (tweak, _))| (*key, *tweak))
+                .collect();
+            assert_eq!(
+                found_tweaks,
+                expected_outputs(expected),
+                "{what}: outputs / priv_key_tweak among non-taproot outputs"
+            );
+            for outpoint in scanner.internal_indexer.index().by_shared_secret.keys() {
+                assert_eq!(outpoint.vout % 2, 1, "{what}: stored at a P2WPKH vout");
+            }
+
+            asserted_outputs += found.len();
+            exercised += 1;
+        }
+    }
+
+    assert_eq!(
+        exercised,
+        SCANNED_SUBCASE_COUNT - K_MAX_SUBCASE_COUNT,
+        "not every scannable non-K_max sub-case reached the live receive step"
+    );
+    assert_eq!(
+        asserted_outputs, EXPECTED_OUTPUT_COUNT,
+        "the fixture's per-output expectations were not all asserted"
+    );
+}
+
 /// The BIP-352 recipient limit on the live receive path.
 ///
 /// Ignored because it fails today: `apply_block_relevant` enforces no K_max, so
