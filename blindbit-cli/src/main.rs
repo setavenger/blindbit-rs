@@ -94,19 +94,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .with_target(false)
                 .init();
 
-            // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
                 .map_err(|e| format!("Invalid scan_secret: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"))?;
 
-            // Parse the spend public key (33 bytes hex)
             let public_spend = PublicKey::from_str(&spend_pubkey)
                 .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
-            // Parse the P2P socket address
             let p2p_socket_addr = SocketAddr::from_str(&p2p_node_addr)
                 .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
 
-            // Create scanner configuration
             let config = ScannerConfig::new(
                 oracle_url.clone(),
                 p2p_socket_addr,
