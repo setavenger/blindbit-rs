@@ -3,6 +3,8 @@ mod cancel_tests;
 mod changeset;
 mod config;
 mod electrum_index;
+#[cfg(test)]
+mod electrum_index_tests;
 mod health;
 mod load;
 #[cfg(test)]
