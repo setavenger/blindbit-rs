@@ -72,6 +72,9 @@ with no flags at all.
 - Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
   `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
 - `--print-config` prints the merged configuration as TOML and exits.
+- `http_addr` (`--http-addr`, `FRIGLET_HTTP_ADDR`) is obsolete: friglet no
+  longer has an HTTP API. The key is still accepted, and still written to
+  config files for compatibility with older trays, but nothing listens on it.
 
 Instead of the hex keys, the config can name the wallet by its Silent
 Payments descriptor as Sparrow exports it (BIP-392; in Sparrow: wallet
