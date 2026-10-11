@@ -165,17 +165,6 @@ pub(crate) fn derive_label_addresses(
         .collect()
 }
 
-pub(crate) fn wallet_network(network: bitcoin_rev::Network) -> BitcoinNetwork {
-    use bitcoin_rev::network::TestnetVersion;
-    match network {
-        bitcoin_rev::Network::Bitcoin => BitcoinNetwork::Bitcoin,
-        bitcoin_rev::Network::Signet => BitcoinNetwork::Signet,
-        bitcoin_rev::Network::Regtest => BitcoinNetwork::Regtest,
-        bitcoin_rev::Network::Testnet(TestnetVersion::V4) => BitcoinNetwork::Testnet4,
-        bitcoin_rev::Network::Testnet(_) => BitcoinNetwork::Testnet,
-    }
-}
-
 /// The scanner's published health as sent over the control socket.
 fn scan_health_info(health: &scanner::ScanHealth) -> friglet_ipc::ScanHealthInfo {
     friglet_ipc::ScanHealthInfo {
@@ -798,7 +787,7 @@ mod tests {
             label_addresses: derive_label_addresses(
                 secret,
                 resolved.spend_pubkey,
-                wallet_network(resolved.network),
+                scanner::convert_network(resolved.network),
                 resolved.raw.max_label_num,
             ),
             state_file: resolved.state_file.clone(),
