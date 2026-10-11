@@ -5,28 +5,16 @@ edition = "2024"
 
 [features]
 default = []
-serde = ["dep:serde", "dep:serde_json", "dep:base64"]
+serde = ["dep:serde", "dep:serde_json"]
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 
-[[example]]
-name = "stream_oracle"
-
-[[example]]
-name = "fetch_block"
-
 [dependencies]
-# bitcoin = "0.32.7"
-# bitcoin = { version = "0.32.7", features = ["secp256k1"] }
-# bdk_sp = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
-# indexer = { git = "https://github.com/bitcoindevkit/bdk-sp", version = "0.1.0", features = ["serde"] }
 bdk_sp = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
 indexer = { features = ["serde"], git = "https://github.com/setavenger/bdk-sp", version = "0.1.0" }
 
-
 prost = "0.14.1"
-prost-types = "0.14.1"
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 # net, sync, macros: the P2P block fetch connects asynchronously and waits
@@ -37,14 +25,10 @@ tokio-util = "0.7"
 tonic = { version = "0.14.2", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
 hex = "0.4.3"
-base64 = { version = "0.22", optional = true }
 tracing = { workspace = true }
 bitcoin = "0.32.7"
 # due to bitcoin-p2p using a different version
 bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598", package = "bitcoin" }
-
-
-silentpayments = { git = "https://github.com/cygnet3/rust-silentpayments", version = "0.4.1" }
 
 # bitcoin-p2p is on a specific revision of rust-bitcoin which creates some issues
 bitcoin-p2p = { git = "https://github.com/2140-dev/bitcoin-p2p", version = "0.1.0" }

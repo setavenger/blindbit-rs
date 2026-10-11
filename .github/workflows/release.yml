@@ -33,7 +33,7 @@ defaults:
 env:
   # Tauri releases the CLI in lockstep with the `tauri` crate; keep this equal
   # to the `tauri` version in Cargo.lock.
-  TAURI_CLI_VERSION: 2.11.5
+  TAURI_CLI_VERSION: 2.12.1
   PROTOC_VERSION: "36.2"
   CARGO_TERM_COLOR: always
 
