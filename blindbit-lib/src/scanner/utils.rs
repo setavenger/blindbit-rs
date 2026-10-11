@@ -21,20 +21,6 @@ pub fn match_short_pubkey(p_n: &XOnlyPublicKey, output_short_vector: &[u8]) -> b
     false
 }
 
-#[allow(dead_code)]
-fn _match_short_pubkey_bytes(p_n: &[u8; 32], output_short_vector: &[u8]) -> bool {
-    let outputs_short_len = output_short_vector.len();
-    for i in 0..outputs_short_len / 8 {
-        let output_short = &output_short_vector[i * 8..(i + 1) * 8];
-        if p_n[..8] == *output_short {
-            // we only need to find the first match to assert a probable match
-            return true;
-        }
-    }
-
-    false
-}
-
 /// A stand-in `TxOut` for a vout the oracle did not serve.
 ///
 /// Its script is empty, so `bdk_sp::receive::scan_txouts`' `is_p2tr` filter
@@ -121,15 +107,11 @@ pub fn construct_dummy_tx(item: &FullTxItem) -> Transaction {
     }
 }
 
-/// Convert a byte array to a Txid, handling byte order reversal
+/// The `Txid` of a txid the oracle serves in display order (reversed).
 pub fn byte_array_to_txid(txid: &[u8; 32]) -> Txid {
-    // Ensure we have exactly 32 bytes
-    let mut reversed_txid_slice = *txid;
-    reversed_txid_slice.reverse();
-    let txid_array: [u8; 32] = reversed_txid_slice;
-
-    // Construct Txid directly from the byte array (preserves byte order)
-    Txid::from_byte_array(txid_array)
+    let mut bytes = *txid;
+    bytes.reverse();
+    Txid::from_byte_array(bytes)
 }
 
 #[cfg(test)]

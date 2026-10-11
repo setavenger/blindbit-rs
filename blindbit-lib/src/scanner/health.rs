@@ -1,4 +1,4 @@
-//! What a long-running scan (`Scanner::watch_chain`) reports besides its
+//! What a long-running scan (`Scanner::watch_chain_until`) reports besides its
 //! progress: why it is stuck, and where it started when the wallet's start
 //! height lay below the oracle's first indexed block.
 //!
