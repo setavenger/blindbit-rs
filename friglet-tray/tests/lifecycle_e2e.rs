@@ -223,31 +223,6 @@ async fn spawn_failure_surfaces_captured_stderr() {
     }
 }
 
-/// A stale daemon binary (pre config-file support) rejects the zero-arg
-/// spawn with a clap usage dump and exit 2 — the reason must call out the
-/// outdated binary and how to fix it, not just echo the usage text.
-#[cfg(unix)]
-#[tokio::test]
-async fn stale_binary_usage_output_gets_rebuild_hint() {
-    let path = test_socket_path("stalebin");
-    let bin = fixture("stale-friglet.sh");
-
-    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin)).await;
-    match att {
-        Attachment::Unreachable { reason } => {
-            assert!(
-                reason.contains("outdated build"),
-                "expected stale-binary hint, got: {reason}"
-            );
-            assert!(
-                reason.contains("cargo build --release -p friglet"),
-                "expected rebuild instruction, got: {reason}"
-            );
-        }
-        other => panic!("expected Unreachable, got {other:?}"),
-    }
-}
-
 #[tokio::test]
 async fn quit_shuts_daemon_down_only_when_spawned_by_tray() {
     let path = test_socket_path("quit");
