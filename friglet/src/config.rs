@@ -80,8 +80,9 @@ pub struct ScanArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
 
-    /// HTTP server address [default: 127.0.0.1:8080]
-    #[arg(long)]
+    /// Obsolete, ignored (the HTTP API was removed); accepted so existing
+    /// startup scripts keep working
+    #[arg(long, hide = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_addr: Option<String>,
 
@@ -249,8 +250,8 @@ fn merge_layers(file: Option<&Path>, args: &ScanArgs) -> Result<DaemonConfig, St
 }
 
 /// Fully validated configuration with parsed types, ready for scanner setup.
-/// Settings that need no parsing (`oracle_url`, `max_label_num`, the bind
-/// addresses) are read from `raw`.
+/// Settings that need no parsing (`oracle_url`, `max_label_num`, the
+/// Electrum bind address) are read from `raw`.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     /// The merged plain config, kept for `GetConfig` / `--print-config`.
@@ -359,7 +360,7 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 /// [`resolve`] checks (network, p2p address, start height, spend pubkey)
 /// plus checks that would otherwise only surface at startup — mirroring
 /// blindbit-lib's `ScannerConfig::validate` (oracle URL scheme) and the
-/// HTTP/Electrum bind addresses parsing.
+/// Electrum bind address parsing.
 pub fn validate_daemon_config(cfg: &DaemonConfig) -> Result<ResolvedConfig, String> {
     let resolved = resolve(cfg.clone())?;
     let raw = &resolved.raw;
@@ -376,8 +377,6 @@ pub fn validate_daemon_config(cfg: &DaemonConfig) -> Result<ResolvedConfig, Stri
     if resolved.start_height == 0 {
         return Err("invalid start_height 0: must be at least 1".to_string());
     }
-    SocketAddr::from_str(&raw.http_addr)
-        .map_err(|e| format!("invalid http_addr `{}`: {e}", raw.http_addr))?;
     SocketAddr::from_str(&raw.electrum_addr)
         .map_err(|e| format!("invalid electrum_addr `{}`: {e}", raw.electrum_addr))?;
     if resolved.state_file.as_os_str().is_empty() {
@@ -1104,6 +1103,22 @@ mod tests {
     fn resolve_reports_missing_required_fields() {
         let err = resolve(DaemonConfig::default()).unwrap_err();
         assert!(err.contains("p2p_node_addr"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn obsolete_http_addr_flag_still_parses() {
+        use clap::{CommandFactory, Parser};
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ScanArgs,
+        }
+
+        let cli = Cli::try_parse_from(["friglet", "--http-addr", "127.0.0.1:1"]).unwrap();
+        assert_eq!(cli.args.http_addr.as_deref(), Some("127.0.0.1:1"));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("http-addr"), "flag should be hidden: {help}");
     }
 
     #[test]

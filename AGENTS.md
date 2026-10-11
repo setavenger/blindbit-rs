@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Rust Cargo workspace (edition 2024) for BlindBit BIP-352 Silent Payments. Crates: `blindbit-lib` (core scanner + gRPC oracle client), `friglet` (daemon: scanner + HTTP + Electrum + control socket), `friglet-ipc` (control-socket protocol, shared by daemon and tray), `friglet-tray` (Tauri v2 tray UI), `blindbit-cli` (one-shot range scan, no servers). See `README.md` for full flags/usage.
+Rust Cargo workspace (edition 2024) for BlindBit BIP-352 Silent Payments. Crates: `blindbit-lib` (core scanner + gRPC oracle client), `friglet` (daemon: scanner + Electrum + control socket), `friglet-ipc` (control-socket protocol, shared by daemon and tray), `friglet-tray` (Tauri v2 tray UI), `blindbit-cli` (one-shot range scan, no servers). See `README.md` for full flags/usage.
 
 ## Toolchain and system packages
 
@@ -49,7 +49,6 @@ cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
 
 - Control socket (preferred; newline-delimited JSON, `friglet-ipc` protocol): set `FRIGLET_SOCKET="${FRIGLET_CONTROL_SOCKET:-${XDG_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/friglet}/friglet.sock}"`, then `printf '"GetStatus"\n' | nc -U -w 2 "$FRIGLET_SOCKET"`. This honors the environment override and selects the usual Linux default even without `XDG_RUNTIME_DIR`; when the config's `control_socket` key overrides that path, set `FRIGLET_SOCKET` to its value instead. `GetStatus` never waits on the network.
 - Electrum (`127.0.0.1:50001` by default): `printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001` returns `["Friglet","1.4"]`; `blockchain.headers.subscribe` returns the latest scanned height.
-- HTTP `/height` and `/subscribe` **do not answer while scanning is enabled**: the scan task holds the scanner `Mutex` for its whole `watch_chain_until` loop, including while it waits for new blocks (`friglet/src/main.rs` scan task, `friglet/src/server/mod.rs`). They answer only while scanning is stopped (`Stop` / paused). Never use them as a health check; give any `curl` a timeout (`-m 5`).
 
 ## Running friglet-tray
 
@@ -212,9 +211,9 @@ dbus-run-session -- bash -c '
   needs network; the deb target has no such dependency.
 - Docker: root `Dockerfile` (multi-stage; builder needs `protobuf-compiler`
   AND `libprotobuf-dev`) + `docs/docker.md`. The image presets
-  `FRIGLET_HTTP_ADDR`/`FRIGLET_ELECTRUM_ADDR` to `0.0.0.0` binds (env beats
-  config file, loses to flags) and puts the config, key file, control
-  socket and log under the `/data` volume. The scanner state is NOT under
+  `FRIGLET_ELECTRUM_ADDR` to a `0.0.0.0` bind (env beats config file, loses
+  to flags) and puts the config, key file, control socket and log under the
+  `/data` volume. The scanner state is NOT under
   `/data` by default (SNB-635): the default lands in
   `/home/friglet/.config/friglet/` inside the container. Workaround: an
   absolute `state_file = "/data/scanner_state.json"` in `config.toml`.
@@ -279,8 +278,7 @@ dbus-run-session -- bash -c '
   moves the state to `*.json.bak` and scans from scratch.
 - A dead Electrum or control-socket server (e.g. bind failure) ends the
   process with exit code 1; a control socket that failed to bind (another
-  daemon owns it) is left in place. An HTTP bind failure panics instead
-  (exit 101; abort in release builds).
+  daemon owns it) is left in place.
 - Control-socket tests live in `friglet/src/control/mod.rs` (friglet is a
   bin crate); they build offline `Scanner`s via a lazy tonic channel and
   assert the restart via `ControlCtx::restart_requested` + the cancelled
@@ -360,7 +358,7 @@ dbus-run-session -- bash -c '
 
 ## Rules
 
-- Do NOT modify `blindbit-lib` (or `blindbit-cli` / HTTP / Electrum behavior)
+- Do NOT modify `blindbit-lib` (or `blindbit-cli` / Electrum behavior)
   in tray-project work; the tray talks to the daemon only via `friglet-ipc`.
 - Workspace-wide `cargo fmt` reformats `blindbit-lib` files that are not
   fmt-clean; run fmt scoped with `-p` to avoid unrelated diffs.

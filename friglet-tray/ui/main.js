@@ -553,7 +553,6 @@ function fillForm(cfg) {
   $("cfg-spend-pubkey").value = cfg.spend_pubkey ?? "";
   $("cfg-max-labels").value = cfg.max_label_num;
   $("cfg-key-file").value = cfg.key_file ?? "";
-  $("cfg-http-addr").value = cfg.http_addr;
   $("cfg-electrum-addr").value = cfg.electrum_addr;
   $("cfg-state-file").value = cfg.state_file;
   $("cfg-scan-key").value = "";
@@ -580,7 +579,6 @@ function formConfig() {
     spend_pubkey: optional("cfg-spend-pubkey"),
     max_label_num: Number(text("cfg-max-labels") || "0"),
     key_file: optional("cfg-key-file"),
-    http_addr: text("cfg-http-addr"),
     electrum_addr: text("cfg-electrum-addr"),
     state_file: text("cfg-state-file"),
   };
