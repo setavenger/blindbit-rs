@@ -1188,10 +1188,10 @@ mod tests {
             ),
             (
                 DaemonConfig {
-                    http_addr: "localhost:notaport".to_string(),
+                    electrum_addr: "localhost:notaport".to_string(),
                     ..test_config(&dir)
                 },
-                "http_addr",
+                "electrum_addr",
             ),
         ] {
             let resp = client

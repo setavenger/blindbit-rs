@@ -12,7 +12,6 @@ BlindBit is a comprehensive software suite for Bitcoin BIP-352 Silent Payments. 
 - **BlindBit Oracle Integration**: Connects to BlindBit Oracle services for efficient blockchain data access
 - **State Persistence**: Saves and restores scanner state for incremental scanning
 - **Electrum Server**: Exposes a local Electrum TCP interface for wallet compatibility (e.g. Sparrow)
-- **HTTP API**: Lightweight HTTP server exposing scanner state and subscription endpoints
 - **Multi-Network Support**: Works with Bitcoin mainnet, signet, testnet, testnet4, and regtest
 - **Privacy-Preserving**: Scanner queries reveal only general interest in Silent Payments, not specific keys or transactions
 
@@ -21,7 +20,7 @@ BlindBit is a comprehensive software suite for Bitcoin BIP-352 Silent Payments. 
 This is a Cargo workspace containing the following crates:
 
 - **blindbit-lib**: Core library containing the scanning logic and gRPC client
-- **friglet**: Lightweight scanner compatible with Frigate's Silent Payments endpoints, with built-in Electrum and HTTP servers
+- **friglet**: Lightweight scanner compatible with Frigate's Silent Payments endpoints, with a built-in Electrum server
 - **friglet-ipc**: Shared IPC protocol (control socket) between the friglet daemon and its clients
 - **friglet-tray**: System tray companion app for the friglet daemon (Tauri v2)
 - **blindbit-cli**: Minimal command-line interface for scanning (no server functionality)
@@ -30,7 +29,7 @@ This is a Cargo workspace containing the following crates:
 
 ### friglet (Recommended)
 
-`friglet` is the recommended tool. It scans Bitcoin blocks for Silent Payments and exposes both an Electrum TCP server and an HTTP API, making it compatible with wallets like Sparrow via Frigate.
+`friglet` is the recommended tool. It scans Bitcoin blocks for Silent Payments and exposes an Electrum TCP server, making it compatible with wallets like Sparrow via Frigate.
 
 ```bash
 cargo run --release --package friglet scan \
@@ -57,7 +56,6 @@ cargo run --release --package friglet scan \
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
 | `--state-file` | Path to persist scanner state. The default is kept per wallet (`scanner_state-<network>-<id>.json` next to it), so new keys start a fresh scan; an explicit path holding another wallet's state is refused | `<config dir>/friglet/scanner_state.json` |
-| `--http-addr` | HTTP server bind address | `127.0.0.1:8080` |
 | `--electrum-addr` | Electrum TCP server bind address | `127.0.0.1:50001` |
 | `--log-level` | `trace\|debug\|info\|warn\|error`; `RUST_LOG` overrides it | `info` |
 
@@ -74,6 +72,9 @@ with no flags at all.
 - Env vars: flag name upper-cased with the `FRIGLET_` prefix, e.g.
   `FRIGLET_ORACLE_URL`, `FRIGLET_START_HEIGHT`.
 - `--print-config` prints the merged configuration as TOML and exits.
+- `http_addr` (`--http-addr`, `FRIGLET_HTTP_ADDR`) is obsolete: friglet no
+  longer has an HTTP API. The key is still accepted, and still written to
+  config files for compatibility with older trays, but nothing listens on it.
 
 Instead of the hex keys, the config can name the wallet by its Silent
 Payments descriptor as Sparrow exports it (BIP-392; in Sparrow: wallet
@@ -108,20 +109,8 @@ Default socket: `$XDG_RUNTIME_DIR/friglet.sock` (Linux), falling back to
 `\\.\pipe\friglet` (Windows); override with the config key
 `control_socket` or `FRIGLET_CONTROL_SOCKET` (the environment wins).
 
-#### HTTP API
-
-Once running, `friglet` exposes the following endpoints on `--http-addr`:
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /height` | Returns the last scanned block height as `{"height": <n>}` |
-| `GET /subscribe` | Returns the current scanner state in Frigate-compatible format |
-
-These endpoints do not answer while scanning is enabled: the scan holds the
-scanner for as long as it runs, including while it waits for new blocks. They
-answer only while scanning is stopped (**Stop scanning**, or `Stop` over the
-control socket). To check on a running daemon, ask the control socket for
-`GetStatus` or send the Electrum server a `server.version` request:
+To check on a running daemon, ask the control socket for `GetStatus` or
+send the Electrum server a `server.version` request:
 
 For the control query, set `FRIGLET_SOCKET` to the daemon's socket path.
 This example honors `FRIGLET_CONTROL_SOCKET` and selects the usual Linux
@@ -222,8 +211,8 @@ stdout (`friglet-daemon` lines) when the tray runs in a terminal.
 
 The window's **Settings** tab lets you view and edit all daemon settings —
 wallet descriptor, network, wallet birthday, Bitcoin node, oracle URL, and
-under *Advanced* the scan key, spend pubkey, max labels, HTTP/Electrum bind
-addresses, state and key file paths. Saving sends the config (and a new
+under *Advanced* the scan key, spend pubkey, max labels, Electrum bind
+address, state and key file paths. Saving sends the config (and a new
 scan key, if a descriptor was pasted) to the daemon in one request; it
 validates it, persists it to its config file (the scan key to the 0600 key
 file) and then **restarts itself in-process** so every setting takes full
@@ -482,7 +471,7 @@ container is recreated.
 
 ```bash
 docker build -t friglet .
-docker run -d -p 8080:8080 -p 50001:50001 -v "$PWD/friglet-data:/data" friglet
+docker run -d -p 50001:50001 -v "$PWD/friglet-data:/data" friglet
 printf '{"id":1,"method":"server.version","params":["x","1.4"]}\n' | nc -w 2 127.0.0.1 50001
 ```
 

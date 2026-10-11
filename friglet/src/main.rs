@@ -2,9 +2,7 @@ mod blockheader;
 mod config;
 mod control;
 mod electrum;
-mod server;
 mod supervisor;
-mod types;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -15,7 +13,6 @@ use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use axum::{Extension, Router, routing::get};
 use blindbit_lib::scanner;
 
 use config::ScanArgs;
@@ -377,23 +374,6 @@ async fn run(
     });
     let control_server = control::run(cfg.control_socket.clone(), control_ctx.clone());
 
-    let app = Router::new()
-        .route("/height", get(server::get_height))
-        .route("/subscribe", get(server::subscribe))
-        .layer(Extension(server::ScanStartHeight(cfg.start_height)))
-        .layer(Extension(scanner_instance.clone()));
-
-    let http_addr = cfg.raw.http_addr.clone();
-    let http_server = async move {
-        let listener = tokio::net::TcpListener::bind(&http_addr)
-            .await
-            .expect("Failed to bind HTTP server");
-        tracing::info!(addr = %http_addr, "HTTP server listening");
-        axum::serve(listener, app)
-            .await
-            .expect("HTTP server failed");
-    };
-
     let electrum_server = {
         let electrum_addr = cfg.raw.electrum_addr.clone();
         let electrum_clients = electrum_clients.clone();
@@ -422,12 +402,11 @@ async fn run(
     };
 
     // Run everything until a server dies or shutdown/restart is requested;
-    // leaving the select! drops the HTTP/Electrum/control listeners. A dead
+    // leaving the select! drops the Electrum and control listeners. A dead
     // server is an error (non-zero exit), so a supervising tray sees a crash
     // rather than a deliberate stop.
     let mut owns_socket = true;
     let failure: Option<String> = tokio::select! {
-        _ = http_server => Some("HTTP server stopped".to_string()),
         _ = electrum_server => Some("Electrum server stopped".to_string()),
         result = control_server => {
             // The control server only returns when binding failed — possibly

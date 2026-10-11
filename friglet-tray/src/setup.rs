@@ -255,8 +255,6 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
     }
 
-    SocketAddr::from_str(&cfg.http_addr)
-        .map_err(|e| format!("invalid HTTP bind address `{}`: {e}", cfg.http_addr))?;
     SocketAddr::from_str(&cfg.electrum_addr)
         .map_err(|e| format!("invalid Electrum bind address `{}`: {e}", cfg.electrum_addr))?;
     if cfg.state_file.as_os_str().is_empty() {
@@ -548,11 +546,11 @@ mod tests {
             (valid_config(), "zz", "invalid scan key"),
             (
                 DaemonConfig {
-                    http_addr: "nope".to_string(),
+                    electrum_addr: "nope".to_string(),
                     ..valid_config()
                 },
                 KEY_HEX,
-                "invalid HTTP bind address",
+                "invalid Electrum bind address",
             ),
         ];
         for (cfg, key, expected) in cases {
