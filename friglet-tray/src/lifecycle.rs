@@ -323,24 +323,12 @@ where
         tokio::time::sleep(SPAWN_CONNECT_INTERVAL).await;
         // Spawned daemon died already (e.g. bad config)? Stop waiting.
         if let Ok(Some(status)) = child.try_wait() {
-            let tail = recent_output_tail(&recent_output);
             let summary = failure_summary(&recent_output);
-            let mut reason = if summary.is_empty() {
+            let reason = if summary.is_empty() {
                 format!("spawned daemon exited immediately ({status})")
             } else {
                 format!("spawned daemon exited immediately ({status}): {summary}")
             };
-            // A clap usage dump means the binary rejected our zero-arg
-            // invocation — i.e. it's an outdated friglet that still requires
-            // the `scan` subcommand and CLI flags.
-            if tail.contains("Usage:") && tail.contains("<COMMAND>") {
-                reason.push_str(&format!(
-                    " — the daemon binary at {} is an outdated build that requires CLI \
-                     arguments; rebuild it (`cargo build --release -p friglet`) or point \
-                     FRIGLET_DAEMON_BIN at a current one",
-                    bin.display()
-                ));
-            }
             return Attachment::Unreachable { reason };
         }
         if probe(socket_path, PROBE_TIMEOUT).await.is_some() {
