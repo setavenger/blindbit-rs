@@ -23,7 +23,7 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
 use super::types::OwnedOutputRecord;
-use super::electrum_index::{OwnedScripts, WalletElectrumIndex};
+use super::electrum_index::{WalletElectrumIndex, WalletView};
 use super::ScannerError;
 use super::p2p;
 
@@ -201,26 +201,23 @@ impl Scanner {
     /// `scan_start_height` should match the configured scan start so that
     /// Sparrow's subscription key matches across restarts.
     pub async fn rebuild_electrum_index_from_graph(&self, scan_start_height: u64) {
-        let owned = OwnedScripts::of(&self.internal_indexer);
+        let wallet = WalletView::of(&self.internal_indexer);
+
+        // In height order, as the live scan adds them, so each entry lands at
+        // the end of its list. The sort is stable: transactions at one height
+        // keep the graph's order, as before.
+        let mut confirmed: Vec<_> = self
+            .internal_indexer
+            .graph()
+            .full_txs()
+            .filter_map(|node| Some((node.anchors.first()?.block_id.height, node)))
+            .collect();
+        confirmed.sort_by_key(|(height, _)| *height);
 
         let mut index = self.electrum_index.lock().await;
         index.sp_start_height = scan_start_height;
-
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            let Some(anchor) = inner_tx.anchors.first() else {
-                continue;
-            };
-            let height = anchor.block_id.height;
-            let txid = inner_tx.txid;
-            index.index_confirmed_tx(&inner_tx.tx, txid, height, &owned);
-            if let Some(tweak) = self
-                .internal_indexer
-                .index()
-                .txid_to_partial_secret
-                .get(&txid)
-            {
-                index.add_sp_history(txid, height, tweak);
-            }
+        for (height, node) in confirmed {
+            index.index_confirmed_tx(&node.tx, node.txid, height, &wallet);
         }
 
         // Restore tip height from last_scanned_block_height.

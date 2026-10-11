@@ -14,7 +14,7 @@ use crate::oracle_grpc::{
     RangedBlockHeightRequestFiltered,
 };
 
-use super::electrum_index::OwnedScripts;
+use super::electrum_index::WalletView;
 use super::health::{ScanCancelled, ScanStopped};
 use super::p2p;
 use super::health::{OracleProbe, indexed_block_hash};
@@ -463,7 +463,7 @@ impl Scanner {
                 {
                     // After apply_matched_block, so an output received and
                     // spent in this block counts.
-                    let owned = OwnedScripts::of(&self.internal_indexer);
+                    let wallet = WalletView::of(&self.internal_indexer);
 
                     let header_hex = hex::encode(
                         bitcoin::consensus::encode::serialize(&block.header),
@@ -476,21 +476,7 @@ impl Scanner {
                     }
 
                     for tx in &block.txdata {
-                        idx.index_confirmed_tx(tx, tx.compute_txid(), block_height_u32, &owned);
-                    }
-
-                    // SP history — use confirmed txid_to_partial_secret
-                    // (populated by apply_block_relevant for this block's matches).
-                    for tx in &block.txdata {
-                        let txid = tx.compute_txid();
-                        if let Some(tweak) = self
-                            .internal_indexer
-                            .index()
-                            .txid_to_partial_secret
-                            .get(&txid)
-                        {
-                            idx.add_sp_history(txid, block_height_u32, tweak);
-                        }
+                        idx.index_confirmed_tx(tx, tx.compute_txid(), block_height_u32, &wallet);
                     }
 
                     // Promote any pending (unconfirmed) height-0 entries for txs

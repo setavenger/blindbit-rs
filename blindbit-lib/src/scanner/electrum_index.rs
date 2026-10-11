@@ -8,7 +8,7 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 use indexer::bdk_chain::ConfirmationBlockTime;
 use indexer::v2::SpIndexerV2;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::health::ScanHealth;
 
@@ -87,19 +87,21 @@ pub struct SpHistoryEntry {
     pub tweak_hex: String,
 }
 
-/// The wallet's outputs as an index update needs them: which outpoints are
-/// the wallet's, and the script of each, so a spend is filed under the
-/// scripthash of the output it consumes.
-pub(crate) struct OwnedScripts {
+/// What an index update needs to know about the wallet: which outpoints are
+/// its outputs, the script of each (so a spend is filed under the scripthash
+/// of the output it consumes), and the silent-payment tweak of each
+/// transaction that paid it.
+pub(crate) struct WalletView<'a> {
     outpoints: HashSet<OutPoint>,
     scripts: HashMap<OutPoint, ScriptBuf>,
+    tweaks: &'a BTreeMap<Txid, PublicKey>,
 }
 
-impl OwnedScripts {
+impl<'a> WalletView<'a> {
     /// Taken from the wallet graph. Build it after the block being indexed
     /// was applied, so an output received and spent in that same block
     /// counts.
-    pub(crate) fn of(indexer: &SpIndexerV2<ConfirmationBlockTime>) -> Self {
+    pub(crate) fn of(indexer: &'a SpIndexerV2<ConfirmationBlockTime>) -> Self {
         let outpoints: HashSet<OutPoint> =
             indexer.index().by_shared_secret.keys().cloned().collect();
         let mut scripts = HashMap::new();
@@ -114,7 +116,11 @@ impl OwnedScripts {
                 }
             }
         }
-        Self { outpoints, scripts }
+        Self {
+            outpoints,
+            scripts,
+            tweaks: &indexer.index().txid_to_partial_secret,
+        }
     }
 }
 
@@ -139,12 +145,12 @@ impl WalletElectrumIndex {
             }
             Some(_) => false,
             None => {
-                history.push(ScriptHashEntry {
+                let entry = ScriptHashEntry {
                     tx_hash: tx_hash.to_owned(),
                     height,
                     fee: 0,
-                });
-                history.sort_by_key(|e| e.height);
+                };
+                history.insert(insertion_point(history, |e| e.height, height), entry);
                 true
             }
         }
@@ -153,14 +159,15 @@ impl WalletElectrumIndex {
     /// Indexes a transaction confirmed at `height`: lists it under the
     /// scripthash of every wallet output it pays and of every wallet output
     /// it spends (Sparrow expects a spend in the history of the scripthash it
-    /// spends), and keeps its raw bytes for `blockchain.transaction.get` when
-    /// it does either.
+    /// spends), keeps its raw bytes for `blockchain.transaction.get` when it
+    /// does either, and lists it in the SP history when it paid the wallet a
+    /// silent payment.
     pub(crate) fn index_confirmed_tx(
         &mut self,
         tx: &Transaction,
         txid: Txid,
         height: u32,
-        owned: &OwnedScripts,
+        wallet: &WalletView,
     ) {
         // Formatted only for a wallet transaction: a matched block is
         // indexed whole, and most of its transactions are not the wallet's.
@@ -170,13 +177,13 @@ impl WalletElectrumIndex {
                 txid,
                 vout: vout as u32,
             };
-            if owned.outpoints.contains(&outpoint) {
+            if wallet.outpoints.contains(&outpoint) {
                 let tx_hash = tx_hash.get_or_insert_with(|| txid.to_string());
                 self.add_history(electrum_scripthash(&output.script_pubkey), tx_hash, height);
             }
         }
         for input in &tx.input {
-            if let Some(script) = owned.scripts.get(&input.previous_output) {
+            if let Some(script) = wallet.scripts.get(&input.previous_output) {
                 let tx_hash = tx_hash.get_or_insert_with(|| txid.to_string());
                 self.add_history(electrum_scripthash(script), tx_hash, height);
             }
@@ -185,20 +192,24 @@ impl WalletElectrumIndex {
             self.txs
                 .insert(tx_hash, bitcoin::consensus::encode::serialize(tx));
         }
+        if let Some(tweak) = wallet.tweaks.get(&txid) {
+            self.add_sp_history(txid, height, tweak);
+        }
     }
 
     /// Lists a silent-payment transaction confirmed at `height`, with its
     /// tweak, in the SP history, which stays sorted by height. A transaction
     /// already listed keeps its entry.
-    pub(crate) fn add_sp_history(&mut self, txid: Txid, height: u32, tweak: &PublicKey) {
+    fn add_sp_history(&mut self, txid: Txid, height: u32, tweak: &PublicKey) {
         let tx_hash = txid.to_string();
         if !self.sp_history.iter().any(|e| e.tx_hash == tx_hash) {
-            self.sp_history.push(SpHistoryEntry {
+            let entry = SpHistoryEntry {
                 tx_hash,
                 height,
                 tweak_hex: tweak.to_string(),
-            });
-            self.sp_history.sort_by_key(|e| e.height);
+            };
+            let at = insertion_point(&self.sp_history, |e| e.height, height);
+            self.sp_history.insert(at, entry);
         }
     }
 
@@ -212,6 +223,13 @@ impl WalletElectrumIndex {
             None => scanned,
         }
     }
+}
+
+/// Where an entry at `height` goes in a list sorted by height: after every
+/// entry at the same or a lower height, which is where pushing it and then
+/// stably sorting the list would put it.
+fn insertion_point<T>(sorted: &[T], height_of: impl Fn(&T) -> u32, height: u32) -> usize {
+    sorted.partition_point(|e| height_of(e) <= height)
 }
 
 /// Compute the Electrum scripthash for a script.

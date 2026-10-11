@@ -7,9 +7,10 @@
 //! live scan writes these per matched block; a restart rebuilds them from the
 //! wallet graph. Both must agree, entry for entry.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bitcoin::Transaction;
+use bitcoin::consensus::encode::serialize;
 
 use super::Scanner;
 use super::electrum_index::{WalletElectrumIndex, electrum_scripthash};
@@ -34,18 +35,22 @@ async fn histories(scanner: &Scanner) -> Histories {
         .collect()
 }
 
-async fn sp_history(scanner: &Scanner) -> Vec<(String, u32)> {
+/// The SP history as `silentpayments.subscribe` serves it: tx, height, tweak.
+async fn sp_history(scanner: &Scanner) -> Vec<(String, u32, String)> {
     let idx = scanner.electrum_index.lock().await;
     idx.sp_history
         .iter()
-        .map(|e| (e.tx_hash.clone(), e.height))
+        .map(|e| (e.tx_hash.clone(), e.height, e.tweak_hex.clone()))
         .collect()
 }
 
-/// The txids `blockchain.transaction.get` can serve.
-async fn served_txids(scanner: &Scanner) -> BTreeSet<String> {
+/// What `blockchain.transaction.get` serves: txid -> raw transaction.
+async fn served_txs(scanner: &Scanner) -> BTreeMap<String, Vec<u8>> {
     let idx = scanner.electrum_index.lock().await;
-    idx.txs.keys().cloned().collect()
+    idx.txs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// `histories` with same-height entries ordered by txid. A restore walks the
@@ -60,8 +65,9 @@ fn by_height_then_txid(mut histories: Histories) -> Histories {
 
 /// Receives at 101, 102 and 103; the 103 output is spent in its own block,
 /// the 101 output at 104. Each scripthash lists its receive and its spend at
-/// their heights; the SP history lists the three payments; all five wallet
-/// transactions are served, the coinbases are not.
+/// their heights; the SP history lists the three payments with their tweaks;
+/// all five wallet transactions are served, byte for byte, the coinbases are
+/// not.
 #[test]
 fn live_scan_and_restore_build_the_same_electrum_index() {
     run(async {
@@ -94,16 +100,20 @@ fn live_scan_and_restore_build_the_same_electrum_index() {
             (sh(c_key), vec![(id(&c), 103), (id(&c_spend), 103)]),
         ]
         .into();
-        let expected_sp = vec![(id(&a), 101), (id(&b), 102), (id(&c), 103)];
-        let expected_txids: BTreeSet<String> = [&a, &b, &c, &a_spend, &c_spend]
+        let expected_sp = vec![
+            (id(&a), 101, a_tweak.to_string()),
+            (id(&b), 102, b_tweak.to_string()),
+            (id(&c), 103, c_tweak.to_string()),
+        ];
+        let expected_txs: BTreeMap<String, Vec<u8>> = [&a, &b, &c, &a_spend, &c_spend]
             .into_iter()
-            .map(id)
+            .map(|tx| (id(tx), serialize(tx)))
             .collect();
 
         // The live scan writes each block's transactions in block order.
         assert_eq!(histories(&scanner).await, expected);
         assert_eq!(sp_history(&scanner).await, expected_sp);
-        assert_eq!(served_txids(&scanner).await, expected_txids);
+        assert_eq!(served_txs(&scanner).await, expected_txs);
 
         #[cfg(feature = "serde")]
         {
@@ -115,7 +125,7 @@ fn live_scan_and_restore_build_the_same_electrum_index() {
                 by_height_then_txid(expected)
             );
             assert_eq!(sp_history(&restarted).await, expected_sp);
-            assert_eq!(served_txids(&restarted).await, expected_txids);
+            assert_eq!(served_txs(&restarted).await, expected_txs);
         }
     });
 }
