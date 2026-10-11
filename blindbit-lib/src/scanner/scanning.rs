@@ -14,7 +14,7 @@ use crate::oracle_grpc::{
     RangedBlockHeightRequestFiltered,
 };
 
-use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, electrum_scripthash};
+use super::electrum_index::OwnedScripts;
 use super::health::{ScanCancelled, ScanStopped};
 use super::p2p;
 use super::health::{OracleProbe, indexed_block_hash};
@@ -37,27 +37,6 @@ use super::ScannerError;
               uses this constant, which makes this expectation fail and forces its removal"
 )]
 const BIP352_K_MAX: usize = 2323;
-
-/// Insert or upgrade a scripthash history entry.
-///
-/// If the tx is already present with a confirmed height (> 0), it is left
-/// untouched.  If it is present at height 0 (unconfirmed, added by the
-/// broadcast handler), the entry is upgraded to the confirmed height.
-/// Otherwise the entry is appended and the list is re-sorted.
-fn upsert_history_entry(history: &mut Vec<ScriptHashEntry>, entry: ScriptHashEntry) {
-    match history.iter().position(|e| e.tx_hash == entry.tx_hash) {
-        Some(pos) if history[pos].height == 0 && entry.height > 0 => {
-            // Promote unconfirmed → confirmed.
-            history[pos].height = entry.height;
-            history.sort_by_key(|e| e.height);
-        }
-        Some(_) => {} // already confirmed (or same height), leave it
-        None => {
-            history.push(entry);
-            history.sort_by_key(|e| e.height);
-        }
-    }
-}
 
 /// The per-block message source of a block-range scan.
 ///
@@ -482,27 +461,9 @@ impl Scanner {
                 // Update the wallet-scoped Electrum index while the full block is in hand.
                 // The block is already fetched from P2P so this costs nothing extra.
                 {
-                    let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
-                        .internal_indexer
-                        .index()
-                        .by_shared_secret
-                        .keys()
-                        .cloned()
-                        .collect();
-
-                    // Build outpoint → script map from the graph so we can derive the
-                    // scripthash of a spent output without re-fetching anything.
-                    let mut outpoint_scripts: HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
-                        HashMap::new();
-                    for node in self.internal_indexer.graph().full_txs() {
-                        let node_txid = node.txid;
-                        for (vout, out) in node.tx.output.iter().enumerate() {
-                            let op = bitcoin::OutPoint { txid: node_txid, vout: vout as u32 };
-                            if owned_outpoints.contains(&op) {
-                                outpoint_scripts.insert(op, out.script_pubkey.clone());
-                            }
-                        }
-                    }
+                    // After apply_matched_block, so an output received and
+                    // spent in this block counts.
+                    let owned = OwnedScripts::of(&self.internal_indexer);
 
                     let header_hex = hex::encode(
                         bitcoin::consensus::encode::serialize(&block.header),
@@ -515,79 +476,20 @@ impl Scanner {
                     }
 
                     for tx in &block.txdata {
-                        let txid = tx.compute_txid();
-                        let mut is_ours = false;
-
-                        // Receiving side: outputs belonging to the wallet.
-                        for (vout, output) in tx.output.iter().enumerate() {
-                            let outpoint = bitcoin::OutPoint {
-                                txid,
-                                vout: vout as u32,
-                            };
-                            if owned_outpoints.contains(&outpoint) {
-                                is_ours = true;
-                                let scripthash =
-                                    electrum_scripthash(&output.script_pubkey);
-                                let entry = ScriptHashEntry {
-                                    tx_hash: txid.to_string(),
-                                    height: block_height_u32,
-                                    fee: 0,
-                                };
-                                let history = idx
-                                    .scripthash_history
-                                    .entry(scripthash)
-                                    .or_default();
-                                upsert_history_entry(history, entry);
-                            }
-                        }
-
-                        // Spending side: inputs that consume one of our outputs.
-                        // Sparrow expects the spending tx to also appear in
-                        // blockchain.scripthash.get_history for the spent scripthash.
-                        for input in &tx.input {
-                            if let Some(script) =
-                                outpoint_scripts.get(&input.previous_output)
-                            {
-                                is_ours = true;
-                                let scripthash = electrum_scripthash(script);
-                                let entry = ScriptHashEntry {
-                                    tx_hash: txid.to_string(),
-                                    height: block_height_u32,
-                                    fee: 0,
-                                };
-                                let history = idx
-                                    .scripthash_history
-                                    .entry(scripthash)
-                                    .or_default();
-                                upsert_history_entry(history, entry);
-                            }
-                        }
-
-                        if is_ours {
-                            let raw = bitcoin::consensus::encode::serialize(tx);
-                            idx.txs.insert(txid.to_string(), raw);
-                        }
+                        idx.index_confirmed_tx(tx, tx.compute_txid(), block_height_u32, &owned);
                     }
 
                     // SP history — use confirmed txid_to_partial_secret
                     // (populated by apply_block_relevant for this block's matches).
                     for tx in &block.txdata {
                         let txid = tx.compute_txid();
-                        if let Some(secret) = self
+                        if let Some(tweak) = self
                             .internal_indexer
                             .index()
                             .txid_to_partial_secret
                             .get(&txid)
                         {
-                            let entry = SpHistoryEntry {
-                                tx_hash: txid.to_string(),
-                                height: block_height_u32,
-                                tweak_hex: secret.to_string(),
-                            };
-                            if !idx.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                                idx.sp_history.push(entry);
-                                idx.sp_history.sort_by_key(|e| e.height);
-                            }
+                            idx.add_sp_history(txid, block_height_u32, tweak);
                         }
                     }
 

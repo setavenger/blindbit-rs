@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bitcoin::Transaction;
 
 use super::Scanner;
-use super::electrum_index::electrum_scripthash;
+use super::electrum_index::{WalletElectrumIndex, electrum_scripthash};
 use super::reorg_tests::{Oracle, p2tr, payment, spend_of};
 use super::test_support::{run, scanner};
 
@@ -118,4 +118,50 @@ fn live_scan_and_restore_build_the_same_electrum_index() {
             assert_eq!(served_txids(&restarted).await, expected_txids);
         }
     });
+}
+
+/// A scripthash's history stays sorted by height with unconfirmed entries
+/// first; a listed transaction keeps its entry, except that an unconfirmed
+/// one is promoted once it confirms, and a confirmed one never goes back to
+/// unconfirmed. `add_history` reports only entries it added.
+#[test]
+fn add_history_keeps_one_entry_per_tx_and_promotes_unconfirmed_ones() {
+    let mut idx = WalletElectrumIndex::new();
+    let history = |idx: &WalletElectrumIndex| -> Vec<(String, u32)> {
+        idx.scripthash_history["sh"]
+            .iter()
+            .map(|e| (e.tx_hash.clone(), e.height))
+            .collect()
+    };
+    let entries = |list: &[(&str, u32)]| -> Vec<(String, u32)> {
+        list.iter().map(|(tx, h)| (tx.to_string(), *h)).collect()
+    };
+
+    assert!(idx.add_history("sh".into(), "t1", 105));
+    assert!(idx.add_history("sh".into(), "t2", 101));
+    assert_eq!(history(&idx), entries(&[("t2", 101), ("t1", 105)]));
+
+    assert!(!idx.add_history("sh".into(), "t1", 105));
+    assert!(
+        !idx.add_history("sh".into(), "t1", 200),
+        "a confirmed entry stays"
+    );
+    assert!(idx.add_history("sh".into(), "t3", 0));
+    assert_eq!(
+        history(&idx),
+        entries(&[("t3", 0), ("t2", 101), ("t1", 105)])
+    );
+
+    assert!(
+        !idx.add_history("sh".into(), "t3", 110),
+        "promoted, not added"
+    );
+    assert!(
+        !idx.add_history("sh".into(), "t1", 0),
+        "never back to unconfirmed"
+    );
+    assert_eq!(
+        history(&idx),
+        entries(&[("t2", 101), ("t1", 105), ("t3", 110)])
+    );
 }

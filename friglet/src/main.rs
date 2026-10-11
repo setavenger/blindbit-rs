@@ -235,7 +235,7 @@ async fn run(
     let label_addresses = control::derive_label_addresses(
         secret_scan,
         cfg.spend_pubkey,
-        control::wallet_network(cfg.network),
+        blindbit_lib::scanner::convert_network(cfg.network),
         cfg.raw.max_label_num,
     );
     // blindbit-lib persists the scan secret inside the state JSON (see
