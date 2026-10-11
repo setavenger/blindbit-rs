@@ -46,6 +46,10 @@ const CLIENT_NAME: &str = "SwiftSync";
 /// checked again.
 const READ_POLL: Duration = Duration::from_millis(200);
 
+/// How long to wait for the peer to settle after the handshake; see
+/// [`Peer::wait_until_settled`].
+pub const SETTLE_WAIT: Duration = Duration::from_secs(2);
+
 /// Bitcoin Core's `MAX_PROTOCOL_MESSAGE_LENGTH` is 4 MB; blocks are larger
 /// on the wire only through `MAX_SIZE` (32 MB). Anything above is garbage.
 const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
@@ -335,40 +339,32 @@ impl Peer {
         }
     }
 
-    /// Headers of the given blocks, `None` for each block the peer does not
-    /// know. One round trip: every `getheaders` is answered in order, and the
-    /// trailing ping's pong marks the end of the answers.
-    pub fn headers_by_hash(
+    /// The header of block `hash`, `None` when the peer does not know the
+    /// block. Only a header whose hash is `hash` is returned. One round trip:
+    /// the `getheaders` is answered before the trailing ping's pong.
+    pub fn header_by_hash(
         &mut self,
-        hashes: &[BlockHash],
+        hash: BlockHash,
         deadline: Instant,
-    ) -> Result<Vec<Option<Header>>, P2pError> {
-        for hash in hashes {
-            self.send(NetworkMessage::GetHeaders(GetHeadersMessage {
-                version: ProtocolVersion::WTXID_RELAY_VERSION,
-                locator_hashes: Vec::new(),
-                stop_hash: wire_block_hash(*hash),
-            }))?;
-        }
+    ) -> Result<Option<Header>, P2pError> {
+        self.send(NetworkMessage::GetHeaders(GetHeadersMessage {
+            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            locator_hashes: Vec::new(),
+            stop_hash: wire_block_hash(hash),
+        }))?;
         let mut found = Vec::new();
         self.sync_with_ping(deadline, "block headers", |message| {
             if let NetworkMessage::Headers(headers) = message {
                 found.extend(headers.0.iter().cloned());
             }
         })?;
-        let mut result = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            let mut header = None;
-            for candidate in &found {
-                let converted = header_from_wire(candidate)?;
-                if converted.block_hash() == *hash {
-                    header = Some(converted);
-                    break;
-                }
+        for candidate in &found {
+            let converted = header_from_wire(candidate)?;
+            if converted.block_hash() == hash {
+                return Ok(Some(converted));
             }
-            result.push(header);
         }
-        Ok(result)
+        Ok(None)
     }
 
     /// Wait until the peer has processed everything sent so far: it answers
