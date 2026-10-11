@@ -98,9 +98,9 @@ pub(crate) struct WalletView<'a> {
 }
 
 impl<'a> WalletView<'a> {
-    /// Taken from the wallet graph. Build it after the block being indexed
-    /// was applied, so an output received and spent in that same block
-    /// counts.
+    /// Taken from the wallet's index and graph. Build it after the block
+    /// being indexed was applied, so an output received and spent in that
+    /// same block counts.
     pub(crate) fn of(indexer: &'a SpIndexerV2<ConfirmationBlockTime>) -> Self {
         let outpoints: HashSet<OutPoint> =
             indexer.index().by_shared_secret.keys().cloned().collect();
