@@ -112,14 +112,13 @@ async fn main() -> std::io::Result<()> {
                     Request::SetConfig(new_cfg) => match check_config(&new_cfg) {
                         Ok(()) => {
                             let mut cfg = config.lock().unwrap();
-                            let bind_changed = new_cfg.http_addr != cfg.http_addr
-                                || new_cfg.electrum_addr != cfg.electrum_addr;
+                            let bind_changed = new_cfg.electrum_addr != cfg.electrum_addr;
                             *cfg = *new_cfg;
                             eprintln!("fake daemon config updated");
                             if bind_changed {
                                 Response::OkWithNote(
-                                    "changes to http_addr, electrum_addr are saved but only \
-                                     take effect after a daemon restart"
+                                    "changes to electrum_addr are saved but only take effect \
+                                     after a daemon restart"
                                         .to_string(),
                                 )
                             } else {

@@ -175,38 +175,6 @@ impl Scanner {
         self.last_scanned_block_height
     }
 
-    pub fn get_scanner_sp_address(&self) -> String {
-        self.internal_indexer
-            .get_address(convert_network(self.network))
-            .to_string()
-    }
-
-    pub fn get_max_label_num(&self) -> u32 {
-        self.max_label_num
-    }
-
-    pub fn get_relevant_txs(&self) -> Vec<(Txid, &PublicKey, u32)> {
-        let mut txs: Vec<(Txid, &PublicKey, u32)> = Vec::new();
-
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            let Some(anchor) = inner_tx.anchors.first() else {
-                continue;
-            };
-            let Some(shared_secret_tx) = self
-                .internal_indexer
-                .index()
-                .txid_to_partial_secret
-                .get(&inner_tx.txid)
-            else {
-                continue;
-            };
-
-            txs.push((inner_tx.txid, shared_secret_tx, anchor.block_id.height));
-        }
-
-        txs
-    }
-
     /// Returns a cloned Arc to the wallet-scoped Electrum index.
     /// The Electrum TCP server holds this Arc and serves requests without
     /// locking the scanner itself.
