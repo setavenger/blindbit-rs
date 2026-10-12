@@ -48,7 +48,7 @@ type Message = BlockScanDataShortResponse;
 
 /// One chain as the oracle serves it: height -> block message.
 #[derive(Clone, Default)]
-struct Oracle {
+pub(super) struct Oracle {
     chain: BTreeMap<u64, Message>,
     /// Ends a stream with an UNAVAILABLE status at this height, if the
     /// stream began below it (so the first block of a stream is always
@@ -81,7 +81,7 @@ impl Traffic {
     }
 }
 
-struct ChainStream(VecDeque<Result<Message, tonic::Status>>);
+pub(super) struct ChainStream(VecDeque<Result<Message, tonic::Status>>);
 
 impl BlockScanDataStream for ChainStream {
     fn next_message(
@@ -139,7 +139,7 @@ impl OracleProbe for Oracle {
 }
 
 impl Oracle {
-    fn tip(&self) -> u64 {
+    pub(super) fn tip(&self) -> u64 {
         *self.chain.keys().next_back().expect("non-empty chain")
     }
 
@@ -167,7 +167,7 @@ impl Oracle {
 
     /// A block holding `txs` (payments carry their served tweak), served in
     /// place of P2P.
-    fn block(
+    pub(super) fn block(
         &mut self,
         branch: u8,
         height: u64,
@@ -259,7 +259,7 @@ fn full_block(branch: u8, height: u64, txs: Vec<Transaction>) -> Block {
 
 /// A payment of `sat` to the wallet's unlabelled address; the tweak the
 /// oracle serves for it and the paid outpoint.
-fn payment(seed: u8, sat: u64) -> (Transaction, PublicKey, OutPoint, XOnlyPublicKey) {
+pub(super) fn payment(seed: u8, sat: u64) -> (Transaction, PublicKey, OutPoint, XOnlyPublicKey) {
     let (scan_sk, spend_pk) = keys();
     let tweak = secret(seed).public_key(&Secp256k1::new());
     let shared = bdk_sp::compute_shared_secret(&scan_sk, &tweak);
@@ -285,7 +285,7 @@ fn payment(seed: u8, sat: u64) -> (Transaction, PublicKey, OutPoint, XOnlyPublic
 }
 
 /// A spend of `outpoint` to a foreign key.
-fn spend_of(outpoint: OutPoint) -> Transaction {
+pub(super) fn spend_of(outpoint: OutPoint) -> Transaction {
     let foreign = secret(0x66)
         .public_key(&Secp256k1::new())
         .x_only_public_key()
@@ -306,7 +306,7 @@ fn spend_of(outpoint: OutPoint) -> Transaction {
     }
 }
 
-fn p2tr(key: XOnlyPublicKey) -> ScriptBuf {
+pub(super) fn p2tr(key: XOnlyPublicKey) -> ScriptBuf {
     ScriptBuf::new_p2tr_tweaked(TweakedPublicKey::dangerous_assume_tweaked(key))
 }
 

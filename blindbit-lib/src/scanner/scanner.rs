@@ -23,7 +23,7 @@ use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
 use super::types::OwnedOutputRecord;
-use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
+use super::electrum_index::{WalletElectrumIndex, WalletView};
 use super::ScannerError;
 use super::p2p;
 
@@ -201,107 +201,24 @@ impl Scanner {
     /// `scan_start_height` should match the configured scan start so that
     /// Sparrow's subscription key matches across restarts.
     pub async fn rebuild_electrum_index_from_graph(&self, scan_start_height: u64) {
-        let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
-            .internal_indexer
-            .index()
-            .by_shared_secret
-            .keys()
-            .cloned()
-            .collect();
+        let wallet = WalletView::of(&self.internal_indexer);
 
-        // Build outpoint → script map once so spend detection can look up the
-        // scripthash of a consumed output without re-iterating the graph.
-        let mut outpoint_scripts: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
-            std::collections::HashMap::new();
-        for node in self.internal_indexer.graph().full_txs() {
-            let txid = node.txid;
-            for (vout, out) in node.tx.output.iter().enumerate() {
-                let op = bitcoin::OutPoint { txid, vout: vout as u32 };
-                if owned_outpoints.contains(&op) {
-                    outpoint_scripts.insert(op, out.script_pubkey.clone());
-                }
-            }
-        }
+        // In height order, as the live scan adds them, so each entry lands at
+        // the end of its list. The sort is stable: transactions at one height
+        // keep the graph's order, as before.
+        let mut confirmed: Vec<_> = self
+            .internal_indexer
+            .graph()
+            .full_txs()
+            .filter_map(|node| Some((node.anchors.first()?.block_id.height, node)))
+            .collect();
+        confirmed.sort_by_key(|(height, _)| *height);
 
         let mut index = self.electrum_index.lock().await;
         index.sp_start_height = scan_start_height;
-
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            let Some(anchor) = inner_tx.anchors.first() else {
-                continue;
-            };
-            let height = anchor.block_id.height;
-            let txid = inner_tx.txid;
-
-            let raw = bitcoin::consensus::encode::serialize(inner_tx.tx.as_ref());
-
-            let mut is_ours = false;
-
-            // Receiving side: outputs belonging to the wallet.
-            for (vout, output) in inner_tx.tx.output.iter().enumerate() {
-                let outpoint = bitcoin::OutPoint {
-                    txid,
-                    vout: vout as u32,
-                };
-                if owned_outpoints.contains(&outpoint) {
-                    is_ours = true;
-                    let scripthash = electrum_scripthash(&output.script_pubkey);
-                    let entry = ScriptHashEntry {
-                        tx_hash: txid.to_string(),
-                        height,
-                        fee: 0,
-                    };
-                    let history = index.scripthash_history.entry(scripthash).or_default();
-                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                        history.push(entry);
-                    }
-                }
-            }
-
-            // Spending side: inputs that consume one of our outputs.
-            for input in inner_tx.tx.input.iter() {
-                if let Some(script) = outpoint_scripts.get(&input.previous_output) {
-                    is_ours = true;
-                    let scripthash = electrum_scripthash(script);
-                    let entry = ScriptHashEntry {
-                        tx_hash: txid.to_string(),
-                        height,
-                        fee: 0,
-                    };
-                    let history = index.scripthash_history.entry(scripthash).or_default();
-                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                        history.push(entry);
-                    }
-                }
-            }
-
-            if is_ours {
-                index.txs.insert(txid.to_string(), raw);
-            }
-
-            // SP history from txid_to_partial_secret
-            if let Some(secret) = self
-                .internal_indexer
-                .index()
-                .txid_to_partial_secret
-                .get(&txid)
-            {
-                let entry = SpHistoryEntry {
-                    tx_hash: txid.to_string(),
-                    height,
-                    tweak_hex: secret.to_string(),
-                };
-                if !index.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                    index.sp_history.push(entry);
-                }
-            }
+        for (height, node) in confirmed {
+            index.index_confirmed_tx(&node.tx, node.txid, height, &wallet);
         }
-
-        // Sort all histories by height ascending (Electrum spec order).
-        for history in index.scripthash_history.values_mut() {
-            history.sort_by_key(|e| e.height);
-        }
-        index.sp_history.sort_by_key(|e| e.height);
 
         // Restore tip height from last_scanned_block_height.
         // Header hex is not recoverable without re-fetching; Sparrow's BlockHeaderTip
@@ -614,7 +531,9 @@ impl Scanner {
     }
 }
 
-fn convert_network(nw: Network) -> BTCNetwork {
+/// The `bitcoin` crate's network for a wallet on `nw` (the scanner takes the
+/// `bitcoin_rev` network; addresses and the wallet graph use `bitcoin`'s).
+pub fn convert_network(nw: Network) -> BTCNetwork {
     match nw {
         Network::Bitcoin => BTCNetwork::Bitcoin,
         Network::Signet => BTCNetwork::Signet,
