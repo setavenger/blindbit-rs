@@ -17,10 +17,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut stream = client
         .stream_block_scan_data_short(request)
-        .await
-        .unwrap()
+        .await?
         .into_inner();
-    while let Some(block_scan_data) = stream.message().await.unwrap() {
+    // An error status (e.g. NOT_FOUND for a height the oracle has not
+    // indexed) ends the stream; `?` surfaces it instead of panicking.
+    while let Some(block_scan_data) = stream.message().await? {
         let Some(block_identifier) = block_scan_data.block_identifier.clone() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -28,6 +29,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .into());
         };
+        // Older oracles answer an unindexed height with an empty block hash
+        // and no data; that is not an empty block.
+        if block_identifier.block_hash.len() != 32 {
+            return Err(format!(
+                "height {} has no valid block hash; the oracle has probably not indexed it",
+                block_identifier.block_height
+            )
+            .into());
+        }
         println!("height: {}", block_identifier.block_height);
     }
 

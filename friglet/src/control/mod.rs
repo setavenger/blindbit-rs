@@ -1,29 +1,26 @@
 //! Control socket: serves `friglet-ipc` requests over a local socket
 //! (Unix domain socket / Windows named pipe, newline-delimited JSON).
 //!
-//! # `SetConfig` / `SetScanKey` apply semantics (v1)
+//! # `SetConfig` / `SetScanKey` / `ApplySettings` semantics
 //!
-//! - The new config is validated first; on any validation error nothing is
-//!   persisted and nothing changes.
-//! - Valid configs are persisted to the daemon's config file (the file it
-//!   loaded at startup, or the default path when none existed) as TOML.
-//! - Scanner-affecting fields (`network`, `oracle_url`, `p2p_node_addr`,
-//!   `start_height`, `spend_pubkey`, `max_label_num`, `state_file`,
-//!   `key_file`) are applied live: the scan task is stopped, state is saved,
-//!   a fresh scanner is built from the new settings and swapped in, and the
-//!   scan task is restarted if it was running. The Electrum server keeps
-//!   serving the pre-change wallet view (its index and notification channel
-//!   belong to the old scanner) until the daemon restarts — reported to the
-//!   client via `Response::OkWithNote`.
-//! - `http_addr` / `electrum_addr` / `control_socket` / `log_level` changes
-//!   are persisted but only take effect after a daemon restart (live
-//!   rebinding is out of scope); also reported via `OkWithNote`.
+//! - The new config (and scan key, if any) is validated first; on any
+//!   validation error nothing is persisted and nothing changes.
+//! - Valid input is persisted — the config to the daemon's config file (the
+//!   file it loaded at startup, or the default path when none existed) as
+//!   TOML, the scan key to the 0600 key file.
+//! - If anything changed, the daemon answers `OkWithNote` and then restarts
+//!   in-process (see `main.rs`): every setting takes full effect, including
+//!   bind addresses and log level, and Electrum clients such as Sparrow are
+//!   disconnected so they reconnect to the new wallet view. New keys get
+//!   their own state file (`config::wallet_state_file`), so switching
+//!   wallets starts a fresh scan without manual cleanup.
+//! - Unchanged input answers `Ok` without a restart.
 
 use std::io;
-use std::path::PathBuf;
-use std::pin::Pin;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bdk_sp::encoding::SilentPaymentCode;
@@ -34,55 +31,116 @@ use friglet_ipc::{DaemonConfig, LabelAddress, Listener, Request, Response, Statu
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{self, ResolvedConfig};
-use crate::supervisor::ScanSupervisor;
+use crate::config;
+use crate::supervisor::{ScanSupervisor, StartOutcome};
 
-/// How long a cached oracle tip is considered fresh.
-const ORACLE_TIP_TTL: Duration = Duration::from_secs(10);
-/// Cap how long `GetStatus` waits on a slow/unreachable oracle.
-const ORACLE_TIP_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the background poller asks the oracle for its tip.
+const ORACLE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// Cap on one oracle tip poll (connect + `GetInfo`).
+const ORACLE_POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// The oracle counts as connected while its last good answer is this recent.
+const ORACLE_STALE_AFTER: Duration = Duration::from_secs(30);
+/// How long `Stop` waits for the scan task to end before answering that it
+/// is still stopping (it then finishes in the background). The scan stops
+/// within milliseconds, and is dropped after the supervisor's
+/// `CANCEL_GRACE` at the latest, so this only covers a task that blocks a
+/// worker thread.
+const STOP_WAIT: Duration = Duration::from_secs(3);
+/// Settings validation includes a blocking DNS lookup; match the tray's cap.
+const SETTINGS_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Builds a fresh [`Scanner`] for a new configuration. In the daemon this is
-/// `blindbit_lib::scanner::load_scanner` (which connects to the oracle);
-/// tests inject a builder that needs no network.
-pub type ScannerBuilder = Box<
-    dyn Fn(scanner::ScannerConfig) -> Pin<Box<dyn Future<Output = Result<Scanner, String>> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Cached BlindBit oracle chain tip for [`ControlCtx::status`].
+/// The oracle's reachability and chain tip, kept current by
+/// [`spawn_oracle_poller`] so `GetStatus` never waits on the network (a slow
+/// or unreachable oracle used to make every status request take ~2 s, longer
+/// than the tray's poll timeout, so the tray took the daemon for dead).
 #[derive(Debug, Default, Clone)]
-pub struct OracleTipCache {
+pub struct OracleStatus {
     tip: Option<u64>,
-    fetched_at: Option<Instant>,
+    last_ok: Option<Instant>,
+    error: Option<String>,
+    down_since_unix: Option<u64>,
 }
 
-impl OracleTipCache {
-    fn is_fresh(&self) -> bool {
-        self.fetched_at
-            .is_some_and(|at| at.elapsed() < ORACLE_TIP_TTL)
+impl OracleStatus {
+    pub fn record_ok(&mut self, tip: u64) {
+        self.tip = Some(tip);
+        self.last_ok = Some(Instant::now());
+        self.error = None;
+        self.down_since_unix = None;
+    }
+
+    pub fn record_error(&mut self, error: String) {
+        self.error = Some(error);
+        self.down_since_unix
+            .get_or_insert_with(crate::electrum::now_secs);
+    }
+
+    fn connected(&self) -> bool {
+        self.error.is_none()
+            && self
+                .last_ok
+                .is_some_and(|at| at.elapsed() < ORACLE_STALE_AFTER)
     }
 }
 
-/// Prefer the oracle tip when known; else the last scanned (electrum) tip.
-fn pick_tip(oracle: Option<u64>, electrum: Option<u64>) -> Option<u64> {
-    oracle.or(electrum)
+/// Poll the oracle's tip every [`ORACLE_POLL_INTERVAL`] into `status`,
+/// logging when it becomes unreachable and when it recovers.
+pub fn spawn_oracle_poller(url: String, status: Arc<std::sync::Mutex<OracleStatus>>) {
+    tokio::spawn(async move {
+        let mut client: Option<blindbit_lib::OracleServiceClient<tonic::transport::Channel>> = None;
+        loop {
+            let poll = async {
+                if client.is_none() {
+                    client = Some(
+                        blindbit_lib::OracleServiceClient::connect(url.clone())
+                            .await
+                            .map_err(|e| format!("cannot connect: {e}"))?,
+                    );
+                }
+                let response = client
+                    .as_mut()
+                    .expect("connected above")
+                    .get_info(tonic::Request::new(()))
+                    .await
+                    .map_err(|e| format!("GetInfo failed: {}", e.message()))?;
+                Ok::<u64, String>(response.into_inner().height)
+            };
+            let result = match tokio::time::timeout(ORACLE_POLL_TIMEOUT, poll).await {
+                Ok(result) => result,
+                Err(_) => Err(format!(
+                    "no answer within {}s",
+                    ORACLE_POLL_TIMEOUT.as_secs()
+                )),
+            };
+            match result {
+                Ok(tip) => {
+                    let mut s = status.lock().unwrap();
+                    if s.error.is_some() {
+                        tracing::info!(tip, "oracle reachable again");
+                    }
+                    s.record_ok(tip);
+                }
+                Err(e) => {
+                    client = None;
+                    let mut s = status.lock().unwrap();
+                    if s.error.is_none() {
+                        tracing::warn!(url = %url, error = %e, "oracle unreachable; retrying");
+                    }
+                    s.record_error(format!("oracle {url}: {e}"));
+                }
+            }
+            tokio::time::sleep(ORACLE_POLL_INTERVAL).await;
+        }
+    });
 }
 
-/// Count persisted wallet-owned outputs without making daemon startup depend
-/// on the state file being present or valid.
-pub(crate) fn owned_outputs_count(state_file: &std::path::Path) -> u64 {
-    std::fs::read(state_file)
-        .ok()
-        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok())
-        .and_then(|value| {
-            value
-                .get("owned_outputs")?
-                .as_array()
-                .map(|a| a.len() as u64)
-        })
-        .unwrap_or(0)
+/// The wallet-owned outputs (spent and unspent) of the restored scanner, the
+/// status count at startup. It does not depend on the state file being
+/// present, valid or current: restoring sets an unreadable file aside and
+/// starts empty, and rebuilds the records a state file written before they
+/// existed (or with bare-key entries) lacks.
+pub(crate) fn owned_outputs_count(scanner: &Scanner) -> u64 {
+    scanner.owned_outputs().count() as u64
 }
 
 /// Derive every configured label address. Label 0 is included because the
@@ -107,50 +165,72 @@ pub(crate) fn derive_label_addresses(
         .collect()
 }
 
-pub(crate) fn wallet_network(network: bitcoin_rev::Network) -> BitcoinNetwork {
-    use bitcoin_rev::network::TestnetVersion;
-    match network {
-        bitcoin_rev::Network::Bitcoin => BitcoinNetwork::Bitcoin,
-        bitcoin_rev::Network::Signet => BitcoinNetwork::Signet,
-        bitcoin_rev::Network::Regtest => BitcoinNetwork::Regtest,
-        bitcoin_rev::Network::Testnet(TestnetVersion::V4) => BitcoinNetwork::Testnet4,
-        bitcoin_rev::Network::Testnet(_) => BitcoinNetwork::Testnet,
+/// The scanner's published health as sent over the control socket.
+fn scan_health_info(health: &scanner::ScanHealth) -> friglet_ipc::ScanHealthInfo {
+    friglet_ipc::ScanHealthInfo {
+        stall: health
+            .stall
+            .as_ref()
+            .map(|stall| friglet_ipc::ScanStallInfo {
+                height: stall.height,
+                reason: stall.reason.clone(),
+                since_unix: stall.since_unix,
+            }),
+        start_adjusted: health
+            .oracle_floor_start
+            .map(|start| friglet_ipc::StartAdjustedInfo {
+                requested_height: start.requested_height,
+                oracle_floor: start.floor_height,
+            }),
+        state_rescan: health
+            .state_rescan
+            .map(|rescan| friglet_ipc::StateRescanInfo {
+                from_height: rescan.from_height,
+                until_height: rescan.until_height,
+            }),
+        state_reset: health
+            .state_file_reset
+            .as_ref()
+            .map(|reset| friglet_ipc::StateResetInfo {
+                backup_path: reset.backup_path.display().to_string(),
+                error: reset.error.clone(),
+            }),
     }
 }
 
 /// Everything the request handler needs from the daemon.
 pub struct ControlCtx {
     pub supervisor: Arc<ScanSupervisor>,
-    /// The scanner is swapped in place when `SetConfig` changes
-    /// scanner-affecting settings; the supervisor's task factory locks this
-    /// same `Arc`, so a restart picks up the new instance.
     pub scanner: Arc<Mutex<Scanner>>,
-    /// Index of the *current* scanner, used for status reporting. Replaced
-    /// together with the scanner. The Electrum server holds its own clone of
-    /// the startup index and is not rewired (see module docs).
-    pub electrum_index: std::sync::Mutex<Arc<Mutex<WalletElectrumIndex>>>,
+    /// The scanner's Electrum index, used for status reporting.
+    pub electrum_index: Arc<Mutex<WalletElectrumIndex>>,
     pub electrum_clients: Arc<AtomicU64>,
     /// Cumulative wallet-owned output count, seeded from persisted state and
     /// updated from scanner notifications.
     pub outputs_found: Arc<AtomicU64>,
     /// Label addresses derived from the scan secret. Never sent separately
-    /// from the status snapshot and replaced whenever the scanner is rebuilt.
-    pub label_addresses: std::sync::Mutex<Vec<LabelAddress>>,
+    /// from the status snapshot.
+    pub label_addresses: Vec<LabelAddress>,
     /// Current effective configuration, updated by `SetConfig`.
     pub settings: std::sync::Mutex<DaemonConfig>,
+    /// The wallet's state file this run uses (`settings.state_file` is the
+    /// configured base path; see `config::wallet_state_file`).
+    pub state_file: PathBuf,
     /// Where `SetConfig` persists the config; `None` when no location could
     /// be determined (no config dir on this platform).
     pub config_path: Option<PathBuf>,
     /// Serializes `SetConfig` / `SetScanKey` / `Start` / `Stop` so lifecycle
-    /// verbs cannot interleave with persist + scanner rebuild (e.g. starting
-    /// the outgoing scanner in the middle of a swap).
+    /// verbs cannot interleave with persisting new settings. Never held while
+    /// an apply waits on the network (see [`ControlCtx::apply`]).
     pub apply_lock: Mutex<()>,
-    /// How to construct a scanner when new settings are applied.
-    pub scanner_builder: ScannerBuilder,
-    /// Cached oracle chain tip so `GetStatus` does not hit the network every
-    /// poll (TTL ≈ 10s).
-    pub oracle_tip_cache: std::sync::Mutex<OracleTipCache>,
+    /// Oracle tip and reachability, updated by [`spawn_oracle_poller`].
+    pub oracle: Arc<std::sync::Mutex<OracleStatus>>,
+    /// The log file this daemon writes, if any.
+    pub log_file: Option<PathBuf>,
     pub shutdown: CancellationToken,
+    /// Set (together with cancelling `shutdown`) when new settings were
+    /// saved: the run ends and `main` starts the next one.
+    pub restart_requested: AtomicBool,
     /// Whether this process was launched by a tray (`FRIGLET_SPAWNED_BY_TRAY`),
     /// reported back in `GetStatus` so ownership survives a tray restart —
     /// see [`StatusInfo::spawned_by_tray`].
@@ -162,94 +242,110 @@ impl ControlCtx {
         match req {
             Request::GetStatus => Response::Status(self.status().await),
             Request::Start => {
-                // Serialize with SetConfig/SetScanKey so the old scanner
-                // cannot be started in the middle of a rebuild + swap.
+                // Serialized with persisting new settings (see `apply_lock`).
                 let _guard = self.apply_lock.lock().await;
-                if self.supervisor.start() {
-                    tracing::info!("scan task started via control socket");
+                match self.supervisor.start() {
+                    StartOutcome::Started => {
+                        tracing::info!("scanning started via control socket");
+                        Response::Ok
+                    }
+                    StartOutcome::AlreadyRunning => Response::Ok,
+                    StartOutcome::StillStopping => {
+                        let message = "scanning is still stopping: the scanner pauses as soon \
+                                       as its current step returns; start it again once the \
+                                       status says paused";
+                        tracing::warn!("start refused: {message}");
+                        Response::Error(message.to_string())
+                    }
                 }
-                Response::Ok
             }
-            Request::Stop => {
-                let _guard = self.apply_lock.lock().await;
-                if self.supervisor.stop().await {
-                    tracing::info!("scan task stopped via control socket");
-                    self.save_state().await;
-                }
-                Response::Ok
-            }
+            Request::Stop => self.pause_scanning().await,
             Request::GetConfig => Response::Config(self.settings.lock().unwrap().clone()),
-            Request::SetConfig(new_cfg) => self.set_config(*new_cfg).await,
-            Request::SetScanKey(hex) => self.set_scan_key(&hex).await,
+            Request::SetConfig(new_cfg) => self.apply(Some(*new_cfg), None).await,
+            Request::SetScanKey(hex) => self.apply(None, Some(&hex)).await,
+            Request::ApplySettings { config, scan_key } => {
+                self.apply(Some(*config), scan_key.as_deref()).await
+            }
             Request::Shutdown => {
                 tracing::info!("shutdown requested via control socket");
-                // Delay the cancel slightly so the Ok response reaches the
-                // client before the listener is torn down.
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    shutdown.cancel();
-                });
+                self.stop_soon();
                 Response::Ok
             }
         }
     }
 
-    /// Poll the BlindBit oracle for the real chain tip, with a short TTL
-    /// cache. Failures return the stale cache (if any) and never break
-    /// `GetStatus`.
-    async fn fetch_oracle_tip(&self) -> Option<u64> {
-        {
-            let cache = self.oracle_tip_cache.lock().unwrap();
-            if cache.is_fresh() {
-                return cache.tip;
-            }
+    /// `Stop`: pause scanning. The scan task ends within milliseconds, also
+    /// in the middle of a P2P block download (the download is cancelled and
+    /// the block is scanned again on the next start). Should it not have
+    /// ended within [`STOP_WAIT`], the answer says it is still stopping and
+    /// the status reports `stopping` until the task has really ended, then
+    /// `paused`.
+    async fn pause_scanning(&self) -> Response {
+        let _guard = self.apply_lock.lock().await;
+        if !self.supervisor.request_stop() {
+            return Response::Ok;
         }
-
-        let url = self.settings.lock().unwrap().oracle_url.clone();
-        let stale = self.oracle_tip_cache.lock().unwrap().tip;
-
-        let fetch = async {
-            let mut client = blindbit_lib::OracleServiceClient::connect(url).await.ok()?;
-            let resp = client.get_info(tonic::Request::new(())).await.ok()?;
-            Some(resp.into_inner().height)
-        };
-
-        match tokio::time::timeout(ORACLE_TIP_FETCH_TIMEOUT, fetch).await {
-            Ok(Some(height)) => {
-                let mut cache = self.oracle_tip_cache.lock().unwrap();
-                cache.tip = Some(height);
-                cache.fetched_at = Some(Instant::now());
-                Some(height)
-            }
-            _ => stale,
+        tracing::info!("stop requested via control socket");
+        if self.supervisor.wait_stopped(Some(STOP_WAIT)).await {
+            tracing::info!("scanning paused");
+            save_scanner_state(&self.scanner, &self.state_file).await;
+            return Response::Ok;
         }
+        tracing::warn!(
+            "scan task has not stopped yet; scanning pauses as soon as its current step returns"
+        );
+        let supervisor = self.supervisor.clone();
+        let scanner = self.scanner.clone();
+        let state_file = self.state_file.clone();
+        tokio::spawn(async move {
+            supervisor.wait_stopped(None).await;
+            tracing::info!("scanning paused");
+            save_scanner_state(&scanner, &state_file).await;
+        });
+        Response::OkWithNote(
+            "stopping: the scanner pauses as soon as its current step returns".to_string(),
+        )
     }
 
     async fn status(&self) -> StatusInfo {
-        let index = self.electrum_index.lock().unwrap().clone();
-        let (electrum_tip, scan_progress, sp_address, tx_count) = {
+        let index = &self.electrum_index;
+        let (electrum_tip, scan_progress, sp_address, tx_count, start_height) = {
             let idx = index.lock().await;
             let tip = idx.tip.as_ref().map(|(h, _)| u64::from(*h));
             let addr = (!idx.sp_address.is_empty()).then(|| idx.sp_address.clone());
-            (tip, idx.scan_progress, addr, idx.sp_history.len() as u64)
+            (
+                tip,
+                idx.scan_progress,
+                addr,
+                idx.sp_history.len() as u64,
+                idx.sp_start_height,
+            )
         };
+        let mut scan_health = scan_health_info(&index.lock().await.scan_health);
+        let scan_state = self.supervisor.state();
+        // A stall describes the scan loop retrying; a paused or stopping
+        // scan is not retrying anything.
+        if scan_state != friglet_ipc::ScanState::Running {
+            scan_health.stall = None;
+        }
 
         // While the scan task runs it holds the scanner mutex, so fall back
         // to the electrum index tip (which the scanner advances per scanned
-        // block) when the lock is unavailable.
+        // block) when the lock is unavailable — and before the first block
+        // of a new wallet is scanned, to the block below its start height
+        // rather than 0.
         let scanned_height = match self.scanner.try_lock() {
             Ok(s) => s.get_last_scanned_block_height(),
-            Err(_) => electrum_tip.unwrap_or(0),
+            Err(_) => electrum_tip.unwrap_or(start_height.saturating_sub(1)),
         };
 
-        let oracle_tip = self.fetch_oracle_tip().await;
-        let tip_height = pick_tip(oracle_tip, electrum_tip);
+        // Prefer the oracle tip when known; else the last scanned tip.
+        let oracle = self.oracle.lock().unwrap().clone();
+        let tip_height = oracle.tip.or(electrum_tip);
 
         let scanning = self.supervisor.is_running();
         let last_error = self.supervisor.last_error();
         let network = self.settings.lock().unwrap().network.clone();
-        let oracle_connected = self.oracle_tip_cache.lock().unwrap().is_fresh();
 
         StatusInfo {
             scanning,
@@ -258,14 +354,20 @@ impl ControlCtx {
             scan_progress,
             network,
             electrum_clients: self.electrum_clients.load(Ordering::Relaxed),
-            oracle_connected,
+            oracle_connected: oracle.connected(),
             last_error,
             sp_address,
             tx_count,
             outputs_found: self.outputs_found.load(Ordering::Relaxed),
-            label_addresses: self.label_addresses.lock().unwrap().clone(),
+            label_addresses: self.label_addresses.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             spawned_by_tray: self.spawned_by_tray,
+            scan_health,
+            scan_state: Some(scan_state),
+            pid: Some(std::process::id()),
+            log_file: self.log_file.as_ref().map(|p| p.display().to_string()),
+            oracle_error: oracle.error,
+            oracle_down_since_unix: oracle.down_since_unix,
         }
     }
 
@@ -275,26 +377,46 @@ impl ControlCtx {
         std::env::var("FRIGLET_SPAWNED_BY_TRAY").is_ok_and(|v| v == "1")
     }
 
-    pub async fn save_state(&self) {
-        let state_file = self.settings.lock().unwrap().state_file.clone();
-        let scanner = self.scanner.lock().await;
-        if let Err(e) = scanner.save_to_file(&state_file) {
-            tracing::warn!(error = %e, "failed to save scanner state");
-        } else {
-            tracing::debug!("scanner state saved");
-        }
-        // The state JSON contains the scan secret (written by blindbit-lib);
-        // keep it owner-only. Files created by the scan loop's own
-        // checkpoints get tightened here and on the next startup.
-        crate::config::tighten_state_file_perms(&state_file);
+    /// Whether the run is ending for a restart rather than a shutdown.
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::SeqCst)
     }
 
-    /// Validate → persist → apply a full config replacement.
-    async fn set_config(&self, new_cfg: DaemonConfig) -> Response {
-        let _guard = self.apply_lock.lock().await;
-        let resolved = match config::validate_daemon_config(&new_cfg) {
-            Ok(r) => r,
+    /// End the run shortly — after the current response reached the client,
+    /// before the listener is torn down.
+    fn stop_soon(&self) {
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shutdown.cancel();
+        });
+    }
+
+    pub async fn save_state(&self) {
+        save_scanner_state(&self.scanner, &self.state_file).await;
+    }
+
+    /// Validate → persist → restart. `new_cfg = None` keeps the current
+    /// settings; `scan_key = None` keeps the current key.
+    ///
+    /// The steps that can wait on the network (a new wallet's birthday from
+    /// the oracle, the DNS lookup of the P2P host) never run under
+    /// `apply_lock`, so Start and Stop do not wait behind them. Comparing with
+    /// and persisting the settings happens under the lock.
+    async fn apply(&self, new_cfg: Option<DaemonConfig>, scan_key: Option<&str>) -> Response {
+        let keep_config = new_cfg.is_none();
+        let mut current = self.settings.lock().unwrap().clone();
+        let mut prepared = match prepare(new_cfg.unwrap_or_else(|| current.clone())).await {
+            Ok(prepared) => prepared,
             Err(e) => return Response::Error(e),
+        };
+        let new_secret = match scan_key.map(|k| SecretKey::from_str(k.trim())).transpose() {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::Error(format!(
+                    "invalid scan key: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"
+                ));
+            }
         };
         let Some(config_path) = &self.config_path else {
             return Response::Error(
@@ -304,250 +426,140 @@ impl ControlCtx {
             );
         };
 
-        let old_cfg = self.settings.lock().unwrap().clone();
-
-        if let Err(e) = config::write_config_file(config_path, &new_cfg) {
-            return Response::Error(e);
-        }
-        tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
-        // Update the effective settings as soon as the file is written so
-        // `GetConfig` matches the on-disk config even when applying fails
-        // below (the error tells the client it was saved but not applied).
-        *self.settings.lock().unwrap() = new_cfg.clone();
-
-        let mut notes: Vec<String> = Vec::new();
-        let restart_only: Vec<&str> = [
-            ("http_addr", new_cfg.http_addr != old_cfg.http_addr),
-            (
-                "electrum_addr",
-                new_cfg.electrum_addr != old_cfg.electrum_addr,
-            ),
-            (
-                "control_socket",
-                new_cfg.control_socket != old_cfg.control_socket,
-            ),
-            ("log_level", new_cfg.log_level != old_cfg.log_level),
-        ]
-        .into_iter()
-        .filter_map(|(name, changed)| changed.then_some(name))
-        .collect();
-        if !restart_only.is_empty() {
-            notes.push(format!(
-                "changes to {} are saved but only take effect after a daemon restart",
-                restart_only.join(", ")
-            ));
-        }
-
-        if scanner_settings_changed(&old_cfg, &new_cfg) {
-            if let Err(e) = self.rebuild_scanner(&resolved, None).await {
-                return Response::Error(format!(
-                    "config saved to {}, but applying it failed: {e}; \
-                     a daemon restart may be required",
-                    config_path.display()
-                ));
+        // Without a config of its own the apply keeps the current settings.
+        // Should another apply have changed them meanwhile, prepare again from
+        // the new ones (outside the lock) and check again, as if the two had
+        // run one after the other.
+        let (_guard, old_cfg, (new_cfg, resolved)) = loop {
+            let guard = self.apply_lock.lock().await;
+            let old_cfg = self.settings.lock().unwrap().clone();
+            if !keep_config || old_cfg == current {
+                break (guard, old_cfg, prepared);
             }
-            notes.push(
-                "scan settings applied; the Electrum server keeps serving the previous \
-                 wallet view until the daemon restarts"
-                    .to_string(),
-            );
-        }
-
-        if notes.is_empty() {
-            Response::Ok
-        } else {
-            Response::OkWithNote(notes.join(". "))
-        }
-    }
-
-    /// Validate and write the scan secret to the key file, then restart the
-    /// scanner so the new key takes effect (unless an existing state file
-    /// pins the old key — see the note below).
-    async fn set_scan_key(&self, hex: &str) -> Response {
-        let _guard = self.apply_lock.lock().await;
-        let settings = self.settings.lock().unwrap().clone();
-        let resolved = match config::validate_daemon_config(&settings) {
-            Ok(r) => r,
-            Err(e) => return Response::Error(format!("current configuration is unusable: {e}")),
+            drop(guard);
+            prepared = match prepare(old_cfg.clone()).await {
+                Ok(prepared) => prepared,
+                Err(e) => return Response::Error(e),
+            };
+            current = old_cfg;
         };
-
-        let secret = match config::replace_scan_key(&resolved.key_file, hex) {
-            Ok(s) => s,
-            Err(e) => return Response::Error(e),
-        };
-        tracing::info!(path = %resolved.key_file.display(), "scan key replaced via control socket");
-
-        // blindbit-lib restores the scan secret embedded in the state file,
-        // ignoring the key file, so rebuilding against a state file created
-        // with a different key would silently keep the old key.
-        if state_file_key_mismatch(&resolved.state_file, &secret) {
-            return Response::OkWithNote(format!(
-                "scan key file updated, but the existing state file {} was created with a \
-                 different key and the daemon keeps scanning with that key. Point state_file \
-                 at a fresh path (or remove the old state file) for the new key to take effect",
-                resolved.state_file.display()
-            ));
-        }
-
-        // Rebuild with the just-written key explicitly: `resolve_scan_secret`
-        // prefers FRIGLET_SCAN_SECRET over the key file, which would silently
-        // ignore the rotation while that env var is set.
-        match self.rebuild_scanner(&resolved, Some(secret)).await {
-            Ok(()) => match scan_secret_env_shadows(&secret) {
-                Some(note) => Response::OkWithNote(note),
-                None => Response::Ok,
-            },
-            Err(e) => Response::Error(format!(
-                "scan key file updated, but restarting the scanner failed: {e}; \
-                 a daemon restart may be required"
-            )),
-        }
-    }
-
-    /// Stop the scan task, save state, build a fresh scanner from `resolved`
-    /// and swap it into the shared `Arc`, then restart the scan task if it
-    /// was running.
-    ///
-    /// `secret` overrides the usual secret resolution (env var, then key
-    /// file); `SetScanKey` passes the key it just wrote so a lingering
-    /// `FRIGLET_SCAN_SECRET` cannot undo the rotation.
-    async fn rebuild_scanner(
-        &self,
-        resolved: &ResolvedConfig,
-        secret: Option<bitcoin::secp256k1::SecretKey>,
-    ) -> Result<(), String> {
-        let was_running = self.supervisor.is_running();
-        self.supervisor.stop().await;
-        // Persist the outgoing scanner's progress to the *old* state file.
-        self.save_state().await;
-
-        let secret = match secret {
-            Some(s) => s,
-            None => config::resolve_scan_secret(None, &resolved.key_file)?,
-        };
-        let scanner_config = scanner::ScannerConfig::new(
-            resolved.oracle_url.clone(),
-            resolved.p2p_addr,
-            secret,
-            resolved.spend_pubkey,
-            resolved.max_label_num,
-            resolved.state_file.clone(),
-            resolved.network,
-        );
-        let mut new_scanner = (self.scanner_builder)(scanner_config)
-            .await
-            .map_err(|e| format!("failed to load scanner with the new settings: {e}"))?;
-        new_scanner
-            .rebuild_electrum_index_from_graph(resolved.start_height)
-            .await;
-        let new_index = new_scanner.electrum_index();
-        {
-            let mut idx = new_index.lock().await;
-            idx.sp_start_height = resolved.start_height;
-        }
-        if new_scanner.get_last_scanned_block_height() < resolved.start_height {
-            new_scanner.update_last_scanned_block_height(resolved.start_height.saturating_sub(1));
-        }
-        let label_addresses = derive_label_addresses(
-            secret,
-            resolved.spend_pubkey,
-            wallet_network(resolved.network),
-            resolved.max_label_num,
-        );
-        self.outputs_found
-            .store(owned_outputs_count(&resolved.state_file), Ordering::Relaxed);
-        let mut outputs_rx = new_scanner.subscribe_to_found_utxos();
-        let outputs_found = self.outputs_found.clone();
-        tokio::spawn(async move {
-            while let Ok(count) = outputs_rx.recv().await {
-                outputs_found.store(count as u64, Ordering::Relaxed);
-            }
+        let config_changed = new_cfg != old_cfg;
+        let key_changed = new_secret.is_some_and(|secret| {
+            config::resolve_scan_secret(None, &resolved.key_file).ok() != Some(secret)
         });
-        config::tighten_state_file_perms(&resolved.state_file);
-
-        *self.scanner.lock().await = new_scanner;
-        *self.electrum_index.lock().unwrap() = new_index;
-        *self.label_addresses.lock().unwrap() = label_addresses;
-
-        if was_running {
-            self.supervisor.start();
-            tracing::info!("scan task restarted with new settings");
+        if !config_changed && !key_changed {
+            return Response::Ok;
         }
-        Ok(())
+
+        if config_changed {
+            if let Err(e) = friglet_ipc::write_config_toml(config_path, &new_cfg) {
+                return Response::Error(e);
+            }
+            tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
+            *self.settings.lock().unwrap() = new_cfg;
+        }
+        let mut notes = vec![
+            "saved; the daemon restarts to apply it (Electrum clients such as Sparrow \
+             reconnect automatically)"
+                .to_string(),
+        ];
+        if let Some(secret) = new_secret.filter(|_| key_changed) {
+            let hex = hex::encode(secret.secret_bytes());
+            if let Err(e) = friglet_ipc::write_key_file(&resolved.key_file, &hex, true) {
+                return Response::Error(if config_changed {
+                    format!("config saved, but writing the scan key failed: {e}")
+                } else {
+                    e
+                });
+            }
+            tracing::info!(path = %resolved.key_file.display(), "scan key replaced via control socket");
+            if let Some(note) = scan_secret_env_shadows(&secret) {
+                notes.push(note);
+            }
+        }
+
+        tracing::info!("new settings saved; restarting");
+        self.restart_requested.store(true, Ordering::SeqCst);
+        self.stop_soon();
+        Response::OkWithNote(notes.join(". "))
     }
 }
 
+/// The part of [`ControlCtx::apply`] that may wait on the network: a new
+/// wallet's birthday from the oracle tip, then full validation (which
+/// resolves the P2P host name).
+async fn prepare(mut cfg: DaemonConfig) -> Result<(DaemonConfig, config::ResolvedConfig), String> {
+    // New wallet → pin the birthday to the oracle tip before persisting.
+    config::resolve_start_at_tip(&mut cfg).await?;
+    let resolved = validate_settings(
+        cfg.clone(),
+        SETTINGS_VALIDATION_TIMEOUT,
+        config::validate_daemon_config,
+    )
+    .await?;
+    Ok((cfg, resolved))
+}
+
+/// Keep the system resolver off the async runtime, and bound how long a
+/// settings request waits for it. A timed-out resolver may finish on the
+/// blocking pool later; validation only reads its private config copy.
+async fn validate_settings(
+    cfg: DaemonConfig,
+    timeout: Duration,
+    validate: impl FnOnce(&DaemonConfig) -> Result<config::ResolvedConfig, String> + Send + 'static,
+) -> Result<config::ResolvedConfig, String> {
+    let validation = tokio::task::spawn_blocking(move || validate(&cfg));
+    tokio::time::timeout(timeout, validation)
+        .await
+        .map_err(|_| "settings validation timed out resolving the P2P node".to_string())?
+        .map_err(|e| format!("settings validation task failed: {e}"))?
+}
+
+/// Save the scanner's state to `state_file` (waits for the scanner lock).
+async fn save_scanner_state(scanner: &Mutex<Scanner>, state_file: &Path) {
+    let scanner = scanner.lock().await;
+    if let Err(e) = scanner.save_to_file(state_file) {
+        tracing::warn!(error = %e, "failed to save scanner state");
+    } else {
+        tracing::debug!("scanner state saved");
+    }
+    // The state JSON contains the scan secret (written by blindbit-lib);
+    // keep it owner-only. Files created by the scan loop's own
+    // checkpoints get tightened here and on the next startup.
+    crate::config::tighten_state_file_perms(state_file);
+}
+
 /// A warning note when `FRIGLET_SCAN_SECRET` is set to a key other than
-/// `new_secret`: the running scanner uses the new key, but
-/// [`config::resolve_scan_secret`] prefers the env var over the key file, so
-/// the next daemon restart would revert to the env key.
-fn scan_secret_env_shadows(new_secret: &bitcoin::secp256k1::SecretKey) -> Option<String> {
-    use std::str::FromStr;
+/// `new_secret`: [`config::resolve_scan_secret`] prefers the env var over the
+/// key file, so the restarted daemon keeps using the env key.
+fn scan_secret_env_shadows(new_secret: &SecretKey) -> Option<String> {
     let env = std::env::var("FRIGLET_SCAN_SECRET").ok()?;
     let env = env.trim();
     if env.is_empty() {
         return None;
     }
-    if bitcoin::secp256k1::SecretKey::from_str(env).is_ok_and(|k| k == *new_secret) {
+    if SecretKey::from_str(env).is_ok_and(|k| k == *new_secret) {
         return None;
     }
     Some(
-        "scan key applied, but FRIGLET_SCAN_SECRET is set in the daemon's environment and \
-         overrides the key file: the old key comes back on the next daemon restart unless \
-         the variable is unset"
+        "FRIGLET_SCAN_SECRET is set in the daemon's environment and overrides the key \
+         file: the daemon keeps using that key unless the variable is unset"
             .to_string(),
     )
 }
 
-/// Whether any field that is baked into the scanner differs.
-fn scanner_settings_changed(old: &DaemonConfig, new: &DaemonConfig) -> bool {
-    old.network != new.network
-        || old.oracle_url != new.oracle_url
-        || old.p2p_node_addr != new.p2p_node_addr
-        || old.start_height != new.start_height
-        || old.spend_pubkey != new.spend_pubkey
-        || old.max_label_num != new.max_label_num
-        || old.state_file != new.state_file
-        || old.key_file != new.key_file
-}
-
-/// Whether `state_file` exists and embeds a scan secret other than `secret`
-/// (blindbit-lib persists the secret inside the state JSON).
-fn state_file_key_mismatch(
-    state_file: &std::path::Path,
-    secret: &bitcoin::secp256k1::SecretKey,
-) -> bool {
-    let Ok(json) = std::fs::read_to_string(state_file) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return false;
-    };
-    match value.get("secret_scan_hex").and_then(|v| v.as_str()) {
-        Some(embedded) => !embedded.eq_ignore_ascii_case(&hex::encode(secret.secret_bytes())),
-        None => false,
-    }
-}
-
 /// Serve control requests on `socket_path` until the future is dropped.
-///
-/// Generic over the handler so tests can use a stub instead of a full
-/// [`ControlCtx`].
-pub async fn run<H, Fut>(socket_path: String, handler: H) -> io::Result<()>
-where
-    H: Fn(Request) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Response> + Send,
-{
+pub async fn run(socket_path: String, ctx: Arc<ControlCtx>) -> io::Result<()> {
     let listener = bind_with_stale_cleanup(&socket_path).await?;
     tracing::info!(path = %socket_path, "control socket listening");
 
     loop {
         match friglet_ipc::accept(&listener).await {
             Ok(mut conn) => {
-                let handler = handler.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
                     while let Ok(Some(req)) = conn.next_request().await {
-                        let resp = handler(req).await;
+                        let resp = ctx.handle(req).await;
                         if conn.respond(&resp).await.is_err() {
                             break;
                         }
@@ -592,25 +604,62 @@ mod tests {
         "0000000000000000000000000000000000000000000000000000000000000002";
     const SPEND_PK: &str = "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443";
 
-    #[test]
-    fn pick_tip_prefers_oracle_then_electrum() {
-        assert_eq!(pick_tip(Some(300), Some(200)), Some(300));
-        assert_eq!(pick_tip(None, Some(200)), Some(200));
-        assert_eq!(pick_tip(None, None), None);
+    /// A state file written before owned outputs were recorded (format 0).
+    /// Its wallet received two outputs; the file has no records for them.
+    const STATE_BEFORE_OWNED_OUTPUTS: &str =
+        include_str!("../../../blindbit-lib/src/scanner/testdata/state_before_owned_outputs.json");
+
+    /// The startup count of owned outputs for a copy of `state` (`None`: no
+    /// file), restored the way the daemon does it at startup.
+    async fn startup_count(dir: &Path, state: Option<&[u8]>) -> u64 {
+        let path = dir.join("state.json");
+        let _ = std::fs::remove_file(&path);
+        if let Some(state) = state {
+            std::fs::write(&path, state).unwrap();
+        }
+        // load_scanner connects first; an oracle that accepts is enough.
+        // A runtime-owned task drops its listener and sockets on abort.
+        let oracle = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oracle_url = format!("http://{}", oracle.local_addr().unwrap());
+        let accept = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = oracle.accept().await {
+                held.push(stream);
+            }
+        });
+        let wallet: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
+        let config = scanner::ScannerConfig::new(
+            oracle_url,
+            "127.0.0.1:1".parse().unwrap(),
+            SecretKey::from_str(wallet["secret_scan_hex"].as_str().unwrap()).unwrap(),
+            PublicKey::from_str(wallet["public_spend_hex"].as_str().unwrap()).unwrap(),
+            0,
+            path,
+            bitcoin_rev::Network::Regtest,
+        );
+        let scanner = scanner::load_scanner(&config).await.unwrap();
+        accept.abort();
+        owned_outputs_count(&scanner)
     }
 
-    #[test]
-    fn owned_outputs_count_tolerates_state_file_variants() {
+    /// The startup count never makes startup depend on the state file and
+    /// counts what the restored wallet holds, also for old state files.
+    #[tokio::test]
+    async fn owned_outputs_count_tolerates_state_file_variants() {
         let dir = temp_dir("owned-outputs");
-        let path = dir.join("state.json");
 
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, b"not json").unwrap();
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, br#"{"other":[]}"#).unwrap();
-        assert_eq!(owned_outputs_count(&path), 0);
-        std::fs::write(&path, br#"{"owned_outputs":["02aa","02bb"]}"#).unwrap();
-        assert_eq!(owned_outputs_count(&path), 2);
+        assert_eq!(startup_count(&dir, None).await, 0);
+        // Unreadable: set aside, the new scan starts empty.
+        assert_eq!(startup_count(&dir, Some(b"not json")).await, 0);
+        assert_eq!(startup_count(&dir, Some(br#"{"other":[]}"#)).await, 0);
+        // Format 0, no records: rebuilt on restore.
+        let old = STATE_BEFORE_OWNED_OUTPUTS.as_bytes();
+        assert_eq!(startup_count(&dir, Some(old)).await, 2);
+        // Bare-key entries of an older format: dropped, records rebuilt.
+        let mut bare_keys: serde_json::Value = serde_json::from_slice(old).unwrap();
+        bare_keys["owned_outputs"] = serde_json::json!(["02aa", "02bb", "02cc"]);
+        let bare_keys = serde_json::to_vec(&bare_keys).unwrap();
+        assert_eq!(startup_count(&dir, Some(&bare_keys)).await, 2);
     }
 
     #[test]
@@ -675,6 +724,7 @@ mod tests {
             oracle_url: "http://127.0.0.1:1".to_string(),
             p2p_node_addr: Some("127.0.0.1:18444".to_string()),
             start_height: Some(100),
+            start_at_tip: false,
             spend_pubkey: Some(SPEND_PK.to_string()),
             max_label_num: 0,
             http_addr: "127.0.0.1:0".to_string(),
@@ -686,31 +736,39 @@ mod tests {
         }
     }
 
-    /// A full `ControlCtx` wired against a temp dir, with an offline scanner
-    /// and a scanner builder that needs no network.
+    /// A full `ControlCtx` wired against a temp dir, with an offline scanner.
     fn test_ctx(dir: &Path) -> Arc<ControlCtx> {
-        test_ctx_with_builder(
-            dir,
-            Box::new(|cfg| Box::pin(async move { Ok(offline_scanner(&cfg)) })),
-        )
+        test_ctx_with_scan(dir, |cancel| {
+            Box::pin(async move {
+                cancel.cancelled().await;
+                Ok(())
+            })
+        })
     }
 
-    /// [`test_ctx`] with a custom scanner builder (failure injection,
-    /// recording the config the rebuild uses, ...).
-    fn test_ctx_with_builder(dir: &Path, scanner_builder: ScannerBuilder) -> Arc<ControlCtx> {
+    /// [`test_ctx`] with a custom scan task, given the token that stops it.
+    fn test_ctx_with_scan(
+        dir: &Path,
+        scan: impl Fn(
+            CancellationToken,
+        ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<ControlCtx> {
         let cfg = test_config(dir);
-        config::replace_scan_key(&dir.join("scan.key"), SECRET_HEX).unwrap();
+        friglet_ipc::write_key_file(&dir.join("scan.key"), SECRET_HEX, true).unwrap();
         let config_path = dir.join("config.toml");
-        config::write_config_file(&config_path, &cfg).unwrap();
+        friglet_ipc::write_config_toml(&config_path, &cfg).unwrap();
 
         let resolved = config::validate_daemon_config(&cfg).unwrap();
         let secret = config::resolve_scan_secret(None, &resolved.key_file).unwrap();
         let scanner_config = scanner::ScannerConfig::new(
-            resolved.oracle_url.clone(),
+            resolved.raw.oracle_url.clone(),
             resolved.p2p_addr,
             secret,
             resolved.spend_pubkey,
-            resolved.max_label_num,
+            resolved.raw.max_label_num,
             resolved.state_file.clone(),
             resolved.network,
         );
@@ -718,33 +776,38 @@ mod tests {
         let electrum_index = scanner_instance.electrum_index();
         let scanner_arc = Arc::new(Mutex::new(scanner_instance));
 
-        let supervisor = Arc::new(ScanSupervisor::new(|| {
-            Box::pin(async {
-                std::future::pending::<()>().await;
-                Ok(())
-            })
-        }));
+        let supervisor = Arc::new(ScanSupervisor::new(scan, Arc::default()));
 
         Arc::new(ControlCtx {
             supervisor,
             scanner: scanner_arc,
-            electrum_index: std::sync::Mutex::new(electrum_index),
+            electrum_index,
             electrum_clients: Arc::new(AtomicU64::new(0)),
             outputs_found: Arc::new(AtomicU64::new(0)),
-            label_addresses: std::sync::Mutex::new(derive_label_addresses(
+            label_addresses: derive_label_addresses(
                 secret,
                 resolved.spend_pubkey,
-                wallet_network(resolved.network),
-                resolved.max_label_num,
-            )),
+                scanner::convert_network(resolved.network),
+                resolved.raw.max_label_num,
+            ),
+            state_file: resolved.state_file.clone(),
             settings: std::sync::Mutex::new(cfg),
             config_path: Some(config_path),
             apply_lock: Mutex::new(()),
-            scanner_builder,
-            oracle_tip_cache: std::sync::Mutex::new(OracleTipCache::default()),
+            oracle: Arc::default(),
+            log_file: None,
             shutdown: CancellationToken::new(),
+            restart_requested: AtomicBool::new(false),
             spawned_by_tray: false,
         })
+    }
+
+    /// Whether `ctx` ended its run for a restart within a second.
+    async fn restarted(ctx: &ControlCtx) -> bool {
+        tokio::time::timeout(Duration::from_secs(1), ctx.shutdown.cancelled())
+            .await
+            .is_ok()
+            && ctx.restart_requested()
     }
 
     async fn connect_with_retry(path: &str) -> Client {
@@ -757,30 +820,11 @@ mod tests {
         panic!("control socket did not come up at {path}");
     }
 
-    fn dummy_status() -> StatusInfo {
-        StatusInfo {
-            scanning: false,
-            scanned_height: 42,
-            tip_height: None,
-            scan_progress: 0.0,
-            network: "regtest".to_string(),
-            electrum_clients: 0,
-            oracle_connected: false,
-            last_error: None,
-            sp_address: None,
-            tx_count: 0,
-            outputs_found: 0,
-            label_addresses: Vec::new(),
-            version: "test".to_string(),
-            spawned_by_tray: false,
-        }
-    }
-
     #[tokio::test]
     async fn status_reports_silent_payment_transaction_count() {
         let dir = temp_dir("status-tx-count");
         let ctx = test_ctx(&dir);
-        let index = ctx.electrum_index.lock().unwrap().clone();
+        let index = ctx.electrum_index.clone();
         index.lock().await.sp_history.extend([
             blindbit_lib::scanner::SpHistoryEntry {
                 tx_hash: "11".repeat(32),
@@ -793,49 +837,222 @@ mod tests {
                 tweak_hex: "03".repeat(33),
             },
         ]);
-        {
-            let mut cache = ctx.oracle_tip_cache.lock().unwrap();
-            cache.fetched_at = Some(Instant::now());
-        }
+        ctx.oracle.lock().unwrap().record_ok(10);
 
         assert_eq!(ctx.status().await.tx_count, 2);
     }
 
     #[tokio::test]
-    async fn get_status_roundtrip_over_control_socket() {
-        #[cfg(windows)]
-        let path = format!(r"\\.\pipe\friglet-control-test-{}", std::process::id());
-        #[cfg(not(windows))]
-        let path = std::env::temp_dir()
-            .join(format!("friglet-control-test-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
+    async fn status_reports_a_stalled_scan_and_an_adjusted_start() {
+        let dir = temp_dir("status-scan-health");
+        let ctx = test_ctx(&dir);
+        ctx.supervisor.start();
+        assert_eq!(
+            ctx.status().await.scan_health,
+            friglet_ipc::ScanHealthInfo::default()
+        );
 
-        let server_path = path.clone();
-        tokio::spawn(run(server_path, |req| async move {
-            match req {
-                Request::GetStatus => Response::Status(dummy_status()),
-                _ => Response::Ok,
-            }
-        }));
-
-        let mut client = None;
-        for _ in 0..50 {
-            match Client::connect(&path).await {
-                Ok(c) => {
-                    client = Some(c);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
+        let index = ctx.electrum_index.clone();
+        {
+            let mut idx = index.lock().await;
+            idx.scan_health.stall = Some(scanner::ScanStall {
+                height: 100_002,
+                reason: "scan stopped at height 100002: the oracle sent no valid block hash"
+                    .to_string(),
+                since_unix: 1_790_000_000,
+            });
+            idx.scan_health.oracle_floor_start = Some(scanner::OracleFloorStart {
+                requested_height: 50_000,
+                floor_height: 100_000,
+            });
+            idx.scan_health.state_rescan = Some(scanner::StateRescan {
+                from_height: 100_500,
+                until_height: 101_000,
+            });
+            idx.scan_health.state_file_reset = Some(scanner::StateFileReset {
+                backup_path: "/data/scanner_state.json.unreadable-1".into(),
+                error: "Failed to parse JSON".to_string(),
+            });
         }
-        let mut client = client.expect("control socket did not come up");
 
-        let resp = client.request(&Request::GetStatus).await.unwrap();
-        assert_eq!(resp, Response::Status(dummy_status()));
+        let health = ctx.status().await.scan_health;
+        let stall = health.stall.expect("stall is reported");
+        assert_eq!(stall.height, 100_002);
+        assert_eq!(stall.since_unix, 1_790_000_000);
+        assert!(stall.reason.contains("no valid block hash"));
+        assert_eq!(
+            health.start_adjusted,
+            Some(friglet_ipc::StartAdjustedInfo {
+                requested_height: 50_000,
+                oracle_floor: 100_000,
+            })
+        );
+        assert_eq!(
+            health.state_rescan,
+            Some(friglet_ipc::StateRescanInfo {
+                from_height: 100_500,
+                until_height: 101_000,
+            })
+        );
+        assert_eq!(
+            health.state_reset,
+            Some(friglet_ipc::StateResetInfo {
+                backup_path: "/data/scanner_state.json.unreadable-1".to_string(),
+                error: "Failed to parse JSON".to_string(),
+            })
+        );
 
-        #[cfg(not(windows))]
-        let _ = std::fs::remove_file(&path);
+        // Paused, nothing is retrying: the stall is not reported.
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(status.scan_health.stall.is_none());
+        assert!(status.scan_health.start_adjusted.is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_pauses_and_start_resumes_in_status() {
+        let dir = temp_dir("status-pause");
+        let ctx = test_ctx(&dir);
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
+        let status = ctx.status().await;
+        assert!(status.scanning);
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Running));
+        assert_eq!(status.pid, Some(std::process::id()));
+
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        assert!(!status.scanning);
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(ctx.supervisor.is_paused());
+
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
+        assert_eq!(
+            ctx.status().await.scan_state,
+            Some(friglet_ipc::ScanState::Running)
+        );
+    }
+
+    /// A step that blocks a worker thread cannot be interrupted (the scan
+    /// has none left; this covers one that slips in): Stop answers within
+    /// its wait budget with a note, the status says `stopping` (not
+    /// stopped) until the task really ended, Start is refused meanwhile,
+    /// and the pause lands afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_a_blocking_scan_step_reports_stopping_then_paused() {
+        let dir = temp_dir("status-stopping");
+        let ctx = test_ctx_with_scan(&dir, |cancel| {
+            Box::pin(async move {
+                while !cancel.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(4500));
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            })
+        });
+        ctx.supervisor.start();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let began = Instant::now();
+        let answer = ctx.handle(Request::Stop).await;
+        assert!(
+            matches!(&answer, Response::OkWithNote(note) if note.starts_with("stopping")),
+            "{answer:?}"
+        );
+        assert!(began.elapsed() < STOP_WAIT + Duration::from_secs(1));
+        let status = ctx.status().await;
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Stopping));
+        assert!(status.scanning, "the task is still alive");
+        assert!(matches!(
+            ctx.handle(Request::Start).await,
+            Response::Error(e) if e.contains("still stopping")
+        ));
+
+        assert!(
+            ctx.supervisor
+                .wait_stopped(Some(Duration::from_secs(10)))
+                .await
+        );
+        assert_eq!(
+            ctx.status().await.scan_state,
+            Some(friglet_ipc::ScanState::Paused)
+        );
+    }
+
+    /// Stop while the scan downloads a block from a P2P node that has gone
+    /// silent (it accepted the connection and sends nothing; blindbit-lib
+    /// would wait 30 s per read and retry 5 times): the real
+    /// `BlockFetcher`, under the real supervisor, gives way to the stop
+    /// token, so Stop answers plainly and the status is `paused` well
+    /// within a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_during_a_stalled_p2p_download_pauses_within_a_second() {
+        use bitcoin::hashes::Hash;
+        use blindbit_lib::scanner::{BlockFetcher, FetchFailure};
+
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let node_addr = node.local_addr().unwrap();
+        let (accepted_tx, accepted) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = node.accept() {
+                held.push(stream); // never answers, never closes
+                let _ = accepted_tx.send(());
+            }
+        });
+        let dir = temp_dir("status-stalled-download");
+        let ctx = test_ctx_with_scan(&dir, move |cancel| {
+            Box::pin(async move {
+                let hash = bitcoin::BlockHash::from_byte_array([7; 32]);
+                let fetched = BlockFetcher::new(node_addr, bitcoin_rev::Network::Regtest)
+                    .with_cancel(cancel)
+                    .fetch(hash, 1)
+                    .await;
+                match fetched {
+                    Err(e) if e.failure == FetchFailure::Cancelled => Ok(()),
+                    other => Err(format!("download ended without a stop: {other:?}")),
+                }
+            })
+        });
+        ctx.supervisor.start();
+        tokio::task::spawn_blocking(move || accepted.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the scan connected to the node");
+        tokio::time::sleep(Duration::from_millis(200)).await; // waiting on the node
+
+        let began = Instant::now();
+        assert_eq!(ctx.handle(Request::Stop).await, Response::Ok);
+        let status = ctx.status().await;
+        let took = began.elapsed();
+        assert!(took < Duration::from_secs(1), "Stop took {took:?}");
+        assert_eq!(status.scan_state, Some(friglet_ipc::ScanState::Paused));
+        assert!(!status.scanning);
+        assert_eq!(ctx.supervisor.last_error(), None);
+        assert_eq!(ctx.handle(Request::Start).await, Response::Ok);
+    }
+
+    #[tokio::test]
+    async fn status_reports_an_unreachable_oracle_without_waiting_for_it() {
+        let dir = temp_dir("status-oracle-down");
+        let ctx = test_ctx(&dir);
+        ctx.oracle
+            .lock()
+            .unwrap()
+            .record_error("oracle http://127.0.0.1:9: no answer within 5s".to_string());
+        let began = Instant::now();
+        let status = ctx.status().await;
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(!status.oracle_connected);
+        assert!(status.oracle_error.unwrap().contains("no answer"));
+        assert!(status.oracle_down_since_unix.is_some());
+
+        ctx.oracle.lock().unwrap().record_ok(1234);
+        let status = ctx.status().await;
+        assert!(status.oracle_connected);
+        assert_eq!(status.tip_height, Some(1234));
+        assert_eq!(status.oracle_error, None);
+        assert_eq!(status.oracle_down_since_unix, None);
     }
 
     fn test_socket_path(tag: &str) -> String {
@@ -863,10 +1080,7 @@ mod tests {
         let path = test_socket_path(tag);
         #[cfg(not(windows))]
         let _ = std::fs::remove_file(&path);
-        tokio::spawn(run(path.clone(), move |req| {
-            let ctx = ctx.clone();
-            async move { ctx.handle(req).await }
-        }));
+        tokio::spawn(run(path.clone(), ctx));
         connect_with_retry(&path).await
     }
 
@@ -876,7 +1090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_config_roundtrip_persists_and_applies() {
+    async fn set_config_persists_and_restarts() {
         let dir = temp_dir("setconfig-ok");
         let ctx = test_ctx(&dir);
         let mut client = serve_ctx("setconfig-ok", ctx.clone()).await;
@@ -884,6 +1098,7 @@ mod tests {
         let new_cfg = DaemonConfig {
             start_height: Some(250),
             oracle_url: "http://oracle.changed.example".to_string(),
+            http_addr: "127.0.0.1:9999".to_string(),
             max_label_num: 3,
             ..test_config(&dir)
         };
@@ -891,49 +1106,36 @@ mod tests {
             .request(&Request::SetConfig(Box::new(new_cfg.clone())))
             .await
             .unwrap();
-        // Scanner-affecting fields changed → rebuild happened → the response
-        // carries the Electrum-restart note.
         match &resp {
-            Response::OkWithNote(note) => assert!(note.contains("Electrum"), "note: {note}"),
+            Response::OkWithNote(note) => assert!(note.contains("restarts"), "note: {note}"),
             other => panic!("expected OkWithNote, got {other:?}"),
         }
 
-        // GetConfig reflects the new values.
+        // GetConfig reflects the new values until the restart happens.
         let resp = client.request(&Request::GetConfig).await.unwrap();
         assert_eq!(resp, Response::Config(new_cfg.clone()));
-
         // The config file was rewritten as TOML with the new values.
         assert_eq!(read_config_file(&dir), new_cfg);
-
-        // The swapped-in scanner starts from the new start height.
-        assert_eq!(
-            ctx.scanner.lock().await.get_last_scanned_block_height(),
-            249
-        );
+        // ... and the run ends for a restart (not a shutdown).
+        assert!(restarted(&ctx).await, "SetConfig must restart the daemon");
     }
 
     #[tokio::test]
-    async fn set_config_bind_addr_change_needs_daemon_restart() {
-        let dir = temp_dir("setconfig-bind");
+    async fn unchanged_settings_do_not_restart() {
+        let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
+        let dir = temp_dir("setconfig-same");
         let ctx = test_ctx(&dir);
-        let mut client = serve_ctx("setconfig-bind", ctx).await;
+        let mut client = serve_ctx("setconfig-same", ctx.clone()).await;
 
-        let new_cfg = DaemonConfig {
-            http_addr: "127.0.0.1:9999".to_string(),
-            ..test_config(&dir)
-        };
         let resp = client
-            .request(&Request::SetConfig(Box::new(new_cfg.clone())))
+            .request(&Request::ApplySettings {
+                config: Box::new(test_config(&dir)),
+                scan_key: Some(SECRET_HEX.to_string()),
+            })
             .await
             .unwrap();
-        match &resp {
-            Response::OkWithNote(note) => {
-                assert!(note.contains("http_addr"), "note: {note}");
-                assert!(note.contains("daemon restart"), "note: {note}");
-            }
-            other => panic!("expected OkWithNote, got {other:?}"),
-        }
-        assert_eq!(read_config_file(&dir).http_addr, "127.0.0.1:9999");
+        assert_eq!(resp, Response::Ok);
+        assert!(!restarted(&ctx).await);
     }
 
     #[tokio::test]
@@ -975,10 +1177,10 @@ mod tests {
             ),
             (
                 DaemonConfig {
-                    http_addr: "localhost:notaport".to_string(),
+                    electrum_addr: "localhost:notaport".to_string(),
                     ..test_config(&dir)
                 },
-                "http_addr",
+                "electrum_addr",
             ),
         ] {
             let resp = client
@@ -1001,19 +1203,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_scan_key_writes_0600_key_file() {
-        // `Response::Ok` (note-less) requires FRIGLET_SCAN_SECRET to be
-        // unset, so exclude the test that sets it.
+    async fn set_scan_key_writes_0600_key_file_and_restarts() {
+        // A note-free outcome requires FRIGLET_SCAN_SECRET to be unset, so
+        // exclude the test that sets it.
         let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
         let dir = temp_dir("setkey-ok");
         let ctx = test_ctx(&dir);
-        let mut client = serve_ctx("setkey-ok", ctx).await;
+        let mut client = serve_ctx("setkey-ok", ctx.clone()).await;
 
         let resp = client
             .request(&Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
             .await
             .unwrap();
-        assert_eq!(resp, Response::Ok);
+        match &resp {
+            Response::OkWithNote(note) => {
+                assert!(note.contains("restarts"), "note: {note}");
+                assert!(!note.contains("FRIGLET_SCAN_SECRET"), "note: {note}");
+            }
+            other => panic!("expected OkWithNote, got {other:?}"),
+        }
 
         let key_path = dir.join("scan.key");
         assert_eq!(
@@ -1026,6 +1234,67 @@ mod tests {
             let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        assert!(restarted(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn apply_settings_switches_wallet_in_one_restart() {
+        let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
+        let dir = temp_dir("apply-wallet");
+        let ctx = test_ctx(&dir);
+        let mut client = serve_ctx("apply-wallet", ctx.clone()).await;
+
+        let new_cfg = DaemonConfig {
+            spend_pubkey: Some(
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_string(),
+            ),
+            start_height: Some(50),
+            ..test_config(&dir)
+        };
+        let resp = client
+            .request(&Request::ApplySettings {
+                config: Box::new(new_cfg.clone()),
+                scan_key: Some(OTHER_SECRET_HEX.to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::OkWithNote(_)), "got {resp:?}");
+        assert_eq!(read_config_file(&dir), new_cfg);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scan.key"))
+                .unwrap()
+                .trim(),
+            OTHER_SECRET_HEX
+        );
+        assert!(restarted(&ctx).await);
+    }
+
+    #[tokio::test]
+    async fn apply_settings_rejects_bad_key_before_persisting_anything() {
+        let dir = temp_dir("apply-badkey");
+        let ctx = test_ctx(&dir);
+        let mut client = serve_ctx("apply-badkey", ctx.clone()).await;
+        let file_before = std::fs::read_to_string(dir.join("config.toml")).unwrap();
+
+        let resp = client
+            .request(&Request::ApplySettings {
+                config: Box::new(DaemonConfig {
+                    start_height: Some(50),
+                    ..test_config(&dir)
+                }),
+                scan_key: Some("zz".to_string()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Error(msg) if msg.contains("invalid scan key")),
+            "got {resp:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+            file_before
+        );
+        assert!(!restarted(&ctx).await);
     }
 
     #[tokio::test]
@@ -1057,36 +1326,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_scan_key_warns_when_state_file_pins_old_key() {
-        let dir = temp_dir("setkey-mismatch");
-        let ctx = test_ctx(&dir);
-        // Persist state embedding the current (old) secret.
-        ctx.save_state().await;
-        let mut client = serve_ctx("setkey-mismatch", ctx).await;
-
-        let resp = client
-            .request(&Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
-            .await
-            .unwrap();
-        match &resp {
-            Response::OkWithNote(note) => {
-                assert!(note.contains("state file"), "note: {note}");
-            }
-            other => panic!("expected OkWithNote, got {other:?}"),
-        }
-        // The key file itself was still updated.
-        assert_eq!(
-            std::fs::read_to_string(dir.join("scan.key"))
-                .unwrap()
-                .trim(),
-            OTHER_SECRET_HEX
-        );
-    }
-
-    #[tokio::test]
-    async fn set_scan_key_rebuilds_with_new_key_despite_env_override() {
-        use std::str::FromStr;
-
+    async fn set_scan_key_warns_when_env_secret_overrides_it() {
         let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
         // SAFETY: guarded by SCAN_SECRET_ENV_LOCK; the value equals the key
         // file content every test ctx starts with, so concurrent tests that
@@ -1095,34 +1335,203 @@ mod tests {
         let _env_guard = EnvVarGuard("FRIGLET_SCAN_SECRET");
 
         let dir = temp_dir("setkey-env");
-        let seen_secret = Arc::new(std::sync::Mutex::new(None));
-        let recorder = seen_secret.clone();
-        let ctx = test_ctx_with_builder(
-            &dir,
-            Box::new(move |cfg| {
-                *recorder.lock().unwrap() = Some(cfg.secret_scan);
-                Box::pin(async move { Ok(offline_scanner(&cfg)) })
-            }),
-        );
+        let ctx = test_ctx(&dir);
         let mut client = serve_ctx("setkey-env", ctx).await;
 
         let resp = client
             .request(&Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
             .await
             .unwrap();
-        // Rotation succeeds but warns that the env var wins after a restart.
         match &resp {
             Response::OkWithNote(note) => {
                 assert!(note.contains("FRIGLET_SCAN_SECRET"), "note: {note}")
             }
             other => panic!("expected OkWithNote, got {other:?}"),
         }
-        // The rebuilt scanner uses the just-written key, not the env secret.
         assert_eq!(
-            *seen_secret.lock().unwrap(),
-            Some(bitcoin::secp256k1::SecretKey::from_str(OTHER_SECRET_HEX).unwrap()),
-            "rebuild must use the rotated key, not FRIGLET_SCAN_SECRET"
+            std::fs::read_to_string(dir.join("scan.key"))
+                .unwrap()
+                .trim(),
+            OTHER_SECRET_HEX
         );
+    }
+
+    /// The URL of an oracle that accepts connections and never answers:
+    /// connecting succeeds, and a new wallet's birthday lookup against it
+    /// waits its full 15 s.
+    fn silent_oracle() -> String {
+        let oracle = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", oracle.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = oracle.accept() {
+                held.push(stream); // never answers, never closes
+            }
+        });
+        url
+    }
+
+    /// Stop and then Start, each within 2 s; together well within 1 s.
+    async fn assert_stop_and_start_answer_promptly(ctx: &ControlCtx) {
+        let began = Instant::now();
+        let answer = |request| tokio::time::timeout(Duration::from_secs(2), ctx.handle(request));
+        assert_eq!(answer(Request::Stop).await, Ok(Response::Ok));
+        assert!(!ctx.supervisor.is_running());
+        assert_eq!(answer(Request::Start).await, Ok(Response::Ok));
+        assert!(ctx.supervisor.is_running());
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    /// With only one async worker, a slow system resolver still leaves
+    /// status and scan controls responsive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_settings_validation_keeps_control_requests_responsive() {
+        let dir = temp_dir("slow-settings-validation");
+        let ctx = test_ctx(&dir);
+        let cfg = test_config(&dir);
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let began = Instant::now();
+        let validating = tokio::spawn(validate_settings(cfg, Duration::from_secs(5), move |cfg| {
+            let _ = entered.send(());
+            std::thread::sleep(Duration::from_secs(1));
+            config::validate_daemon_config(cfg)
+        }));
+        started.await.unwrap();
+        assert!(matches!(
+            ctx.handle(Request::GetStatus).await,
+            Response::Status(_)
+        ));
+        assert_stop_and_start_answer_promptly(&ctx).await;
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(!validating.is_finished());
+        validating.await.unwrap().unwrap();
+    }
+
+    /// A resolver that outlives the deadline returns an error; its late
+    /// result cannot reach the persist/restart part of an apply.
+    #[tokio::test]
+    async fn settings_validation_has_a_deadline() {
+        let dir = temp_dir("settings-validation-deadline");
+        let result = validate_settings(test_config(&dir), Duration::from_millis(30), |cfg| {
+            std::thread::sleep(Duration::from_millis(200));
+            config::validate_daemon_config(cfg)
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err(),
+            "settings validation timed out resolving the P2P node"
+        );
+    }
+
+    /// An apply waiting on the network (here a new wallet's birthday from an
+    /// oracle that never answers) does not hold up Stop and Start.
+    #[tokio::test]
+    async fn stop_and_start_answer_while_an_apply_waits_for_the_oracle() {
+        let oracle_url = silent_oracle();
+        let dir = temp_dir("apply-waits-for-oracle");
+        let ctx = test_ctx(&dir);
+        ctx.supervisor.start();
+
+        let new_wallet = DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            oracle_url,
+            ..test_config(&dir)
+        };
+        let applying = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.handle(Request::ApplySettings {
+                    config: Box::new(new_wallet),
+                    scan_key: None,
+                })
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!applying.is_finished(), "the apply waits for the oracle");
+
+        assert_stop_and_start_answer_promptly(&ctx).await;
+        assert!(!applying.is_finished(), "the apply is still waiting");
+        applying.abort();
+    }
+
+    /// A SetScanKey whose settings were replaced while it waited for the
+    /// lock prepares again from the new ones, and that also happens outside
+    /// the lock. (The new settings here need the silent oracle; a slow DNS
+    /// lookup of the P2P host would wait the same way.)
+    #[tokio::test]
+    async fn preparing_again_after_a_concurrent_apply_does_not_hold_the_lock() {
+        let dir = temp_dir("setkey-prepares-again");
+        let ctx = test_ctx(&dir);
+        ctx.supervisor.start();
+
+        let guard = ctx.apply_lock.lock().await;
+        let setting_key = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.handle(Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        *ctx.settings.lock().unwrap() = DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            oracle_url: silent_oracle(),
+            ..test_config(&dir)
+        };
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!setting_key.is_finished(), "it prepares again");
+
+        assert_stop_and_start_answer_promptly(&ctx).await;
+        assert!(!setting_key.is_finished(), "still preparing");
+        setting_key.abort();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("scan.key"))
+                .unwrap()
+                .trim(),
+            SECRET_HEX,
+            "nothing persisted"
+        );
+    }
+
+    /// A SetScanKey that prepared against settings another apply has
+    /// replaced since keeps the newer settings, as if the two had run one
+    /// after the other.
+    #[tokio::test]
+    async fn set_scan_key_keeps_settings_changed_while_it_waited() {
+        let _env_lock = SCAN_SECRET_ENV_LOCK.lock().await;
+        let dir = temp_dir("setkey-after-apply");
+        let ctx = test_ctx(&dir);
+
+        let guard = ctx.apply_lock.lock().await;
+        let setting_key = {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                ctx.handle(Request::SetScanKey(OTHER_SECRET_HEX.to_string()))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Meanwhile another apply saved new settings.
+        let newer = DaemonConfig {
+            start_height: Some(250),
+            ..test_config(&dir)
+        };
+        friglet_ipc::write_config_toml(&dir.join("config.toml"), &newer).unwrap();
+        *ctx.settings.lock().unwrap() = newer.clone();
+        drop(guard);
+
+        let answer = setting_key.await.unwrap();
+        assert!(matches!(answer, Response::OkWithNote(_)), "{answer:?}");
+        assert_eq!(*ctx.settings.lock().unwrap(), newer);
+        assert_eq!(read_config_file(&dir), newer);
         assert_eq!(
             std::fs::read_to_string(dir.join("scan.key"))
                 .unwrap()
@@ -1160,59 +1569,5 @@ mod tests {
         drop(guard);
         assert_eq!(stop.await.unwrap(), Response::Ok);
         assert!(!ctx.supervisor.is_running());
-    }
-
-    #[tokio::test]
-    async fn failed_apply_keeps_get_config_matching_disk() {
-        let dir = temp_dir("setconfig-applyfail");
-        let ctx = test_ctx_with_builder(
-            &dir,
-            Box::new(|_cfg| Box::pin(async { Err("injected scanner build failure".to_string()) })),
-        );
-        let mut client = serve_ctx("setconfig-applyfail", ctx).await;
-
-        let new_cfg = DaemonConfig {
-            start_height: Some(777),
-            ..test_config(&dir)
-        };
-        let resp = client
-            .request(&Request::SetConfig(Box::new(new_cfg.clone())))
-            .await
-            .unwrap();
-        match &resp {
-            Response::Error(msg) => {
-                assert!(msg.contains("config saved"), "error: {msg}");
-                assert!(msg.contains("applying it failed"), "error: {msg}");
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-
-        // Disk has the new config and GetConfig agrees with it.
-        assert_eq!(read_config_file(&dir), new_cfg);
-        let resp = client.request(&Request::GetConfig).await.unwrap();
-        assert_eq!(resp, Response::Config(new_cfg));
-    }
-
-    #[tokio::test]
-    async fn set_config_restarts_running_scan_task() {
-        let dir = temp_dir("setconfig-restart");
-        let ctx = test_ctx(&dir);
-        assert!(ctx.supervisor.start());
-        assert!(ctx.supervisor.is_running());
-        let mut client = serve_ctx("setconfig-restart", ctx.clone()).await;
-
-        let new_cfg = DaemonConfig {
-            start_height: Some(300),
-            ..test_config(&dir)
-        };
-        let resp = client
-            .request(&Request::SetConfig(Box::new(new_cfg)))
-            .await
-            .unwrap();
-        assert!(matches!(resp, Response::OkWithNote(_)), "got {resp:?}");
-        assert!(
-            ctx.supervisor.is_running(),
-            "scan task must be restarted after apply"
-        );
     }
 }

@@ -1,0 +1,164 @@
+{
+  "block_checkpoints": {
+    "0": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "100": "0d52ac6e67ab550e176ebb2fb29d8fdf9a113ae2549b05d800cde721dde38d29"
+  },
+  "indexer": {
+    "scan_sk": "1111111111111111111111111111111111111111111111111111111111111111",
+    "spend_pk": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "txid_to_partial_secret": {
+      "cd8a3efcfeedb7d07d87fce2288ceb2a6bfc3348b035f6bf8c878efad06f7a81": "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1",
+      "1d0e05d33c0c47a86009983a84044e3c59c702d8e08cd5adf8e3c95e0b665dbe": "023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1"
+    },
+    "label_lookup": [
+      [
+        0,
+        [
+          53,
+          81,
+          172,
+          101,
+          113,
+          186,
+          106,
+          173,
+          137,
+          199,
+          228,
+          228,
+          29,
+          126,
+          48,
+          225,
+          160,
+          91,
+          41,
+          98,
+          115,
+          232,
+          204,
+          116,
+          50,
+          67,
+          212,
+          126,
+          61,
+          200,
+          124,
+          148
+        ],
+        "038b2709f0aa4014d750140cbdc445634f3e4b16e3c686806127d53a9c8cf29921"
+      ],
+      [
+        1,
+        [
+          194,
+          60,
+          36,
+          4,
+          114,
+          227,
+          65,
+          153,
+          163,
+          180,
+          221,
+          100,
+          222,
+          126,
+          135,
+          216,
+          187,
+          62,
+          157,
+          157,
+          102,
+          237,
+          145,
+          164,
+          174,
+          11,
+          209,
+          154,
+          6,
+          161,
+          183,
+          32
+        ],
+        "035be3a727b6bccdf4bbd4e6ebf27266b41816b3ee373237540942b8fc339c5bf9"
+      ]
+    ],
+    "graph": {
+      "txs": [
+        {
+          "version": 2,
+          "lock_time": 0,
+          "input": [
+            {
+              "previous_output": "0101010101010101010101010101010101010101010101010101010101010101:0",
+              "script_sig": "",
+              "sequence": 4294967295,
+              "witness": []
+            }
+          ],
+          "output": [
+            {
+              "value": 50000,
+              "script_pubkey": "5120495feefbace0631dfad36337aeaa066615dc1f34598b21e455599670607858f1"
+            }
+          ]
+        },
+        {
+          "version": 2,
+          "lock_time": 0,
+          "input": [
+            {
+              "previous_output": "0202020202020202020202020202020202020202020202020202020202020202:0",
+              "script_sig": "",
+              "sequence": 4294967295,
+              "witness": []
+            }
+          ],
+          "output": [
+            {
+              "value": 20000,
+              "script_pubkey": "512090e97c584c5888d5287961b2af2c7b729f60f4e5973a24e394b993d017024f19"
+            }
+          ]
+        }
+      ],
+      "txouts": {},
+      "anchors": [
+        [
+          {
+            "block_id": {
+              "height": 100,
+              "hash": "0d52ac6e67ab550e176ebb2fb29d8fdf9a113ae2549b05d800cde721dde38d29"
+            },
+            "confirmation_time": 1713571867
+          },
+          "cd8a3efcfeedb7d07d87fce2288ceb2a6bfc3348b035f6bf8c878efad06f7a81"
+        ],
+        [
+          {
+            "block_id": {
+              "height": 100,
+              "hash": "0d52ac6e67ab550e176ebb2fb29d8fdf9a113ae2549b05d800cde721dde38d29"
+            },
+            "confirmation_time": 1713571867
+          },
+          "1d0e05d33c0c47a86009983a84044e3c59c702d8e08cd5adf8e3c95e0b665dbe"
+        ]
+      ],
+      "last_seen": {},
+      "last_evicted": {},
+      "first_seen": {}
+    }
+  },
+  "last_scanned_block_height": 300,
+  "last_scanned_block_height_rescan": 0,
+  "owned_outputs": [],
+  "secret_scan_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "public_spend_hex": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+  "max_label_num": 1
+}

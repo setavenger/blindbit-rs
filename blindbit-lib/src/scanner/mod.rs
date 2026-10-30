@@ -1,25 +1,51 @@
-// todo: make scanner data pulling engine flexible
-
+#[cfg(test)]
+mod cancel_tests;
 mod changeset;
 mod config;
-pub mod electrum_index;
+mod electrum_index;
+#[cfg(test)]
+mod electrum_index_tests;
+mod health;
 mod load;
+#[cfg(test)]
+mod oracle_floor_tests;
 mod p2p;
+#[cfg(test)]
+mod p2p_tests;
+mod reorg;
+#[cfg(test)]
+mod reorg_tests;
 mod scanner;
 mod scanning;
+#[cfg(feature = "serde")]
+mod state_file;
+#[cfg(all(test, feature = "serde"))]
+mod state_file_tests;
+#[cfg(test)]
+mod stream_safety_tests;
+#[cfg(test)]
+mod test_support;
 mod types;
 mod utils;
+mod witness;
+#[cfg(test)]
+mod witness_tests;
 
 /// Shared error type for scanner operations used across async tasks.
 pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
 
 // Re-export public types and the main Scanner struct
-pub use changeset::ChangeSet;
+pub use changeset::{ChangeSet, STATE_FORMAT_VERSION};
 pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
-pub use p2p::broadcast_tx;
-pub use scanner::Scanner;
-pub use types::{BlockIdentifierDisplay, OwnedOutput};
+pub use health::{
+    OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
+    StateRescan, oracle_block_hash,
+};
+pub use p2p::{BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy};
+pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
+pub use scanner::{Scanner, convert_network};
+pub use types::OwnedOutputRecord;
 
 // Re-export load_scanner function when serde feature is enabled
 #[cfg(feature = "serde")]

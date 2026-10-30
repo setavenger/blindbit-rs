@@ -1,5 +1,5 @@
-//! IPC protocol shared between the friglet daemon and its clients (tray UI,
-//! `frigletctl`-style tools, tests).
+//! IPC protocol shared between the friglet daemon and its clients (the tray
+//! UI, tests).
 //!
 //! # Wire format
 //!
@@ -26,6 +26,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub use interprocess::local_socket::tokio::Listener;
 
+pub mod descriptor;
+pub mod logfile;
+pub mod network;
+
 /// Daemon configuration as exchanged over IPC and layered from
 /// file / environment / CLI. Field names double as TOML keys and
 /// `FRIGLET_*` environment variable suffixes.
@@ -40,21 +44,34 @@ pub struct DaemonConfig {
     pub network: String,
     /// BlindBit oracle URL.
     pub oracle_url: String,
-    /// Bitcoin P2P node address (`host:port`). Required to start scanning.
+    /// Bitcoin P2P node address: `host:port`, `ip:port`, or a bare host/IP
+    /// (the network's default port). Hostnames are resolved at daemon start.
+    /// Required to start scanning.
     pub p2p_node_addr: Option<String>,
-    /// Wallet birthday block height. Required to start scanning.
+    /// Wallet birthday block height. Required to start scanning unless
+    /// `start_at_tip` is set.
     pub start_height: Option<u64>,
+    /// New wallet: when `start_height` is unset, the daemon uses the
+    /// oracle's current chain tip as the birthday (nothing to rescan) and
+    /// persists that height as `start_height`, clearing this flag.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub start_at_tip: bool,
     /// Spend public key (33-byte hex). Required to start scanning.
     pub spend_pubkey: Option<String>,
     /// Maximum Silent Payments label number.
     pub max_label_num: u32,
-    /// HTTP server bind address.
+    /// Obsolete and ignored since the HTTP API was removed (SNB-668); still
+    /// accepted so existing config files, older trays and friglet-ui keep
+    /// working.
     pub http_addr: String,
     /// Electrum TCP server bind address.
     pub electrum_addr: String,
     /// Path for scanner state persistence. Defaults to
     /// [`default_state_file`] (`<platform config dir>/friglet/scanner_state.json`)
-    /// when a config dir exists, else the relative `scanner_state.json`.
+    /// when a config dir exists, else the relative `scanner_state.json`. With
+    /// the default, the daemon keeps one file per wallet beside it
+    /// (`scanner_state-<network>-<wallet id>.json`); any other path is used
+    /// as is.
     pub state_file: PathBuf,
     /// Default log level when RUST_LOG is not set.
     pub log_level: String,
@@ -69,9 +86,10 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             network: "bitcoin".to_string(),
-            oracle_url: "https://oracle.setor.dev".to_string(),
+            oracle_url: network::MAINNET_ORACLE_URL.to_string(),
             p2p_node_addr: None,
             start_height: None,
+            start_at_tip: false,
             spend_pubkey: None,
             max_label_num: 0,
             http_addr: "127.0.0.1:8080".to_string(),
@@ -95,16 +113,23 @@ pub enum Request {
     /// Current effective configuration (never contains the scan secret).
     GetConfig,
     /// Replace the daemon configuration: the daemon validates it, persists
-    /// it to its config file (TOML) and applies it. Scanner-affecting fields
-    /// restart the scan task; bind addresses (`http_addr`, `electrum_addr`)
-    /// only take effect after a daemon restart (reported via
-    /// [`Response::OkWithNote`]).
+    /// it to its config file (TOML) and, when anything changed, restarts
+    /// itself in-process so every setting takes full effect (Electrum
+    /// clients are disconnected and reconnect to the new wallet view). The
+    /// answer ([`Response::OkWithNote`]) is sent before the restart.
     SetConfig(Box<DaemonConfig>),
     /// Replace the scan secret: a hex-encoded 32-byte secp256k1 secret key.
-    /// The daemon validates it and writes it to its key file (0600 on Unix).
-    /// The secret is deliberately not part of [`DaemonConfig`], so this is a
-    /// separate verb; `GetConfig` never returns it.
+    /// The daemon validates it, writes it to its key file (0600 on Unix) and
+    /// restarts like [`Request::SetConfig`]. The secret is deliberately not
+    /// part of [`DaemonConfig`], so this is a separate verb; `GetConfig`
+    /// never returns it.
     SetScanKey(String),
+    /// [`Request::SetConfig`] and [`Request::SetScanKey`] in one step (one
+    /// validation, one restart) — used when switching wallets.
+    ApplySettings {
+        config: Box<DaemonConfig>,
+        scan_key: Option<String>,
+    },
     /// Gracefully shut down the whole daemon process.
     Shutdown,
 }
@@ -115,14 +140,15 @@ pub enum Response {
     Status(StatusInfo),
     Ok,
     /// Success, plus a human-readable note the client should surface (e.g.
-    /// which changed settings need a daemon restart to take effect).
+    /// that the daemon restarts to apply new settings, or that scanning is
+    /// still stopping).
     OkWithNote(String),
     Config(DaemonConfig),
     Error(String),
 }
 
 /// Snapshot of the daemon's state, returned for [`Request::GetStatus`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StatusInfo {
     /// Whether the scan task is currently running.
     pub scanning: bool,
@@ -135,7 +161,8 @@ pub struct StatusInfo {
     pub network: String,
     /// Number of currently connected Electrum clients.
     pub electrum_clients: u64,
-    /// True when an oracle tip was fetched successfully within the cache TTL.
+    /// True when the daemon's last oracle tip poll succeeded within the last
+    /// 30 s.
     pub oracle_connected: bool,
     pub last_error: Option<String>,
     /// Silent Payments address of the wallet, once known.
@@ -159,6 +186,95 @@ pub struct StatusInfo {
     /// instead of assuming it did not spawn it.
     #[serde(default)]
     pub spawned_by_tray: bool,
+    /// Conditions of the scan beyond its progress: why it is stuck, and
+    /// whether it started above the configured start height.
+    #[serde(default)]
+    pub scan_health: ScanHealthInfo,
+    /// What the scan task is doing. `None` from daemons predating it; fall
+    /// back to [`StatusInfo::scanning`] then.
+    #[serde(default)]
+    pub scan_state: Option<ScanState>,
+    /// The daemon's process id.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// The log file the daemon writes, when it writes one.
+    #[serde(default)]
+    pub log_file: Option<String>,
+    /// Why the last oracle tip poll failed, while the oracle is unreachable.
+    #[serde(default)]
+    pub oracle_error: Option<String>,
+    /// Unix seconds since when the oracle has been unreachable.
+    #[serde(default)]
+    pub oracle_down_since_unix: Option<u64>,
+}
+
+/// The scan task's state (see [`StatusInfo::scan_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    /// Scanning or watching for new blocks.
+    Running,
+    /// Stop was requested; the scan task ends at its next suspension point
+    /// (e.g. once a block download from the P2P node returns).
+    Stopping,
+    /// Stopped on request: nothing is scanned until `Start`.
+    Paused,
+    /// The scan task ended with an error ([`StatusInfo::last_error`]).
+    Failed,
+}
+
+/// Scan conditions the user should see (see [`StatusInfo::scan_health`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanHealthInfo {
+    /// Set while the scan cannot get past a height. The daemon keeps
+    /// retrying; this clears once the scan makes progress again.
+    pub stall: Option<ScanStallInfo>,
+    /// Set when the configured start height lay below the oracle's first
+    /// indexed block, so scanning began at that block instead.
+    pub start_adjusted: Option<StartAdjustedInfo>,
+    /// Set while a state file written before spends were tracked is being
+    /// rescanned once for the spends it missed.
+    pub state_rescan: Option<StateRescanInfo>,
+    /// Set when the state file could not be restored: it was moved to
+    /// `backup_path` and the wallet is being scanned again from its start
+    /// height.
+    pub state_reset: Option<StateResetInfo>,
+}
+
+/// The state file could not be restored (see [`ScanHealthInfo::state_reset`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateResetInfo {
+    pub backup_path: String,
+    pub error: String,
+}
+
+/// Blocks `from_height..=until_height` are scanned again because the state
+/// file predates spend tracking (see blindbit-lib `StateRescan`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRescanInfo {
+    pub from_height: u64,
+    pub until_height: u64,
+}
+
+/// The scan cannot get past `height`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanStallInfo {
+    /// First height that could not be scanned.
+    pub height: u64,
+    /// Why, as the scanner reported it.
+    pub reason: String,
+    /// Unix time (seconds) of the first failed attempt at this height.
+    pub since_unix: u64,
+}
+
+/// Scanning began at `oracle_floor` instead of the configured
+/// `requested_height`: the oracle has no data below it, so blocks
+/// `requested_height..oracle_floor` were not scanned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartAdjustedInfo {
+    pub requested_height: u64,
+    pub oracle_floor: u64,
 }
 
 /// A configured Silent Payments label and its receive address.
@@ -251,8 +367,10 @@ pub fn write_config_toml(path: &Path, cfg: &DaemonConfig) -> Result<(), String> 
 
 /// Write the scan-secret key file at `path` (0600 on Unix), creating parent
 /// directories as needed. With `overwrite = false` the call fails if the
-/// file already exists. Performs no validation of `secret_hex` itself —
-/// callers validate the key material.
+/// file already exists. With `overwrite = true` an existing key is replaced
+/// atomically (temp file + rename, like [`write_config_toml`]): a crash
+/// leaves the old key or the new one, never an empty file. Performs no
+/// validation of `secret_hex` itself — callers validate the key material.
 pub fn write_key_file(path: &Path, secret_hex: &str, overwrite: bool) -> Result<(), String> {
     let describe = |e: std::io::Error| format!("cannot write key file {}: {e}", path.display());
     if let Some(parent) = path.parent()
@@ -260,33 +378,46 @@ pub fn write_key_file(path: &Path, secret_hex: &str, overwrite: bool) -> Result<
     {
         std::fs::create_dir_all(parent).map_err(describe)?;
     }
+    let contents = format!("{secret_hex}\n");
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
+    if !overwrite {
+        let mut file =
+            open_key_file(path, std::fs::OpenOptions::new().create_new(true)).map_err(describe)?;
+        return file.write_all(contents.as_bytes()).map_err(describe);
     }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut file = open_key_file(
+        &tmp,
+        std::fs::OpenOptions::new().create(true).truncate(true),
+    )
+    .map_err(describe)?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(describe)?;
+    std::fs::rename(&tmp, path).map_err(describe)
+}
+
+/// Open a key file for writing, owner-only (0600) on Unix. On Windows the
+/// file inherits the profile directory's default ACL, which restricts access
+/// to the owning user — no tighter per-file ceiling is set.
+fn open_key_file(path: &Path, options: &mut std::fs::OpenOptions) -> io::Result<std::fs::File> {
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // On Windows the file inherits the profile directory's default ACL, which
-    // restricts access to the owning user — no tighter per-file ceiling is set.
-    let mut file = options.open(path).map_err(describe)?;
-    // `mode(0o600)` only applies on creation; enforce it when replacing a
-    // pre-existing key file too.
+    let file = options.open(path)?;
+    // `mode(0o600)` only applies on creation; enforce it on a file that was
+    // already there too (a temp file left by a crash).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(describe)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(secret_hex.as_bytes()).map_err(describe)?;
-    file.write_all(b"\n").map_err(describe)?;
-    Ok(())
+    Ok(file)
 }
 
 fn socket_name(path: &str) -> io::Result<Name<'_>> {
@@ -324,7 +455,7 @@ pub async fn connect_stream(path: &str) -> io::Result<Stream> {
 }
 
 /// Serialize `msg` as one JSON line and write it to `writer`.
-pub async fn write_message<W, T>(writer: &mut W, msg: &T) -> io::Result<()>
+async fn write_message<W, T>(writer: &mut W, msg: &T) -> io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
     T: Serialize,
@@ -335,7 +466,7 @@ where
 }
 
 /// Read one JSON-line message from `reader`. Returns `None` on clean EOF.
-pub async fn read_message<R, T>(reader: &mut R) -> io::Result<Option<T>>
+async fn read_message<R, T>(reader: &mut R) -> io::Result<Option<T>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
     T: DeserializeOwned,
@@ -458,6 +589,30 @@ mod tests {
             }],
             version: "test".to_string(),
             spawned_by_tray: true,
+            scan_health: ScanHealthInfo {
+                stall: Some(ScanStallInfo {
+                    height: 102,
+                    reason: "the oracle sent no valid block hash".to_string(),
+                    since_unix: 1_790_000_000,
+                }),
+                start_adjusted: Some(StartAdjustedInfo {
+                    requested_height: 1,
+                    oracle_floor: 100,
+                }),
+                state_rescan: Some(StateRescanInfo {
+                    from_height: 100,
+                    until_height: 101,
+                }),
+                state_reset: Some(StateResetInfo {
+                    backup_path: "/tmp/scanner_state.json.unreadable-1".to_string(),
+                    error: "Failed to parse JSON".to_string(),
+                }),
+            },
+            scan_state: Some(ScanState::Stopping),
+            pid: Some(4242),
+            log_file: Some("/home/u/.local/state/friglet/friglet.log".to_string()),
+            oracle_error: Some("timed out".to_string()),
+            oracle_down_since_unix: Some(1_790_000_100),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
@@ -482,6 +637,7 @@ mod tests {
         assert_eq!(status.outputs_found, 0);
         assert!(status.label_addresses.is_empty());
         assert!(!status.spawned_by_tray);
+        assert_eq!(status.scan_health, ScanHealthInfo::default());
     }
 
     #[test]
@@ -533,6 +689,46 @@ mod tests {
         assert!(write_key_file(&path, "bb", false).is_err());
         write_key_file(&path, "bb", true).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "bb\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replacing the key never leaves the file empty or half written, which
+    /// is what a crash in the middle of a replace would leave behind: a
+    /// reader running alongside only ever sees the old key or the new one.
+    /// (POSIX rename; Windows does not promise it to concurrent readers.)
+    #[cfg(unix)]
+    #[test]
+    fn replacing_the_key_file_never_exposes_an_empty_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = temp_dir("key-file-atomic");
+        let path = dir.join("scan.key");
+        let (old, new) = ("aa".repeat(32), "bb".repeat(32));
+        write_key_file(&path, &old, false).unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done) = (path.clone(), done.clone());
+            let valid = [format!("{old}\n"), format!("{new}\n")];
+            std::thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(valid.contains(&text), "a reader saw {text:?}");
+                }
+            })
+        };
+        for i in 0..200 {
+            write_key_file(&path, if i % 2 == 0 { &new } else { &old }, true).unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        reader.join().expect("the reader only saw whole keys");
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{old}\n"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!dir.join("scan.key.tmp").exists(), "temp file renamed away");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

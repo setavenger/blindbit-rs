@@ -1,7 +1,7 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
 use bitcoin_rev::Network;
 
@@ -58,7 +58,20 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // Display, not the Debug form `main` would print for a returned error: a
+            // stopped scan (`ScanStopped`) says which height it stopped at and where to
+            // rescan from, and its Debug form is a struct dump.
+            eprintln!("Error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -81,19 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .with_target(false)
                 .init();
 
-            // Parse the scan secret (32 bytes hex)
             let secret_scan = SecretKey::from_str(&scan_secret)
                 .map_err(|e| format!("Invalid scan_secret: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"))?;
 
-            // Parse the spend public key (33 bytes hex)
             let public_spend = PublicKey::from_str(&spend_pubkey)
                 .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
-            // Parse the P2P socket address
             let p2p_socket_addr = SocketAddr::from_str(&p2p_node_addr)
                 .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
 
-            // Create scanner configuration
             let config = ScannerConfig::new(
                 oracle_url.clone(),
                 p2p_socket_addr,
