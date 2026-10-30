@@ -28,15 +28,16 @@ use super::ScannerError;
 
 /// BIP-352 limits one recipient group to this many matched outputs.
 ///
-/// The live receive path (`scan_transaction_short`, then `apply_block_relevant`
-/// on the external indexer) does not enforce it yet (SNB-540).
-#[expect(
-    dead_code,
-    reason = "the live receive path does not enforce BIP-352 K_max yet; SNB-540 (PR #18) \
-              adds the enforcement and a compile-time assert against bdk_sp::K_MAX that \
-              uses this constant, which makes this expectation fail and forces its removal"
-)]
+/// The live receive path relies on `bdk_sp::receive::scan_txouts`, which stops at
+/// this limit (`bdk_sp::K_MAX`, SNB-540); the assert below keeps the two equal.
 const BIP352_K_MAX: usize = 2323;
+
+// The live path is only correct while the pinned bdk_sp stops at the same
+// limit, so a bdk_sp that disagrees with BIP-352 must fail the build.
+const _: () = assert!(
+    BIP352_K_MAX == bdk_sp::K_MAX as usize,
+    "bdk_sp::K_MAX differs from BIP-352 K_max"
+);
 
 /// The per-block message source of a block-range scan.
 ///

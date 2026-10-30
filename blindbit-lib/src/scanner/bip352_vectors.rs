@@ -49,7 +49,7 @@ use serde::Deserialize;
 
 use crate::scanner::test_support::{oracle_client, state_file};
 
-use super::Scanner;
+use super::{BIP352_K_MAX, Scanner};
 
 const VECTORS_JSON: &str = include_str!("../../tests/data/bip352-official-vectors.json");
 const VECTORS_SHA256: &str = "f5f9ed4afd76a1b76f3c70b1cbe67532f89abbe559f8e02d7fc3d8ecb93af4a1";
@@ -1227,7 +1227,7 @@ fn live_receive(
 /// owns afterwards must be exactly the vector's `expected.outputs`, with the
 /// vector's `priv_key_tweak` and a label that reproduces the output key.
 ///
-/// The K_max vector is excluded here and has its own ignored test (SNB-540).
+/// The K_max vector is excluded here and has its own (slow) test below.
 #[test]
 fn official_vectors_live_receive_step_finds_expected_outputs() {
     let mut exercised = 0usize;
@@ -1239,7 +1239,7 @@ fn official_vectors_live_receive_step_finds_expected_outputs() {
             let what = format!("case {} sub {sub_idx} ({})", case_idx + 1, case.comment);
             let (given, expected) = (&receiving.given, &receiving.expected);
             if expected.n_outputs.is_some() {
-                continue; // K_max: see the ignored SNB-540 test below.
+                continue; // K_max: see the dedicated test below.
             }
             let (tx, prevouts) = build_transaction(given);
             let Ok(tweak) = compute_tweak_data(&tx, &prevouts) else {
@@ -1385,12 +1385,14 @@ fn official_vectors_live_receive_step_keeps_vouts_among_non_taproot_outputs() {
 
 /// The BIP-352 recipient limit on the live receive path.
 ///
-/// Ignored because it fails today: `apply_block_relevant` enforces no K_max, so
-/// the live path stores one output more than BIP-352 allows on this vector.
-/// That is SNB-540; this test is the acceptance check for it. It is also slow
-/// (the external indexer's scan is quadratic in the 2324 outputs).
+/// The vector pays K_max + 1 outputs to one recipient. What the daemon stores
+/// after `apply_block_relevant` must be exactly the matches for `k = 0..K_max`:
+/// every one of them found, and the `k = K_max` candidate never stored. The
+/// cutoff lives in `bdk_sp::receive::scan_txouts` (SNB-540); without it the live
+/// path stores 2324 outputs here. Expensive: the external indexer's scan
+/// rescans the shrinking candidate pool for every derivation order, which is
+/// quadratic in the 2324 outputs.
 #[test]
-#[ignore = "SNB-540: the live receive path enforces no K_max (stores 2324 of 2323)"]
 fn official_vectors_live_receive_step_enforces_k_max() {
     let mut exercised = 0usize;
     for case in vectors() {
@@ -1399,14 +1401,57 @@ fn official_vectors_live_receive_step_enforces_k_max() {
                 continue;
             };
             let given = &receiving.given;
+            let what = case.comment.as_str();
+            assert_eq!(
+                n_outputs, BIP352_K_MAX,
+                "{what}: fixture no longer pins the BIP-352 recipient limit"
+            );
+            assert_eq!(
+                given.outputs.len(),
+                BIP352_K_MAX + 1,
+                "{what}: fixture no longer exceeds K_max by exactly one match"
+            );
             let (tx, prevouts) = build_transaction(given);
+            let (scan_sk, _) = scan_keys(given);
             let tweak = compute_tweak_data(&tx, &prevouts).expect("K_max vector inputs are valid");
+            let shared_secret = bdk_sp::compute_shared_secret(&scan_sk, &tweak);
             let (_, found) = live_receive(given, &given.labels, &tx, tweak, "live-kmax");
             assert_eq!(
                 found.len(),
                 n_outputs,
-                "{}: receiver must stop at K_max",
-                case.comment
+                "{what}: receiver must stop at K_max"
+            );
+
+            // Exactness, not just the count: every stored output is the match
+            // for a distinct k < K_max (so all 2323 are found), and the k = K_max
+            // candidate, labelled or not, is never stored.
+            let candidates = |k: u32| -> Vec<SecretKey> {
+                std::iter::once(tweak_for(shared_secret, scan_sk, k, None))
+                    .chain(
+                        given
+                            .labels
+                            .iter()
+                            .map(|&m| tweak_for(shared_secret, scan_sk, k, Some(m))),
+                    )
+                    .collect()
+            };
+            // `SecretKey` is not `Hash`; compare by its bytes.
+            let stored: HashSet<[u8; 32]> = found.values().map(|(t, _)| t.secret_bytes()).collect();
+            assert_eq!(stored.len(), n_outputs, "{what}: duplicate stored tweaks");
+            let k_max = BIP352_K_MAX as u32;
+            for k in 0..k_max {
+                assert!(
+                    candidates(k)
+                        .iter()
+                        .any(|t| stored.contains(&t.secret_bytes())),
+                    "{what}: output for k = {k} was not stored"
+                );
+            }
+            assert!(
+                !candidates(k_max)
+                    .iter()
+                    .any(|t| stored.contains(&t.secret_bytes())),
+                "{what}: the k = K_max candidate was stored"
             );
             exercised += 1;
         }
