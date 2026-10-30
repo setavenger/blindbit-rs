@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::BlockHash;
+use bitcoin::Network;
 use bitcoin::block::Header;
-use bitcoin_rev::Network;
 use blindbit_lib::{BlockHeightRequest, OracleServiceClient};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
@@ -198,11 +198,6 @@ mod tests {
     use crate::electrum::fake_peer::{self, FakePeer, Script};
     use bitcoin::hashes::Hash;
 
-    fn to_header(wire: &bitcoin_rev::block::Header) -> Header {
-        bitcoin::consensus::encode::deserialize(&bitcoin_rev::consensus::encode::serialize(wire))
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn headers_come_by_hash_and_are_checked() {
         let known = fake_peer::header(1);
@@ -214,7 +209,7 @@ mod tests {
         let peer = FakePeer::spawn(script, 1);
         let chain = ChainSource::new(peer.addr, Network::Regtest, "http://127.0.0.1:1".into());
 
-        let expected = to_header(&known);
+        let expected = known;
         assert_eq!(chain.header(expected.block_hash()).await.unwrap(), expected);
         let unknown = chain.header(BlockHash::all_zeros()).await.unwrap_err();
         assert!(unknown.contains("does not know block"), "{unknown}");

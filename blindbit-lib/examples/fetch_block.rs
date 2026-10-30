@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use bitcoin::BlockHash;
-use bitcoin_rev::{Network, TestnetVersion};
+use bitcoin::Network;
 use blindbit_lib::scanner::BlockFetcher;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,8 +25,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let network = match rest.first().map(String::as_str).unwrap_or("mainnet") {
         "mainnet" => Network::Bitcoin,
-        "testnet3" => Network::Testnet(TestnetVersion::V3),
-        "testnet4" => Network::Testnet(TestnetVersion::V4),
+        "testnet3" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
         "signet" => Network::Signet,
         "regtest" => Network::Regtest,
         other => return Err(format!("unknown network {other}").into()),

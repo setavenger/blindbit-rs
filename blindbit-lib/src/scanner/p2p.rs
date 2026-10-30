@@ -3,23 +3,16 @@ use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use bitcoin::Block;
-use bitcoin::BlockHash;
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::ServiceFlags;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::{Block, BlockHash, Network};
 
-use bitcoin_p2p::net::{ConnectionReader, ConnectionWriter, Error as P2pNetError};
-use bitcoin_p2p::p2p_message_types::message::InventoryPayload;
-use bitcoin_p2p::p2p_message_types::{NetworkExt, ServiceFlags};
-use bitcoin_p2p::p2p_message_types::{message::NetworkMessage, message_blockdata::Inventory};
-use bitcoin_p2p::{
-    handshake::ConnectionConfig,
-    net::{ConnectionExt, TimeoutParams},
+use bitcoin_p2p::handshake::ConnectionConfig;
+use bitcoin_p2p::net::{
+    ConnectionExt, ConnectionReader, ConnectionWriter, Error as P2pNetError, TimeoutParams,
 };
-
-// rust-bitcoin on specific commit for use with bitcoin-p2p library
-use bitcoin_rev::block::BlockHash as PrimitivesBlockHash;
-use bitcoin_rev::consensus::encode;
-use bitcoin_rev::{Network, TestnetVersion};
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -49,6 +42,16 @@ const LIMITED_BLOCKS: i64 = 288;
 /// reaches its `-maxuploadtarget`, it disconnects peers that ask for older
 /// blocks.
 const HISTORICAL_BLOCKS: i64 = 7 * 144;
+
+/// The user agent of every P2P connection: the one the previous P2P library
+/// (2140-dev/bitcoin-p2p) sent, kept so nodes see the same client as before.
+/// friglet's Electrum peer sends it too.
+const USER_AGENT: &str = "/SwiftSync:0.1.0/";
+
+/// The `feefilter` (sat/kvB) sent after the handshake: 1 sat/vB, what the
+/// previous P2P library sent. A block-fetch connection takes no
+/// transactions, so it only matters to keep the handshake unchanged.
+const FEE_FILTER: i64 = 1_000;
 
 /// How [`BlockFetcher::fetch`] retries within one call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,18 +274,18 @@ impl BlockFetchError {
     /// network's default.
     fn other_network_port_hint(&self) -> String {
         let port = self.peer.port();
-        if port == self.network.default_p2p_port() {
+        if port == default_p2p_port(self.network) {
             return String::new();
         }
         [
             Network::Bitcoin,
-            Network::Testnet(TestnetVersion::V3),
-            Network::Testnet(TestnetVersion::V4),
+            Network::Testnet,
+            Network::Testnet4,
             Network::Signet,
             Network::Regtest,
         ]
         .into_iter()
-        .find(|network| network.default_p2p_port() == port)
+        .find(|network| default_p2p_port(*network) == port)
         .map(|network| format!(": {port} is the {} port", network_name(network)))
         .unwrap_or_default()
     }
@@ -311,7 +314,7 @@ impl BlockFetchError {
 impl fmt::Display for BlockFetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let net = network_name(self.network);
-        let port = self.network.default_p2p_port();
+        let port = default_p2p_port(self.network);
         let tries = if self.attempts > 1 {
             format!(" (all {} tries)", self.attempts)
         } else {
@@ -736,6 +739,8 @@ impl P2pConnection {
         // socket timeouts are the ones `configure` set above.
         let (writer, reader, metadata) = ConnectionConfig::new()
             .change_network(network)
+            .user_agent(USER_AGENT.to_string())
+            .fee_filter(FEE_FILTER)
             .handshake(stream, TimeoutParams::default())
             .map_err(|e| handshake_failure(e, opened))?;
         let feeler = metadata.feeler_data();
@@ -770,14 +775,11 @@ impl P2pConnection {
         deadline: Duration,
         cancel: &CancellationToken,
     ) -> Result<Block, AttemptFailure> {
-        let primitives_block_hash =
-            PrimitivesBlockHash::from_byte_array(*block_hash.as_byte_array());
         // With witnesses: the wallet stores these transactions and the
         // Electrum server hands them to wallets, which need them whole (a
         // plain `MSG_BLOCK` strips every witness: right txids, wrong sizes
         // and fee rates).
-        let inventory = Inventory::WitnessBlock(primitives_block_hash);
-        let net_msg = NetworkMessage::GetData(InventoryPayload(vec![inventory]));
+        let net_msg = NetworkMessage::GetData(vec![Inventory::WitnessBlock(block_hash)]);
 
         // The writer thread only goes away once a write failed: the peer is gone.
         self.writer
@@ -816,9 +818,6 @@ impl P2pConnection {
 
             match self.reader.read_message() {
                 Ok(Some(NetworkMessage::Block(block))) => {
-                    let block_bytes = encode::serialize(&block);
-                    let block: Block = bitcoin::consensus::encode::deserialize(&block_bytes)
-                        .map_err(|e| FetchFailure::Broken(format!("undecodable block: {e}")))?;
                     check_block(&block, block_hash)?;
                     tracing::info!(
                         peer = %self.peer,
@@ -930,7 +929,7 @@ const WITNESS_COMMITMENT_PREFIX: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 fn handshake_failure(error: P2pNetError, opened: Instant) -> FetchFailure {
     match error {
         P2pNetError::UnexpectedMagic(magic) => {
-            FetchFailure::WrongNetwork(Network::try_from(magic).ok())
+            FetchFailure::WrongNetwork(Network::from_magic(magic))
         }
         P2pNetError::Io(e) if is_closed(&e) => FetchFailure::Closed {
             during_handshake: true,
@@ -971,10 +970,21 @@ fn is_closed(e: &io::Error) -> bool {
 fn network_name(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "mainnet",
-        Network::Testnet(TestnetVersion::V3) => "testnet3",
-        Network::Testnet(_) => "testnet4",
+        Network::Testnet => "testnet3",
+        Network::Testnet4 => "testnet4",
         Network::Signet => "signet",
         Network::Regtest => "regtest",
+    }
+}
+
+/// The network's default P2P port (Bitcoin Core's `-port` default).
+fn default_p2p_port(network: Network) -> u16 {
+    match network {
+        Network::Bitcoin => 8333,
+        Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
+        Network::Signet => 38333,
+        Network::Regtest => 18444,
     }
 }
 

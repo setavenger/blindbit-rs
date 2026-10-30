@@ -26,11 +26,9 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use bitcoin::{Transaction, Txid, Wtxid};
-use bitcoin_p2p::p2p_message_types::message::{InventoryPayload, NetworkMessage};
-use bitcoin_p2p::p2p_message_types::message_blockdata::Inventory;
-use bitcoin_rev::Network;
-use bitcoin_rev::consensus::encode;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::{Network, Transaction, Txid, Wtxid};
 
 use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches};
 
@@ -70,12 +68,6 @@ impl Candidate {
             tx,
             fee: None,
         })
-    }
-
-    /// The transaction as the P2P library's type.
-    fn wire_tx(&self) -> Result<bitcoin_rev::Transaction, P2pError> {
-        encode::deserialize(&self.raw)
-            .map_err(|error| P2pError::Protocol(format!("transaction re-encoding failed: {error}")))
     }
 
     fn fee_rate_note(&self) -> String {
@@ -154,7 +146,7 @@ impl Signals {
         &mut self,
         peer: &mut Peer,
         message: NetworkMessage,
-        wire_tx: &bitcoin_rev::Transaction,
+        tx: &Transaction,
         txid: Txid,
         wtxid: Wtxid,
     ) -> Result<(), P2pError> {
@@ -162,9 +154,9 @@ impl Signals {
             return Ok(());
         };
         let mut unknown = Vec::new();
-        for item in items.0 {
+        for item in items {
             if inventory_matches(&item, txid, wtxid) {
-                peer.send(NetworkMessage::Tx(wire_tx.clone()))?;
+                peer.send(NetworkMessage::Tx(tx.clone()))?;
                 self.sent = true;
             } else {
                 if matches!(
@@ -180,7 +172,7 @@ impl Signals {
             }
         }
         if !unknown.is_empty() {
-            peer.send(NetworkMessage::NotFound(InventoryPayload(unknown)))?;
+            peer.send(NetworkMessage::NotFound(unknown))?;
         }
         Ok(())
     }
@@ -190,16 +182,16 @@ impl Signals {
     fn announce(
         &mut self,
         peer: &mut Peer,
-        wire_tx: &bitcoin_rev::Transaction,
+        tx: &Transaction,
         txid: Txid,
         wtxid: Wtxid,
         deadline: Instant,
     ) -> Result<(), P2pError> {
         let inventory = peer.tx_inventory(txid, wtxid);
-        peer.send(NetworkMessage::Inv(InventoryPayload(vec![inventory])))?;
+        peer.send(NetworkMessage::Inv(vec![inventory]))?;
         while !self.sent {
             match peer.recv_until(deadline)? {
-                Some(message) => self.observe(peer, message, wire_tx, txid, wtxid)?,
+                Some(message) => self.observe(peer, message, tx, txid, wtxid)?,
                 None => break,
             }
         }
@@ -225,10 +217,9 @@ pub fn broadcast(
     budget: Duration,
 ) -> Result<(Outcome, Option<u64>), P2pError> {
     let deadline = Instant::now() + budget;
-    let wire_tx = candidate.wire_tx()?;
     let mut peer = connect_settled(addr, network)?;
     let mut signals = Signals::default();
-    let outcome = match drive(&mut peer, &mut signals, candidate, &wire_tx, deadline) {
+    let outcome = match drive(&mut peer, &mut signals, candidate, deadline) {
         Ok(Some(outcome)) => outcome,
         Ok(None) => {
             Outcome::NotAccepted(not_accepted_message(candidate, peer.fee_filter(), budget))
@@ -247,28 +238,27 @@ fn drive(
     peer: &mut Peer,
     signals: &mut Signals,
     candidate: &Candidate,
-    wire_tx: &bitcoin_rev::Transaction,
     deadline: Instant,
 ) -> Result<Option<Outcome>, P2pError> {
-    let (txid, wtxid) = (candidate.txid, candidate.wtxid);
+    let (tx, txid, wtxid) = (&candidate.tx, candidate.txid, candidate.wtxid);
 
     // A resubmission (or a retry after a client timeout) finds it already
     // there.
     let check_deadline = deadline.min(Instant::now() + ANNOUNCE_WAIT);
     if peer.mempool_has(txid, wtxid, check_deadline, |p, m| {
-        signals.observe(p, m, wire_tx, txid, wtxid)
+        signals.observe(p, m, tx, txid, wtxid)
     })? {
         return Ok(Some(Outcome::InMempool));
     }
 
     let ask_deadline = deadline.min(Instant::now() + ANNOUNCE_WAIT);
-    signals.announce(peer, wire_tx, txid, wtxid, ask_deadline)?;
+    signals.announce(peer, tx, txid, wtxid, ask_deadline)?;
     if !signals.sent {
         // No request: the peer knows the transaction already (it is not in
         // its mempool, so it rejected or confirmed it recently) or ignores
         // announcements. Hand it over anyway and let the mempool decide.
         tracing::debug!(%txid, "peer did not request the announced transaction; sending it");
-        peer.send(NetworkMessage::Tx(wire_tx.clone()))?;
+        peer.send(NetworkMessage::Tx(tx.clone()))?;
         signals.sent = true;
     }
 
@@ -277,7 +267,7 @@ fn drive(
             return Ok(Some(Outcome::Rejected(missing_inputs_message())));
         }
         let in_mempool = match peer.mempool_has(txid, wtxid, deadline, |p, m| {
-            signals.observe(p, m, wire_tx, txid, wtxid)
+            signals.observe(p, m, tx, txid, wtxid)
         }) {
             Ok(answer) => answer,
             Err(P2pError::Timeout(_)) => return Ok(None),
@@ -288,7 +278,7 @@ fn drive(
         }
         let pause = deadline.min(Instant::now() + POLL_INTERVAL);
         while let Some(message) = peer.recv_until(pause)? {
-            signals.observe(peer, message, wire_tx, txid, wtxid)?;
+            signals.observe(peer, message, tx, txid, wtxid)?;
         }
     }
     if signals.missing_inputs {
@@ -323,16 +313,15 @@ pub fn recheck(
     let mut peer = connect_settled(addr, network)?;
     let mut present = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let wire_tx = candidate.wire_tx()?;
-        let (txid, wtxid) = (candidate.txid, candidate.wtxid);
+        let (tx, txid, wtxid) = (&candidate.tx, candidate.txid, candidate.wtxid);
         let mut signals = Signals::default();
         let in_mempool =
             peer.mempool_has(txid, wtxid, Instant::now() + ANNOUNCE_WAIT, |p, m| {
-                signals.observe(p, m, &wire_tx, txid, wtxid)
+                signals.observe(p, m, tx, txid, wtxid)
             })?;
         if !in_mempool {
             let ask_deadline = Instant::now() + ANNOUNCE_WAIT;
-            signals.announce(&mut peer, &wire_tx, txid, wtxid, ask_deadline)?;
+            signals.announce(&mut peer, tx, txid, wtxid, ask_deadline)?;
             if signals.sent {
                 peer.flush(Instant::now() + ANNOUNCE_WAIT)?;
             }

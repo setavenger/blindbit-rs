@@ -1,5 +1,5 @@
+use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin_rev::Network;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 

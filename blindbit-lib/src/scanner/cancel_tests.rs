@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::BlockHash;
+use bitcoin::Network;
 use bitcoin::hashes::Hash;
-use bitcoin_rev::Network;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
