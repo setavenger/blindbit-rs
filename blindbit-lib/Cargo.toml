@@ -30,7 +30,7 @@ tonic = { version = "0.14.2", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
 hex = "0.4.3"
 tracing = { workspace = true }
-bitcoin = "0.32.7"
+bitcoin = "0.32.8"
 # Block download over Bitcoin P2P: the `bitcoin-p2p` crate of kernel-node
 # (successor of the archived 2140-dev/bitcoin-p2p), on the same bitcoin 0.32
 # as the rest of the workspace, so its messages, blocks and `Network` are
