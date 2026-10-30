@@ -210,7 +210,7 @@ impl ChainSource {
                         note_fee_filter(&filters, &addr, peer.fee_filter());
                     }
                     Err(e) if e.proxy_down() => {}
-                    Err(_) => peers.report(&addr, PeerEvent::Unreachable),
+                    Err(e) => peers.report(&addr, e.peer_event()),
                 }
             });
         }
@@ -311,7 +311,7 @@ fn ask_header_peer<T>(
         )
         .inspect_err(|e| {
             if !e.proxy_down() {
-                peers.report(addr, PeerEvent::Unreachable);
+                peers.report(addr, e.peer_event());
             }
         })?;
         peers.report(addr, PeerEvent::Connected(peer.info()));

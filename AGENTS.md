@@ -323,7 +323,11 @@ dbus-run-session -- bash -c '
   tells the proxy failing (unreachable, not SOCKS5, login refused) from the
   peer failing (reply codes → readable `io::ErrorKind`s). Proxy down →
   `FetchFailure::Proxy`: the round ends at once, no peer is blamed, and the
-  message names `p2p_proxy`; Electrum header requests do the same.
+  message names `p2p_proxy`; Electrum header requests do the same. No
+  CONNECT reply in time, or reply 0x01/0x06 (`is_proxy_unclear`, what Tor
+  without a working circuit gives) only rests the peer (`Unhelpful`), so a
+  Tor outage cannot empty the saved address book. An empty
+  `FRIGLET_P2P_PROXY` does not override the file's `p2p_proxy`.
 - No local DNS through the proxy: `ResolvedConfig.p2p_node` is a `PeerAddr`
   whose host name stays a name (resolved locally only without a proxy; an
   `.onion` node without a proxy is a config error); `Seeds::resolve` with a

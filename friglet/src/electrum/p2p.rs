@@ -34,7 +34,7 @@ use bitcoin::{BlockHash, Network, Txid, Wtxid};
 
 // The scanner's block downloads send the same user agent, so friglet does
 // not present two different fingerprints to the same peer.
-use blindbit_lib::net::{Dialer, PeerAddr, USER_AGENT};
+use blindbit_lib::net::{Dialer, PROXY_CONNECT_TIMEOUT, PeerAddr, PeerEvent, USER_AGENT};
 use blindbit_lib::scanner::PeerInfo;
 
 /// BIP 339's `WTXID_RELAY_VERSION`: the protocol version friglet speaks.
@@ -80,6 +80,19 @@ impl P2pError {
     /// the peer: nothing to hold against the peer.
     pub fn proxy_down(&self) -> bool {
         matches!(self, P2pError::Io(error) if blindbit_lib::net::is_proxy_down(error))
+    }
+
+    /// How a failed connection counts against the peer: unreachable, or,
+    /// when the proxy said nothing clear about it (no reply in time, a
+    /// general failure: also what Tor without a working circuit does),
+    /// only unhelpful, so it rests but stays in the address book.
+    pub fn peer_event(&self) -> PeerEvent {
+        match self {
+            P2pError::Io(error) if blindbit_lib::net::is_proxy_unclear(error) => {
+                PeerEvent::Unhelpful
+            }
+            _ => PeerEvent::Unreachable,
+        }
     }
 }
 
@@ -144,6 +157,8 @@ pub struct Peer {
 impl Peer {
     /// Connect and complete the version handshake. `relay` is the BIP 37
     /// `fRelay` flag; it must be true for mempool `getdata` to work.
+    /// Through a proxy the connect and the handshake each get at least
+    /// [`PROXY_CONNECT_TIMEOUT`]: every message crosses a Tor circuit.
     pub fn connect(
         dialer: &Dialer,
         addr: &PeerAddr,
@@ -151,6 +166,11 @@ impl Peer {
         relay: bool,
         timeout: Duration,
     ) -> Result<Self, P2pError> {
+        let timeout = if dialer.proxy().is_some() {
+            timeout.max(PROXY_CONNECT_TIMEOUT)
+        } else {
+            timeout
+        };
         let stream = dialer.connect(addr, timeout)?;
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(timeout))?;

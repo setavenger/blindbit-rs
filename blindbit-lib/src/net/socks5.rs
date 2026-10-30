@@ -35,6 +35,8 @@ const ATYP_IPV6: u8 = 0x04;
 #[derive(Debug)]
 pub struct Socks5Error {
     proxy_down: bool,
+    /// No clear answer about the peer (see [`is_proxy_unclear`]).
+    unclear: bool,
     message: String,
 }
 
@@ -57,6 +59,17 @@ pub fn is_proxy_down(error: &io::Error) -> bool {
         .is_some_and(|e| e.proxy_down)
 }
 
+/// Did the proxy answer, but say nothing clear about the peer: no reply in
+/// time, or a general failure? Tor running without a working circuit looks
+/// like that for every peer, so such a failure should not count against
+/// the peer the way a refused connection does.
+pub fn is_proxy_unclear(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Socks5Error>())
+        .is_some_and(|e| e.unclear)
+}
+
 /// The proxy failed. The kinds are never the "connection closed" ones, so
 /// callers that map those to "the peer hung up" keep this message.
 fn proxy_failed(kind: io::ErrorKind, message: String) -> io::Error {
@@ -64,6 +77,7 @@ fn proxy_failed(kind: io::ErrorKind, message: String) -> io::Error {
         kind,
         Socks5Error {
             proxy_down: true,
+            unclear: false,
             message,
         },
     )
@@ -75,6 +89,19 @@ fn peer_failed(kind: io::ErrorKind, message: String) -> io::Error {
         kind,
         Socks5Error {
             proxy_down: false,
+            unclear: false,
+            message,
+        },
+    )
+}
+
+/// The proxy works, but gave no clear answer about the peer.
+fn unclear(kind: io::ErrorKind, message: String) -> io::Error {
+    io::Error::new(
+        kind,
+        Socks5Error {
+            proxy_down: false,
+            unclear: true,
             message,
         },
     )
@@ -191,7 +218,7 @@ pub(crate) fn connect(
     // Through Tor that takes a circuit and the exit's connection.
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).map_err(|e| match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => peer_failed(
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => unclear(
             io::ErrorKind::TimedOut,
             format!(
                 "p2p_proxy {proxy} did not connect to {target} within {} s",
@@ -208,13 +235,16 @@ pub(crate) fn connect(
     }
     if head[1] != 0 {
         let (kind, reason) = reply_error(head[1]);
-        return Err(peer_failed(
-            kind,
-            format!(
-                "p2p_proxy {proxy} could not connect to {target}: {reason} (SOCKS5 reply {})",
-                head[1]
-            ),
-        ));
+        let message = format!(
+            "p2p_proxy {proxy} could not connect to {target}: {reason} (SOCKS5 reply {})",
+            head[1]
+        );
+        // A general failure, or Tor giving up: nothing clear about the peer.
+        return Err(if matches!(head[1], 0x01 | 0x06) {
+            unclear(kind, message)
+        } else {
+            peer_failed(kind, message)
+        });
     }
     // The address the proxy connected from: read and dropped.
     let bound = match head[3] {
