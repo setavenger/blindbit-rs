@@ -4,6 +4,7 @@
 
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::receive::get_silentpayment_pubkey;
+use bitcoin::Network;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -14,7 +15,6 @@ use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Txid, Witness,
 };
-use bitcoin_rev::Network;
 
 use super::p2p::{BlockFetcher, FetchFailure};
 use super::p2p_tests::{Conn, Node, OneBlock, fast, stripped};

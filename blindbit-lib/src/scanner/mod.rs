@@ -46,7 +46,7 @@ pub use health::{
 };
 pub use p2p::{BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy};
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
-pub use scanner::{Scanner, convert_network};
+pub use scanner::Scanner;
 pub use types::OwnedOutputRecord;
 
 // Re-export load_scanner function when serde feature is enabled

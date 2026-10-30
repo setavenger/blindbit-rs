@@ -3,7 +3,7 @@ use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
 
-use bitcoin_rev::Network;
+use bitcoin::Network;
 
 #[derive(Parser)]
 #[command(name = "blindbit-cli")]

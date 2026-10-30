@@ -9,18 +9,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash};
-use bitcoin_p2p::p2p_message_types::message::{
-    InventoryPayload, NetworkMessage, RawNetworkMessage,
-};
-use bitcoin_p2p::p2p_message_types::message_blockdata::Inventory;
-use bitcoin_p2p::p2p_message_types::message_network::{
-    ClientSoftwareVersion, UserAgent, UserAgentVersion, VersionMessage,
-};
-use bitcoin_p2p::p2p_message_types::{Address, NetworkExt, ProtocolVersion, ServiceFlags};
-use bitcoin_rev::Network;
-use bitcoin_rev::consensus::encode;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::{Address, Magic, ServiceFlags};
+use bitcoin::{Block, BlockHash, Network};
 
 use super::ScannerError;
 use super::health::OracleProbe;
@@ -65,21 +60,17 @@ pub(super) struct Node {
     stalled: Arc<Mutex<Option<Instant>>>,
 }
 
-/// The block a node serves, as it goes on the wire with and without its
-/// witnesses.
+/// The block a node serves, with and without its witnesses.
 struct Served {
-    full: bitcoin_rev::Block,
-    stripped: bitcoin_rev::Block,
+    full: Block,
+    stripped: Block,
 }
 
 impl Served {
     fn new(block: &Block) -> Self {
-        let wire = |block: &Block| -> bitcoin_rev::Block {
-            encode::deserialize(&bitcoin::consensus::encode::serialize(block)).unwrap()
-        };
         Self {
-            full: wire(block),
-            stripped: wire(&stripped(block)),
+            full: block.clone(),
+            stripped: stripped(block),
         }
     }
 }
@@ -156,7 +147,7 @@ impl Node {
 struct Wire {
     stream: TcpStream,
     buf: Vec<u8>,
-    magic: bitcoin_p2p::p2p_message_types::Magic,
+    magic: Magic,
 }
 
 impl Wire {
@@ -211,8 +202,8 @@ fn serve(
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
-        Conn::Magic(network) => network.default_network_magic(),
-        _ => Network::Regtest.default_network_magic(),
+        Conn::Magic(network) => network.magic(),
+        _ => Network::Regtest.magic(),
     };
     let mut wire = Wire {
         stream,
@@ -230,24 +221,7 @@ fn serve(
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
         return wire.drain();
     }
-    wire.send(NetworkMessage::Version(VersionMessage {
-        version: ProtocolVersion::WTXID_RELAY_VERSION,
-        services,
-        timestamp: 0,
-        receiver: Address::useless(),
-        sender: Address::useless(),
-        nonce: 7,
-        user_agent: UserAgent::new(
-            "Fake",
-            UserAgentVersion::new(ClientSoftwareVersion::SemVer {
-                major: 1,
-                minor: 0,
-                revision: 0,
-            }),
-        ),
-        start_height: height,
-        relay: true,
-    }))?;
+    wire.send(version_message(services, height))?;
     if let Conn::Magic(_) = conn {
         return wire.drain();
     }
@@ -260,13 +234,13 @@ fn serve(
             break items;
         }
     };
-    let witness = matches!(items.0.first(), Some(Inventory::WitnessBlock(_)));
+    let witness = matches!(items.first(), Some(Inventory::WitnessBlock(_)));
     match conn {
         Conn::Serve if witness => wire.send(NetworkMessage::Block(served.full.clone()))?,
         Conn::Serve | Conn::ServeStripped => {
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
-        Conn::NotFound => wire.send(NetworkMessage::NotFound(InventoryPayload(items.0)))?,
+        Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
         Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(
@@ -293,6 +267,27 @@ fn serve(
         _ => {}
     }
     wire.drain()
+}
+
+/// A node's `version` message, as Bitcoin Core sends it.
+fn version_message(services: ServiceFlags, height: i32) -> NetworkMessage {
+    let useless = Address {
+        services: ServiceFlags::NONE,
+        address: [0; 8],
+        port: 0,
+    };
+    NetworkMessage::Version(VersionMessage {
+        // BIP 339's `WTXID_RELAY_VERSION`.
+        version: 70016,
+        services,
+        timestamp: 0,
+        receiver: useless.clone(),
+        sender: useless,
+        nonce: 7,
+        user_agent: "/Fake:1.0.0/".to_string(),
+        start_height: height,
+        relay: true,
+    })
 }
 
 /// Attempts 10 ms apart, a 2 s budget per block.
@@ -560,6 +555,66 @@ fn a_service_that_is_not_bitcoin_p2p_is_named() {
             .contains("does not speak the regtest Bitcoin P2P protocol"),
         "{err}"
     );
+}
+
+/// What a node learns about friglet in the handshake stays what it was with
+/// the previous P2P library: user agent, protocol version, no services, no
+/// transaction relay, and a 1 sat/vB fee filter after `verack`.
+#[test]
+fn the_handshake_shows_the_node_the_same_client_as_before() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let node = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut wire = Wire {
+            stream,
+            buf: Vec::new(),
+            magic: Network::Regtest.magic(),
+        };
+        let NetworkMessage::Version(version) = wire.recv().unwrap() else {
+            panic!("the client starts with its version message");
+        };
+        wire.send(version_message(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            1,
+        ))
+        .unwrap();
+        wire.send(NetworkMessage::Verack).unwrap();
+        let mut after = Vec::new();
+        loop {
+            match wire.recv().unwrap() {
+                NetworkMessage::GetData(items) => {
+                    wire.send(NetworkMessage::NotFound(items)).unwrap();
+                    break;
+                }
+                message => after.push(message),
+            }
+        }
+        let _ = wire.drain();
+        (version, after)
+    });
+    let err = run(BlockFetcher::new(addr, Network::Regtest)
+        .with_policy(fast(1))
+        .fetch(block().block_hash(), 1))
+    .expect_err("the node answers notfound");
+    assert_eq!(err.failure, FetchFailure::NotFound);
+
+    let (version, after) = node.join().unwrap();
+    assert_eq!(version.user_agent, "/SwiftSync:0.1.0/");
+    assert_eq!(version.version, 70016);
+    assert_eq!(version.services, ServiceFlags::NONE);
+    assert_eq!(version.start_height, 0);
+    assert!(!version.relay);
+    for expected in [
+        NetworkMessage::WtxidRelay,
+        NetworkMessage::Verack,
+        NetworkMessage::FeeFilter(1_000),
+    ] {
+        assert!(after.contains(&expected), "no {expected:?} in {after:?}");
+    }
 }
 
 #[test]
