@@ -285,6 +285,6 @@ fn an_own_node_is_the_only_peer_and_learns_nothing() {
     assert_eq!(run(source.next(Purpose::Relay, &none())).unwrap(), node);
     source.report(&node, PeerEvent::Misbehaved);
     assert_eq!(run(source.next(Purpose::Header, &none())).unwrap(), node);
-    assert!(!source.wants_addr());
+    assert!(!source.wants_addr(&node));
     assert_eq!(source.summary(), "your node 192.0.2.1:8333");
 }

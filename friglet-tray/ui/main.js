@@ -440,10 +440,9 @@ function updateNetworkHints() {
   } else {
     $("cfg-p2p-addr").placeholder = "empty: random peers of the network";
     p2pHint.textContent =
-      "Empty: friglet downloads blocks from random peers of the network. They see this " +
-      "computer's IP address and which blocks it fetches, which likely pay or spend from " +
-      "your wallet. Your own node keeps that private. host:port; a hostname works, the port " +
-      `defaults to the network's${port ? ` (${port})` : ""}.`;
+      "Empty: friglet uses random peers of the network. They see this computer's IP " +
+      "address and which blocks it fetches, likely your wallet's. Your own node keeps that " +
+      `private. host:port or a hostname; the port defaults to ${port ?? "the network's"}.`;
     p2pHint.className = "hint";
   }
 }

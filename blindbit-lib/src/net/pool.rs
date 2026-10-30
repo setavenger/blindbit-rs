@@ -213,12 +213,16 @@ impl PeerSource {
         }
     }
 
-    /// Should the next block download ask its peer for addresses? Only
-    /// while a discovering source knows few.
-    pub fn wants_addr(&self) -> bool {
+    /// Should a block download from `peer` ask it for addresses? Only
+    /// while a discovering source knows few, and only once per peer (Bitcoin
+    /// Core answers a peer's repeated `getaddr` from a cache).
+    pub fn wants_addr(&self, peer: &PeerAddr) -> bool {
         match self {
             Self::OwnNode { .. } => false,
-            Self::Discovered(pool) => pool.lock().known() < WANT_ADDRS_BELOW,
+            Self::Discovered(pool) => {
+                let inner = pool.lock();
+                inner.known() < WANT_ADDRS_BELOW && !inner.gossiped.contains(peer)
+            }
         }
     }
 
@@ -294,6 +298,8 @@ struct Inner {
     ipv6_dead: bool,
     /// When the seeds were last asked, and how many new addresses they gave.
     last_seed: Option<(Instant, usize)>,
+    /// Peers that gossiped addresses this session.
+    gossiped: HashSet<PeerAddr>,
 }
 
 impl PeerPool {
@@ -309,6 +315,7 @@ impl PeerPool {
                 preferred: None,
                 ipv6_dead: false,
                 last_seed: None,
+                gossiped: HashSet::new(),
             }),
             seeding: tokio::sync::Mutex::new(()),
         }
@@ -460,6 +467,7 @@ impl PeerPool {
         let local_source = !is_public(from_ip);
         let source = addrv2(from_ip);
         let mut inner = self.lock();
+        inner.gossiped.insert(from.clone());
         let (mut offered, mut added) = (0, 0);
         for message in addrs.into_iter().take(MAX_GOSSIP_PER_MESSAGE) {
             offered += 1;
