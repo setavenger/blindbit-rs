@@ -1,7 +1,7 @@
 # Headless friglet daemon image.
 #
 #   docker build -t friglet .
-#   docker run -d -p 8080:8080 -p 50001:50001 -v friglet-data:/data friglet
+#   docker run -d -p 50001:50001 -v friglet-data:/data friglet
 #
 # See docs/docker.md for configuration details.
 
@@ -25,18 +25,18 @@ RUN apt-get update \
 COPY --from=builder /src/target/release/friglet /usr/local/bin/friglet
 
 USER friglet
-# All mutable state (config.toml, scan.key, scanner state file, control
-# socket) lives under /data; WORKDIR makes the relative state_file default
-# ("scanner_state.json") land there too.
+# config.toml, scan.key, the control socket and the log live under /data.
+# The scanner state file does not by default: friglet puts it in
+# /home/friglet/.config/friglet/ (SNB-635). Set state_file =
+# "/data/scanner_state.json" in config.toml to keep it in the volume.
 WORKDIR /data
 VOLUME /data
 ENV FRIGLET_CONTROL_SOCKET=/data/friglet.sock \
     FRIGLET_LOG_FILE=/data/friglet.log \
-    FRIGLET_HTTP_ADDR=0.0.0.0:8080 \
     FRIGLET_ELECTRUM_ADDR=0.0.0.0:50001
 
-# HTTP API / Electrum TCP
-EXPOSE 8080 50001
+# Electrum TCP
+EXPOSE 50001
 
 ENTRYPOINT ["friglet"]
 CMD ["scan", "--config", "/data/config.toml", "--key-file", "/data/scan.key"]

@@ -65,7 +65,7 @@ pub struct ScanArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_label_num: Option<u32>,
 
-    /// Oracle service URL [default: https://oracle.setor.dev]
+    /// Oracle service URL [default: the network's hosted oracle (bitcoin, signet)]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle_url: Option<String>,
@@ -80,8 +80,9 @@ pub struct ScanArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<String>,
 
-    /// HTTP server address [default: 127.0.0.1:8080]
-    #[arg(long)]
+    /// Obsolete, ignored (the HTTP API was removed); accepted so existing
+    /// startup scripts keep working
+    #[arg(long, hide = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_addr: Option<String>,
 
@@ -111,14 +112,6 @@ pub struct ScanArgs {
     pub print_config: bool,
 }
 
-pub fn default_config_path() -> Option<PathBuf> {
-    friglet_ipc::default_config_path()
-}
-
-pub fn default_key_file() -> Option<PathBuf> {
-    friglet_ipc::default_key_file()
-}
-
 /// Result of [`load`].
 pub struct Loaded {
     /// Merged settings; a configured descriptor's spend key (and birth
@@ -139,7 +132,7 @@ pub fn load(args: &ScanArgs) -> Result<Loaded, String> {
             }
             Some(path.clone())
         }
-        None => default_config_path().filter(|p| p.exists()),
+        None => friglet_ipc::default_config_path().filter(|p| p.exists()),
     };
     let mut config = merge_layers(file.as_deref(), args)?;
     let descriptor = load_descriptor(file.as_deref(), args)?;
@@ -212,18 +205,20 @@ pub fn apply_descriptor(cfg: &mut DaemonConfig, d: &SpDescriptor) -> Result<(), 
 /// replacing a different key, so later restarts and settings rewrites that
 /// drop the descriptor keep working.
 pub fn store_descriptor_scan_key(d: &SpDescriptor, key_file: &Path) -> Result<(), String> {
-    let current = std::fs::read_to_string(key_file).ok().and_then(|text| {
-        text.lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .and_then(|l| SecretKey::from_str(l).ok())
-    });
+    let current = std::fs::read_to_string(key_file)
+        .ok()
+        .and_then(|text| SecretKey::from_str(key_file_line(&text)?).ok());
     if current == Some(d.scan_secret) {
         return Ok(());
     }
     friglet_ipc::write_key_file(key_file, &d.scan_secret_hex(), true)?;
     tracing::info!(path = %key_file.display(), "scan key from the configured descriptor written to the key file");
     Ok(())
+}
+
+/// The key in a key file: its first non-empty line, trimmed.
+fn key_file_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
 }
 
 /// The user-supplied layers (file, env, CLI) without the built-in defaults.
@@ -255,18 +250,17 @@ fn merge_layers(file: Option<&Path>, args: &ScanArgs) -> Result<DaemonConfig, St
 }
 
 /// Fully validated configuration with parsed types, ready for scanner setup.
+/// Settings that need no parsing (`oracle_url`, `max_label_num`, the
+/// Electrum bind address) are read from `raw`.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     /// The merged plain config, kept for `GetConfig` / `--print-config`.
     pub raw: DaemonConfig,
     pub network: Network,
-    pub oracle_url: String,
     pub p2p_addr: SocketAddr,
     pub start_height: u64,
     pub spend_pubkey: PublicKey,
-    pub max_label_num: u32,
-    pub http_addr: String,
-    pub electrum_addr: String,
+    /// The wallet's state file; `raw.state_file` keeps the configured path.
     pub state_file: PathBuf,
     pub key_file: PathBuf,
     pub control_socket: String,
@@ -332,7 +326,7 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
     let key_file = raw
         .key_file
         .clone()
-        .or_else(default_key_file)
+        .or_else(friglet_ipc::default_key_file)
         .ok_or("cannot determine a key file location; set `key_file` in the config")?;
 
     let control_socket = raw
@@ -352,13 +346,9 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 
     Ok(ResolvedConfig {
         network,
-        oracle_url: raw.oracle_url.clone(),
         p2p_addr,
         start_height,
         spend_pubkey,
-        max_label_num: raw.max_label_num,
-        http_addr: raw.http_addr.clone(),
-        electrum_addr: raw.electrum_addr.clone(),
         state_file: raw.state_file.clone(),
         key_file,
         control_socket,
@@ -370,26 +360,25 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 /// [`resolve`] checks (network, p2p address, start height, spend pubkey)
 /// plus checks that would otherwise only surface at startup — mirroring
 /// blindbit-lib's `ScannerConfig::validate` (oracle URL scheme) and the
-/// HTTP/Electrum bind addresses parsing.
+/// Electrum bind address parsing.
 pub fn validate_daemon_config(cfg: &DaemonConfig) -> Result<ResolvedConfig, String> {
     let resolved = resolve(cfg.clone())?;
+    let raw = &resolved.raw;
 
-    if resolved.oracle_url.is_empty() {
+    if raw.oracle_url.is_empty() {
         return Err("oracle_url cannot be empty".to_string());
     }
-    if !resolved.oracle_url.starts_with("http://") && !resolved.oracle_url.starts_with("https://") {
+    if !raw.oracle_url.starts_with("http://") && !raw.oracle_url.starts_with("https://") {
         return Err(format!(
             "invalid oracle_url `{}`: must start with http:// or https://",
-            resolved.oracle_url
+            raw.oracle_url
         ));
     }
     if resolved.start_height == 0 {
         return Err("invalid start_height 0: must be at least 1".to_string());
     }
-    SocketAddr::from_str(&resolved.http_addr)
-        .map_err(|e| format!("invalid http_addr `{}`: {e}", resolved.http_addr))?;
-    SocketAddr::from_str(&resolved.electrum_addr)
-        .map_err(|e| format!("invalid electrum_addr `{}`: {e}", resolved.electrum_addr))?;
+    SocketAddr::from_str(&raw.electrum_addr)
+        .map_err(|e| format!("invalid electrum_addr `{}`: {e}", raw.electrum_addr))?;
     if resolved.state_file.as_os_str().is_empty() {
         return Err("state_file cannot be empty".to_string());
     }
@@ -466,13 +455,6 @@ pub fn persist_start_height(path: &Path, height: u64) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| describe(e.to_string()))
 }
 
-/// Persist `cfg` as pretty TOML to `path` (atomically: temp file + rename),
-/// creating parent directories as needed. Delegates to the shared helper in
-/// `friglet-ipc` so the tray's first-run setup writes the same format.
-pub fn write_config_file(path: &Path, cfg: &DaemonConfig) -> Result<(), String> {
-    friglet_ipc::write_config_toml(path, cfg)
-}
-
 /// Resolve the scan secret. Precedence: `--scan-secret` flag, then
 /// `FRIGLET_SCAN_SECRET` env, then the key file. When the secret arrives via
 /// flag or env and the key file does not exist yet, it is written there
@@ -489,10 +471,7 @@ pub fn resolve_scan_secret(cli_secret: Option<&str>, key_file: &Path) -> Result<
     } else if key_file.exists() {
         let contents = std::fs::read_to_string(key_file)
             .map_err(|e| format!("cannot read key file {}: {e}", key_file.display()))?;
-        let line = contents
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
+        let line = key_file_line(&contents)
             .ok_or_else(|| format!("key file {} is empty", key_file.display()))?;
         (line.to_string(), true)
     } else {
@@ -509,28 +488,11 @@ pub fn resolve_scan_secret(cli_secret: Option<&str>, key_file: &Path) -> Result<
     })?;
 
     if !from_key_file && !key_file.exists() {
-        write_key_file(key_file, &hex_str)?;
+        friglet_ipc::write_key_file(key_file, &hex_str, false)?;
         tracing::info!(path = %key_file.display(), "scan secret written to key file");
     }
 
     Ok(secret)
-}
-
-/// Validate `hex` as a 32-byte secp256k1 secret key and write/replace the
-/// key file at `path` (0600 on Unix). Backs the `SetScanKey` control verb.
-pub fn replace_scan_key(path: &Path, hex: &str) -> Result<SecretKey, String> {
-    let hex = hex.trim();
-    let secret = SecretKey::from_str(hex).map_err(|e| {
-        format!(
-            "invalid scan key: {e}. Must be a valid 32-byte hex string representing a secp256k1 secret key"
-        )
-    })?;
-    friglet_ipc::write_key_file(path, hex, true)?;
-    Ok(secret)
-}
-
-fn write_key_file(path: &Path, secret_hex: &str) -> Result<(), String> {
-    friglet_ipc::write_key_file(path, secret_hex, false)
 }
 
 /// The scan secret / spend pubkey hex a scanner state file was written for.
@@ -1141,6 +1103,22 @@ mod tests {
     fn resolve_reports_missing_required_fields() {
         let err = resolve(DaemonConfig::default()).unwrap_err();
         assert!(err.contains("p2p_node_addr"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn obsolete_http_addr_flag_still_parses() {
+        use clap::{CommandFactory, Parser};
+
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ScanArgs,
+        }
+
+        let cli = Cli::try_parse_from(["friglet", "--http-addr", "127.0.0.1:1"]).unwrap();
+        assert_eq!(cli.args.http_addr.as_deref(), Some("127.0.0.1:1"));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("http-addr"), "flag should be hidden: {help}");
     }
 
     #[test]

@@ -32,15 +32,10 @@ pub enum TxPolicy {
     Orphan,
 }
 
-#[derive(Default)]
-pub struct Seen {
-    /// Every command received after the handshake, in order.
-    pub commands: Vec<String>,
-}
-
 pub struct FakePeer {
     pub addr: SocketAddr,
-    pub seen: Arc<Mutex<Seen>>,
+    /// Every command received after the handshake, in order.
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -73,22 +68,22 @@ impl FakePeer {
     pub fn spawn(script: Script, connections: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let seen = Arc::new(Mutex::new(Seen::default()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
         let mempool = Arc::new(Mutex::new(script.mempool.clone()));
-        let thread_seen = seen.clone();
+        let thread_commands = commands.clone();
         std::thread::spawn(move || {
             for _ in 0..connections {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
-                let _ = serve(stream, &script, &mempool, &thread_seen);
+                let _ = serve(stream, &script, &mempool, &thread_commands);
             }
         });
-        FakePeer { addr, seen }
+        FakePeer { addr, commands }
     }
 
     pub fn commands(&self) -> Vec<String> {
-        self.seen.lock().unwrap().commands.clone()
+        self.commands.lock().unwrap().clone()
     }
 }
 
@@ -128,7 +123,7 @@ fn serve(
     stream: TcpStream,
     script: &Script,
     mempool: &Mutex<Vec<Vec<u8>>>,
-    seen: &Mutex<Seen>,
+    commands: &Mutex<Vec<String>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut wire = Wire {
@@ -175,10 +170,7 @@ fn serve(
     };
     loop {
         let message = wire.recv()?;
-        seen.lock()
-            .unwrap()
-            .commands
-            .push(message.command().to_string());
+        commands.lock().unwrap().push(message.command().to_string());
         match message {
             NetworkMessage::Ping(nonce) => wire.send(NetworkMessage::Pong(nonce))?,
             NetworkMessage::GetHeaders(request) if request.locator_hashes.is_empty() => {

@@ -17,9 +17,8 @@ use super::health::OracleProbe;
 use super::p2p::{BlockFetcher, FetchFailure, RetryPolicy};
 use super::p2p_tests::{Conn, Node};
 use super::scanning::BlockStreamSource;
-use super::stream_safety_tests::{
-    TestStream, owned_outputs, payment_block, run, scanner, served_block, unserve,
-};
+use super::stream_safety_tests::{TestStream, owned_outputs, payment_block, served_block, unserve};
+use super::test_support::{run, scanner};
 use crate::oracle_grpc::BlockScanDataShortResponse;
 
 /// An oracle serving a fixed run of consecutive blocks.
@@ -84,7 +83,7 @@ async fn wait_until(what: &str, condition: impl Fn() -> bool) {
 #[test]
 fn a_stop_during_a_stalled_block_download_ends_the_scan_at_once_and_it_resumes_there() {
     run(async {
-        let (mut scanner, _state) = scanner("cancel-stalled-download", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("cancel-stalled-download");
         let (a, b, c) = (
             payment_block(4201),
             payment_block(4202),
@@ -169,7 +168,7 @@ fn a_stop_during_a_stalled_block_download_ends_the_scan_at_once_and_it_resumes_t
 #[test]
 fn a_stop_ends_the_wait_between_download_attempts() {
     run(async {
-        let node = Node::full(1_000, vec![Conn::CloseAfterHandshake, Conn::Serve]);
+        let node = Node::full(1_000, vec![Conn::CloseAfterRequest, Conn::Serve]);
         let cancel = CancellationToken::new();
         let fetcher = BlockFetcher::new(node.addr, Network::Regtest)
             .with_policy(RetryPolicy {
@@ -205,7 +204,7 @@ fn a_stop_ends_the_wait_between_download_attempts() {
 #[test]
 fn a_stop_ends_the_wait_for_the_next_poll() {
     run(async {
-        let (mut scanner, _state) = scanner("cancel-poll", "http://127.0.0.1:1");
+        let (mut scanner, _state) = scanner("cancel-poll");
         let cancel = CancellationToken::new();
         let stop = async {
             tokio::time::sleep(Duration::from_millis(500)).await;

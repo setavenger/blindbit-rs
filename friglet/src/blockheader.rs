@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use bitcoin::BlockHash;
 use bitcoin::block::Header;
-use bitcoin::hashes::Hash;
 
 type HeaderResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -33,17 +32,14 @@ pub fn save_headers(path: &Path, headers: &HashMap<u32, String>) -> HeaderResult
     Ok(())
 }
 
-pub fn block_hash_from_oracle(mut bytes: Vec<u8>) -> HeaderResult<BlockHash> {
-    if bytes.len() != 32 {
-        return Err(format!(
+pub fn block_hash_from_oracle(bytes: Vec<u8>) -> HeaderResult<BlockHash> {
+    blindbit_lib::scanner::oracle_block_hash(&bytes).ok_or_else(|| {
+        format!(
             "oracle returned {} block-hash bytes, expected 32",
             bytes.len()
         )
-        .into());
-    }
-    bytes.reverse();
-    let bytes: [u8; 32] = bytes.try_into().expect("length checked above");
-    Ok(BlockHash::from_byte_array(bytes))
+        .into()
+    })
 }
 
 pub fn header_hex(header: &Header) -> String {
@@ -57,6 +53,7 @@ pub fn header_from_hex(hex: &str) -> HeaderResult<Header> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()

@@ -22,9 +22,8 @@ use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
 use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
-use super::config::ScannerConfig;
 use super::types::OwnedOutputRecord;
-use super::electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash};
+use super::electrum_index::{WalletElectrumIndex, WalletView};
 use super::ScannerError;
 use super::p2p;
 
@@ -48,19 +47,8 @@ pub struct Scanner {
     /// sends notification when a new utxo is found
     pub(crate) notify_found_utxos: broadcast::Sender<usize>,
 
-    /// probabilistic matches found both used for found utxos and spent outpoints
-    /// send the txid of the transaction that is of interest
-    pub(crate) notify_probabilistic_matches: broadcast::Sender<[u8; 32]>,
-
-    /// sends notification when a pubkey was probably spent
-    /// contains the blockhash which needs to be verified to assert an actual match
-    pub(crate) notify_spent_outpoints: broadcast::Sender<[u8; 32]>,
-
     /// the last block height that was scanned
     pub(crate) last_scanned_block_height: u64,
-
-    /// the last block height that was scanned on most recent rescan
-    pub(crate) last_scanned_block_height_rescan: u64,
 
     /// Wallet-owned outputs, keyed by outpoint. Maintained by
     /// [`Scanner::sync_owned_outputs`] from the indexer after every applied
@@ -100,7 +88,7 @@ pub struct Scanner {
     pub(crate) p2p_retry: p2p::RetryPolicy,
 
     /// Rounds of failed fetches of the block the scan is stuck on, across
-    /// `watch_chain` polls.
+    /// `watch_chain_until` polls.
     pub(crate) fetch_backoff: p2p::FetchBackoff,
 
     /// When to next try restoring the witness data of wallet transactions
@@ -113,7 +101,6 @@ pub struct Scanner {
 }
 
 impl Scanner {
-    // TODO: create a config with defaults instead of a long list of args
     pub fn new(
         client: OracleServiceClient<Channel>,
         p2p_socket_addr: SocketAddr,
@@ -123,74 +110,59 @@ impl Scanner {
         state_file: PathBuf,
         network: Network,
     ) -> Self {
-        // secret scan needed
-        // public spend needed
-        let mut indexer = SpIndexerV2::new(secret_scan, public_spend);
-
-        // always use the change label m=0
-        _ = indexer.add_label(0);
-
-        for i in 1..=max_label_num {
-            _ = indexer.add_label(i);
-        }
-
-        // Initialize sparse checkpoints with genesis block
-        // This ensures LocalChain::from_blocks can always create a valid chain
-        let genesis_hash = BlockHash::from_byte_array(
-            indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
-        );
-        let mut block_checkpoints = BTreeMap::new();
-        block_checkpoints.insert(0, genesis_hash);
-
-        // Initialize the staged changeset with initial state
-        let mut stage = ChangeSet {
+        let indexer = labelled_indexer(secret_scan, public_spend, max_label_num);
+        let stage = ChangeSet {
             format_version: STATE_FORMAT_VERSION,
-            block_checkpoints: block_checkpoints.clone(),
+            // The genesis checkpoint lets LocalChain::from_blocks always build
+            // a valid chain.
+            block_checkpoints: BTreeMap::from([(0, genesis_hash())]),
             indexer: indexer.initial_changeset(),
-            last_scanned_block_height: 0,
-            last_scanned_block_height_rescan: 0,
-            owned_outputs: vec![],
             secret_scan_hex: Some(hex::encode(secret_scan.secret_bytes())),
             public_spend_hex: Some(hex::encode(public_spend.serialize())),
             max_label_num,
-            scanned_block_hashes: BTreeMap::new(),
-            oracle_floor_start: None,
+            ..ChangeSet::default()
         };
+        Self::from_stage(client, p2p_socket_addr, indexer, stage, state_file, network)
+    }
 
-        // Merge the initial label changes
-        stage.indexer.merge(indexer.add_label(0));
-        for i in 1..=max_label_num {
-            stage.indexer.merge(indexer.add_label(i));
-        }
-
-        let sp_address = indexer
-            .get_address(convert_network(network))
-            .to_string();
+    /// A scanner whose state is `stage`, the changeset it keeps staging into
+    /// and saves; `indexer` must already hold that state.
+    fn from_stage(
+        client: OracleServiceClient<Channel>,
+        p2p_peer: SocketAddr,
+        indexer: SpIndexerV2<ConfirmationBlockTime>,
+        stage: ChangeSet,
+        state_file: PathBuf,
+        network: Network,
+    ) -> Self {
+        let mut block_checkpoints = stage.block_checkpoints.clone();
+        block_checkpoints.entry(0).or_insert_with(genesis_hash);
+        let max_label_num = stage.max_label_num;
+        let mut electrum_index = WalletElectrumIndex::new();
+        electrum_index.sp_address = indexer.get_address(convert_network(network)).to_string();
+        electrum_index.sp_labels = (0..=max_label_num).collect();
+        electrum_index.scan_health.oracle_floor_start = stage.oracle_floor_start;
 
         Self {
             client,
-            p2p_peer: p2p_socket_addr,
+            p2p_peer,
             internal_indexer: indexer,
             block_checkpoints,
-            notify_probabilistic_matches: broadcast::channel(100).0,
             notify_found_utxos: broadcast::channel(100).0,
-            notify_spent_outpoints: broadcast::channel(100).0,
-            last_scanned_block_height: 0,
-            last_scanned_block_height_rescan: 0,
-            owned_outputs: BTreeMap::new(),
+            last_scanned_block_height: stage.last_scanned_block_height,
+            owned_outputs: stage
+                .owned_outputs
+                .iter()
+                .map(|record| (record.outpoint, record.clone()))
+                .collect(),
             owned_prefixes: HashMap::new(),
-            scanned_block_hashes: BTreeMap::new(),
+            scanned_block_hashes: stage.scanned_block_hashes.clone(),
             notify_reorg: broadcast::channel(16).0,
             stage,
             state_file,
             network,
             max_label_num,
-            electrum_index: Arc::new(Mutex::new({
-                let mut idx = WalletElectrumIndex::new();
-                idx.sp_address = sp_address;
-                idx.sp_labels = (0..=max_label_num).collect();
-                idx
-            })),
+            electrum_index: Arc::new(Mutex::new(electrum_index)),
             p2p_retry: p2p::RetryPolicy::default(),
             fetch_backoff: p2p::FetchBackoff::default(),
             witness_restore_due: Some(std::time::Instant::now()),
@@ -198,87 +170,10 @@ impl Scanner {
         }
     }
 
-    /// Create a new Scanner from configuration
-    ///
-    /// This is a convenience constructor that takes a ScannerConfig instead of
-    /// individual parameters. The Oracle client will be created automatically.
-    pub async fn from_config(config: &ScannerConfig) -> Result<Self, ScannerError> {
-        // Validate configuration
-        config.validate()?;
-
-        // Connect to oracle service
-        let client = OracleServiceClient::connect(config.oracle_url.clone()).await?;
-
-        Ok(Self::new(
-            client,
-            config.p2p_socket_addr,
-            config.secret_scan,
-            config.public_spend,
-            config.max_label_num,
-            config.state_file.clone(),
-            config.network,
-        ))
-    }
-
     /// get the last block height that was scanned
     pub fn get_last_scanned_block_height(&self) -> u64 {
         self.last_scanned_block_height
     }
-
-    pub fn get_last_scanned_block_height_rescan(&self) -> u64 {
-        self.last_scanned_block_height_rescan
-    }
-
-    pub fn get_scanner_sp_address(&self) -> String {
-        self.internal_indexer
-            .get_address(convert_network(self.network))
-            .to_string()
-    }
-
-    pub fn get_max_label_num(&self) -> u32 {
-        self.max_label_num
-    }
-
-    pub fn get_relevant_txs(&self) -> Vec<(Txid, &PublicKey, u32)> {
-        let mut txs: Vec<(Txid, &PublicKey, u32)> = Vec::new();
-
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            let Some(anchor) = inner_tx.anchors.first() else {
-                continue;
-            };
-            let Some(shared_secret_tx) = self
-                .internal_indexer
-                .index()
-                .txid_to_partial_secret
-                .get(&inner_tx.txid)
-            else {
-                continue;
-            };
-
-            txs.push((inner_tx.txid, shared_secret_tx, anchor.block_id.height));
-        }
-
-        txs
-    }
-
-    // pub fn get_outputs(&self) -> Vec<OwnedOutput> {
-    //     let mut outputs: Vec<OwnedOutput> = Vec::new();
-    //     self.internal_indexer.index().index_spout(outpoint, spout);
-    //     self.internal_indexer.index().txid_to_partial_secret
-    //         outputs.push(OwnedOutput {
-    //             outpoint: OutPoint {
-    //                 txid: inner_tx.txid,
-    //                 vout: 0,
-    //             },
-    //             blockheight: Height::from_consensus(anchor.block_id.height).unwrap(),
-    //             tweak: shared_secret_tx.to_x_only_pubkey().serialize(),
-    //             amount: Amount::from_sat(0),
-    //             script: ScriptBuf::new(),
-    //             label: None,
-    //             spent: None,
-    //         });
-    //     outputs
-    // }
 
     /// Returns a cloned Arc to the wallet-scoped Electrum index.
     /// The Electrum TCP server holds this Arc and serves requests without
@@ -306,107 +201,24 @@ impl Scanner {
     /// `scan_start_height` should match the configured scan start so that
     /// Sparrow's subscription key matches across restarts.
     pub async fn rebuild_electrum_index_from_graph(&self, scan_start_height: u64) {
-        let owned_outpoints: std::collections::HashSet<bitcoin::OutPoint> = self
-            .internal_indexer
-            .index()
-            .by_shared_secret
-            .keys()
-            .cloned()
-            .collect();
+        let wallet = WalletView::of(&self.internal_indexer);
 
-        // Build outpoint → script map once so spend detection can look up the
-        // scripthash of a consumed output without re-iterating the graph.
-        let mut outpoint_scripts: std::collections::HashMap<bitcoin::OutPoint, bitcoin::ScriptBuf> =
-            std::collections::HashMap::new();
-        for node in self.internal_indexer.graph().full_txs() {
-            let txid = node.txid;
-            for (vout, out) in node.tx.output.iter().enumerate() {
-                let op = bitcoin::OutPoint { txid, vout: vout as u32 };
-                if owned_outpoints.contains(&op) {
-                    outpoint_scripts.insert(op, out.script_pubkey.clone());
-                }
-            }
-        }
+        // In height order, as the live scan adds them, so each entry lands at
+        // the end of its list. The sort is stable: transactions at one height
+        // keep the graph's order, as before.
+        let mut confirmed: Vec<_> = self
+            .internal_indexer
+            .graph()
+            .full_txs()
+            .filter_map(|node| Some((node.anchors.first()?.block_id.height, node)))
+            .collect();
+        confirmed.sort_by_key(|(height, _)| *height);
 
         let mut index = self.electrum_index.lock().await;
         index.sp_start_height = scan_start_height;
-
-        for inner_tx in self.internal_indexer.graph().full_txs() {
-            let Some(anchor) = inner_tx.anchors.first() else {
-                continue;
-            };
-            let height = anchor.block_id.height;
-            let txid = inner_tx.txid;
-
-            let raw = bitcoin::consensus::encode::serialize(inner_tx.tx.as_ref());
-
-            let mut is_ours = false;
-
-            // Receiving side: outputs belonging to the wallet.
-            for (vout, output) in inner_tx.tx.output.iter().enumerate() {
-                let outpoint = bitcoin::OutPoint {
-                    txid,
-                    vout: vout as u32,
-                };
-                if owned_outpoints.contains(&outpoint) {
-                    is_ours = true;
-                    let scripthash = electrum_scripthash(&output.script_pubkey);
-                    let entry = ScriptHashEntry {
-                        tx_hash: txid.to_string(),
-                        height,
-                        fee: 0,
-                    };
-                    let history = index.scripthash_history.entry(scripthash).or_default();
-                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                        history.push(entry);
-                    }
-                }
-            }
-
-            // Spending side: inputs that consume one of our outputs.
-            for input in inner_tx.tx.input.iter() {
-                if let Some(script) = outpoint_scripts.get(&input.previous_output) {
-                    is_ours = true;
-                    let scripthash = electrum_scripthash(script);
-                    let entry = ScriptHashEntry {
-                        tx_hash: txid.to_string(),
-                        height,
-                        fee: 0,
-                    };
-                    let history = index.scripthash_history.entry(scripthash).or_default();
-                    if !history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                        history.push(entry);
-                    }
-                }
-            }
-
-            if is_ours {
-                index.txs.insert(txid.to_string(), raw);
-            }
-
-            // SP history from txid_to_partial_secret
-            if let Some(secret) = self
-                .internal_indexer
-                .index()
-                .txid_to_partial_secret
-                .get(&txid)
-            {
-                let entry = SpHistoryEntry {
-                    tx_hash: txid.to_string(),
-                    height,
-                    tweak_hex: secret.to_string(),
-                };
-                if !index.sp_history.iter().any(|e| e.tx_hash == entry.tx_hash) {
-                    index.sp_history.push(entry);
-                }
-            }
+        for (height, node) in confirmed {
+            index.index_confirmed_tx(&node.tx, node.txid, height, &wallet);
         }
-
-        // Sort all histories by height ascending (Electrum spec order).
-        for history in index.scripthash_history.values_mut() {
-            history.sort_by_key(|e| e.height);
-        }
-        index.sp_history.sort_by_key(|e| e.height);
 
         // Restore tip height from last_scanned_block_height.
         // Header hex is not recoverable without re-fetching; Sparrow's BlockHeaderTip
@@ -425,21 +237,11 @@ impl Scanner {
         self.notify_found_utxos.subscribe()
     }
 
-    /// subscribe to notifications when a new outpoint is spent
-    pub fn subscribe_to_spent_outpoints(&self) -> broadcast::Receiver<[u8; 32]> {
-        self.notify_spent_outpoints.subscribe()
-    }
-
     /// subscribe to chain reorganisations: each message is the fork height
     /// the wallet state was rolled back to (everything above it was dropped
     /// and is rescanned from the oracle's current chain)
     pub fn subscribe_to_reorgs(&self) -> broadcast::Receiver<u32> {
         self.notify_reorg.subscribe()
-    }
-
-    /// subscribe to notifications when a probabilistic match is found
-    pub fn subscribe_to_probabilistic_matches(&self) -> broadcast::Receiver<[u8; 32]> {
-        self.notify_probabilistic_matches.subscribe()
     }
 
     /// All wallet-owned outputs found so far (spent and unspent), in outpoint
@@ -600,36 +402,6 @@ impl Scanner {
         }
     }
 
-    /// Returns an optional mutable reference to the currently staged [`ChangeSet`].
-    ///
-    /// # Returns
-    ///
-    /// `Some(&mut ChangeSet)` if changes are staged, `None` otherwise.
-    pub fn staged_mut(&mut self) -> Option<&mut ChangeSet> {
-        if self.stage.is_empty() {
-            None
-        } else {
-            Some(&mut self.stage)
-        }
-    }
-
-    /// Takes ownership of the currently staged [`ChangeSet`], leaving an empty [`ChangeSet`] in its place.
-    ///
-    /// This is useful for atomically applying or persisting the staged changes.
-    ///
-    /// # Returns
-    ///
-    /// `Some(ChangeSet)` if changes were staged, `None` otherwise.
-    pub fn take_staged(&mut self) -> Option<ChangeSet> {
-        if self.stage.is_empty() {
-            None
-        } else {
-            let changes = self.stage.clone();
-            self.stage = ChangeSet::default();
-            Some(changes)
-        }
-    }
-
     /// Save the current staged changes to a file using JSON serialization.
     ///
     /// This saves the ChangeSet which contains all the indexer and chain state changes.
@@ -649,26 +421,10 @@ impl Scanner {
             }
         }
 
-        // Ensure we have the keys in the changeset for reconstruction
+        // The keys and `max_label_num` are in `stage` from construction on
+        // (`new` / `from_changeset`), and merging never clears them.
         let mut changeset = self.stage.clone();
-        if changeset.secret_scan_hex.is_none() {
-            let secret_scan_bytes: [u8; 32] = self.internal_indexer.scan_sk().secret_bytes();
-            changeset.secret_scan_hex = Some(hex::encode(secret_scan_bytes));
-        }
-        if changeset.public_spend_hex.is_none() {
-            let public_spend_bytes = self.internal_indexer.spend_pk().serialize();
-            changeset.public_spend_hex = Some(hex::encode(&public_spend_bytes));
-        }
-        if changeset.max_label_num == 0 {
-            let label_count = self.internal_indexer.index().label_lookup.len();
-            changeset.max_label_num = if label_count > 0 {
-                (label_count - 1) as u32
-            } else {
-                0
-            };
-        }
         changeset.last_scanned_block_height = self.last_scanned_block_height;
-        changeset.last_scanned_block_height_rescan = self.last_scanned_block_height_rescan;
         changeset.owned_outputs = self.owned_outputs.values().cloned().collect();
         changeset.scanned_block_hashes = self.scanned_block_hashes.clone();
         changeset.format_version = STATE_FORMAT_VERSION;
@@ -751,75 +507,20 @@ impl Scanner {
         else {
             return Err("Failed to reconstruct indexer from changeset: keys missing".into());
         };
-        let mut indexer = SpIndexerV2::new(indexer_scan_sk, indexer_spend_pk);
-
-        // Regenerate labels BEFORE applying the changeset: `apply_changeset`
-        // re-runs the BIP-352 scan (`index_tx`) over every stored transaction,
-        // and `load_from_file` blanks the persisted `label_lookup`. Labels added
-        // afterwards would leave every labelled output (change included, m = 0)
-        // out of the restored index.
-        // ignore change set and be aligned with max_label_num
-        let max_label_num = changeset.max_label_num;
-        _ = indexer.add_label(0);
-        for i in 1..=max_label_num {
-            _ = indexer.add_label(i);
-        }
-        indexer.apply_changeset(changeset.indexer.clone());
-
-        // Reconstruct block checkpoints from the changeset
-        let mut block_checkpoints = changeset.block_checkpoints.clone();
-        block_checkpoints.entry(0).or_insert_with(|| {
-            BlockHash::from_byte_array(
-                indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
-            )
-        });
+        let indexer = restored_indexer(
+            indexer_scan_sk,
+            indexer_spend_pk,
+            changeset.max_label_num,
+            changeset.indexer.clone(),
+        );
 
         // Restore the keys in the changeset for future saves
         changeset.secret_scan_hex = Some(secret_scan_hex);
         changeset.public_spend_hex = Some(public_spend_hex);
-
-        let sp_address = indexer
-            .get_address(convert_network(network))
-            .to_string();
-        let oracle_floor_start = changeset.oracle_floor_start;
         let format_version = changeset.format_version;
 
-        let owned_outputs = changeset
-            .owned_outputs
-            .iter()
-            .map(|record| (record.outpoint, record.clone()))
-            .collect();
-
-        let mut scanner = Self {
-            client,
-            p2p_peer: p2p_socket_addr,
-            internal_indexer: indexer,
-            block_checkpoints,
-            notify_probabilistic_matches: broadcast::channel(100).0,
-            notify_found_utxos: broadcast::channel(100).0,
-            notify_spent_outpoints: broadcast::channel(100).0,
-            last_scanned_block_height: changeset.last_scanned_block_height,
-            last_scanned_block_height_rescan: changeset.last_scanned_block_height_rescan,
-            owned_outputs,
-            owned_prefixes: HashMap::new(),
-            scanned_block_hashes: changeset.scanned_block_hashes.clone(),
-            notify_reorg: broadcast::channel(16).0,
-            stage: changeset,
-            state_file: state_file,
-            network: network,
-            max_label_num,
-            electrum_index: Arc::new(Mutex::new({
-                let mut idx = WalletElectrumIndex::new();
-                idx.sp_address = sp_address;
-                idx.sp_labels = (0..=max_label_num).collect();
-                idx.scan_health.oracle_floor_start = oracle_floor_start;
-                idx
-            })),
-            p2p_retry: p2p::RetryPolicy::default(),
-            fetch_backoff: p2p::FetchBackoff::default(),
-            witness_restore_due: Some(std::time::Instant::now()),
-            cancel: CancellationToken::new(),
-        };
+        let mut scanner =
+            Self::from_stage(client, p2p_socket_addr, indexer, changeset, state_file, network);
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.
         scanner.sync_owned_outputs();
@@ -830,7 +531,9 @@ impl Scanner {
     }
 }
 
-fn convert_network(nw: Network) -> BTCNetwork {
+/// The `bitcoin` crate's network for a wallet on `nw` (the scanner takes the
+/// `bitcoin_rev` network; addresses and the wallet graph use `bitcoin`'s).
+pub fn convert_network(nw: Network) -> BTCNetwork {
     match nw {
         Network::Bitcoin => BTCNetwork::Bitcoin,
         Network::Signet => BTCNetwork::Signet,
@@ -839,4 +542,44 @@ fn convert_network(nw: Network) -> BTCNetwork {
         Network::Testnet(TestnetVersion::V4) => BTCNetwork::Testnet4,
         Network::Testnet(_) => BTCNetwork::Testnet,
     }
+}
+
+/// The placeholder genesis checkpoint (mainnet's genesis hash, whatever the
+/// network): sparse checkpoints always start with it.
+pub(crate) fn genesis_hash() -> BlockHash {
+    BlockHash::from_byte_array(
+        indexer::bdk_chain::bitcoin::blockdata::constants::ChainHash::BITCOIN.to_bytes(),
+    )
+}
+
+/// A new indexer for the wallet's keys with labels `0..=max_label_num`
+/// (m = 0 is the change label).
+fn labelled_indexer(
+    scan_sk: SecretKey,
+    spend_pk: PublicKey,
+    max_label_num: u32,
+) -> SpIndexerV2<ConfirmationBlockTime> {
+    let mut indexer = SpIndexerV2::new(scan_sk, spend_pk);
+    for m in 0..=max_label_num {
+        _ = indexer.add_label(m);
+    }
+    indexer
+}
+
+/// The wallet's indexer rebuilt from `changeset`, as on restore and after a
+/// reorganisation rollback.
+///
+/// Labels come first: `apply_changeset` re-runs the BIP-352 scan
+/// (`index_tx`) over every stored transaction, and `load_from_file` blanks
+/// the persisted `label_lookup`. Labels added afterwards would leave every
+/// labelled output (change included, m = 0) out of the index.
+pub(crate) fn restored_indexer(
+    scan_sk: SecretKey,
+    spend_pk: PublicKey,
+    max_label_num: u32,
+    changeset: indexer::v2::ChangeSet<ConfirmationBlockTime>,
+) -> SpIndexerV2<ConfirmationBlockTime> {
+    let mut indexer = labelled_indexer(scan_sk, spend_pk, max_label_num);
+    indexer.apply_changeset(changeset);
+    indexer
 }

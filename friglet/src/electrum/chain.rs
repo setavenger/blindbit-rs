@@ -20,7 +20,7 @@ use blindbit_lib::{BlockHeightRequest, OracleServiceClient};
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
-use super::p2p::{P2pError, Peer};
+use super::p2p::{P2pError, Peer, SETTLE_WAIT};
 use crate::blockheader;
 
 const ORACLE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -104,23 +104,11 @@ impl ChainSource {
 
     /// The header of block `hash`, from the P2P peer, checked against `hash`.
     pub async fn header(&self, hash: BlockHash) -> Result<Header, String> {
-        let header = self
-            .with_header_peer(move |peer| {
-                peer.headers_by_hash(&[hash], Instant::now() + P2P_REQUEST_TIMEOUT)
-            })
-            .await?
-            .pop()
-            .flatten()
-            .ok_or_else(|| format!("the P2P peer does not know block {hash}"))?;
-        // headers_by_hash already matches by hash; keep the check at this
-        // trust boundary so no caller can be handed another block's header.
-        if header.block_hash() != hash {
-            return Err(format!(
-                "P2P peer returned header {} for {hash}",
-                header.block_hash()
-            ));
-        }
-        Ok(header)
+        self.with_header_peer(move |peer| {
+            peer.header_by_hash(hash, Instant::now() + P2P_REQUEST_TIMEOUT)
+        })
+        .await?
+        .ok_or_else(|| format!("the P2P peer does not know block {hash}"))
     }
 
     /// The peer's current mempool minimum fee rate in sat/kvB.
@@ -134,7 +122,7 @@ impl ChainSource {
         // right after the handshake.
         self.header_peer.lock().expect("header peer lock").take();
         self.with_header_peer(|peer| {
-            peer.wait_until_settled(Instant::now() + Duration::from_secs(2))?;
+            peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
             Ok(())
         })
         .await?;

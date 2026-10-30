@@ -1,4 +1,4 @@
-//! What a long-running scan (`Scanner::watch_chain`) reports besides its
+//! What a long-running scan (`Scanner::watch_chain_until`) reports besides its
 //! progress: why it is stuck, and where it started when the wallet's start
 //! height lay below the oracle's first indexed block.
 //!
@@ -160,15 +160,18 @@ impl OracleProbe for OracleServiceClient<Channel> {
     }
 }
 
+/// A block hash as the oracle serves it, in display order (byte-reversed), or
+/// `None` when it is not 32 bytes long.
+pub fn oracle_block_hash(display_order: &[u8]) -> Option<BlockHash> {
+    let mut bytes: [u8; 32] = display_order.try_into().ok()?;
+    bytes.reverse();
+    Some(BlockHash::from_byte_array(bytes))
+}
+
 /// A block hash as the oracle serves it (display order), or `None` when it is
 /// not a real hash: what an oracle answers for a height it has not indexed.
 pub(crate) fn indexed_block_hash(display_order: &[u8]) -> Option<BlockHash> {
-    let mut bytes: [u8; 32] = display_order.try_into().ok()?;
-    if bytes.iter().all(|b| *b == 0) {
-        return None;
-    }
-    bytes.reverse();
-    Some(BlockHash::from_byte_array(bytes))
+    oracle_block_hash(display_order).filter(|hash| *hash != BlockHash::all_zeros())
 }
 
 /// Upper bound on `GetBlockHashByHeight` calls one floor search may make.

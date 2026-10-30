@@ -116,7 +116,7 @@
       </section>
 
       <section class="card">
-        <details id="recent-errors" class="recent-errors">
+        <details class="recent-errors">
           <summary><span class="label">Recent errors</span> <span id="recent-count" class="label"></span></summary>
           <p id="no-recent-errors" class="small muted">None this session.</p>
           <ul id="recent-list" class="problem-list"></ul>
@@ -245,10 +245,6 @@
             <div class="field">
               <label for="cfg-key-file">Key file path</label>
               <input id="cfg-key-file" type="text" class="mono" spellcheck="false" />
-            </div>
-            <div class="field">
-              <label for="cfg-http-addr">HTTP bind address</label>
-              <input id="cfg-http-addr" type="text" placeholder="127.0.0.1:8080" />
             </div>
             <div class="field">
               <label for="cfg-electrum-addr">Electrum bind address</label>
