@@ -235,6 +235,8 @@ pub struct ControlCtx {
     /// reported back in `GetStatus` so ownership survives a tray restart —
     /// see [`StatusInfo::spawned_by_tray`].
     pub spawned_by_tray: bool,
+    /// Where blocks come from, for [`StatusInfo::p2p`].
+    pub peers: Arc<blindbit_lib::net::PeerSource>,
 }
 
 impl ControlCtx {
@@ -368,6 +370,7 @@ impl ControlCtx {
             log_file: self.log_file.as_ref().map(|p| p.display().to_string()),
             oracle_error: oracle.error,
             oracle_down_since_unix: oracle.down_since_unix,
+            p2p: Some(self.peers.summary()),
         }
     }
 
@@ -630,7 +633,7 @@ mod tests {
         let wallet: serde_json::Value = serde_json::from_str(STATE_BEFORE_OWNED_OUTPUTS).unwrap();
         let config = scanner::ScannerConfig::new(
             oracle_url,
-            "127.0.0.1:1".parse().unwrap(),
+            own_node("127.0.0.1:1".parse().unwrap()),
             SecretKey::from_str(wallet["secret_scan_hex"].as_str().unwrap()).unwrap(),
             PublicKey::from_str(wallet["public_spend_hex"].as_str().unwrap()).unwrap(),
             0,
@@ -699,6 +702,14 @@ mod tests {
         dir
     }
 
+    fn own_node(addr: std::net::SocketAddr) -> Arc<blindbit_lib::net::PeerSource> {
+        blindbit_lib::net::PeerSource::own_node(
+            addr.into(),
+            blindbit_lib::net::Dialer::Direct,
+            bitcoin::Network::Regtest,
+        )
+    }
+
     /// Oracle client on a lazy channel: no connection is made until an RPC
     /// is issued, which these tests never do.
     fn lazy_oracle_client() -> blindbit_lib::OracleServiceClient<tonic::transport::Channel> {
@@ -709,7 +720,7 @@ mod tests {
     fn offline_scanner(cfg: &scanner::ScannerConfig) -> Scanner {
         Scanner::new(
             lazy_oracle_client(),
-            cfg.p2p_socket_addr,
+            cfg.peers.clone(),
             cfg.secret_scan,
             cfg.public_spend,
             cfg.max_label_num,
@@ -763,9 +774,15 @@ mod tests {
 
         let resolved = config::validate_daemon_config(&cfg).unwrap();
         let secret = config::resolve_scan_secret(None, &resolved.key_file).unwrap();
+        let peers = blindbit_lib::net::PeerSource::new(
+            resolved.network,
+            blindbit_lib::net::Dialer::Direct,
+            resolved.p2p_node.map(Into::into),
+            blindbit_lib::net::Seeds::for_network(resolved.network),
+        );
         let scanner_config = scanner::ScannerConfig::new(
             resolved.raw.oracle_url.clone(),
-            resolved.p2p_addr,
+            peers.clone(),
             secret,
             resolved.spend_pubkey,
             resolved.raw.max_label_num,
@@ -798,6 +815,7 @@ mod tests {
             log_file: None,
             shutdown: CancellationToken::new(),
             restart_requested: AtomicBool::new(false),
+            peers,
             spawned_by_tray: false,
         })
     }
@@ -1004,7 +1022,7 @@ mod tests {
         let ctx = test_ctx_with_scan(&dir, move |cancel| {
             Box::pin(async move {
                 let hash = bitcoin::BlockHash::from_byte_array([7; 32]);
-                let fetched = BlockFetcher::new(node_addr, bitcoin::Network::Regtest)
+                let fetched = BlockFetcher::new(own_node(node_addr))
                     .with_cancel(cancel)
                     .fetch(hash, 1)
                     .await;

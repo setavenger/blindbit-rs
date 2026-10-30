@@ -504,7 +504,11 @@ fn default_scanner(scan_sk: SecretKey, spend_pk: PublicKey, tag: &str) -> Scanne
     let socket: SocketAddr = "127.0.0.1:1".parse().expect("socket address");
     Scanner::new(
         oracle_client(),
-        socket,
+        crate::net::PeerSource::own_node(
+            socket.into(),
+            crate::net::Dialer::Direct,
+            Network::Bitcoin,
+        ),
         scan_sk,
         spend_pk,
         0,

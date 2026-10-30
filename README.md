@@ -13,7 +13,7 @@ BlindBit is a comprehensive software suite for Bitcoin BIP-352 Silent Payments. 
 - **State Persistence**: Saves and restores scanner state for incremental scanning
 - **Electrum Server**: Exposes a local Electrum TCP interface for wallet compatibility (e.g. Sparrow)
 - **Multi-Network Support**: Works with Bitcoin mainnet, signet, testnet, testnet4, and regtest
-- **Privacy-Preserving**: Scanner queries reveal only general interest in Silent Payments, not specific keys or transactions
+- **Privacy-Preserving**: Scanner queries reveal only general interest in Silent Payments, not specific keys or transactions (full blocks come from your own node, or from random peers who see which blocks you fetch: see [Privacy](#privacy-your-node-or-random-peers))
 
 ## Workspace Structure
 
@@ -51,7 +51,7 @@ cargo run --release --package friglet scan \
 | `--spend-pubkey` | Spend public key (33-byte hex, secp256k1) | required |
 | `--start-height` | Wallet birthday block height | required (or `--start-at-tip`) |
 | `--start-at-tip` | New wallet: use the oracle's current tip as the birthday (recorded as `start_height` in the config file on first start) | off |
-| `--p2p-node-addr` | Bitcoin P2P node: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start | required |
+| `--p2p-node-addr` | Your Bitcoin node's P2P address: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start. When set, friglet talks only to this node. Empty: random peers of the network (see [Privacy: your node or random peers](#privacy-your-node-or-random-peers)) | empty (random peers); required on regtest |
 | `--oracle-url` | BlindBit Oracle URL | hosted oracle of `--network` (mainnet `https://oracle.setor.dev`, signet `https://signet.oracle.setor.dev`; none for other networks) |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
@@ -133,8 +133,10 @@ What to expect from it:
 - **New blocks** are announced with the real header of the tip block. friglet
   asks the oracle which block is at the scanned height and fetches that
   block's 80-byte header from the P2P peer.
-- **Broadcasting** succeeds only once the P2P peer (`--p2p-node-addr`) has the
-  transaction in its mempool, which usually takes 5–10 seconds. Otherwise
+- **Broadcasting** succeeds only once the P2P peer (your node, or without
+  one a random peer of the network) has the transaction in its mempool,
+  which usually takes 5–10 seconds. With random peers this is one peer's
+  word for now; a stronger check (another peer must announce it) is planned. Otherwise
   Sparrow shows an error. The P2P protocol does not say why a peer refuses a
   transaction. friglet reports what it can tell: missing or spent inputs, a
   fee below the peer's mempool minimum, or a dropped connection, which means
@@ -144,9 +146,28 @@ What to expect from it:
   stops when they confirm or when a conflicting transaction confirms.
 - **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
   with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
-  minimum fee rate that the P2P peer's mempool currently accepts. Keep
+  minimum fee rate that the P2P peer's mempool currently accepts (with
+  random peers: the median of the last few peers' minimums). Keep
   Sparrow's fee rate source on an external service (mempool.space by
   default), or set fee rates by hand.
+
+#### Privacy: your node or random peers
+
+friglet downloads full blocks (only those that probably hold a payment to
+or from the wallet), block headers, and broadcasts over Bitcoin P2P.
+
+- **Your own node** (`p2p_node_addr`) is the recommended setup. friglet then
+  talks only to it: no other peer learns anything.
+- **Without a node**, friglet finds peers of the network through its DNS
+  seeds and the addresses peers share, and asks them one after another. It
+  checks every block against its header and witness commitment, skips peers
+  that are behind, pruned or unreachable, and ignores a peer that sends a bad
+  block for the rest of the session. The cost is privacy: those peers see
+  this computer's IP address and which blocks it downloads, and those blocks
+  probably pay or spend from your wallet. friglet keeps asking the peer that
+  served the last block first, so that peer sees most of them. Use your own
+  node, or (planned) Tor, if that matters to you.
+- Regtest has no public peers: it needs `p2p_node_addr`.
 
 ---
 
@@ -309,10 +330,12 @@ first-time-setup banner. Then:
    (nothing to rescan; the daemon records the tip as `start_height` on
    first start). **From block height** scans from the height you enter
    (pre-filled when the descriptor carries Sparrow's `?bh=` birth height).
-3. *Bitcoin node*: any reachable node of that network, `host:port` or just
-   `host`.
+3. *Your Bitcoin node* (optional): your own node of that network,
+   `host:port` or just `host`. Left empty, friglet downloads blocks from
+   random peers of the network (see
+   [Privacy](#privacy-your-node-or-random-peers)); regtest needs a node.
 
-Save validates the form (including a DNS lookup of the node), writes the
+Save validates the form (including a DNS lookup of the node, if one is set), writes the
 config file (atomic TOML at the platform default path, e.g.
 `~/.config/friglet/config.toml` on Linux or
 `~/Library/Application Support/friglet/config.toml` on macOS) and the scan
@@ -545,7 +568,7 @@ cargo run --release --package blindbit-cli scan \
 - `--spend-pubkey`: 33-byte hex string representing the spend public key (required)
 - `--start-height`: Block height to begin scanning from (wallet birthday; required)
 - `--end-height`: Last block height to scan (required)
-- `--p2p-node-addr`: Bitcoin P2P node as `ip:port`; hostnames are not accepted (required)
+- `--p2p-node-addr`: your Bitcoin node's P2P address as `ip:port`; hostnames are not accepted (default: random peers of the network, found through its DNS seeds; required on regtest)
 - `--oracle-url`: Oracle service URL (default: `https://oracle.setor.dev`)
 - `--state-file`: Path for scanner state, loaded at start and saved at the end; the given range is scanned either way (default: `scanner_state.json` in the working directory)
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +15,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 
+use crate::net::PeerSource;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
@@ -30,9 +30,9 @@ pub struct Scanner {
     /// Client to connect to `BlindBit` Oracle via gRPC
     pub(crate) client: OracleServiceClient<Channel>,
 
-    /// `p2p_peer` as of now one fixed peer connection.
-    // todo: use DNS to find peers at random
-    pub(crate) p2p_peer: SocketAddr,
+    /// Where full blocks are downloaded from: the own node or discovered
+    /// peers. Shared with the Electrum server.
+    pub(crate) peers: Arc<PeerSource>,
 
     /// the internal indexer used for cryptographic scanning computations
     /// specific to BIP 352
@@ -82,8 +82,9 @@ pub struct Scanner {
     /// without waiting on the scanner lock.
     pub(crate) electrum_index: Arc<Mutex<WalletElectrumIndex>>,
 
-    /// How a full-block fetch retries within one scan.
-    pub(crate) p2p_retry: p2p::RetryPolicy,
+    /// How a full-block fetch retries within one scan; `None`: the
+    /// default for `peers` ([`p2p::RetryPolicy::for_source`]).
+    pub(crate) p2p_retry: Option<p2p::RetryPolicy>,
 
     /// Rounds of failed fetches of the block the scan is stuck on, across
     /// `watch_chain_until` polls.
@@ -101,7 +102,7 @@ pub struct Scanner {
 impl Scanner {
     pub fn new(
         client: OracleServiceClient<Channel>,
-        p2p_socket_addr: SocketAddr,
+        peers: Arc<PeerSource>,
         secret_scan: SecretKey,
         public_spend: PublicKey,
         max_label_num: u32, // highest m for label index
@@ -120,14 +121,14 @@ impl Scanner {
             max_label_num,
             ..ChangeSet::default()
         };
-        Self::from_stage(client, p2p_socket_addr, indexer, stage, state_file, network)
+        Self::from_stage(client, peers, indexer, stage, state_file, network)
     }
 
     /// A scanner whose state is `stage`, the changeset it keeps staging into
     /// and saves; `indexer` must already hold that state.
     fn from_stage(
         client: OracleServiceClient<Channel>,
-        p2p_peer: SocketAddr,
+        peers: Arc<PeerSource>,
         indexer: SpIndexerV2<ConfirmationBlockTime>,
         stage: ChangeSet,
         state_file: PathBuf,
@@ -143,7 +144,7 @@ impl Scanner {
 
         Self {
             client,
-            p2p_peer,
+            peers,
             internal_indexer: indexer,
             block_checkpoints,
             notify_found_utxos: broadcast::channel(100).0,
@@ -161,7 +162,7 @@ impl Scanner {
             network,
             max_label_num,
             electrum_index: Arc::new(Mutex::new(electrum_index)),
-            p2p_retry: p2p::RetryPolicy::default(),
+            p2p_retry: None,
             fetch_backoff: p2p::FetchBackoff::default(),
             witness_restore_due: Some(std::time::Instant::now()),
             cancel: CancellationToken::new(),
@@ -180,9 +181,9 @@ impl Scanner {
         self.electrum_index.clone()
     }
 
-    /// Returns the P2P peer address. Used by the Electrum server to broadcast txs.
-    pub fn p2p_peer(&self) -> SocketAddr {
-        self.p2p_peer
+    /// Where P2P connections go (the own node or discovered peers).
+    pub fn peers(&self) -> Arc<PeerSource> {
+        self.peers.clone()
     }
 
     /// Returns the network. Used by the Electrum server for P2P broadcast.
@@ -473,13 +474,13 @@ impl Scanner {
     /// Create a new Scanner from a ChangeSet.
     ///
     /// This allows restoring a scanner's state from persisted changes.
-    /// The client and p2p_peer must be provided separately as they can't be serialized.
+    /// The client and the peers must be provided separately as they can't be serialized.
     ///
     /// Note: Labels are recomputed from the keys and max_label_num on startup,
     /// so label_lookup data in the changeset is redundant but harmless.
     pub fn from_changeset(
         client: OracleServiceClient<Channel>,
-        p2p_socket_addr: SocketAddr,
+        peers: Arc<PeerSource>,
         mut changeset: ChangeSet,
         state_file: PathBuf,
         network: Network,
@@ -519,14 +520,7 @@ impl Scanner {
         changeset.public_spend_hex = Some(public_spend_hex);
         let format_version = changeset.format_version;
 
-        let mut scanner = Self::from_stage(
-            client,
-            p2p_socket_addr,
-            indexer,
-            changeset,
-            state_file,
-            network,
-        );
+        let mut scanner = Self::from_stage(client, peers, indexer, changeset, state_file, network);
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.
         scanner.sync_owned_outputs();

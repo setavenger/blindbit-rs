@@ -4,13 +4,14 @@
 //! daemon) when it is tried again.
 
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::consensus::encode;
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
@@ -19,14 +20,16 @@ use bitcoin::{Block, BlockHash, Network};
 
 use super::ScannerError;
 use super::health::OracleProbe;
-use super::p2p::{BlockFetchError, BlockFetcher, FetchBackoff, FetchFailure, RetryPolicy};
+use super::p2p::{
+    BlockFetchError, BlockFetcher, FetchBackoff, FetchFailure, FetchedFrom, RetryPolicy,
+};
 use super::scanning::BlockStreamSource;
 use super::stream_safety_tests::{TestStream, payment_block};
-use super::test_support::{run, scanner};
+use super::test_support::{own_node, run, scanner};
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Conn {
     /// Close after receiving the block request, as a node that evicts, bans
     /// or disconnects friglet does.
@@ -41,6 +44,8 @@ pub(super) enum Conn {
     Serve,
     /// Serve the block without its witnesses whatever was asked.
     ServeStripped,
+    /// [`Conn::Serve`], answering `getaddr` with [`GOSSIP`] first.
+    ServeWithAddr,
     NotFound,
     /// Never answer the request (pings still get their pong, as from
     /// Bitcoin Core).
@@ -53,11 +58,17 @@ pub(super) enum Conn {
     CloseBeforeVersion,
 }
 
+/// What a [`Conn::ServeWithAddr`] node gossips: two loopback peers (that
+/// nothing listens on).
+pub(super) const GOSSIP: [&str; 2] = ["127.0.0.61:18444", "127.0.0.62:18444"];
+
 pub(super) struct Node {
     pub(super) addr: SocketAddr,
     connections: Arc<AtomicUsize>,
     /// When a [`Conn::StallMidBlock`] connection went silent.
     stalled: Arc<Mutex<Option<Instant>>>,
+    /// Every command received after the handshake, on every connection.
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 /// The block a node serves, with and without its witnesses.
@@ -110,28 +121,67 @@ impl Node {
     /// A node advertising `services` and `height` and serving `block` that
     /// handles one connection after another as `script` says, then stops
     /// listening.
-    fn spawn(services: ServiceFlags, height: i32, block: &Block, script: Vec<Conn>) -> Self {
-        let served = Served::new(block);
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    pub(super) fn spawn(
+        services: ServiceFlags,
+        height: i32,
+        block: &Block,
+        script: Vec<Conn>,
+    ) -> Self {
+        Self::spawn_on([127, 0, 0, 1].into(), services, height, block, script)
+    }
+
+    /// [`Self::spawn`] listening on `ip` (any port). Several nodes need
+    /// several IPs: the address book tells peers apart by IP only.
+    pub(super) fn spawn_on(
+        ip: IpAddr,
+        services: ServiceFlags,
+        height: i32,
+        block: &Block,
+        script: Vec<Conn>,
+    ) -> Self {
+        let served = Arc::new(Served::new(block));
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = connections.clone();
         let stalled = Arc::new(Mutex::new(None));
         let stalled_at = stalled.clone();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let received = commands.clone();
         std::thread::spawn(move || {
             for conn in script {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-                let _ = serve(stream, conn, services, height, &served, &stalled_at);
+                // Each connection on a thread of its own, so a client that
+                // keeps one open never holds up the next.
+                let (served, stalled_at, received) =
+                    (served.clone(), stalled_at.clone(), received.clone());
+                std::thread::spawn(move || {
+                    let _ = serve(
+                        stream,
+                        conn,
+                        services,
+                        height,
+                        &served,
+                        &stalled_at,
+                        &received,
+                    );
+                });
             }
         });
         Node {
             addr,
             connections,
             stalled,
+            commands,
         }
+    }
+
+    /// Commands received after the handshake, across connections.
+    pub(super) fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
     }
 
     pub(super) fn connections(&self) -> usize {
@@ -199,6 +249,7 @@ fn serve(
     height: i32,
     served: &Served,
     stalled: &Mutex<Option<Instant>>,
+    commands: &Mutex<Vec<String>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
@@ -230,14 +281,22 @@ fn serve(
     while !matches!(wire.recv()?, NetworkMessage::Verack) {}
     wire.send(NetworkMessage::Ping(1))?;
     let items = loop {
-        if let NetworkMessage::GetData(items) = wire.recv()? {
-            break items;
+        let message = wire.recv()?;
+        commands.lock().unwrap().push(message.command().to_string());
+        match message {
+            NetworkMessage::GetData(items) => break items,
+            NetworkMessage::GetAddr if conn == Conn::ServeWithAddr => {
+                wire.send(NetworkMessage::AddrV2(gossip()))?;
+            }
+            _ => {}
         }
     };
     let witness = matches!(items.first(), Some(Inventory::WitnessBlock(_)));
     match conn {
-        Conn::Serve if witness => wire.send(NetworkMessage::Block(served.full.clone()))?,
-        Conn::Serve | Conn::ServeStripped => {
+        Conn::Serve | Conn::ServeWithAddr if witness => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?
+        }
+        Conn::Serve | Conn::ServeWithAddr | Conn::ServeStripped => {
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
@@ -269,6 +328,25 @@ fn serve(
     wire.drain()
 }
 
+/// [`GOSSIP`] as an `addrv2` message.
+fn gossip() -> Vec<AddrV2Message> {
+    GOSSIP
+        .iter()
+        .map(|addr| {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let IpAddr::V4(ip) = addr.ip() else {
+                unreachable!("IPv4 gossip")
+            };
+            AddrV2Message {
+                time: 0,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                addr: AddrV2::Ipv4(ip),
+                port: addr.port(),
+            }
+        })
+        .collect()
+}
+
 /// A node's `version` message, as Bitcoin Core sends it.
 fn version_message(services: ServiceFlags, height: i32) -> NetworkMessage {
     let useless = Address {
@@ -297,11 +375,12 @@ pub(super) fn fast(attempts: u32) -> RetryPolicy {
         first_delay: Duration::from_millis(10),
         max_delay: Duration::from_millis(20),
         block_deadline: Duration::from_secs(2),
+        connect_timeout: Duration::from_secs(2),
     }
 }
 
 fn fetch(node: &Node, policy: RetryPolicy, height: u64) -> Result<Block, Box<BlockFetchError>> {
-    run(BlockFetcher::new(node.addr, Network::Regtest)
+    run(BlockFetcher::new(own_node(node.addr))
         .with_policy(policy)
         .fetch(block().block_hash(), height))
 }
@@ -392,7 +471,7 @@ fn a_mainnet_scan_pointed_at_a_signet_port_is_told_so() {
     // What friglet reports when its mainnet config names the signet node's
     // port: Bitcoin Core closes the connection before answering.
     let err = BlockFetchError {
-        peer: "152.53.151.148:38333".parse().unwrap(),
+        from: FetchedFrom::OwnNode("152.53.151.148:38333".parse::<SocketAddr>().unwrap().into()),
         network: Network::Bitcoin,
         height: 921_763,
         block_hash: block().block_hash(),
@@ -596,7 +675,7 @@ fn the_handshake_shows_the_node_the_same_client_as_before() {
         let _ = wire.drain();
         (version, after)
     });
-    let err = run(BlockFetcher::new(addr, Network::Regtest)
+    let err = run(BlockFetcher::new(own_node(addr))
         .with_policy(fast(1))
         .fetch(block().block_hash(), 1))
     .expect_err("the node answers notfound");
@@ -623,7 +702,7 @@ fn a_refused_connection_is_retried_then_explained() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap()
     };
-    let err = run(BlockFetcher::new(addr, Network::Regtest)
+    let err = run(BlockFetcher::new(own_node(addr))
         .with_policy(fast(3))
         .fetch(block().block_hash(), 100))
     .expect_err("nothing listens");
@@ -678,8 +757,8 @@ fn the_daemon_publishes_an_actionable_stall_with_its_next_try_and_backs_off() {
     run(async {
         let (mut scanner, _state) = scanner("p2p-stall");
         let node = Node::full(1_000, vec![Conn::CloseAfterRequest; 4]);
-        scanner.p2p_peer = node.addr;
-        scanner.p2p_retry = fast(2);
+        scanner.peers = own_node(node.addr);
+        scanner.p2p_retry = Some(fast(2));
         // A payment to the wallet, in a block nobody serves in-process: the
         // scan has to fetch it from the node.
         let mut message = payment_block(1).message;

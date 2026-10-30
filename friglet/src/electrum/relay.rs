@@ -23,12 +23,12 @@
 //! outside: the transaction never shows up. The error then says so, and
 //! names the fee shortfall when the fee is known.
 
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::{Network, Transaction, Txid, Wtxid};
+use blindbit_lib::net::{Dialer, PeerAddr};
 
 use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches};
 
@@ -200,8 +200,8 @@ impl Signals {
 }
 
 /// Connect with transaction relay on and wait for the peer to settle.
-fn connect_settled(addr: SocketAddr, network: Network) -> Result<Peer, P2pError> {
-    let mut peer = Peer::connect(addr, network, true, CONNECT_TIMEOUT)?;
+fn connect_settled(dialer: &Dialer, addr: &PeerAddr, network: Network) -> Result<Peer, P2pError> {
+    let mut peer = Peer::connect(dialer, addr, network, true, CONNECT_TIMEOUT)?;
     peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
     Ok(peer)
 }
@@ -211,13 +211,14 @@ fn connect_settled(addr: SocketAddr, network: Network) -> Result<Peer, P2pError>
 /// asked at all; a transaction the peer did not take is `Ok(Rejected)`.
 /// Also returns the peer's fee filter (sat/kvB) when it sent one.
 pub fn broadcast(
-    addr: SocketAddr,
+    dialer: &Dialer,
+    addr: &PeerAddr,
     network: Network,
     candidate: &Candidate,
     budget: Duration,
 ) -> Result<(Outcome, Option<u64>), P2pError> {
     let deadline = Instant::now() + budget;
-    let mut peer = connect_settled(addr, network)?;
+    let mut peer = connect_settled(dialer, addr, network)?;
     let mut signals = Signals::default();
     let outcome = match drive(&mut peer, &mut signals, candidate, deadline) {
         Ok(Some(outcome)) => outcome,
@@ -289,11 +290,12 @@ fn drive(
 
 /// Is the transaction in the peer's mempool now? Blocking.
 pub fn in_mempool(
-    addr: SocketAddr,
+    dialer: &Dialer,
+    addr: &PeerAddr,
     network: Network,
     candidate: &Candidate,
 ) -> Result<bool, P2pError> {
-    let mut peer = connect_settled(addr, network)?;
+    let mut peer = connect_settled(dialer, addr, network)?;
     peer.mempool_has(
         candidate.txid,
         candidate.wtxid,
@@ -306,11 +308,12 @@ pub fn in_mempool(
 /// ones that are not. Used for pending broadcasts; does not wait for
 /// acceptance. Returns, per transaction, whether it was in the mempool.
 pub fn recheck(
-    addr: SocketAddr,
+    dialer: &Dialer,
+    addr: &PeerAddr,
     network: Network,
     candidates: &[Candidate],
 ) -> Result<(Vec<bool>, Option<u64>), P2pError> {
-    let mut peer = connect_settled(addr, network)?;
+    let mut peer = connect_settled(dialer, addr, network)?;
     let mut present = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let (tx, txid, wtxid) = (&candidate.tx, candidate.txid, candidate.wtxid);
@@ -496,8 +499,14 @@ mod tests {
 
     fn run(script: Script, candidate: &Candidate, budget: Duration) -> (Outcome, FakePeer) {
         let peer = FakePeer::spawn(script, 1);
-        let (outcome, fee_filter) =
-            broadcast(peer.addr, Network::Regtest, candidate, budget).unwrap();
+        let (outcome, fee_filter) = broadcast(
+            &Dialer::Direct,
+            &peer.addr.into(),
+            Network::Regtest,
+            candidate,
+            budget,
+        )
+        .unwrap();
         assert_eq!(fee_filter, Some(1000), "the peer's feefilter is read");
         (outcome, peer)
     }
@@ -593,7 +602,8 @@ mod tests {
         drop(unused);
         assert!(
             broadcast(
-                addr,
+                &Dialer::Direct,
+                &addr.into(),
                 Network::Regtest,
                 &candidate(7),
                 Duration::from_secs(3)
@@ -611,7 +621,13 @@ mod tests {
             ..Script::default()
         };
         let peer = FakePeer::spawn(script, 1);
-        let (present, _) = recheck(peer.addr, Network::Regtest, &[kept, lost]).unwrap();
+        let (present, _) = recheck(
+            &Dialer::Direct,
+            &peer.addr.into(),
+            Network::Regtest,
+            &[kept, lost],
+        )
+        .unwrap();
         assert_eq!(present, vec![true, false]);
         // recheck returns right after handing the transaction over; give the
         // peer's thread a moment to record it.

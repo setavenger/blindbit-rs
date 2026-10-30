@@ -149,6 +149,7 @@ function render(payload) {
   setText("network", status.network);
   setText("electrum-clients", status.electrum_clients);
   setText("oracle", status.oracle_connected ? "connected" : "disconnected");
+  setText("p2p", status.p2p ?? "–");
   setText("version", status.version);
   setText("sp-address", status.sp_address ?? "–");
   renderScanNotes(status.scan_health ?? {});
@@ -345,7 +346,7 @@ let setupConfig = null;
 
 // Hosted oracles and default P2P ports per network (from the Rust side, so
 // the daemon and the form agree).
-let networkDefaults = { hosted_oracles: {}, default_ports: {} };
+let networkDefaults = { hosted_oracles: {}, default_ports: {}, needs_own_node: [] };
 
 function updateSettingsAvailability() {
   $("setup-banner").hidden = !setupMode;
@@ -431,7 +432,20 @@ function updateNetworkHints() {
     hint.className = url ? "hint" : "hint warn";
   }
   const port = networkDefaults.default_ports[network];
-  $("cfg-p2p-addr").placeholder = port ? `node.example.com:${port}` : "host:port";
+  const p2pHint = $("p2p-hint");
+  if ((networkDefaults.needs_own_node ?? []).includes(network)) {
+    $("cfg-p2p-addr").placeholder = port ? `required: node.example.com:${port}` : "required: host:port";
+    p2pHint.textContent = `${network} has no public peers: enter your ${network} node (host:port).`;
+    p2pHint.className = $("cfg-p2p-addr").value.trim() ? "hint" : "hint warn";
+  } else {
+    $("cfg-p2p-addr").placeholder = "empty: random peers of the network";
+    p2pHint.textContent =
+      "Empty: friglet downloads blocks from random peers of the network. They see this " +
+      "computer's IP address and which blocks it fetches, which likely pay or spend from " +
+      "your wallet. Your own node keeps that private. host:port; a hostname works, the port " +
+      `defaults to the network's${port ? ` (${port})` : ""}.`;
+    p2pHint.className = "hint";
+  }
 }
 
 // Switching networks swaps a hosted (or empty) oracle URL for the new
@@ -530,6 +544,7 @@ $("cfg-descriptor").addEventListener("input", () => {
 });
 $("cfg-network").addEventListener("change", () => onNetworkChange());
 $("cfg-oracle-url").addEventListener("input", updateNetworkHints);
+$("cfg-p2p-addr").addEventListener("input", updateNetworkHints);
 $("birthday-tip").addEventListener("change", () => setBirthday("tip"));
 $("birthday-height").addEventListener("change", () => {
   setBirthday("height");

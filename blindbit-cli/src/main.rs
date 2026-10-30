@@ -1,4 +1,5 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+use blindbit_lib::net::{Dialer, PeerSource, Seeds};
 use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
@@ -33,8 +34,11 @@ enum Commands {
         #[arg(long)]
         end_height: u64,
 
+        /// Your Bitcoin node's P2P address (ip:port). Without it, blocks come
+        /// from random peers of the network, found through its DNS seeds
+        /// (they see this computer's IP and which blocks it downloads).
         #[arg(long)]
-        p2p_node_addr: String,
+        p2p_node_addr: Option<String>,
 
         /// Maximum label number
         #[arg(long, default_value = "0")]
@@ -100,12 +104,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let public_spend = PublicKey::from_str(&spend_pubkey)
                 .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
-            let p2p_socket_addr = SocketAddr::from_str(&p2p_node_addr)
+            let own_node = p2p_node_addr
+                .as_deref()
+                .map(str::trim)
+                .filter(|addr| !addr.is_empty())
+                .map(SocketAddr::from_str)
+                .transpose()
                 .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
+            if own_node.is_none() && network == Network::Regtest {
+                return Err(
+                    "regtest has no public peers: pass --p2p-node-addr with your regtest node"
+                        .into(),
+                );
+            }
+            let peers = PeerSource::new(
+                network,
+                Dialer::Direct,
+                own_node.map(Into::into),
+                Seeds::for_network(network),
+            );
+            peers.start();
+            tracing::info!(p2p = %peers.summary(), "block downloads");
 
             let config = ScannerConfig::new(
                 oracle_url.clone(),
-                p2p_socket_addr,
+                peers,
                 secret_scan,
                 public_spend,
                 max_label_num,

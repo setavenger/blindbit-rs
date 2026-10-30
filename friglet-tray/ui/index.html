@@ -61,8 +61,12 @@
           <span id="electrum-clients" class="value">–</span>
         </div>
         <div class="row">
-          <span class="label">Oracle / P2P</span>
+          <span class="label">Oracle</span>
           <span id="oracle" class="value">–</span>
+        </div>
+        <div class="row">
+          <span class="label">Blocks from</span>
+          <span id="p2p" class="value">–</span>
         </div>
         <div class="row">
           <span class="label">Daemon version</span>
@@ -215,10 +219,12 @@
 
           <section class="card">
             <div class="field">
-              <label for="cfg-p2p-addr">Bitcoin node (host:port)</label>
-              <input id="cfg-p2p-addr" type="text" spellcheck="false" placeholder="node.example.com:8333" />
-              <p class="hint">Any reachable Bitcoin node on this network — your own node
-                or a public one. A hostname works; the port defaults to the network's.</p>
+              <label for="cfg-p2p-addr">Your Bitcoin node (optional)</label>
+              <input id="cfg-p2p-addr" type="text" spellcheck="false" placeholder="empty: random peers of the network" />
+              <p id="p2p-hint" class="hint">Empty: friglet downloads blocks from random peers of
+                the network. They see this computer's IP address and which blocks it fetches,
+                which likely pay or spend from your wallet. Your own node keeps that private.
+                host:port; a hostname works, the port defaults to the network's.</p>
             </div>
             <div class="field">
               <label for="cfg-oracle-url">BlindBit oracle URL</label>
