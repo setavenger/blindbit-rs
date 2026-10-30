@@ -44,6 +44,7 @@ const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
 const MAX_WEIGHT: u64 = 4_000_000;
 
 /// A decoded transaction ready to broadcast.
+#[derive(Clone)]
 pub struct Candidate {
     pub raw: Vec<u8>,
     pub tx: Transaction,
@@ -70,7 +71,7 @@ impl Candidate {
         })
     }
 
-    fn fee_rate_note(&self) -> String {
+    pub(super) fn fee_rate_note(&self) -> String {
         match self.fee {
             Some(fee) => format!(
                 " The transaction pays {fee} sat ({:.2} sat/vB).",
@@ -134,15 +135,17 @@ pub enum Outcome {
 
 /// What the peer revealed while we waited.
 #[derive(Default)]
-struct Signals {
+pub(super) struct Signals {
     /// The transaction went to the peer.
-    sent: bool,
+    pub(super) sent: bool,
     /// The peer asked for another transaction: a parent of ours.
-    missing_inputs: bool,
+    pub(super) missing_inputs: bool,
 }
 
 impl Signals {
-    fn observe(
+    /// React to `message`: hand the transaction over when the peer asks for
+    /// it, answer any other request with `notfound`.
+    pub(super) fn observe(
         &mut self,
         peer: &mut Peer,
         message: NetworkMessage,
@@ -179,7 +182,7 @@ impl Signals {
 
     /// Announce the transaction with `inv` and hand it over if the peer asks
     /// for it before `deadline`.
-    fn announce(
+    pub(super) fn announce(
         &mut self,
         peer: &mut Peer,
         tx: &Transaction,
@@ -352,25 +355,48 @@ fn disconnected_message() -> String {
         .into()
 }
 
+/// The fee `candidate` would need to pass a mempool minimum of `fee_filter`
+/// sat/kvB, with what it pays, when it pays less.
+pub(super) fn fee_shortfall(candidate: &Candidate, fee_filter: Option<u64>) -> Option<(u64, u64)> {
+    let (fee, filter) = (candidate.fee?, fee_filter?);
+    let required = (filter * candidate.vsize).div_ceil(1000);
+    (fee < required).then_some((fee, required))
+}
+
+/// Bitcoin Core's reject reason for a fee below the mempool minimum, as
+/// ElectrumX relays it: Sparrow recognises this wording and tells the user
+/// the fee to pay. `inferred` says how friglet concluded it (ending in "the
+/// transaction"), `minimum` whose minimum it is ("its mempool currently
+/// accepts").
+pub(super) fn fee_shortfall_message(
+    candidate: &Candidate,
+    (fee, required): (u64, u64),
+    fee_filter: u64,
+    inferred: &str,
+    minimum: &str,
+) -> String {
+    format!(
+        "the transaction was rejected by network rules.\n\nmempool min fee not met, \
+         {fee} < {required}\n\nInferred by friglet: {inferred}, which pays {:.2} sat/vB, and \
+         {minimum} no less than {:.2} sat/vB.",
+        fee as f64 / candidate.vsize as f64,
+        fee_filter as f64 / 1000.0,
+    )
+}
+
 fn not_accepted_message(
     candidate: &Candidate,
     fee_filter: Option<u64>,
     waited: Duration,
 ) -> String {
-    if let (Some(fee), Some(filter)) = (candidate.fee, fee_filter) {
-        let required = (filter * candidate.vsize).div_ceil(1000);
-        if fee < required {
-            // Sparrow recognises this wording (Bitcoin Core's reject reason as
-            // ElectrumX relays it) and tells the user the fee to pay.
-            return format!(
-                "the transaction was rejected by network rules.\n\nmempool min fee not met, \
-                 {fee} < {required}\n\nInferred by friglet: the P2P peer did not accept the \
-                 transaction, which pays {:.2} sat/vB, and its mempool currently accepts no \
-                 less than {:.2} sat/vB.",
-                fee as f64 / candidate.vsize as f64,
-                filter as f64 / 1000.0,
-            );
-        }
+    if let (Some(shortfall), Some(filter)) = (fee_shortfall(candidate, fee_filter), fee_filter) {
+        return fee_shortfall_message(
+            candidate,
+            shortfall,
+            filter,
+            "the P2P peer did not accept the transaction",
+            "its mempool currently accepts",
+        );
     }
     format!(
         "the P2P peer did not accept the transaction into its mempool within {} seconds. The P2P \

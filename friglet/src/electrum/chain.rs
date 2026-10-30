@@ -162,6 +162,18 @@ impl ChainSource {
             .ok_or_else(|| "no P2P peer sent a fee filter".to_string())
     }
 
+    /// What [`Self::fee_filter`] would report now, without asking a peer.
+    pub fn known_fee_filter(&self) -> Option<u64> {
+        let filters = self.fee_filters();
+        if self.peers.is_own_node() {
+            filters.current(1)
+        } else {
+            filters
+                .current(FEE_FILTER_QUORUM)
+                .or_else(|| filters.lowest())
+        }
+    }
+
     fn fee_filters(&self) -> std::sync::MutexGuard<'_, FeeFilters> {
         self.fee_filters.lock().expect("fee filter lock")
     }
