@@ -1,7 +1,7 @@
 # Headless friglet daemon image.
 #
 #   docker build -t friglet .
-#   docker run -d -p 8080:8080 -p 50001:50001 -v friglet-data:/data friglet
+#   docker run -d -p 50001:50001 -v friglet-data:/data friglet
 #
 # See docs/docker.md for configuration details.
 
@@ -33,11 +33,10 @@ WORKDIR /data
 VOLUME /data
 ENV FRIGLET_CONTROL_SOCKET=/data/friglet.sock \
     FRIGLET_LOG_FILE=/data/friglet.log \
-    FRIGLET_HTTP_ADDR=0.0.0.0:8080 \
     FRIGLET_ELECTRUM_ADDR=0.0.0.0:50001
 
-# HTTP API / Electrum TCP
-EXPOSE 8080 50001
+# Electrum TCP
+EXPOSE 50001
 
 ENTRYPOINT ["friglet"]
 CMD ["scan", "--config", "/data/config.toml", "--key-file", "/data/scan.key"]

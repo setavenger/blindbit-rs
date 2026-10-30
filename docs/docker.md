@@ -35,11 +35,11 @@ SNB-635.)
 
 The image's default command is
 `friglet scan --config /data/config.toml --key-file /data/scan.key`, and the
-image presets `FRIGLET_HTTP_ADDR=0.0.0.0:8080` and
-`FRIGLET_ELECTRUM_ADDR=0.0.0.0:50001` so the servers are reachable from
-outside the container (env vars still lose to CLI flags but beat the config
-file, so don't set `http_addr`/`electrum_addr` in `config.toml` unless you
-want to fight the presets — override the env vars with `-e` instead).
+image presets `FRIGLET_ELECTRUM_ADDR=0.0.0.0:50001` so the Electrum server
+is reachable from outside the container (env vars still lose to CLI flags
+but beat the config file, so don't set `electrum_addr` in `config.toml`
+unless you want to fight the preset — override the env var with `-e`
+instead).
 
 Minimal `config.toml`:
 
@@ -64,7 +64,7 @@ printf '<32-byte hex scan secret>' > ./friglet-data/scan.key && chmod 600 ./frig
 $EDITOR ./friglet-data/config.toml
 
 docker run -d --name friglet \
-  -p 8080:8080 -p 50001:50001 \
+  -p 50001:50001 \
   -v "$PWD/friglet-data:/data" \
   friglet
 ```
@@ -86,13 +86,5 @@ The daemon also writes its log to `/data/friglet.log` in the volume
 (`FRIGLET_LOG_FILE` in the image; capped at 10 MiB, rotated to
 `friglet.log.1`/`.2`). Set `-e FRIGLET_LOG_FILE=off` to log to stdout only.
 
-The HTTP endpoints `/height` and `/subscribe` do not answer while scanning
-is enabled, and that includes the whole time the daemon is caught up and
-waiting for new blocks: the scan holds the scanner for as long as it runs.
-They answer only while scanning is stopped (`Stop` over the control socket).
-Do not use them as a health check; use the Electrum `server.version` call or
-`GetStatus` on the control socket (`friglet-ipc` protocol) as above, or
-`docker logs` (scan progress lines).
-
-Port `8080` is the HTTP API (`/height`, `/subscribe`), `50001` the Electrum
-TCP server (point Sparrow at `127.0.0.1:50001`).
+Port `50001` is the Electrum TCP server (point Sparrow at
+`127.0.0.1:50001`).

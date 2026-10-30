@@ -60,7 +60,9 @@ pub struct DaemonConfig {
     pub spend_pubkey: Option<String>,
     /// Maximum Silent Payments label number.
     pub max_label_num: u32,
-    /// HTTP server bind address.
+    /// Obsolete and ignored since the HTTP API was removed (SNB-668); still
+    /// accepted so existing config files, older trays and friglet-ui keep
+    /// working.
     pub http_addr: String,
     /// Electrum TCP server bind address.
     pub electrum_addr: String,
