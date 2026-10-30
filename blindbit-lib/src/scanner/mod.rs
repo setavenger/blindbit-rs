@@ -3,6 +3,8 @@ mod cancel_tests;
 mod changeset;
 mod config;
 mod electrum_index;
+#[cfg(test)]
+mod electrum_index_tests;
 mod health;
 mod load;
 #[cfg(test)]
@@ -38,11 +40,11 @@ pub use config::ScannerConfig;
 pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
 pub use health::{
     OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
-    StateRescan,
+    StateRescan, oracle_block_hash,
 };
 pub use p2p::{BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy};
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
-pub use scanner::Scanner;
+pub use scanner::{Scanner, convert_network};
 pub use types::OwnedOutputRecord;
 
 // Re-export load_scanner function when serde feature is enabled

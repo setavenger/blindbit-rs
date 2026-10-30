@@ -31,9 +31,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use bitcoin::BlockHash;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
 use bitcoin_rev::Network;
-use blindbit_lib::scanner::{
-    ScriptHashEntry, WalletElectrumIndex, electrum_scripthash, electrum_status,
-};
+use blindbit_lib::scanner::{WalletElectrumIndex, electrum_scripthash, electrum_status};
 
 use crate::blockheader;
 
@@ -693,19 +691,11 @@ async fn index_unconfirmed_tx(index: &Arc<Mutex<WalletElectrumIndex>>, raw_hex: 
     // Store raw bytes so blockchain.transaction.get can serve the tx.
     idx.txs.insert(txid.to_string(), tx_bytes);
 
-    // Add height-0 entries to every affected scripthash.
-    let entry = ScriptHashEntry {
-        tx_hash: txid.to_string(),
-        height: 0,
-        fee: 0,
-    };
+    // Add height-0 entries to every affected scripthash; a tx already
+    // listed there, unconfirmed or confirmed, keeps its entry.
     let mut added = 0usize;
     for sh in &affected {
-        let history = idx.scripthash_history.entry(sh.clone()).or_default();
-        // Already there, unconfirmed or confirmed: leave it.
-        if !history.iter().any(|e| e.tx_hash == txid) {
-            history.push(entry.clone());
-            history.sort_by_key(|e| e.height);
+        if idx.add_history(sh.clone(), txid, 0) {
             added += 1;
         }
     }
@@ -1245,6 +1235,7 @@ mod tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use blindbit_lib::scanner::ScriptHashEntry;
     use std::path::Path;
 
     fn temp_dir(tag: &str) -> PathBuf {
