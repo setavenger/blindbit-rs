@@ -1,30 +1,25 @@
 # Packaging only: builds the friglet-tray desktop bundles (tray app + the
-# friglet daemon as a Tauri sidecar) with Tauri's own bundler. Tests and
-# lints live in ci.yml and are not repeated here.
+# friglet daemon as a Tauri sidecar) with Tauri's own bundler, installs the
+# Linux ones on several distros, and signs + notarizes the macOS one when
+# the Apple secrets are set. Tests and lints live in ci.yml.
 name: Release bundles
 
+# Runs only for a release tag (vX.Y.Z, matching friglet-tray's version),
+# which drafts the GitHub release, or when started by hand from the Actions
+# tab, which only builds and checks (bundles stay in the run's artifacts).
+# Never on pushes or PRs.
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
-  pull_request:
-    # Packaging-relevant files only. Ordinary code PRs are covered by ci.yml
-    # and must not pay for three release builds.
-    paths:
-      - .github/workflows/release.yml
-      - friglet-tray/tauri*.conf.json
-      - friglet-tray/icons/**
-      - friglet-tray/Cargo.toml
-      - friglet-tray/build.rs
-      - scripts/prepare-sidecar.sh
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -39,10 +34,19 @@ env:
 
 jobs:
   linux:
-    name: Linux x86_64 (deb, AppImage)
+    name: Linux ${{ matrix.arch }} (deb, rpm, AppImage)
     # Oldest supported image: the bundles inherit its glibc (2.35) as their
-    # minimum, so Ubuntu 22.04 / Debian 12 users can run them too.
-    runs-on: ubuntu-22.04
+    # minimum, so Ubuntu 22.04 / Debian 12 users can run them too. arm64
+    # builds natively on GitHub's arm runner (no QEMU, no cross toolchain).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -61,11 +65,12 @@ jobs:
             patchelf \
             pkg-config \
             protobuf-compiler \
+            rpm \
             xdg-utils
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: x86_64-unknown-linux-gnu
+          key: ${{ matrix.arch }}-unknown-linux-gnu
           cache-on-failure: true
       - name: Stage daemon sidecar
         run: scripts/prepare-sidecar.sh
@@ -73,27 +78,81 @@ jobs:
         working-directory: friglet-tray
         run: >-
           npx --yes "@tauri-apps/cli@${TAURI_CLI_VERSION}" build
-          --bundles deb,appimage --config tauri.sidecar.conf.json
+          --bundles deb,rpm,appimage --config tauri.sidecar.conf.json
       - name: Check the daemon is bundled
         run: |
           bundle=target/release/bundle
           deb=$(echo "$bundle"/deb/*.deb)
+          rpm=$(echo "$bundle"/rpm/*.rpm)
           appimage=$(echo "$bundle"/appimage/*.AppImage)
           dpkg-deb -c "$deb" | tee "$RUNNER_TEMP/deb-contents.txt"
           grep -qE ' (\./)?usr/bin/friglet-tray$' "$RUNNER_TEMP/deb-contents.txt"
           grep -qE ' (\./)?usr/bin/friglet$' "$RUNNER_TEMP/deb-contents.txt"
           dpkg-deb -x "$deb" "$RUNNER_TEMP/deb"
           "$RUNNER_TEMP/deb/usr/bin/friglet" --help > /dev/null
+          rpm -qpl "$rpm" | tee "$RUNNER_TEMP/rpm-contents.txt"
+          grep -qx /usr/bin/friglet-tray "$RUNNER_TEMP/rpm-contents.txt"
+          grep -qx /usr/bin/friglet "$RUNNER_TEMP/rpm-contents.txt"
+          rpm -qpR "$rpm"
           chmod +x "$appimage"
           (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null)
           test -x "$RUNNER_TEMP/squashfs-root/usr/bin/friglet"
-          ls -l "$deb" "$appimage"
+          ls -l "$deb" "$rpm" "$appimage"
       - uses: actions/upload-artifact@v6
         with:
-          name: friglet-tray-linux-x86_64
+          name: friglet-tray-linux-${{ matrix.arch }}
           path: |
             target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
             target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-install:
+    name: Install on ${{ matrix.image }} ${{ matrix.arch }} (${{ matrix.kind }})
+    needs: linux
+    # Each bundle installed the way a user would, on the distros we tell
+    # people to use it on; see scripts/linux-install-check.sh for the checks.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, kind: deb, image: "ubuntu:22.04" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: deb, image: "ubuntu:24.04" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: deb, image: "debian:12" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: deb, image: "debian:13" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: rpm, image: "fedora:latest" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: rpm, image: "opensuse/tumbleweed" }
+          - { arch: x86_64, runner: ubuntu-24.04, kind: appimage, image: "archlinux:latest" }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, kind: deb, image: "ubuntu:24.04" }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, kind: rpm, image: "fedora:latest" }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: friglet-tray-linux-${{ matrix.arch }}
+          path: dist
+      - name: Install and start friglet-tray
+        id: check
+        env:
+          IMAGE: ${{ matrix.image }}
+          KIND: ${{ matrix.kind }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name=$(echo "setup-window-$IMAGE-$ARCH-$KIND" | tr ':/' '--')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/shots"
+          docker run --rm -v "$GITHUB_WORKSPACE:/w:ro" -v "$RUNNER_TEMP/shots:/out" -w /w \
+            -e SCREENSHOT="/out/$name.png" "$IMAGE" \
+            scripts/linux-install-check.sh "$KIND" /w/dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.check.outputs.name }}
+          path: ${{ runner.temp }}/shots/*.png
           if-no-files-found: error
           retention-days: 14
 
@@ -103,6 +162,8 @@ jobs:
     # users need not pick an arch, and no dependency on Intel runner images.
     runs-on: macos-15
     timeout-minutes: 90
+    outputs:
+      signing: ${{ steps.build.outputs.signing }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -123,13 +184,71 @@ jobs:
       - name: Stage daemon sidecar (universal)
         run: scripts/prepare-sidecar.sh universal-apple-darwin
       - name: Build bundle
+        id: build
         working-directory: friglet-tray
-        run: >-
-          npx --yes "@tauri-apps/cli@${TAURI_CLI_VERSION}" build
-          --target universal-apple-darwin
-          --bundles dmg --config tauri.sidecar.conf.json
+        # With the Apple secrets (README "macOS signing"), Tauri imports the
+        # Developer ID certificate into a throwaway keychain, signs the
+        # daemon and the app with the hardened runtime, notarizes and
+        # staples the app, and signs the dmg. Without them the bundle stays
+        # ad-hoc signed. Tauri treats a set-but-empty variable as set, so
+        # the APPLE_* variables are only exported when the secrets exist.
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set=0
+          for v in CERTIFICATE CERTIFICATE_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
+            [ -n "${!v}" ] && set=$((set + 1))
+          done
+          if [ "$set" = 5 ]; then
+            export APPLE_CERTIFICATE=$CERTIFICATE
+            export APPLE_CERTIFICATE_PASSWORD=$CERTIFICATE_PASSWORD
+            # A substring of the certificate's name; overrides the "-" in
+            # tauri.conf.json and refuses any other kind of certificate.
+            export APPLE_SIGNING_IDENTITY="Developer ID Application"
+            export APPLE_ID=$NOTARY_APPLE_ID
+            export APPLE_PASSWORD=$NOTARY_PASSWORD
+            export APPLE_TEAM_ID=$NOTARY_TEAM_ID
+            echo "signing=developer-id" >> "$GITHUB_OUTPUT"
+          elif [ "$set" = 0 ]; then
+            echo "::notice::Apple signing secrets not set: building an ad-hoc signed, not notarized dmg"
+            echo "signing=adhoc" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::only $set of the 5 Apple signing secrets are set (README \"macOS signing\")"
+            exit 1
+          fi
+          npx --yes "@tauri-apps/cli@${TAURI_CLI_VERSION}" build \
+            --target universal-apple-darwin \
+            --bundles dmg --config tauri.sidecar.conf.json
+      - name: Notarize and staple the dmg
+        # Tauri notarizes only the app inside; notarizing the dmg as well
+        # lets Gatekeeper accept the download itself, also offline.
+        if: steps.build.outputs.signing == 'developer-id'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          dmg=$(echo target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          # Rejections are handled below, with the notary log.
+          xcrun notarytool submit "$dmg" --wait --output-format json \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
+            | tee "$RUNNER_TEMP/notary.json" || true
+          status=$(jq -r .status "$RUNNER_TEMP/notary.json")
+          if [ "$status" != Accepted ]; then
+            echo "::error::dmg notarization: $status"
+            xcrun notarytool log "$(jq -r .id "$RUNNER_TEMP/notary.json")" \
+              --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
       - name: Check the daemon is bundled
         # Tauri deletes the intermediate .app, so check the copy in the dmg.
+        env:
+          SIGNING: ${{ steps.build.outputs.signing }}
         run: |
           dmg=$(echo target/universal-apple-darwin/release/bundle/dmg/*.dmg)
           mnt="$RUNNER_TEMP/dmg"
@@ -141,8 +260,26 @@ jobs:
           done
           "$app/Contents/MacOS/friglet" --help > /dev/null
           codesign --verify --deep --strict "$app"
-          codesign -dv "$app" 2>&1 | grep 'Signature=adhoc'
+          if [ "$SIGNING" = developer-id ]; then
+            for item in "$app" "$app/Contents/MacOS/friglet"; do
+              codesign -dv --verbose=2 "$item" 2>&1 | tee "$RUNNER_TEMP/codesign.txt"
+              grep -q '^Authority=Developer ID Application: ' "$RUNNER_TEMP/codesign.txt"
+              grep -q 'flags=.*runtime' "$RUNNER_TEMP/codesign.txt"
+            done
+            # What Gatekeeper decides for a downloaded copy.
+            spctl --assess --type execute --verbose=2 "$app" 2>&1 | tee "$RUNNER_TEMP/spctl.txt"
+            grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl.txt"
+            xcrun stapler validate "$app"
+          else
+            codesign -dv "$app" 2>&1 | grep 'Signature=adhoc'
+          fi
           hdiutil detach "$mnt"
+          if [ "$SIGNING" = developer-id ]; then
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg" 2>&1 \
+              | tee "$RUNNER_TEMP/spctl-dmg.txt"
+            grep -q 'source=Notarized Developer ID' "$RUNNER_TEMP/spctl-dmg.txt"
+            xcrun stapler validate "$dmg"
+          fi
           ls -l "$dmg"
       - uses: actions/upload-artifact@v6
         with:
@@ -206,12 +343,14 @@ jobs:
 
   draft-release:
     name: Draft GitHub release
-    needs: [linux, macos, windows]
-    # Never on pull_request. Windows is best effort, so only Linux and macOS
-    # are required; Windows assets are attached when that job succeeded.
+    needs: [linux, linux-install, macos, windows]
+    # Release tags only. Windows is best effort, so only Linux (built and
+    # installed on every listed distro) and macOS are required; Windows
+    # assets are attached when that job succeeded.
     if: >-
-      !cancelled() && github.event_name != 'pull_request' &&
-      needs.linux.result == 'success' && needs.macos.result == 'success'
+      !cancelled() && github.ref_type == 'tag' &&
+      needs.linux.result == 'success' && needs.linux-install.result == 'success' &&
+      needs.macos.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -229,37 +368,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          MACOS_SIGNING: ${{ needs.macos.outputs.signing }}
         run: |
           version=$(jq -r .version friglet-tray/tauri.conf.json)
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            tag=$GITHUB_REF_NAME
-            case "$tag" in
-              "v$version" | "v$version"-*) ;;
-              *)
-                echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
-                exit 1
-                ;;
-            esac
-            create_args=(--verify-tag)
-          else
-            # Manual runs get a clearly non-release name; no tag is created
-            # because the release stays a draft.
-            tag="friglet-tray-dev-${GITHUB_SHA::12}"
-            create_args=(--target "$GITHUB_SHA")
+          tag=$GITHUB_REF_NAME
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
+            exit 1
           fi
 
+          # Multi-path artifacts keep their bundle/<kind>/ subfolders.
+          find dist -mindepth 2 -type f -exec mv -t dist {} +
+          find dist -mindepth 1 -type d -empty -delete
           (cd dist && sha256sum -- * > SHA256SUMS)
           ls -l dist
 
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          docs_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/README.md#opening-unsigned-builds"
-          notes="Unsigned friglet-tray $version bundles with the friglet daemon included, built by $run_url from $GITHUB_SHA.
+          docs_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/README.md#installing-a-release"
+          if [ "$MACOS_SIGNING" = developer-id ]; then
+            macos="universal .dmg (Apple Silicon and Intel), signed with Developer ID and notarized by Apple"
+          else
+            macos="universal .dmg (Apple Silicon and Intel), ad-hoc signed, not notarized (macOS asks you to allow it once)"
+          fi
+          notes="friglet-tray $version bundles with the friglet daemon included, built by $run_url from $GITHUB_SHA.
 
-          - Linux x86_64: .deb and .AppImage
-          - macOS: universal .dmg (Apple Silicon and Intel), ad-hoc signed, not notarized
-          - Windows x86_64: .msi and -setup.exe, best effort and untested (only present if that job succeeded)
+          - macOS: $macos
+          - Linux x86_64 and arm64: .deb (Debian, Ubuntu), .rpm (Fedora, openSUSE) and .AppImage (other distros); install-tested on Ubuntu 22.04/24.04, Debian 12/13, Fedora, openSUSE Tumbleweed and Arch
+          - Windows x86_64: .msi and -setup.exe, not code-signed (SmartScreen asks you to allow it once), best effort and untested (only present if that job succeeded)
 
-          These builds are not code-signed. How to open them: $docs_url"
+          Check downloads against SHA256SUMS. How to install: $docs_url"
 
           if is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2> /dev/null); then
             if [ "$is_draft" != true ]; then
@@ -268,7 +405,7 @@ jobs:
             fi
             gh release upload "$tag" dist/* --clobber
           else
-            gh release create "$tag" dist/* --draft "${create_args[@]}" \
+            gh release create "$tag" dist/* --draft --verify-tag \
               --title "friglet-tray $version ($tag)" --notes "$notes"
           fi
           echo "Draft release: $(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
