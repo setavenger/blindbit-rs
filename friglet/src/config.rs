@@ -236,9 +236,15 @@ fn user_layers(file: Option<&Path>, args: &ScanArgs) -> Figment {
     if let Some(path) = file {
         figment = figment.merge(Toml::file_exact(path));
     }
-    figment
-        .merge(Env::prefixed("FRIGLET_"))
-        .merge(Serialized::defaults(args.clone()))
+    let mut env = Env::prefixed("FRIGLET_");
+    // An empty FRIGLET_P2P_PROXY (a service or container template's
+    // default) must not switch off a proxy the config file sets: P2P
+    // connections would then silently go out directly. Clearing it takes
+    // the file or the flag.
+    if std::env::var("FRIGLET_P2P_PROXY").is_ok_and(|value| value.trim().is_empty()) {
+        env = env.ignore(&["p2p_proxy"]);
+    }
+    figment.merge(env).merge(Serialized::defaults(args.clone()))
 }
 
 fn merge_layers(file: Option<&Path>, args: &ScanArgs) -> Result<DaemonConfig, String> {
@@ -1070,6 +1076,10 @@ mod tests {
             };
             let from_flag = merge_layers(Some(&file), &args).unwrap();
             assert_eq!(from_flag.p2p_proxy.as_deref(), Some("[::1]:9050"));
+            // An empty variable does not switch the file's proxy off.
+            jail.set_env("FRIGLET_P2P_PROXY", " ");
+            let empty_env = merge_layers(Some(&file), &ScanArgs::default()).unwrap();
+            assert_eq!(empty_env.p2p_proxy.as_deref(), Some("127.0.0.1:9150"));
             Ok(())
         });
     }

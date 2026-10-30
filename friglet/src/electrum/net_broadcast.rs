@@ -523,7 +523,7 @@ fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2p
             let event = if no_route {
                 PeerEvent::NoRoute
             } else {
-                PeerEvent::Unreachable
+                error.peer_event()
             };
             peers.report(addr, event);
             Err(error)

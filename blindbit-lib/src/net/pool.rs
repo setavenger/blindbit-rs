@@ -1136,7 +1136,12 @@ fn write_book(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> i
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("book.tmp");
-    let mut file = File::create(&tmp)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // The peers this computer talks to: owner only, like the wallet state.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp)?;
     write(&mut file)?;
     drop(file);
     std::fs::rename(&tmp, path)

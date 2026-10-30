@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::net::{
     PROXY_CONNECT_TIMEOUT, PeerAddr, PeerEvent, PeerSource, Purpose, USER_AGENT, is_proxy_down,
+    is_proxy_unclear,
 };
 
 // ---------------------------------------------------------------------------
@@ -222,11 +223,15 @@ impl FetchFailure {
 /// A quiet deadline is kept distinct inside one fetch so it gets one fresh
 /// connection without spending the full retry budget on repeated 90 s waits.
 /// It is still exposed to callers as a broken connection. A missing route
-/// is kept distinct so a discovering source can skip that address family.
+/// is kept distinct so a discovering source can skip that address family,
+/// and a connect the proxy gave no clear answer about so the peer is only
+/// rested, not counted unreachable (Tor without a working circuit would
+/// otherwise empty the address book).
 enum AttemptFailure {
     Regular(FetchFailure),
     QuietDeadline(Duration),
     NoRoute(String),
+    ProxyUnclear(String),
 }
 
 impl AttemptFailure {
@@ -237,7 +242,7 @@ impl AttemptFailure {
                 "the node went quiet: no block and no answer to a ping in {}",
                 human_duration(waited)
             )),
-            Self::NoRoute(error) => FetchFailure::Connect(error),
+            Self::NoRoute(error) | Self::ProxyUnclear(error) => FetchFailure::Connect(error),
         }
     }
 
@@ -246,7 +251,7 @@ impl AttemptFailure {
     fn peer_event(&self, connected: bool) -> PeerEvent {
         match self {
             Self::NoRoute(_) => PeerEvent::NoRoute,
-            Self::QuietDeadline(_) => PeerEvent::Unhelpful,
+            Self::QuietDeadline(_) | Self::ProxyUnclear(_) => PeerEvent::Unhelpful,
             Self::Regular(failure) => match failure {
                 FetchFailure::WrongNetwork(_)
                 | FetchFailure::WitnessStripped
@@ -1225,11 +1230,14 @@ impl BlockFetcher {
     }
 }
 
-/// How a failed connect counts: the proxy failing, no route to the peer's
-/// network, or the peer unreachable.
+/// How a failed connect counts: the proxy failing, the proxy saying nothing
+/// clear about the peer, no route to the peer's network, or the peer
+/// unreachable.
 fn connect_failure(error: io::Error) -> AttemptFailure {
     if is_proxy_down(&error) {
         FetchFailure::Proxy(error.to_string()).into()
+    } else if is_proxy_unclear(&error) {
+        AttemptFailure::ProxyUnclear(error.to_string())
     } else if is_no_route(&error) {
         AttemptFailure::NoRoute(error.to_string())
     } else {

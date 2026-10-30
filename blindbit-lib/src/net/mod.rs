@@ -36,7 +36,7 @@ pub use pool::{NoPeers, PeerEvent, PeerPool, PeerSource};
 pub use seeds::Seeds;
 #[cfg(test)]
 pub(crate) use seeds::lookups::asked as seeds_asked;
-pub use socks5::{Socks5Error, is_proxy_down};
+pub use socks5::{Socks5Error, is_proxy_down, is_proxy_unclear};
 
 /// The user agent of every P2P connection friglet opens, block downloads and
 /// the Electrum server's own peer alike, so a node sees one client. It is the

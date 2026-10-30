@@ -161,3 +161,21 @@ fn through_a_proxy_connections_race_past_dead_peers() {
     );
     assert_eq!(node.connections(), 1);
 }
+
+/// A refusal through the proxy counts against the peer (forgotten after
+/// three); a general failure, what Tor without a working circuit answers,
+/// only rests it, so an outage cannot empty the address book.
+#[test]
+fn only_a_clear_refusal_through_the_proxy_counts_against_a_peer() {
+    for (code, kept) in [(0x05, 0), (0x01, 1)] {
+        let proxy = FakeSocks5::start();
+        proxy.refuse_with(code);
+        let peer: PeerAddr = "203.0.113.77:18444".parse::<SocketAddr>().unwrap().into();
+        let source =
+            PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(vec![peer]));
+        for _ in 0..3 {
+            fetch(source.clone()).expect_err("refused");
+        }
+        assert_eq!(source.known(), kept, "SOCKS5 reply {code}");
+    }
+}
