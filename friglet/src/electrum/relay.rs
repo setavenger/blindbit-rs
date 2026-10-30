@@ -182,7 +182,7 @@ impl Signals {
 
     /// Announce the transaction with `inv` and hand it over if the peer asks
     /// for it before `deadline`.
-    pub(super) fn announce(
+    fn announce(
         &mut self,
         peer: &mut Peer,
         tx: &Transaction,
@@ -500,6 +500,17 @@ mod tests {
         // Sparrow's MIN_MEMPOOL_FEE pattern.
         assert!(message.starts_with("the transaction was rejected by network rules."));
         assert!(message.contains(&format!("mempool min fee not met, 10 < {vsize}\n")));
+        // The own node's wording, word for word.
+        assert_eq!(
+            message,
+            format!(
+                "the transaction was rejected by network rules.\n\nmempool min fee not met, 10 < \
+                 {vsize}\n\nInferred by friglet: the P2P peer did not accept the transaction, \
+                 which pays {:.2} sat/vB, and its mempool currently accepts no less than 1.00 \
+                 sat/vB.",
+                10.0 / vsize as f64
+            )
+        );
 
         // Enough fee: the honest "don't know why" message, with the fee.
         candidate.fee = Some(vsize * 2);

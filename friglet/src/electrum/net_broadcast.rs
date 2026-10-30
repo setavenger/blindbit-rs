@@ -81,9 +81,15 @@ pub struct Report {
 pub enum Verdict {
     /// `by`, a peer the transaction was not handed to, served it.
     InMempool { by: PeerAddr },
-    /// Every sender refused it the same way; the message is for the user.
+    /// Every sender asked for a parent: its inputs are missing or spent.
+    /// The message is for the user.
     Rejected(String),
-    /// No observer had it `waited` after the first hand-over.
+    /// Every sender dropped the connection before answering the ping after
+    /// the transaction, which Bitcoin Core does with a consensus-invalid
+    /// transaction. A peer can also just go away, so this is not final.
+    Dropped(String),
+    /// No observer had it `waited` after the first hand-over (observers that
+    /// went away are replaced while the pool has peers).
     Unconfirmed { waited: Duration },
 }
 
@@ -328,7 +334,7 @@ impl Round {
             let gave_up = Instant::now() >= deadline || self.senders_connecting() == 0;
             return gave_up.then(|| Err(self.unreachable("to take the transaction")));
         }
-        if Instant::now() >= deadline || !observers_left {
+        if Instant::now() >= deadline {
             return Some(unconfirmed());
         }
         // Every sender that got it refused it the same way, and no other
@@ -337,10 +343,11 @@ impl Round {
             let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
             let first = signals.next().flatten().copied()?;
             if signals.all(|signal| signal == Some(&first)) {
-                return Some(Ok(Verdict::Rejected(rejected_message(
-                    first,
-                    self.sent_to.len(),
-                ))));
+                let message = rejected_message(first, self.sent_to.len());
+                return Some(Ok(match first {
+                    Signal::MissingInputs => Verdict::Rejected(message),
+                    Signal::Dropped => Verdict::Dropped(message),
+                }));
             }
         }
         None
@@ -527,20 +534,41 @@ fn connect_sender(peers: &PeerSource, addr: &PeerAddr) -> Result<Peer, P2pError>
 
 /// Announce `candidate` and hand it over when the peer asks for it, or
 /// unasked once [`ANNOUNCE_WAIT`] has passed (the peer may know it from
-/// before, or be slow).
+/// before, or be slow). Nothing is handed over once `stopped` says so: a
+/// broadcast that has ended must not leave a peer it does not know about
+/// holding the transaction. Returns `None` when it was not handed over,
+/// else whether the peer asked for it.
 fn announce_and_hand_over(
     peer: &mut Peer,
     candidate: &Candidate,
     signals: &mut Signals,
-) -> Result<(), P2pError> {
+    stopped: impl Fn() -> bool,
+) -> Result<Option<bool>, P2pError> {
     let (tx, txid, wtxid) = (&candidate.tx, candidate.txid, candidate.wtxid);
-    signals.announce(peer, tx, txid, wtxid, Instant::now() + ANNOUNCE_WAIT)?;
-    if !signals.sent {
-        tracing::debug!(peer = %peer.addr(), %txid, "peer did not request the announced transaction; sending it");
-        peer.send(NetworkMessage::Tx(tx.clone()))?;
-        signals.sent = true;
+    if stopped() {
+        return Ok(None);
     }
-    Ok(())
+    peer.send(NetworkMessage::Inv(vec![peer.tx_inventory(txid, wtxid)]))?;
+    let asked_until = Instant::now() + ANNOUNCE_WAIT;
+    while !signals.sent && Instant::now() < asked_until {
+        if stopped() {
+            return Ok(None);
+        }
+        let slice = asked_until.min(Instant::now() + STOP_CHECK);
+        if let Some(message) = peer.recv_until(slice)? {
+            signals.observe(peer, message, tx, txid, wtxid)?;
+        }
+    }
+    if signals.sent {
+        return Ok(Some(true));
+    }
+    if stopped() {
+        return Ok(None);
+    }
+    tracing::debug!(peer = %peer.addr(), %txid, "peer did not request the announced transaction; sending it");
+    peer.send(NetworkMessage::Tx(tx.clone()))?;
+    signals.sent = true;
+    Ok(Some(false))
 }
 
 /// Ping and wait for the pong: the peer processes messages in order, so by
@@ -577,7 +605,9 @@ fn send(job: Job, addr: PeerAddr) {
     let mut told_missing = false;
     let result = (|| {
         let mut peer = connect_sender(&job.peers, &addr)?;
-        announce_and_hand_over(&mut peer, &candidate, &mut signals)?;
+        if announce_and_hand_over(&mut peer, &candidate, &mut signals, || job.over())?.is_none() {
+            return Ok(());
+        }
         job.tell(Event::HandedOver { addr: addr.clone() });
         flush(
             &mut peer,
@@ -695,18 +725,24 @@ pub struct Asked {
     pub fee_filters: Vec<(PeerAddr, u64)>,
 }
 
-/// Ask up to `count` peers that are not in `exclude` (nor in its network
-/// groups, nor in each other's) whether each candidate is in their mempool,
-/// on observer connections opened at once. Unreachable peers are replaced a
-/// few times. `Err` when none answered.
+/// Ask up to `count` peers that are not in `exclude` (nor, with
+/// `avoid_groups`, in its network groups), each in a group of its own,
+/// whether each candidate is in their mempool, on observer connections
+/// opened at once. Unreachable peers are replaced a few times. `Err` when
+/// none answered.
 pub async fn ask_mempools(
     peers: &Arc<PeerSource>,
     candidates: Arc<Vec<Candidate>>,
     exclude: &HashSet<PeerAddr>,
+    avoid_groups: bool,
     count: usize,
 ) -> Result<Asked, String> {
     let mut used = exclude.clone();
-    let mut groups: HashSet<NetGroup> = exclude.iter().map(PeerAddr::netgroup).collect();
+    let mut groups: HashSet<NetGroup> = if avoid_groups {
+        exclude.iter().map(PeerAddr::netgroup).collect()
+    } else {
+        HashSet::new()
+    };
     let mut asking = tokio::task::JoinSet::new();
     let mut tries = 0;
     let mut answers: Vec<(PeerAddr, Vec<bool>, Option<u64>)> = Vec::new();
@@ -793,18 +829,8 @@ pub fn hand_over(
     let mut requested = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let mut signals = Signals::default();
-        signals.announce(
-            &mut peer,
-            &candidate.tx,
-            candidate.txid,
-            candidate.wtxid,
-            Instant::now() + ANNOUNCE_WAIT,
-        )?;
-        requested.push(signals.sent);
-        if !signals.sent {
-            peer.send(NetworkMessage::Tx(candidate.tx.clone()))?;
-            signals.sent = true;
-        }
+        let asked = announce_and_hand_over(&mut peer, candidate, &mut signals, || false)?;
+        requested.push(asked == Some(true));
         flush(
             &mut peer,
             candidate,
@@ -1044,7 +1070,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_sender_dropping_it_is_a_rejection() {
+    async fn every_sender_dropping_it_is_reported_but_not_final() {
         let net = FakeNet::new();
         let invalid = Script {
             policy: TxPolicy::Disconnect,
@@ -1052,8 +1078,8 @@ mod tests {
         };
         let fakes = net_of(&net, 60, vec![invalid; 5]);
         let report = run(&fakes, &candidate(6), Duration::from_secs(20)).await;
-        let Verdict::Rejected(message) = &report.verdict else {
-            panic!("expected a rejection, got {report:?}");
+        let Verdict::Dropped(message) = &report.verdict else {
+            panic!("expected every sender to drop it, got {report:?}");
         };
         assert!(
             message.contains("disconnected right after receiving"),
@@ -1103,6 +1129,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_sender_that_connects_after_the_broadcast_ended_hands_nothing_over() {
+        let net = FakeNet::new();
+        let fake = net.peer(ip(100, 0), Script::default());
+        let peers = pool(&[fake.addr]).await;
+        let (events, mut received) = mpsc::unbounded_channel();
+        let job = Job {
+            peers,
+            candidate: candidate(11),
+            stop: CancellationToken::new(),
+            deadline: Instant::now() + Duration::from_secs(10),
+            events,
+        };
+        job.stop.cancel();
+        let addr = PeerAddr::from(fake.addr);
+        let task_job = job.clone();
+        tokio::task::spawn_blocking(move || send(task_job, addr))
+            .await
+            .unwrap();
+        assert!(!got_tx(&fake));
+        assert!(!fake.commands().iter().any(|c| c == "inv"));
+        assert!(matches!(received.recv().await, Some(Event::Gone { .. })));
+    }
+
+    #[tokio::test]
     async fn rechecks_ask_only_peers_it_was_not_handed_to() {
         let net = FakeNet::new();
         let fakes = net_of(&net, 90, vec![Script::default(); 4]);
@@ -1113,6 +1163,7 @@ mod tests {
             &peers,
             Arc::new(vec![Candidate::clone(&candidate)]),
             &sent_to,
+            true,
             2,
         )
         .await
