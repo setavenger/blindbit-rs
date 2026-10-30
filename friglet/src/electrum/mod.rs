@@ -19,7 +19,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +30,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
+use blindbit_lib::net::{Dialer, PeerAddr, PeerEvent, PeerSource, Purpose};
 use blindbit_lib::scanner::{WalletElectrumIndex, electrum_scripthash, electrum_status};
 
 use crate::blockheader;
@@ -43,6 +43,7 @@ mod pending;
 mod relay;
 
 use self::chain::ChainSource;
+use self::p2p::P2pError;
 use self::pending::PendingStore;
 pub(crate) use self::pending::now_secs;
 use self::relay::{Candidate, Outcome};
@@ -56,6 +57,8 @@ const BROADCAST_BUDGET: Duration = Duration::from_secs(25);
 const BROADCAST_OUTCOME_TTL: Duration = Duration::from_secs(120);
 /// Retry delay after the tip header could not be fetched.
 const TIP_RETRY: Duration = Duration::from_secs(15);
+/// Discovered peers tried for one relay job when a peer cannot be asked.
+const RELAY_PEERS: usize = 3;
 /// How often pending broadcasts are checked against the peer's mempool.
 const PENDING_RECHECK: Duration = Duration::from_secs(10 * 60);
 /// Bitcoin Core's long-standing default minimum relay fee (1 sat/vB),
@@ -206,8 +209,7 @@ pub async fn run(
     mut found_rx: broadcast::Receiver<usize>,
     mut reorg_rx: broadcast::Receiver<u32>,
     addr: &str,
-    p2p_peer: SocketAddr,
-    network: Network,
+    peers: Arc<PeerSource>,
     oracle_url: String,
     block_checkpoints: HashMap<u32, BlockHash>,
     header_sidecar: PathBuf,
@@ -218,7 +220,7 @@ pub async fn run(
 
     let state = Arc::new(ElectrumServerState {
         index,
-        chain: ChainSource::new(p2p_peer, network, oracle_url),
+        chain: ChainSource::new(peers, oracle_url),
         block_checkpoints: std::sync::Mutex::new(block_checkpoints),
         header_sidecar,
         header_fetch_lock: Mutex::new(()),
@@ -233,6 +235,15 @@ pub async fn run(
     // Broadcasts from before a restart that have not confirmed: show them as
     // unconfirmed again, as they were.
     restore_pending(&state).await;
+
+    // Discovered peers: collect fee filters from a few of them now, so the
+    // first `blockchain.relayfee` already has its median.
+    if !state.chain.peers().is_own_node() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = state.chain.fee_filter().await;
+        });
+    }
 
     // Background push task: receives a signal whenever the scanner updates the
     // index and broadcasts pre-serialised JSON notifications to all clients.
@@ -737,8 +748,6 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     let candidate = Candidate::decode(raw).map_err(|message| (1, message))?;
     relay::check_transaction(&candidate.tx).map_err(|message| (1, message))?;
     let txid = candidate.txid.to_string();
-    let addr = state.chain.p2p_peer();
-    let network = state.chain.network();
 
     // One broadcast at a time. Sparrow resends a request that took longer
     // than its read timeout; the resend waits here and gets the first
@@ -756,11 +765,11 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
         Some(RecentBroadcast::Inconclusive(error)) => {
             let candidate = Arc::new(candidate);
             let task_candidate = candidate.clone();
-            let now_in_mempool = tokio::task::spawn_blocking(move || {
-                relay::in_mempool(addr, network, &task_candidate)
+            let now_in_mempool = with_relay_peer(state, move |dialer, addr, network| {
+                relay::in_mempool(dialer, addr, network, &task_candidate)
             })
             .await;
-            if !matches!(now_in_mempool, Ok(Ok(true))) {
+            if !matches!(now_in_mempool, Ok((true, _))) {
                 return Err(error);
             }
             tracing::info!(%txid, "broadcast reached the peer's mempool after the wait ended");
@@ -783,24 +792,29 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     let candidate = Arc::new(candidate);
     let task_candidate = candidate.clone();
     let started = Instant::now();
-    let result = tokio::task::spawn_blocking(move || {
-        relay::broadcast(addr, network, &task_candidate, BROADCAST_BUDGET)
+    let result = with_relay_peer(state, move |dialer, addr, network| {
+        relay::broadcast(dialer, addr, network, &task_candidate, BROADCAST_BUDGET)
     })
     .await;
-    let (outcome, fee_filter) = match result {
-        Ok(Ok(answer)) => answer,
+    let ((outcome, fee_filter), addr) = match result {
+        Ok(answer) => answer,
         // The peer could not be asked: not an answer about the transaction,
         // so it is not remembered for resends either.
-        Ok(Err(error)) => {
-            tracing::warn!(%txid, peer = %addr, %error, "broadcast failed");
-            return Err((
-                2,
-                format!("broadcast failed: P2P peer {addr} unavailable: {error}"),
-            ));
+        Err(RelayFailure::Unavailable { peer, error }) => {
+            tracing::warn!(%txid, peer = ?peer.as_ref().map(ToString::to_string), %error, "broadcast failed");
+            let message = match peer {
+                Some(addr) if state.chain.peers().is_own_node() => {
+                    format!("broadcast failed: P2P peer {addr} unavailable: {error}")
+                }
+                _ => format!("broadcast failed: no Bitcoin peer could be asked: {error}"),
+            };
+            return Err((2, message));
         }
-        Err(error) => return Err((-32603, format!("broadcast task failed: {error}"))),
+        Err(RelayFailure::Task(error)) => {
+            return Err((-32603, format!("broadcast task failed: {error}")));
+        }
     };
-    state.chain.note_fee_filter(fee_filter);
+    state.chain.note_fee_filter(&addr, fee_filter);
     let remembered = match outcome {
         Outcome::InMempool => {
             tracing::info!(
@@ -827,6 +841,62 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     };
     remember_broadcast(state, &txid, remembered).await;
     result
+}
+
+/// Why a relay job got no answer.
+enum RelayFailure {
+    /// No peer could be asked; the last one tried, if any, and why.
+    Unavailable {
+        peer: Option<PeerAddr>,
+        error: String,
+    },
+    /// The blocking task itself failed.
+    Task(String),
+}
+
+/// Run `job` (blocking) against a peer for relaying: the own node, or a
+/// discovered peer, moving on to another (up to [`RELAY_PEERS`]) when one
+/// cannot be asked. Returns the answer and the peer that gave it.
+async fn with_relay_peer<T: Send + 'static>(
+    state: &ElectrumServerState,
+    job: impl Fn(&Dialer, &PeerAddr, Network) -> Result<T, P2pError> + Send + Sync + 'static,
+) -> Result<(T, PeerAddr), RelayFailure> {
+    let peers = state.chain.peers().clone();
+    let tries = if peers.is_own_node() { 1 } else { RELAY_PEERS };
+    let job = Arc::new(job);
+    let mut asked = std::collections::HashSet::new();
+    let mut last = None;
+    for _ in 0..tries {
+        let addr = match peers.next(Purpose::Relay, &asked).await {
+            Ok(addr) => addr,
+            Err(no_peers) => {
+                return Err(RelayFailure::Unavailable {
+                    peer: last.map(|(peer, _)| peer),
+                    error: no_peers.to_string(),
+                });
+            }
+        };
+        asked.insert(addr.clone());
+        let (task_peers, task_addr, task_job) = (peers.clone(), addr.clone(), job.clone());
+        let answer = tokio::task::spawn_blocking(move || {
+            task_job(task_peers.dialer(), &task_addr, task_peers.network())
+        })
+        .await
+        .map_err(|error| RelayFailure::Task(error.to_string()))?;
+        match answer {
+            Ok(value) => return Ok((value, addr)),
+            Err(error) => {
+                peers.report(&addr, PeerEvent::Unreachable);
+                tracing::debug!(peer = %addr, %error, "relay peer could not be asked");
+                last = Some((addr, error.to_string()));
+            }
+        }
+    }
+    let (peer, error) = last.expect("at least one try");
+    Err(RelayFailure::Unavailable {
+        peer: Some(peer),
+        error,
+    })
 }
 
 async fn remember_broadcast(state: &ElectrumServerState, txid: &str, outcome: RecentBroadcast) {
@@ -950,16 +1020,15 @@ async fn recheck_pending(state: &ElectrumServerState) {
     };
 
     if !candidates.is_empty() {
-        let addr = state.chain.p2p_peer();
-        let network = state.chain.network();
         let candidates = Arc::new(candidates);
         let task_candidates = candidates.clone();
-        let result =
-            tokio::task::spawn_blocking(move || relay::recheck(addr, network, &task_candidates))
-                .await;
+        let result = with_relay_peer(state, move |dialer, addr, network| {
+            relay::recheck(dialer, addr, network, &task_candidates)
+        })
+        .await;
         match result {
-            Ok(Ok((present, fee_filter))) => {
-                state.chain.note_fee_filter(fee_filter);
+            Ok(((present, fee_filter), addr)) => {
+                state.chain.note_fee_filter(&addr, fee_filter);
                 let now = pending::now_secs();
                 let mut store = state.pending.lock().await;
                 let mut expired = Vec::new();
@@ -990,10 +1059,10 @@ async fn recheck_pending(state: &ElectrumServerState) {
                 }
                 store.save();
             }
-            Ok(Err(error)) => {
-                tracing::warn!(peer = %addr, %error, "could not recheck pending broadcasts")
+            Err(RelayFailure::Unavailable { peer, error }) => {
+                tracing::warn!(peer = ?peer.as_ref().map(ToString::to_string), %error, "could not recheck pending broadcasts")
             }
-            Err(error) => tracing::warn!(%error, "pending recheck task failed"),
+            Err(RelayFailure::Task(error)) => tracing::warn!(%error, "pending recheck task failed"),
         }
     }
 
@@ -1251,14 +1320,17 @@ mod tests {
     /// No oracle and, unless one is given, no P2P peer: whatever needs them fails.
     fn state(
         index: WalletElectrumIndex,
-        p2p: Option<SocketAddr>,
+        p2p: Option<std::net::SocketAddr>,
         dir: &Path,
     ) -> ElectrumServerState {
         ElectrumServerState {
             index: Arc::new(Mutex::new(index)),
             chain: ChainSource::new(
-                p2p.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap()),
-                Network::Regtest,
+                PeerSource::own_node(
+                    p2p.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap()).into(),
+                    Dialer::Direct,
+                    Network::Regtest,
+                ),
                 "http://127.0.0.1:1".into(),
             ),
             block_checkpoints: std::sync::Mutex::new(HashMap::new()),

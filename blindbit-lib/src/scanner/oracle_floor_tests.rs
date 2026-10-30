@@ -240,7 +240,7 @@ fn wallet_start_below_the_floor_starts_at_the_floor_and_says_so() {
             scanner.save_to_file(&state.0).expect("save");
             let restored = Scanner::from_changeset(
                 scanner.client.clone(),
-                scanner.p2p_peer(),
+                scanner.peers(),
                 Scanner::load_from_file(&state.0).expect("load"),
                 state.0.clone(),
                 scanner.network(),

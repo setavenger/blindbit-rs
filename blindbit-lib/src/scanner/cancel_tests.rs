@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bitcoin::BlockHash;
-use bitcoin::Network;
 use bitcoin::hashes::Hash;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -18,7 +17,7 @@ use super::p2p::{BlockFetcher, FetchFailure, RetryPolicy};
 use super::p2p_tests::{Conn, Node};
 use super::scanning::BlockStreamSource;
 use super::stream_safety_tests::{TestStream, owned_outputs, payment_block, served_block, unserve};
-use super::test_support::{run, scanner};
+use super::test_support::{own_node, run, scanner};
 use crate::oracle_grpc::BlockScanDataShortResponse;
 
 /// An oracle serving a fixed run of consecutive blocks.
@@ -93,8 +92,8 @@ fn a_stop_during_a_stalled_block_download_ends_the_scan_at_once_and_it_resumes_t
         let b_block = served_block(&b_hash).expect("payment_block serves it");
         unserve(&b_hash);
         let node = Node::serving(&b_block, vec![Conn::StallMidBlock, Conn::Serve]);
-        scanner.p2p_peer = node.addr;
-        scanner.p2p_retry = RetryPolicy::default();
+        scanner.peers = own_node(node.addr);
+        scanner.p2p_retry = Some(RetryPolicy::default());
         scanner.update_last_scanned_block_height(4200);
         let oracle = Chain(vec![a.message, b.message, c.message]);
         let scanner = Arc::new(Mutex::new(scanner));
@@ -170,12 +169,13 @@ fn a_stop_ends_the_wait_between_download_attempts() {
     run(async {
         let node = Node::full(1_000, vec![Conn::CloseAfterRequest, Conn::Serve]);
         let cancel = CancellationToken::new();
-        let fetcher = BlockFetcher::new(node.addr, Network::Regtest)
+        let fetcher = BlockFetcher::new(own_node(node.addr))
             .with_policy(RetryPolicy {
                 attempts: 5,
                 first_delay: Duration::from_secs(30),
                 max_delay: Duration::from_secs(30),
                 block_deadline: Duration::from_secs(5),
+                connect_timeout: Duration::from_secs(5),
             })
             .with_cancel(cancel.clone());
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);

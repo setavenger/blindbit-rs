@@ -206,6 +206,10 @@ pub struct StatusInfo {
     /// Unix seconds since when the oracle has been unreachable.
     #[serde(default)]
     pub oracle_down_since_unix: Option<u64>,
+    /// Where blocks come from, in a few words: "your node 1.2.3.4:38333" or
+    /// "random peers: 37 known, 1 ignored". `None` from older daemons.
+    #[serde(default)]
+    pub p2p: Option<String>,
 }
 
 /// The scan task's state (see [`StatusInfo::scan_state`]).
@@ -613,6 +617,7 @@ mod tests {
             log_file: Some("/home/u/.local/state/friglet/friglet.log".to_string()),
             oracle_error: Some("timed out".to_string()),
             oracle_down_since_unix: Some(1_790_000_100),
+            p2p: Some("random peers: 37 known, 1 ignored".to_string()),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert_eq!(serde_json::from_str::<StatusInfo>(&json).unwrap(), status);
@@ -634,6 +639,7 @@ mod tests {
         }"#;
         let status: StatusInfo = serde_json::from_str(json).unwrap();
         assert_eq!(status.tx_count, 0);
+        assert_eq!(status.p2p, None);
         assert_eq!(status.outputs_found, 0);
         assert!(status.label_addresses.is_empty());
         assert!(!status.spawned_by_tray);

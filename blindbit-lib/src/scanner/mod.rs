@@ -2,6 +2,8 @@
 mod cancel_tests;
 mod changeset;
 mod config;
+#[cfg(all(test, not(target_os = "macos")))]
+mod discovery_tests;
 mod electrum_index;
 #[cfg(test)]
 mod electrum_index_tests;
@@ -44,7 +46,9 @@ pub use health::{
     OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
     StateRescan, oracle_block_hash,
 };
-pub use p2p::{BlockFetchError, BlockFetcher, FetchFailure, PeerInfo, RetryNote, RetryPolicy};
+pub use p2p::{
+    BlockFetchError, BlockFetcher, FetchFailure, FetchedFrom, PeerInfo, RetryNote, RetryPolicy,
+};
 pub use reorg::{REORG_LOOKBACK, ReorgTooDeep};
 pub use scanner::Scanner;
 pub use types::OwnedOutputRecord;

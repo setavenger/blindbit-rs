@@ -4,7 +4,6 @@
 
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::receive::get_silentpayment_pubkey;
-use bitcoin::Network;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -20,7 +19,7 @@ use super::p2p::{BlockFetcher, FetchFailure};
 use super::p2p_tests::{Conn, Node, OneBlock, fast, stripped};
 use super::scanner::Scanner;
 use super::stream_safety_tests::{serve, unserve};
-use super::test_support::{keys, run, scanner, secret};
+use super::test_support::{keys, own_node, run, scanner, secret};
 use super::witness::lacks_witness;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
@@ -28,7 +27,7 @@ use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeInd
 /// key-path spend that pays the test wallet; that payment; and the oracle
 /// message describing the block. `seed` keeps the blocks of different tests
 /// apart.
-fn taproot_payment_block(seed: u8) -> (Block, Transaction, BlockScanDataShortResponse) {
+pub(super) fn taproot_payment_block(seed: u8) -> (Block, Transaction, BlockScanDataShortResponse) {
     let (scan_sk, spend_pk) = keys();
     let tweak = secret(seed).public_key(&Secp256k1::new());
     let shared = bdk_sp::compute_shared_secret(&scan_sk, &tweak);
@@ -136,7 +135,7 @@ async fn restart(path: &std::path::Path) -> Scanner {
 fn a_block_stripped_of_its_witnesses_is_refused_and_fetched_again() {
     let (block, _, _) = taproot_payment_block(0x92);
     let node = Node::serving(&block, vec![Conn::ServeStripped, Conn::Serve]);
-    let got = run(BlockFetcher::new(node.addr, Network::Regtest)
+    let got = run(BlockFetcher::new(own_node(node.addr))
         .with_policy(fast(3))
         .fetch(block.block_hash(), 1))
     .expect("the second connection serves it whole");
@@ -144,7 +143,7 @@ fn a_block_stripped_of_its_witnesses_is_refused_and_fetched_again() {
     assert_eq!(node.connections(), 2);
 
     let node = Node::serving(&block, vec![Conn::ServeStripped; 2]);
-    let err = run(BlockFetcher::new(node.addr, Network::Regtest)
+    let err = run(BlockFetcher::new(own_node(node.addr))
         .with_policy(fast(2))
         .fetch(block.block_hash(), 1))
     .expect_err("never whole");
@@ -163,8 +162,8 @@ fn a_served_taproot_tx_round_trips_with_its_witness() {
         let txid = payment.compute_txid();
         let node = Node::serving(&block, vec![Conn::Serve]);
         let (mut scanner, _state) = scanner("witness-roundtrip");
-        scanner.p2p_peer = node.addr;
-        scanner.p2p_retry = fast(1);
+        scanner.peers = own_node(node.addr);
+        scanner.p2p_retry = Some(fast(1));
 
         assert!(!scanner.watch_step(1, OneBlock(message)).await);
         assert_eq!(scanner.scan_health().await.stall, None);
@@ -213,13 +212,13 @@ fn wallet_txs_stored_without_witnesses_get_them_back() {
         );
 
         // No node to fetch from: tried again in 5 minutes, not every poll.
-        scanner.p2p_retry = fast(1);
+        scanner.p2p_retry = Some(fast(1));
         scanner.restore_missing_witnesses_when_due().await;
         let due = scanner.witness_restore_due.expect("still to do");
         assert!(due > std::time::Instant::now() + std::time::Duration::from_secs(4 * 60));
 
         let node = Node::serving(&block, vec![Conn::Serve]);
-        scanner.p2p_peer = node.addr;
+        scanner.peers = own_node(node.addr);
         assert!(scanner.restore_missing_witnesses().await);
         assert_eq!(node.connections(), 1);
         let restored = scanner.internal_indexer.graph().get_tx(txid).unwrap();
@@ -264,7 +263,7 @@ fn a_stop_during_a_witness_restore_retries_it_when_scanning_resumes() {
         assert!(!scanner.watch_step(1, OneBlock(message)).await);
         unserve(&block.block_hash());
         let node = Node::serving(&block, vec![Conn::StallMidBlock, Conn::Serve]);
-        scanner.p2p_peer = node.addr;
+        scanner.peers = own_node(node.addr);
         let due = scanner.witness_restore_due.expect("due");
 
         let cancel = tokio_util::sync::CancellationToken::new();
