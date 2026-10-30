@@ -134,17 +134,22 @@ What to expect from it:
 - **New blocks** are announced with the real header of the tip block. friglet
   asks the oracle which block is at the scanned height and fetches that
   block's 80-byte header from the P2P peer.
-- **Broadcasting** succeeds only once the P2P peer (your node, or without
-  one a random peer of the network) has the transaction in its mempool,
-  which usually takes 5–10 seconds. With random peers this is one peer's
-  word for now; a stronger check (another peer must announce it) is planned. Otherwise
-  Sparrow shows an error. The P2P protocol does not say why a peer refuses a
-  transaction. friglet reports what it can tell: missing or spent inputs, a
-  fee below the peer's mempool minimum, or a dropped connection, which means
-  the transaction is invalid. Broadcasts that have not confirmed are kept in
-  `<state file>.pending.json`. While they are pending, friglet re-announces
-  them whenever the peer's mempool loses them, including after a restart. It
-  stops when they confirm or when a conflicting transaction confirms.
+- **Broadcasting** succeeds only once the transaction is in a mempool,
+  which usually takes 5–10 seconds. With your node, its mempool. Without
+  one, friglet first connects to three random peers that relay
+  transactions, then hands the transaction to two others, and reports
+  success only once one of the first three has it: a peer it was not handed
+  to, in another network (/16) than the peers it was handed to. Otherwise
+  Sparrow shows an error after 25 seconds. The P2P protocol does not say
+  why a peer refuses a transaction. friglet reports what it can tell:
+  missing or spent inputs, a fee below the mempool minimum, or a dropped
+  connection, which means the transaction is invalid (with random peers,
+  only when every peer it was handed to says so). Broadcasts that have not
+  confirmed are kept in `<state file>.pending.json`. While they are pending,
+  friglet re-announces them whenever they drop out of the mempool it asks
+  (with random peers: two peers they were not handed to), including after a
+  restart. It stops when they confirm or when a conflicting transaction
+  confirms.
 - **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
   with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
   minimum fee rate that the P2P peer's mempool currently accepts (with
@@ -167,8 +172,11 @@ or from the wallet), block headers, and broadcasts over Bitcoin P2P.
   block for the rest of the session. The cost is privacy: those peers see
   this computer's IP address and which blocks it downloads, and those blocks
   probably pay or spend from your wallet. friglet keeps asking the peer that
-  served the last block first, so that peer sees most of them. Use your own
-  node, or [Tor](#tor), if that matters to you.
+  served the last block first, so that peer sees most of them. A broadcast
+  hands the transaction to two random peers straight from this computer's
+  IP address, and asks three more for it before it has spread, so all five
+  can tell it comes from here. Use your own node, or [Tor](#tor), if that
+  matters to you.
 - Regtest has no public peers: it needs `p2p_node_addr`.
 - The addresses friglet learns are kept beside the wallet state
   (`peers-<network>-new.book`, `peers-<network>-tried.book`; saved every

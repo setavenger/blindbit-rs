@@ -412,3 +412,62 @@ fn a_saved_book_that_knows_enough_peers_is_not_seeded_at_start() {
     assert!(pool(&restarted).seeded_at().is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn netgroups_are_slash_16_and_slash_32() {
+    use super::NetGroup;
+    let group = |s: &str| addr(s).netgroup();
+    assert_eq!(group("203.0.113.1:8333"), group("203.0.200.9:18444"));
+    assert_ne!(group("203.0.113.1:8333"), group("203.1.113.1:8333"));
+    assert_eq!(group("203.0.113.1:8333"), NetGroup::Ipv4([203, 0]));
+    // An IPv4-mapped IPv6 address is its IPv4 address.
+    assert_eq!(group("[::ffff:203.0.1.1]:8333"), group("203.0.113.1:8333"));
+    assert_eq!(
+        group("[2001:db8:1::1]:8333"),
+        group("[2001:db8:ffff::2]:8333")
+    );
+    assert_ne!(group("[2001:db8::1]:8333"), group("[2001:db9::1]:8333"));
+    assert_eq!(group("[2001:db8::1]:8333").to_string(), "2001:db8::/32");
+    assert_eq!(group("203.0.113.1:8333").to_string(), "203.0.0.0/16");
+}
+
+#[test]
+fn peers_in_a_group_already_in_use_are_passed_over() {
+    let same_group = "203.0.7.7:18444";
+    let source = seeded(&[PEERS[0], PEERS[1], same_group]);
+    let groups = HashSet::from([addr(PEERS[0]).netgroup()]);
+    for _ in 0..30 {
+        let peer = run(source.next_outside(Purpose::Relay, &none(), &groups)).unwrap();
+        assert_eq!(peer, addr(PEERS[1]), "203.0/16 is in use");
+    }
+    let asked = HashSet::from([addr(PEERS[1])]);
+    let err = run(source.next_outside(Purpose::Relay, &asked, &groups)).expect_err("none left");
+    assert!(err.0.contains("network groups already in use"), "{err}");
+    // A resting peer is still better than none, but not one of those groups.
+    source.report(&addr(PEERS[1]), PeerEvent::Unreachable);
+    assert_eq!(
+        run(source.next_outside(Purpose::Relay, &none(), &groups)).unwrap(),
+        addr(PEERS[1])
+    );
+}
+
+#[test]
+fn a_peer_that_relays_no_transactions_is_never_handed_out_for_relay() {
+    let source = seeded(&PEERS[..2]);
+    let blocks_only = addr(PEERS[0]);
+    source.report(&blocks_only, PeerEvent::Connected(info()));
+    source.report(&blocks_only, PeerEvent::NoTxRelay);
+    for _ in 0..30 {
+        assert_eq!(
+            run(source.next(Purpose::Relay, &none())).unwrap(),
+            addr(PEERS[1])
+        );
+    }
+    let asked = HashSet::from([addr(PEERS[1])]);
+    run(source.next(Purpose::Relay, &asked)).expect_err("only the blocks-only peer left");
+    // Blocks may still come from it.
+    assert_eq!(
+        run(source.next(Purpose::Block, &asked)).unwrap(),
+        blocks_only
+    );
+}
