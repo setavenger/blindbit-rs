@@ -310,6 +310,7 @@ fn ask_header_peer<T>(
 
 fn note_fee_filter(filters: &StdMutex<FeeFilters>, peer: &PeerAddr, rate: Option<u64>) {
     if let Some(rate) = rate {
+        tracing::debug!(%peer, sat_per_kvb = rate, "P2P peer's fee filter");
         filters
             .lock()
             .expect("fee filter lock")
