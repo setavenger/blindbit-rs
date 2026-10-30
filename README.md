@@ -368,8 +368,8 @@ the control protocol: `cargo run -p friglet-tray --example fake-daemon`.
 
 ### Desktop bundles (friglet-tray + bundled daemon)
 
-The tray app ships as a Tauri bundle — `.deb` and `.AppImage` on Linux,
-`.dmg` on macOS — with the `friglet` daemon included as a sidecar binary
+The tray app ships as a Tauri bundle — `.deb`, `.rpm` and `.AppImage` on
+Linux, `.dmg` on macOS, `.msi`/`-setup.exe` on Windows — with the `friglet` daemon included as a sidecar binary
 (Tauri `bundle.externalBin`), so the installed tray always finds a daemon
 right next to its own executable.
 
@@ -381,7 +381,7 @@ scripts/prepare-sidecar.sh
 # 2. build the bundles (tauri-cli v2 via npx; `cargo install tauri-cli --locked`
 #    works too — then use `cargo tauri build ...`)
 cd friglet-tray
-npx @tauri-apps/cli@2 build --bundles deb,appimage --config tauri.sidecar.conf.json  # Linux
+npx @tauri-apps/cli@2 build --bundles deb,rpm,appimage --config tauri.sidecar.conf.json  # Linux
 npx @tauri-apps/cli@2 build --bundles dmg --config tauri.sidecar.conf.json           # macOS
 ```
 
@@ -395,6 +395,9 @@ Artifacts land under `target/release/bundle/`:
 - `deb/friglet-tray_<version>_amd64.deb` — installs `friglet-tray` **and**
   `friglet` into `/usr/bin/`; declares `libayatana-appindicator3-1`,
   `libwebkit2gtk-4.1-0` and `libgtk-3-0` as dependencies.
+- `rpm/friglet-tray-<version>-1.x86_64.rpm` — same layout as the deb;
+  requires the same libraries by soname, so it resolves on Fedora and
+  openSUSE alike.
 - `appimage/friglet-tray_<version>_amd64.AppImage` — self-contained; both
   binaries in the embedded `usr/bin/`.
 - `dmg/` / `macos/` — on a macOS host (cannot be cross-built from Linux).
@@ -403,8 +406,9 @@ Artifacts land under `target/release/bundle/`:
   both Apple Silicon and Intel, stage a fat sidecar with
   `scripts/prepare-sidecar.sh universal-apple-darwin` and add
   `--target universal-apple-darwin` to the build (output under
-  `target/universal-apple-darwin/release/bundle/`). The app is ad-hoc
-  signed (`bundle.macOS.signingIdentity: "-"`), not notarized.
+  `target/universal-apple-darwin/release/bundle/`). Local builds are ad-hoc
+  signed (`bundle.macOS.signingIdentity: "-"`), not notarized; CI signs
+  and notarizes (see [macOS signing](#macos-signing)).
 
 ### Prebuilt bundles (GitHub Actions)
 
@@ -413,15 +417,24 @@ runners. It only does packaging; tests and lints stay in `ci.yml`.
 
 | Platform | Runner | Bundles |
 |----------|--------|---------|
-| Linux x86_64 | `ubuntu-22.04` (glibc 2.35 minimum) | `.deb`, `.AppImage` |
-| macOS, Apple Silicon + Intel | `macos-15` | universal `.dmg` |
-| Windows x86_64 (best effort, untested) | `windows-2025` | `.msi`, NSIS `-setup.exe` |
+| Linux x86_64 | `ubuntu-22.04` (glibc 2.35 minimum) | `.deb`, `.rpm`, `.AppImage` |
+| Linux arm64 | `ubuntu-22.04-arm` (glibc 2.35 minimum) | `.deb`, `.rpm`, `.AppImage` |
+| macOS, Apple Silicon + Intel | `macos-15` | universal `.dmg`, Developer ID signed and notarized |
+| Windows x86_64 (best effort, untested) | `windows-2025` | `.msi`, NSIS `-setup.exe`, not code-signed |
+
+Each Linux bundle is then installed the way a user would, in a clean
+container of Ubuntu 22.04 and 24.04, Debian 12 and 13, Fedora, openSUSE
+Tumbleweed and Arch (arm64: Ubuntu 24.04 and Fedora), and started there on
+a virtual display until its first-run setup window opens
+(`scripts/linux-install-check.sh`). A release is only drafted when all of
+those pass.
 
 It runs on `v*` tag pushes, on manual `workflow_dispatch`, and on pull
 requests that touch packaging files (the workflow, `friglet-tray/tauri*.conf.json`,
 `friglet-tray/icons/`, `friglet-tray/Cargo.toml`/`build.rs`,
-`scripts/prepare-sidecar.sh`). Pull request runs only upload workflow
-artifacts. The Windows job is `continue-on-error`.
+`scripts/prepare-sidecar.sh`, `scripts/linux-install-check.sh`). Pull
+request runs only upload workflow artifacts. The Windows job is
+`continue-on-error`.
 
 To cut a release: set the version in `friglet-tray/tauri.conf.json` (and
 `friglet-tray/Cargo.toml`), then push a matching tag, e.g.
@@ -431,24 +444,57 @@ publish it by hand. A manual `workflow_dispatch` run creates or updates the
 draft `friglet-tray-dev-<commit>` instead; delete it when you're done.
 Nothing is ever published automatically.
 
-### Opening unsigned builds
+### Installing a release
 
-The bundles are not code-signed or notarized yet, so each OS warns on first
-launch. Check the download against `SHA256SUMS` first
-(`sha256sum -c SHA256SUMS --ignore-missing`).
+Download the file for your system from the release page and check it
+against `SHA256SUMS` (`sha256sum -c SHA256SUMS --ignore-missing`).
 
-- **macOS:** open the dmg and drag `friglet-tray` to Applications. On first
-  launch macOS blocks it; go to System Settings → Privacy & Security and click
-  **Open Anyway** (on macOS 14 and older, right-click the app → Open also
-  works). Or clear the quarantine flag in a terminal:
+- **macOS (Apple Silicon or Intel):** open the `.dmg` and drag
+  `friglet-tray` to Applications. Release builds are signed and notarized,
+  so it opens like any other app. A build without a signature (a dev build,
+  or one made before the signing secrets were set; its release notes say
+  "ad-hoc signed") is blocked on first launch: go to System Settings →
+  Privacy & Security and click **Open Anyway**, or run
   `xattr -dr com.apple.quarantine /Applications/friglet-tray.app`.
-- **Windows:** SmartScreen shows "Windows protected your PC"; click
+- **Debian, Ubuntu and derivatives:**
+  `sudo apt install ./friglet-tray_<version>_<amd64|arm64>.deb`
+- **Fedora:** `sudo dnf install ./friglet-tray-<version>-1.<x86_64|aarch64>.rpm`
+- **openSUSE:** `sudo zypper install --allow-unsigned-rpm ./friglet-tray-<version>-1.<x86_64|aarch64>.rpm`
+  (the rpm is not GPG-signed).
+- **Any other distro (Arch, …):** `chmod +x friglet-tray_<version>_<amd64|aarch64>.AppImage`
+  and run it. AppImages need FUSE 2 (package `fuse2`, `libfuse2` or
+  `libfuse2t64`); without it, run it with `--appimage-extract-and-run`.
+- **Windows:** run the `-setup.exe` (or the `.msi`). The installer is not
+  code-signed, so SmartScreen shows "Windows protected your PC"; click
   **More info** → **Run anyway**.
-- **Linux:** `sudo apt install ./friglet-tray_<version>_amd64.deb`, or
-  `chmod +x friglet-tray_<version>_amd64.AppImage` and run it (AppImages need
-  FUSE 2, package `libfuse2`/`libfuse2t64`; without it, run with
-  `--appimage-extract-and-run`). On GNOME the tray icon needs the
-  AppIndicator extension (Ubuntu ships it enabled).
+
+On GNOME the tray icon needs the AppIndicator extension (Ubuntu ships it
+enabled).
+
+### macOS signing
+
+The macOS job signs with a Developer ID certificate and notarizes when all
+five of these repository secrets are set (Settings → Secrets and variables
+→ Actions); with none set it falls back to an ad-hoc signed dmg, and with
+only some set it fails.
+
+| Secret | Value |
+|--------|-------|
+| `APPLE_CERTIFICATE` | the "Developer ID Application" certificate with its private key, exported as `.p12` and base64-encoded (`base64 -i friglet.p12`) |
+| `APPLE_CERTIFICATE_PASSWORD` | the password chosen when exporting the `.p12` |
+| `APPLE_ID` | the Apple account email of the developer account |
+| `APPLE_PASSWORD` | an app-specific password for that account (account.apple.com → Sign-In and Security → App-Specific Passwords) |
+| `APPLE_TEAM_ID` | the 10-character Team ID (developer.apple.com → Account → Membership details) |
+
+To make the certificate on a Mac: Xcode → Settings → Accounts → the team →
+Manage Certificates → **+** → Developer ID Application, then in Keychain
+Access (login → My Certificates) right-click it → Export as `.p12`.
+Creating a Developer ID certificate needs the Account Holder role.
+
+Tauri signs the bundled daemon and the app with the hardened runtime and
+notarizes and staples the app; the workflow then notarizes and staples the
+dmg too, and checks that Gatekeeper accepts both as "Notarized Developer
+ID". The certificate is valid for five years.
 
 ### Standalone daemon
 

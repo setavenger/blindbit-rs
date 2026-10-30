@@ -183,8 +183,12 @@ dbus-run-session -- bash -c '
   tauri.sidecar.conf.json` (macOS host only — dmg cannot be cross-built
   from Linux). Artifacts: `target/release/bundle/{deb,appimage,dmg}/`.
 - CI packaging: `.github/workflows/release.yml` (packaging only, not a
-  second ci.yml). Linux deb+AppImage on `ubuntu-22.04` (glibc floor),
-  macOS universal dmg on `macos-15` (`prepare-sidecar.sh
+  second ci.yml). Linux deb+rpm+AppImage for x86_64 on `ubuntu-22.04` and
+  arm64 on `ubuntu-22.04-arm` (glibc floor; native, no QEMU), then
+  `linux-install` installs each bundle in clean distro containers
+  (Ubuntu 22.04/24.04, Debian 12/13, Fedora, openSUSE Tumbleweed, Arch via
+  AppImage; arm64: Ubuntu 24.04, Fedora) and waits for the first-run
+  setup window under Xvfb (`scripts/linux-install-check.sh`). macOS universal dmg on `macos-15` (`prepare-sidecar.sh
   universal-apple-darwin` lipo's both daemon slices; Tauri requires the
   sidecar to be universal too), Windows msi+nsis best effort
   (`continue-on-error`). Each job checks the daemon is inside the bundle.
@@ -192,10 +196,19 @@ dbus-run-session -- bash -c '
   match `tauri.conf.json` version); `pull_request` is path-filtered to
   packaging files and only uploads artifacts. `TAURI_CLI_VERSION` there is
   pinned to the locked `tauri` crate version — bump both together.
-- macOS bundles are ad-hoc signed (`bundle.macOS.signingIdentity: "-"`):
-  arm64 needs at least an ad-hoc signature, and it turns Gatekeeper's
-  "damaged" error into the bypassable "Open Anyway" prompt. User steps for
-  unsigned builds: README "Opening unsigned builds".
+- macOS signing (README "macOS signing"): with all five `APPLE_*` repo
+  secrets set, the build step exports them for Tauri, which imports the
+  Developer ID cert into a throwaway keychain, signs sidecar + app with the
+  hardened runtime, notarizes + staples the app and signs the dmg; the
+  next step notarizes + staples the dmg (Tauri doesn't), and the check
+  step requires `spctl` "Notarized Developer ID" for app and dmg. With
+  none set: ad-hoc (`bundle.macOS.signingIdentity: "-"`; arm64 needs at
+  least an ad-hoc signature, and it turns Gatekeeper's "damaged" error into
+  the bypassable "Open Anyway"); some set: the job fails. Tauri treats a
+  set-but-empty `APPLE_*` var as set, so never map secrets straight into
+  `APPLE_*` env. `APPLE_SIGNING_IDENTITY="Developer ID Application"` is a
+  substring match that overrides the config's `"-"`. User install steps:
+  README "Installing a release".
 - The daemon is a Tauri sidecar (`bundle.externalBin`), but it lives in the
   `tauri.sidecar.conf.json` overlay, NOT the base `tauri.conf.json`:
   tauri-build errors at compile time when an externalBin file is missing,
