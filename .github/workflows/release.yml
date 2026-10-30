@@ -4,29 +4,20 @@
 # the Apple secrets are set. Tests and lints live in ci.yml.
 name: Release bundles
 
+# Runs only for a release tag (vX.Y.Z, matching friglet-tray's version) or
+# when started by hand from the Actions tab; never on pushes or PRs.
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
-  pull_request:
-    # Packaging-relevant files only. Ordinary code PRs are covered by ci.yml
-    # and must not pay for three release builds.
-    paths:
-      - .github/workflows/release.yml
-      - friglet-tray/tauri*.conf.json
-      - friglet-tray/icons/**
-      - friglet-tray/Cargo.toml
-      - friglet-tray/build.rs
-      - scripts/prepare-sidecar.sh
-      - scripts/linux-install-check.sh
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 defaults:
   run:
@@ -199,25 +190,18 @@ jobs:
         # staples the app, and signs the dmg. Without them the bundle stays
         # ad-hoc signed. Tauri treats a set-but-empty variable as set, so
         # the APPLE_* variables are only exported when the secrets exist.
-        # Pull requests never sign: their code runs with these variables in
-        # its environment (build.rs, proc macros), and notarizing every
-        # packaging PR is pointless. Dispatch the workflow to test signing.
         env:
-          EVENT: ${{ github.event_name }}
-          CERTIFICATE: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE || '' }}
-          CERTIFICATE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-          NOTARY_APPLE_ID: ${{ github.event_name != 'pull_request' && secrets.APPLE_ID || '' }}
-          NOTARY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.APPLE_PASSWORD || '' }}
-          NOTARY_TEAM_ID: ${{ github.event_name != 'pull_request' && secrets.APPLE_TEAM_ID || '' }}
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set=0
           for v in CERTIFICATE CERTIFICATE_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
             [ -n "${!v}" ] && set=$((set + 1))
           done
-          if [ "$EVENT" = pull_request ]; then
-            echo "::notice::pull request: building an ad-hoc signed, not notarized dmg"
-            echo "signing=adhoc" >> "$GITHUB_OUTPUT"
-          elif [ "$set" = 5 ]; then
+          if [ "$set" = 5 ]; then
             export APPLE_CERTIFICATE=$CERTIFICATE
             export APPLE_CERTIFICATE_PASSWORD=$CERTIFICATE_PASSWORD
             # A substring of the certificate's name; overrides the "-" in
@@ -358,11 +342,11 @@ jobs:
   draft-release:
     name: Draft GitHub release
     needs: [linux, linux-install, macos, windows]
-    # Never on pull_request. Windows is best effort, so only Linux (built and
-    # installed on every listed distro) and macOS are required; Windows
-    # assets are attached when that job succeeded.
+    # Windows is best effort, so only Linux (built and installed on every
+    # listed distro) and macOS are required; Windows assets are attached
+    # when that job succeeded.
     if: >-
-      !cancelled() && github.event_name != 'pull_request' &&
+      !cancelled() &&
       needs.linux.result == 'success' && needs.linux-install.result == 'success' &&
       needs.macos.result == 'success'
     runs-on: ubuntu-24.04
@@ -387,13 +371,10 @@ jobs:
           version=$(jq -r .version friglet-tray/tauri.conf.json)
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             tag=$GITHUB_REF_NAME
-            case "$tag" in
-              "v$version" | "v$version"-*) ;;
-              *)
-                echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
-                exit 1
-                ;;
-            esac
+            if [ "$tag" != "v$version" ]; then
+              echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
+              exit 1
+            fi
             create_args=(--verify-tag)
           else
             # Manual runs get a clearly non-release name; no tag is created

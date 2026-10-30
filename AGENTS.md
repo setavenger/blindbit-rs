@@ -192,9 +192,9 @@ dbus-run-session -- bash -c '
   universal-apple-darwin` lipo's both daemon slices; Tauri requires the
   sidecar to be universal too), Windows msi+nsis best effort
   (`continue-on-error`). Each job checks the daemon is inside the bundle.
-  Triggers: `v*` tags and `workflow_dispatch` → DRAFT release only (tag must
-  match `tauri.conf.json` version); `pull_request` is path-filtered to
-  packaging files and only uploads artifacts. `TAURI_CLI_VERSION` there is
+  Triggers: only `vX.Y.Z` tags (must equal the `tauri.conf.json` version)
+  and manual `workflow_dispatch` → DRAFT release only; no push or
+  pull_request triggers (the user's rule). `TAURI_CLI_VERSION` there is
   pinned to the locked `tauri` crate version — bump both together.
 - macOS signing (README "macOS signing"): with all five `APPLE_*` repo
   secrets set, the build step exports them for Tauri, which imports the

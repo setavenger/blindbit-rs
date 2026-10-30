@@ -429,12 +429,9 @@ a virtual display until its first-run setup window opens
 (`scripts/linux-install-check.sh`). A release is only drafted when all of
 those pass.
 
-It runs on `v*` tag pushes, on manual `workflow_dispatch`, and on pull
-requests that touch packaging files (the workflow, `friglet-tray/tauri*.conf.json`,
-`friglet-tray/icons/`, `friglet-tray/Cargo.toml`/`build.rs`,
-`scripts/prepare-sidecar.sh`, `scripts/linux-install-check.sh`). Pull
-request runs only upload workflow artifacts. The Windows job is
-`continue-on-error`.
+It runs only when a release tag `vX.Y.Z` is pushed, or when started by hand
+(Actions → Release bundles → Run workflow); never on ordinary pushes or pull
+requests. The Windows job is `continue-on-error`.
 
 To cut a release: set the version in `friglet-tray/tauri.conf.json` (and
 `friglet-tray/Cargo.toml`), then push a matching tag, e.g.
@@ -476,9 +473,9 @@ enabled).
 The macOS job signs with a Developer ID certificate and notarizes when all
 five of these repository secrets are set (Settings → Secrets and variables
 → Actions); with none set it falls back to an ad-hoc signed dmg, and with
-only some set it fails. Pull request runs never get the secrets and always
-build ad-hoc; to test signing, run the workflow by hand (Actions → Release
-bundles → Run workflow) on the branch.
+only some set it fails. To test signing before a release, run the workflow
+by hand on the branch; that creates a draft `friglet-tray-dev-<commit>`
+release to delete afterwards.
 
 | Secret | Value |
 |--------|-------|
