@@ -7,14 +7,14 @@
 //!
 //! Usage: `cargo run -p friglet-tray --example fake-daemon`
 
-use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, StatusInfo};
+use friglet_ipc::network::NETWORKS;
+use friglet_ipc::{DaemonConfig, LabelAddress, Request, Response, ScanState, StatusInfo};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Rough imitation of the real daemon's SetConfig validation, so the tray's
 /// error surfacing can be exercised without a real daemon.
 fn check_config(cfg: &DaemonConfig) -> Result<(), String> {
-    const NETWORKS: [&str; 5] = ["bitcoin", "signet", "testnet", "testnet4", "regtest"];
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!("invalid network `{}`", cfg.network));
     }
@@ -28,6 +28,12 @@ fn check_config(cfg: &DaemonConfig) -> Result<(), String> {
         return Err("invalid start_height 0: must be at least 1".to_string());
     }
     Ok(())
+}
+
+/// The real daemon's scan key shape: 32 bytes as hex.
+fn valid_scan_key(key: &str) -> bool {
+    let key = key.trim();
+    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -84,6 +90,15 @@ async fn main() -> std::io::Result<()> {
                         version: "fake-0.0.0".to_string(),
                         spawned_by_tray: false,
                         scan_health: Default::default(),
+                        scan_state: Some(if scanning.load(Ordering::Relaxed) {
+                            ScanState::Running
+                        } else {
+                            ScanState::Paused
+                        }),
+                        pid: Some(std::process::id()),
+                        log_file: None,
+                        oracle_error: None,
+                        oracle_down_since_unix: None,
                     }),
                     Request::Start => {
                         scanning.store(true, Ordering::Relaxed);
@@ -97,14 +112,13 @@ async fn main() -> std::io::Result<()> {
                     Request::SetConfig(new_cfg) => match check_config(&new_cfg) {
                         Ok(()) => {
                             let mut cfg = config.lock().unwrap();
-                            let bind_changed = new_cfg.http_addr != cfg.http_addr
-                                || new_cfg.electrum_addr != cfg.electrum_addr;
+                            let bind_changed = new_cfg.electrum_addr != cfg.electrum_addr;
                             *cfg = *new_cfg;
                             eprintln!("fake daemon config updated");
                             if bind_changed {
                                 Response::OkWithNote(
-                                    "changes to http_addr, electrum_addr are saved but only \
-                                     take effect after a daemon restart"
+                                    "changes to electrum_addr are saved but only take effect \
+                                     after a daemon restart"
                                         .to_string(),
                                 )
                             } else {
@@ -114,14 +128,33 @@ async fn main() -> std::io::Result<()> {
                         Err(e) => Response::Error(e),
                     },
                     Request::SetScanKey(key) => {
-                        let key = key.trim();
-                        if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        if valid_scan_key(&key) {
                             eprintln!("fake daemon scan key updated");
                             Response::Ok
                         } else {
                             Response::Error(
                                 "invalid scan key: must be a 32-byte hex string".to_string(),
                             )
+                        }
+                    }
+                    Request::ApplySettings {
+                        config: new_cfg,
+                        scan_key,
+                    } => {
+                        let key_ok = scan_key.as_deref().is_none_or(valid_scan_key);
+                        match check_config(&new_cfg) {
+                            Err(e) => Response::Error(e),
+                            Ok(()) if !key_ok => Response::Error(
+                                "invalid scan key: must be a 32-byte hex string".to_string(),
+                            ),
+                            Ok(()) => {
+                                *config.lock().unwrap() = *new_cfg;
+                                Response::OkWithNote(
+                                    "saved; the daemon restarts to apply it (fake daemon: \
+                                     applied in memory)"
+                                        .to_string(),
+                                )
+                            }
                         }
                     }
                     Request::Shutdown => {

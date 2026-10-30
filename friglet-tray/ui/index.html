@@ -10,7 +10,7 @@
   <main>
     <header>
       <h1>Friglet</h1>
-      <span id="reachable" class="pill pill-bad">unreachable</span>
+      <span id="daemon-pill" class="pill pill-neutral" title="Daemon">starting…</span>
     </header>
 
     <nav class="tabs">
@@ -20,11 +20,26 @@
     </nav>
 
     <div id="view-status">
-      <section class="card">
+      <section id="problems" class="card problems" hidden>
+        <span class="label">Needs attention</span>
+        <ul id="problem-list" class="problem-list"></ul>
+      </section>
+
+      <section id="daemon-health" class="card health" hidden>
+        <div class="row">
+          <span class="label">Daemon</span>
+          <span id="health-state" class="pill pill-bad"></span>
+        </div>
+        <p id="health-detail" class="small"></p>
+        <code id="health-output" class="error" hidden></code>
+      </section>
+
+      <section class="card live">
         <div class="row">
           <span class="label">Scanning</span>
-          <span id="scanning" class="value">–</span>
+          <span id="scan-pill" class="pill pill-neutral">–</span>
         </div>
+        <p id="scan-detail" class="small muted"></p>
         <div class="row">
           <span class="label">Height</span>
           <span class="value"><span id="scanned-height">–</span> / <span id="tip-height">–</span></span>
@@ -36,7 +51,7 @@
         </div>
       </section>
 
-      <section class="card">
+      <section class="card live">
         <div class="row">
           <span class="label">Network</span>
           <span id="network" class="value">–</span>
@@ -55,18 +70,29 @@
         </div>
       </section>
 
+      <div class="actions">
+        <button id="start-btn" disabled>Start scanning</button>
+        <button id="stop-btn" class="secondary" disabled>Stop scanning</button>
+      </div>
+      <p id="scan-action-msg" class="small"></p>
+
+      <section class="card">
+        <div class="row">
+          <span class="label">Daemon</span>
+          <span id="daemon-state" class="value">–</span>
+        </div>
+        <p id="daemon-detail" class="small muted"></p>
+        <div class="actions">
+          <button id="start-daemon-btn" class="secondary" disabled>Start daemon</button>
+          <button id="stop-daemon-btn" class="secondary" disabled>Stop daemon</button>
+        </div>
+        <p id="daemon-action-msg" class="small"></p>
+      </section>
+
       <section class="card">
         <div class="col">
           <span class="label">SP address</span>
           <code id="sp-address">–</code>
-        </div>
-        <div class="col" id="error-block" hidden>
-          <span class="label">Last error</span>
-          <code id="last-error" class="error"></code>
-        </div>
-        <div class="col" id="stall-block" hidden>
-          <span class="label">Scan stalled</span>
-          <code id="stall" class="error"></code>
         </div>
         <div class="col" id="scan-notes-block" hidden>
           <span class="label">Scan notes</span>
@@ -74,11 +100,28 @@
         </div>
       </section>
 
-      <div class="actions">
-        <button id="start-btn">Start scanning</button>
-        <button id="stop-btn" class="secondary">Stop scanning</button>
-      </div>
-      <p id="action-error" class="error small"></p>
+      <section class="card">
+        <div class="col">
+          <span class="label">Daemon log</span>
+          <code id="daemon-log-path">–</code>
+        </div>
+        <div class="col">
+          <span class="label">Tray log</span>
+          <code id="tray-log-path">–</code>
+        </div>
+        <div class="actions">
+          <button id="open-logs-btn" class="secondary">Open log folder</button>
+        </div>
+        <p id="logs-msg" class="small"></p>
+      </section>
+
+      <section class="card">
+        <details class="recent-errors">
+          <summary><span class="label">Recent errors</span> <span id="recent-count" class="label"></span></summary>
+          <p id="no-recent-errors" class="small muted">None this session.</p>
+          <ul id="recent-list" class="problem-list"></ul>
+        </details>
+      </section>
     </div>
 
     <div id="view-wallet" hidden>
@@ -132,30 +175,60 @@
         <fieldset id="settings-fields" disabled>
           <section class="card">
             <div class="field">
+              <label for="cfg-descriptor">Sparrow wallet descriptor</label>
+              <textarea id="cfg-descriptor" rows="3" class="mono" spellcheck="false"
+                        autocomplete="off" placeholder="sp([…/352h/0h/0h]spscan1q…)#…"></textarea>
+              <p class="hint">In Sparrow, open the Silent Payments wallet, go to the
+                <strong>Settings</strong> tab, right-click the <strong>Descriptor</strong> field
+                and choose <strong>Copy Output Descriptor</strong>, then paste it here.</p>
+              <p id="descriptor-status" class="hint" aria-live="polite"></p>
+            </div>
+            <div class="field">
               <label for="cfg-network">Network</label>
               <select id="cfg-network">
-                <option value="bitcoin">bitcoin</option>
+                <option value="bitcoin">bitcoin (mainnet)</option>
                 <option value="signet">signet</option>
                 <option value="testnet">testnet</option>
                 <option value="testnet4">testnet4</option>
                 <option value="regtest">regtest</option>
               </select>
             </div>
-            <div class="field">
-              <label for="cfg-oracle-url">Oracle URL</label>
-              <input id="cfg-oracle-url" type="text" placeholder="https://oracle.setor.dev" />
-            </div>
-            <div class="field">
-              <label for="cfg-p2p-addr">P2P node address (host:port)</label>
-              <input id="cfg-p2p-addr" type="text" placeholder="127.0.0.1:8333" />
-            </div>
-            <div class="field">
-              <label for="cfg-start-height">Start height (wallet birthday)</label>
-              <input id="cfg-start-height" type="number" min="1" step="1" />
-            </div>
           </section>
 
           <section class="card">
+            <span class="label">Wallet birthday</span>
+            <label class="choice">
+              <input type="radio" name="birthday" id="birthday-tip" value="tip" />
+              <span><strong>New wallet</strong> — nothing received yet. Start at the
+                current block; nothing to rescan.</span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="birthday" id="birthday-height" value="height" />
+              <span><strong>From block height</strong> — the wallet's birthday. Use this
+                if the wallet already received payments:</span>
+            </label>
+            <input id="cfg-start-height" class="indented" type="number" min="1" step="1"
+                   placeholder="block height, e.g. 850000" aria-label="Start block height" />
+            <p class="hint indented">Use a height at or before the wallet's first payment
+              (a block explorer shows a transaction's block height). Lower = longer scan.</p>
+          </section>
+
+          <section class="card">
+            <div class="field">
+              <label for="cfg-p2p-addr">Bitcoin node (host:port)</label>
+              <input id="cfg-p2p-addr" type="text" spellcheck="false" placeholder="node.example.com:8333" />
+              <p class="hint">Any reachable Bitcoin node on this network — your own node
+                or a public one. A hostname works; the port defaults to the network's.</p>
+            </div>
+            <div class="field">
+              <label for="cfg-oracle-url">BlindBit oracle URL</label>
+              <input id="cfg-oracle-url" type="text" spellcheck="false" placeholder="https://oracle.setor.dev" />
+              <p id="oracle-hint" class="hint"></p>
+            </div>
+          </section>
+
+          <details class="card advanced">
+            <summary>Advanced</summary>
             <div class="field">
               <label for="cfg-scan-key">Scan key (32-byte hex, write-only)</label>
               <input id="cfg-scan-key" type="password" autocomplete="off"
@@ -173,13 +246,6 @@
               <label for="cfg-key-file">Key file path</label>
               <input id="cfg-key-file" type="text" class="mono" spellcheck="false" />
             </div>
-          </section>
-
-          <section class="card">
-            <div class="field">
-              <label for="cfg-http-addr">HTTP bind address</label>
-              <input id="cfg-http-addr" type="text" placeholder="127.0.0.1:8080" />
-            </div>
             <div class="field">
               <label for="cfg-electrum-addr">Electrum bind address</label>
               <input id="cfg-electrum-addr" type="text" placeholder="127.0.0.1:50001" />
@@ -188,7 +254,7 @@
               <label for="cfg-state-file">State file path</label>
               <input id="cfg-state-file" type="text" class="mono" spellcheck="false" />
             </div>
-          </section>
+          </details>
 
           <div class="actions">
             <button type="submit" id="save-btn">Save</button>
@@ -197,6 +263,15 @@
         </fieldset>
       </form>
       <p id="settings-msg" class="small"></p>
+
+      <section class="card">
+        <label class="choice">
+          <input type="checkbox" id="cfg-autostart" />
+          <span><strong>Start Friglet when I log in</strong> — keeps the wallet server
+            running for Sparrow after a reboot.</span>
+        </label>
+        <p id="autostart-msg" class="hint"></p>
+      </section>
     </div>
   </main>
 

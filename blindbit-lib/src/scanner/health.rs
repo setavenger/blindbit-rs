@@ -1,4 +1,4 @@
-//! What a long-running scan (`Scanner::watch_chain`) reports besides its
+//! What a long-running scan (`Scanner::watch_chain_until`) reports besides its
 //! progress: why it is stuck, and where it started when the wallet's start
 //! height lay below the oracle's first indexed block.
 //!
@@ -34,6 +34,19 @@ pub struct ScanHealth {
     /// being rescanned for spends it missed; cleared once the scan is back
     /// at `until_height`.
     pub state_rescan: Option<StateRescan>,
+    /// Set when the state file could not be restored, so it was moved aside
+    /// and a new scan started from the configured start height.
+    pub state_file_reset: Option<StateFileReset>,
+}
+
+/// The state file could not be restored. It was moved to `backup_path`
+/// (never overwritten) and a new scan started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateFileReset {
+    /// Where the unreadable state file was moved.
+    pub backup_path: std::path::PathBuf,
+    /// Why it could not be restored.
+    pub error: String,
 }
 
 /// The restored state predates owned-output records (state format 0), so
@@ -99,6 +112,25 @@ impl std::fmt::Display for ScanStopped {
 
 impl std::error::Error for ScanStopped {}
 
+/// The scan was cancelled (the token given to
+/// [`Scanner::watch_chain_until`](super::Scanner::watch_chain_until) was
+/// cancelled) before it finished.
+///
+/// It stops only where nothing is half done: between blocks, or while it
+/// waits for the oracle, the P2P node or its next poll. Every block up to
+/// the scanned height was fully processed and nothing above it was, so the
+/// next scan resumes at the block after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCancelled;
+
+impl std::fmt::Display for ScanCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("scan cancelled")
+    }
+}
+
+impl std::error::Error for ScanCancelled {}
+
 /// The oracle's per-height block hash lookup (`GetBlockHashByHeight`).
 pub(crate) trait OracleProbe {
     /// The block hash the oracle has indexed at `height`, or `None` when it
@@ -128,15 +160,18 @@ impl OracleProbe for OracleServiceClient<Channel> {
     }
 }
 
+/// A block hash as the oracle serves it, in display order (byte-reversed), or
+/// `None` when it is not 32 bytes long.
+pub fn oracle_block_hash(display_order: &[u8]) -> Option<BlockHash> {
+    let mut bytes: [u8; 32] = display_order.try_into().ok()?;
+    bytes.reverse();
+    Some(BlockHash::from_byte_array(bytes))
+}
+
 /// A block hash as the oracle serves it (display order), or `None` when it is
 /// not a real hash: what an oracle answers for a height it has not indexed.
 pub(crate) fn indexed_block_hash(display_order: &[u8]) -> Option<BlockHash> {
-    let mut bytes: [u8; 32] = display_order.try_into().ok()?;
-    if bytes.iter().all(|b| *b == 0) {
-        return None;
-    }
-    bytes.reverse();
-    Some(BlockHash::from_byte_array(bytes))
+    oracle_block_hash(display_order).filter(|hash| *hash != BlockHash::all_zeros())
 }
 
 /// Upper bound on `GetBlockHashByHeight` calls one floor search may make.
@@ -238,6 +273,15 @@ fn unix_now() -> u64 {
 }
 
 impl Scanner {
+    /// Record that this scanner replaces a state file that could not be
+    /// restored. Called right after construction, before the index is shared.
+    #[cfg(feature = "serde")]
+    pub(crate) fn note_state_file_reset(&mut self, reset: StateFileReset) {
+        if let Some(index) = std::sync::Arc::get_mut(&mut self.electrum_index) {
+            index.get_mut().scan_health.state_file_reset = Some(reset);
+        }
+    }
+
     /// Current scan health as published to status readers.
     pub async fn scan_health(&self) -> ScanHealth {
         self.electrum_index.lock().await.scan_health.clone()

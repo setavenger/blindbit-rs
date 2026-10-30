@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Generate placeholder friglet-tray icons (PNG set + ICO) with no external deps.
+"""Generate the friglet-tray icons (PNG set + ICO) with no external deps.
 
-Draws a simple "fridge" glyph on a dark rounded square. Run from the icons/
-directory: python3 generate.py
+Friglet is a lightweight take on Frigate, Sparrow's Silent Payments Electrum
+server, so the mark is a small sailing ship: two white sails over an orange
+hull on a dark rounded square. Shapes are kept large so the glyph still reads
+at tray size (16-32 px). Run from anywhere: python3 generate.py
 """
 
 import os
@@ -10,44 +12,72 @@ import struct
 import zlib
 
 BG = (27, 36, 50, 255)  # dark navy
-FRIDGE = (232, 238, 247, 255)  # near-white
-LINE = (27, 36, 50, 255)
+SAIL = (232, 238, 247, 255)  # near-white
 ACCENT = (247, 147, 26, 255)  # bitcoin orange
 
+# Shapes in unit coordinates (0..1, y pointing down), drawn back to front.
+MAINSAIL = [(0.53, 0.16), (0.53, 0.63), (0.80, 0.63)]
+JIB = [(0.48, 0.25), (0.48, 0.63), (0.24, 0.63)]
+HULL = [(0.16, 0.68), (0.84, 0.68), (0.71, 0.81), (0.29, 0.81)]
+SHAPES = [(MAINSAIL, SAIL), (JIB, SAIL), (HULL, ACCENT)]
 
-def rounded_rect_mask(x, y, x0, y0, x1, y1, r):
-    """1.0 if (x, y) is inside the rounded rect, else 0.0 (hard edge)."""
+SUPERSAMPLE = 4  # samples per pixel along each axis (anti-aliasing)
+
+
+def in_rounded_rect(x, y, x0, y0, x1, y1, r):
+    """True if (x, y) is inside the rounded rect."""
     if x < x0 or x > x1 or y < y0 or y > y1:
-        return 0.0
+        return False
     cx = min(max(x, x0 + r), x1 - r)
     cy = min(max(y, y0 + r), y1 - r)
-    return 1.0 if (x - cx) ** 2 + (y - cy) ** 2 <= r * r else 0.0
+    return (x - cx) ** 2 + (y - cy) ** 2 <= r * r
+
+
+def in_polygon(x, y, pts):
+    """Even-odd ray-casting point-in-polygon test."""
+    inside = False
+    j = len(pts) - 1
+    for i in range(len(pts)):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def sample(u, v):
+    """RGBA at unit-space point (u, v)."""
+    # Background: rounded square with a small transparent margin.
+    if not in_rounded_rect(u, v, 0.02, 0.02, 0.98, 0.98, 0.22):
+        return (0, 0, 0, 0)
+    col = BG
+    for pts, fill in SHAPES:
+        if in_polygon(u, v, pts):
+            col = fill
+    return col
 
 
 def pixel(x, y, s):
-    """RGBA for pixel (x, y) in an s-by-s icon."""
-    # Background: rounded square with small transparent margin.
-    m = s * 0.02
-    if rounded_rect_mask(x, y, m, m, s - m, s - m, s * 0.22) == 0.0:
+    """Anti-aliased RGBA for pixel (x, y) in an s-by-s icon."""
+    n = SUPERSAMPLE
+    acc = [0, 0, 0, 0]
+    for j in range(n):
+        for i in range(n):
+            r, g, b, a = sample((x + (i + 0.5) / n) / s, (y + (j + 0.5) / n) / s)
+            acc[0] += r * a
+            acc[1] += g * a
+            acc[2] += b * a
+            acc[3] += a
+    if acc[3] == 0:
         return (0, 0, 0, 0)
-    col = BG
-    # Fridge body.
-    fw, fh = s * 0.44, s * 0.60
-    fx0, fy0 = (s - fw) / 2, (s - fh) / 2
-    if rounded_rect_mask(x, y, fx0, fy0, fx0 + fw, fy0 + fh, s * 0.06):
-        col = FRIDGE
-        # Freezer-door split line.
-        split = fy0 + fh * 0.33
-        if abs(y - split) <= max(1.0, s * 0.018):
-            col = LINE
-        # Door handles (short vertical accent marks near the left edge).
-        hx = fx0 + fw * 0.18
-        if abs(x - hx) <= max(1.0, s * 0.02):
-            if fy0 + fh * 0.10 <= y <= fy0 + fh * 0.24:
-                col = ACCENT
-            if split + fh * 0.08 <= y <= split + fh * 0.30:
-                col = ACCENT
-    return col
+    # Average premultiplied colour, then un-premultiply.
+    return (
+        round(acc[0] / acc[3]),
+        round(acc[1] / acc[3]),
+        round(acc[2] / acc[3]),
+        round(acc[3] / (n * n)),
+    )
 
 
 def render(s):
@@ -55,7 +85,7 @@ def render(s):
     for y in range(s):
         row = bytearray()
         for x in range(s):
-            row.extend(pixel(x + 0.5, y + 0.5, s))
+            row.extend(pixel(x, y, s))
         rows.append(bytes(row))
     return rows
 

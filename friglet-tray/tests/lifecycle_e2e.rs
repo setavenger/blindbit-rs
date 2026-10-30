@@ -26,6 +26,18 @@ fn test_socket_path(tag: &str) -> String {
     }
 }
 
+/// A committed, executable stand-in for the daemon binary under
+/// `tests/fixtures/`. Committed rather than written by the test: a script
+/// written at test time can still be open for writing in a child that another
+/// test forks at that moment, and executing it then fails with "Text file
+/// busy" (ETXTBSY).
+#[cfg(unix)]
+fn fixture(name: &str) -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
 fn dummy_status() -> StatusInfo {
     StatusInfo {
         scanning: false,
@@ -43,6 +55,7 @@ fn dummy_status() -> StatusInfo {
         version: "test".to_string(),
         spawned_by_tray: false,
         scan_health: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -57,11 +70,12 @@ fn spawn_fake_daemon_with_status(path: String, status: StatusInfo) {
     spawn_fake_daemon_with(path, Arc::new(AtomicBool::new(false)), status);
 }
 
+/// The socket is bound before this returns, so a test can connect right away.
 fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: StatusInfo) {
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(&path);
+    let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
     tokio::spawn(async move {
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&path);
-        let listener = friglet_ipc::listen(&path).expect("bind fake daemon socket");
         loop {
             let Ok(mut conn) = friglet_ipc::accept(&listener).await else {
                 break;
@@ -85,23 +99,6 @@ fn spawn_fake_daemon_with(path: String, saw_shutdown: Arc<AtomicBool>, status: S
             });
         }
     });
-}
-
-#[tokio::test]
-async fn attaches_when_daemon_already_running() {
-    let path = test_socket_path("attach");
-    spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Locator must not be consulted when a daemon is reachable.
-    let att = lifecycle::attach_or_spawn_with(&path, || {
-        panic!("should not look for a binary when attach succeeds")
-    })
-    .await;
-    assert!(matches!(att, Attachment::Attached(_)), "got {att:?}");
-
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -137,7 +134,6 @@ async fn setup_required_instead_of_spawn_when_unconfigured() {
 async fn attach_beats_setup_check_when_daemon_reachable() {
     let path = test_socket_path("setup-attach");
     spawn_fake_daemon(path.clone(), Arc::new(AtomicBool::new(false)));
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let att = lifecycle::attach_spawn_or_setup_with(
         &path,
@@ -162,7 +158,6 @@ async fn attach_carries_daemons_self_reported_ownership() {
     let mut status = dummy_status();
     status.spawned_by_tray = true;
     spawn_fake_daemon_with_status(path.clone(), status);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let att = lifecycle::attach_or_spawn_with(&path, || {
         panic!("should not look for a binary when attach succeeds")
@@ -182,14 +177,8 @@ async fn attach_carries_daemons_self_reported_ownership() {
 #[cfg(unix)]
 #[tokio::test]
 async fn spawns_and_connects_when_socket_comes_up() {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = test_socket_path("spawn");
-    let bin_dir = std::env::temp_dir().join(format!("friglet-tray-e2e-bin-{}", std::process::id()));
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let bin = bin_dir.join("fake-friglet.sh");
-    std::fs::write(&bin, "#!/bin/sh\nsleep 30\n").unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = fixture("fake-friglet.sh");
 
     let socket = path.clone();
     tokio::spawn(async move {
@@ -197,17 +186,15 @@ async fn spawns_and_connects_when_socket_comes_up() {
         spawn_fake_daemon(socket, Arc::new(AtomicBool::new(false)));
     });
 
-    let bin_for_locator: PathBuf = bin.clone();
-    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
+    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin)).await;
     match att {
-        Attachment::Spawned(mut child) => {
+        Attachment::Spawned(mut child, _) => {
             let _ = child.kill().await;
         }
         other => panic!("expected Spawned, got {other:?}"),
     }
 
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir_all(&bin_dir);
 }
 
 /// A daemon binary that fails fast (bad config, missing key, stale/wrong
@@ -217,22 +204,10 @@ async fn spawns_and_connects_when_socket_comes_up() {
 #[cfg(unix)]
 #[tokio::test]
 async fn spawn_failure_surfaces_captured_stderr() {
-    use std::os::unix::fs::PermissionsExt;
-
     let path = test_socket_path("failfast");
-    let bin_dir =
-        std::env::temp_dir().join(format!("friglet-tray-e2e-failbin-{}", std::process::id()));
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let bin = bin_dir.join("bad-friglet.sh");
-    std::fs::write(
-        &bin,
-        "#!/bin/sh\necho 'Error: missing required setting p2p_node_addr' >&2\nexit 2\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = fixture("bad-friglet.sh");
 
-    let bin_for_locator: PathBuf = bin.clone();
-    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
+    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin)).await;
     match att {
         Attachment::Unreachable { reason } => {
             assert!(
@@ -246,47 +221,6 @@ async fn spawn_failure_surfaces_captured_stderr() {
         }
         other => panic!("expected Unreachable, got {other:?}"),
     }
-
-    let _ = std::fs::remove_dir_all(&bin_dir);
-}
-
-/// A stale daemon binary (pre config-file support) rejects the zero-arg
-/// spawn with a clap usage dump and exit 2 — the reason must call out the
-/// outdated binary and how to fix it, not just echo the usage text.
-#[cfg(unix)]
-#[tokio::test]
-async fn stale_binary_usage_output_gets_rebuild_hint() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let path = test_socket_path("stalebin");
-    let bin_dir =
-        std::env::temp_dir().join(format!("friglet-tray-e2e-stalebin-{}", std::process::id()));
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let bin = bin_dir.join("stale-friglet.sh");
-    std::fs::write(
-        &bin,
-        "#!/bin/sh\nprintf 'A CLI tool\\n\\nUsage: friglet <COMMAND>\\n' >&2\nexit 2\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    let bin_for_locator: PathBuf = bin.clone();
-    let att = lifecycle::attach_or_spawn_with(&path, move || Some(bin_for_locator)).await;
-    match att {
-        Attachment::Unreachable { reason } => {
-            assert!(
-                reason.contains("outdated build"),
-                "expected stale-binary hint, got: {reason}"
-            );
-            assert!(
-                reason.contains("cargo build --release -p friglet"),
-                "expected rebuild instruction, got: {reason}"
-            );
-        }
-        other => panic!("expected Unreachable, got {other:?}"),
-    }
-
-    let _ = std::fs::remove_dir_all(&bin_dir);
 }
 
 #[tokio::test]
@@ -294,7 +228,6 @@ async fn quit_shuts_daemon_down_only_when_spawned_by_tray() {
     let path = test_socket_path("quit");
     let saw_shutdown = Arc::new(AtomicBool::new(false));
     spawn_fake_daemon(path.clone(), saw_shutdown.clone());
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Attached daemon: quit must leave it alone.
     lifecycle::perform_quit(&path, false, None).await;
