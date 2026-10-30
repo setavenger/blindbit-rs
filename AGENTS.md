@@ -343,13 +343,19 @@ dbus-run-session -- bash -c '
   node's addresses enter the book most recently seen first (half of a
   signet node's `getaddr` answer is > 5 days old).
 - Broadcast through a proxy (`net_broadcast.rs` `Timing::PROXIED`): 6
-  observer connects at the start (3 directly), observer window 15 s, limit
-  30 s, 12 observer tries; budget `PROXIED_BROADCAST_BUDGET` 45 s
-  (`electrum/mod.rs`; Sparrow's requests end at ~3, 12, 29, 64, 99 s, so
-  the answer lands in the fourth). Each sender/observer is its own SOCKS
-  login (own circuit). Proxy down → `Event::ProxyDown`, no peer blamed,
-  error names `p2p_proxy`. `ask_mempools` races 2 extra connects through a
-  proxy. Senders keep listening after the pong (bounded by the budget).
+  observer connects at the start (3 directly), then every 6 s more
+  observers while < 3 are ready and, once senders start, more senders
+  while < 2 handed over ("hedging"; `Job::claim_hand_over` caps hand-overs
+  at 2); observer window 15 s, limit 30 s, pong wait 15 s (5 s); budget
+  `PROXIED_BROADCAST_BUDGET` 45 s (`electrum/mod.rs`; Sparrow's requests
+  end at ~3, 12, 29, 64, 99 s, so the answer lands in the fourth). Each
+  sender/observer is its own SOCKS login (own circuit). Proxy down →
+  `Event::ProxyDown`, no peer blamed, error names `p2p_proxy`.
+  `ask_mempools` races 2 extra connects and header requests race their
+  first connection (`ChainSource::race_header_connection`) through a proxy:
+  a tip header behind three dead addresses otherwise held a broadcast's
+  answer for 40 s. Senders keep listening after the pong (bounded by the
+  budget).
 - An older tray drops `p2p_proxy` on Save (unknown field); the daemon logs a
   warning when an apply clears it.
 - Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
