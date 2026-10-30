@@ -476,7 +476,9 @@ enabled).
 The macOS job signs with a Developer ID certificate and notarizes when all
 five of these repository secrets are set (Settings → Secrets and variables
 → Actions); with none set it falls back to an ad-hoc signed dmg, and with
-only some set it fails.
+only some set it fails. Pull request runs never get the secrets and always
+build ad-hoc; to test signing, run the workflow by hand (Actions → Release
+bundles → Run workflow) on the branch.
 
 | Secret | Value |
 |--------|-------|

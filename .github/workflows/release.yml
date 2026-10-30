@@ -144,12 +144,24 @@ jobs:
           name: friglet-tray-linux-${{ matrix.arch }}
           path: dist
       - name: Install and start friglet-tray
+        id: check
         env:
           IMAGE: ${{ matrix.image }}
           KIND: ${{ matrix.kind }}
-        run: >-
-          docker run --rm -v "$GITHUB_WORKSPACE:/w:ro" -w /w "$IMAGE"
-          scripts/linux-install-check.sh "$KIND" /w/dist
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name=$(echo "setup-window-$IMAGE-$ARCH-$KIND" | tr ':/' '--')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/shots"
+          docker run --rm -v "$GITHUB_WORKSPACE:/w:ro" -v "$RUNNER_TEMP/shots:/out" -w /w \
+            -e SCREENSHOT="/out/$name.png" "$IMAGE" \
+            scripts/linux-install-check.sh "$KIND" /w/dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.check.outputs.name }}
+          path: ${{ runner.temp }}/shots/*.png
+          if-no-files-found: error
+          retention-days: 14
 
   macos:
     name: macOS universal (dmg)
@@ -187,18 +199,25 @@ jobs:
         # staples the app, and signs the dmg. Without them the bundle stays
         # ad-hoc signed. Tauri treats a set-but-empty variable as set, so
         # the APPLE_* variables are only exported when the secrets exist.
+        # Pull requests never sign: their code runs with these variables in
+        # its environment (build.rs, proc macros), and notarizing every
+        # packaging PR is pointless. Dispatch the workflow to test signing.
         env:
-          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
-          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          EVENT: ${{ github.event_name }}
+          CERTIFICATE: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE || '' }}
+          CERTIFICATE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          NOTARY_APPLE_ID: ${{ github.event_name != 'pull_request' && secrets.APPLE_ID || '' }}
+          NOTARY_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.APPLE_PASSWORD || '' }}
+          NOTARY_TEAM_ID: ${{ github.event_name != 'pull_request' && secrets.APPLE_TEAM_ID || '' }}
         run: |
           set=0
           for v in CERTIFICATE CERTIFICATE_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD NOTARY_TEAM_ID; do
             [ -n "${!v}" ] && set=$((set + 1))
           done
-          if [ "$set" = 5 ]; then
+          if [ "$EVENT" = pull_request ]; then
+            echo "::notice::pull request: building an ad-hoc signed, not notarized dmg"
+            echo "signing=adhoc" >> "$GITHUB_OUTPUT"
+          elif [ "$set" = 5 ]; then
             export APPLE_CERTIFICATE=$CERTIFICATE
             export APPLE_CERTIFICATE_PASSWORD=$CERTIFICATE_PASSWORD
             # A substring of the certificate's name; overrides the "-" in
@@ -228,9 +247,10 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           dmg=$(echo target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          # Rejections are handled below, with the notary log.
           xcrun notarytool submit "$dmg" --wait --output-format json \
             --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" \
-            | tee "$RUNNER_TEMP/notary.json"
+            | tee "$RUNNER_TEMP/notary.json" || true
           status=$(jq -r .status "$RUNNER_TEMP/notary.json")
           if [ "$status" != Accepted ]; then
             echo "::error::dmg notarization: $status"
