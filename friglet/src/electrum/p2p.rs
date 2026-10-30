@@ -21,7 +21,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::block::Header;
@@ -98,14 +98,15 @@ pub fn random_u64() -> u64 {
     hasher.finish()
 }
 
-/// The `version` message's address fields: all zero, so the peer learns
-/// neither friglet's address nor the one friglet sees for it.
+/// The `version` message's address fields: 127.0.0.1:1, so the peer learns
+/// neither friglet's address nor the one friglet sees for it. The same value
+/// the scanner's block-fetch connections send (kernel-node bitcoin-p2p has no
+/// override), so both stacks look alike to a peer.
 fn useless_address() -> Address {
-    Address {
-        services: ServiceFlags::NONE,
-        address: [0; 8],
-        port: 0,
-    }
+    Address::new(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        ServiceFlags::NONE,
+    )
 }
 
 /// One open, handshaken P2P connection.
