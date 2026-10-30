@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use bitcoin::secp256k1::{PublicKey, SecretKey};
 use friglet_ipc::DaemonConfig;
 use friglet_ipc::descriptor::SpDescriptor;
 use friglet_ipc::network::{self, NETWORKS};
@@ -85,7 +86,7 @@ pub fn is_configured(
 }
 
 /// The `descriptor` key of the TOML file at `path`, if any.
-fn file_descriptor(path: &Path) -> Option<String> {
+pub fn file_descriptor(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = toml::from_str(&text).ok()?;
     table.get("descriptor")?.as_str().map(str::to_string)
@@ -182,11 +183,30 @@ pub fn keys_from_descriptor(cfg: &mut DaemonConfig, text: &str) -> Result<String
     Ok(d.scan_secret_hex())
 }
 
-/// Validate a setup-mode save tray-side, mirroring the daemon's own startup
-/// validation with friendlier messages. Hex fields are checked for length
-/// only; full secp256k1 validation happens daemon-side at startup. The P2P
-/// host is checked for syntax only (see [`resolve_peer`] for DNS).
+/// Validate a setup-mode save tray-side: [`validate_config`] plus the scan
+/// key, which setup mode requires.
 pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> {
+    validate_config(cfg)?;
+    let key = scan_key.trim();
+    if key.is_empty() {
+        return Err(
+            "paste your Sparrow wallet descriptor (or enter the scan key under Advanced)"
+                .to_string(),
+        );
+    }
+    if key.len() != 64 || !is_hex(key) {
+        return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
+    }
+    // Checked here so a bad key never replaces a working key file.
+    SecretKey::from_str(key).map_err(|_| "invalid scan key: not a valid secp256k1 secret key")?;
+    Ok(())
+}
+
+/// Validate settings tray-side, mirroring the daemon's own startup
+/// validation with friendlier messages. The spend key is checked as a
+/// secp256k1 public key. The P2P host is checked for syntax only (see
+/// [`resolve_peer`] for DNS).
+pub fn validate_config(cfg: &DaemonConfig) -> Result<(), String> {
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!(
             "invalid network `{}`: must be one of {}",
@@ -243,17 +263,8 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
     if spend.len() != 66 || !is_hex(spend) {
         return Err("invalid spend public key: must be 66 hex characters (33 bytes)".to_string());
     }
-
-    let key = scan_key.trim();
-    if key.is_empty() {
-        return Err(
-            "paste your Sparrow wallet descriptor (or enter the scan key under Advanced)"
-                .to_string(),
-        );
-    }
-    if key.len() != 64 || !is_hex(key) {
-        return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
-    }
+    PublicKey::from_str(spend)
+        .map_err(|_| "invalid spend public key: not a valid secp256k1 public key")?;
 
     SocketAddr::from_str(&cfg.electrum_addr)
         .map_err(|e| format!("invalid Electrum bind address `{}`: {e}", cfg.electrum_addr))?;
@@ -309,6 +320,122 @@ pub fn write_local_config(
     friglet_ipc::write_key_file(&key_file, scan_key.trim(), true)?;
     friglet_ipc::write_config_toml(config_path, cfg)?;
     Ok(key_file)
+}
+
+/// The config file at `path`, for the settings form while the daemon is
+/// down. A `descriptor` key fills in the spend key and, without a start
+/// height, its `bh=` birthday, as the daemon applies them: the form shows
+/// the wallet the daemon would run, and a save (which writes no
+/// `descriptor` key) keeps it.
+pub fn read_config_for_editing(path: &Path) -> Result<DaemonConfig, String> {
+    let mut cfg = friglet_ipc::read_config_toml(path)?;
+    if let Some(d) = file_descriptor(path).and_then(|d| SpDescriptor::parse(&d).ok()) {
+        cfg.spend_pubkey.get_or_insert_with(|| d.spend_pubkey_hex());
+        if cfg.start_height.is_none() {
+            cfg.start_height = d.birth_height;
+        }
+    }
+    Ok(cfg)
+}
+
+/// The scan key a settings save made while the daemon is down writes, with
+/// `cfg.spend_pubkey` filled from a descriptor: a pasted descriptor, else a
+/// manual key, else the `descriptor` in the config file at `config_path`
+/// (the save writes no `descriptor` key, and the daemon may have exited
+/// before copying its scan key to the key file). `None`: keep the key file,
+/// also when the file's descriptor is empty or does not parse (the save
+/// drops it, which may be what fixes the daemon).
+pub fn file_save_scan_key(
+    cfg: &mut DaemonConfig,
+    scan_key: Option<String>,
+    descriptor: Option<String>,
+    config_path: &Path,
+) -> Result<Option<String>, String> {
+    if let Some(d) = descriptor.filter(|d| !d.trim().is_empty()) {
+        return keys_from_descriptor(cfg, d.trim()).map(Some);
+    }
+    let scan_key = scan_key.filter(|k| !k.trim().is_empty());
+    if scan_key.is_some() {
+        return Ok(scan_key);
+    }
+    let Some(text) = file_descriptor(config_path) else {
+        return Ok(None);
+    };
+    let Ok(d) = SpDescriptor::parse(&text) else {
+        return Ok(None);
+    };
+    // The form shows an explicit spend_pubkey over the descriptor's: never
+    // swap it for the descriptor's behind the user's back.
+    let spend = d.spend_pubkey_hex();
+    if let Some(shown) = cfg.spend_pubkey.as_deref().map(str::trim)
+        && !shown.is_empty()
+        && !shown.eq_ignore_ascii_case(&spend)
+    {
+        return Err(format!(
+            "the config file's descriptor is for spend key {spend}, not {shown}: paste the \
+             descriptor of the wallet to use (or enter its scan key under Advanced)"
+        ));
+    }
+    keys_from_descriptor(cfg, text.trim()).map(Some)
+}
+
+/// For a save made after loading the file with an unresolved "new wallet"
+/// birthday: a restart attempt may have resolved the tip since and recorded
+/// it as `start_height` in the file at `config_path`. A save that still asks
+/// for the tip, for the same wallet and network, keeps that birthday rather
+/// than take a later tip, which would skip the blocks in between.
+pub fn keep_recorded_birthday(cfg: &mut DaemonConfig, config_path: &Path) {
+    if !cfg.start_at_tip || cfg.start_height.is_some() {
+        return;
+    }
+    let Ok(on_disk) = read_config_for_editing(config_path) else {
+        return;
+    };
+    let same_wallet = match (&on_disk.spend_pubkey, &cfg.spend_pubkey) {
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    };
+    if let Some(height) = on_disk.start_height
+        && same_wallet
+        && on_disk.network == cfg.network
+    {
+        cfg.start_height = Some(height);
+        cfg.start_at_tip = false;
+    }
+}
+
+/// A save without a new scan key keeps the key file, which must exist.
+pub fn ensure_key_file(cfg: &DaemonConfig, scan_key: Option<&str>) -> Result<(), String> {
+    if scan_key.is_some() {
+        return Ok(());
+    }
+    let key_file = cfg
+        .key_file
+        .clone()
+        .or_else(friglet_ipc::default_key_file)
+        .ok_or("cannot determine a key file location; set the key file path")?;
+    if !key_file.exists() {
+        return Err(format!(
+            "no scan key at {}: paste your Sparrow wallet descriptor (or enter the scan key under Advanced)",
+            key_file.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Persist a settings save made while the daemon is down. With a new scan
+/// key this is [`write_local_config`]; without one the config file is
+/// rewritten and the existing key file kept ([`ensure_key_file`]).
+pub fn write_config_file(
+    config_path: &Path,
+    cfg: &DaemonConfig,
+    scan_key: Option<&str>,
+) -> Result<(), String> {
+    ensure_key_file(cfg, scan_key)?;
+    match scan_key {
+        Some(key) => write_local_config(config_path, cfg, key).map(drop),
+        None => friglet_ipc::write_config_toml(config_path, cfg),
+    }
 }
 
 #[cfg(test)]
@@ -468,6 +595,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_fields_with_friendly_messages() {
+        // 64 hex characters, but zero is not a valid secret key.
+        const ZERO_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
         let cases: Vec<(DaemonConfig, &str, &str)> = vec![
             (
                 DaemonConfig {
@@ -542,8 +671,17 @@ mod tests {
                 KEY_HEX,
                 "invalid spend public key",
             ),
+            (
+                DaemonConfig {
+                    spend_pubkey: Some(format!("04{}", &SPEND_HEX[2..])),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "not a valid secp256k1 public key",
+            ),
             (valid_config(), "", "paste your Sparrow wallet descriptor"),
             (valid_config(), "zz", "invalid scan key"),
+            (valid_config(), ZERO_KEY, "not a valid secp256k1 secret key"),
             (
                 DaemonConfig {
                     electrum_addr: "nope".to_string(),
@@ -724,6 +862,150 @@ mod tests {
 
         // The pair now passes the configured check.
         assert!(is_configured(Some(&config_path), None, &no_env));
+    }
+
+    #[test]
+    fn write_config_file_keeps_the_key_file_without_a_new_key() {
+        let dir = temp_dir("write-file");
+        let config_path = dir.join("config.toml");
+        let key_path = dir.join("scan.key");
+        let cfg = DaemonConfig {
+            key_file: Some(key_path.clone()),
+            ..valid_config()
+        };
+
+        // No key file and no new key: refused, nothing written.
+        let err = write_config_file(&config_path, &cfg, None).unwrap_err();
+        assert!(err.contains("no scan key"), "{err}");
+        assert!(!config_path.exists());
+
+        // With the key file in place the config is rewritten, the key kept.
+        fs::write(&key_path, KEY_HEX).unwrap();
+        write_config_file(&config_path, &cfg, None).unwrap();
+        assert_eq!(friglet_ipc::read_config_toml(&config_path).unwrap(), cfg);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), KEY_HEX);
+
+        // A new key replaces it.
+        let other = "00".repeat(31) + "02";
+        write_config_file(&config_path, &cfg, Some(&other)).unwrap();
+        assert_eq!(fs::read_to_string(&key_path).unwrap().trim(), other);
+    }
+
+    #[test]
+    fn file_save_takes_the_keys_from_the_files_descriptor() {
+        let dir = temp_dir("file-save-keys");
+        let path = dir.join("config.toml");
+        fs::write(&path, format!("descriptor = \"{TEST_DESCRIPTOR}\"\n")).unwrap();
+        let d = SpDescriptor::parse(TEST_DESCRIPTOR).unwrap();
+        let testnet = |spend: Option<String>| DaemonConfig {
+            network: "testnet".to_string(),
+            spend_pubkey: spend,
+            ..valid_config()
+        };
+
+        // Nothing entered: the file's descriptor supplies both keys.
+        let mut cfg = testnet(None);
+        let key = file_save_scan_key(&mut cfg, None, Some(" ".into()), &path).unwrap();
+        assert_eq!(key, Some(d.scan_secret_hex()));
+        assert_eq!(cfg.spend_pubkey, Some(d.spend_pubkey_hex()));
+
+        // The form showed another spend key: refused, not swapped.
+        let mut cfg = testnet(Some(SPEND_HEX.into()));
+        let err = file_save_scan_key(&mut cfg, None, None, &path).unwrap_err();
+        assert!(err.contains("descriptor is for spend key"), "{err}");
+
+        // A manual key wins; the spend key is left as entered.
+        let mut cfg = testnet(Some(SPEND_HEX.into()));
+        let key = file_save_scan_key(&mut cfg, Some(KEY_HEX.into()), None, &path).unwrap();
+        assert_eq!(key.as_deref(), Some(KEY_HEX));
+        assert_eq!(cfg.spend_pubkey.as_deref(), Some(SPEND_HEX));
+
+        // The file's descriptor must match the network.
+        let mut cfg = DaemonConfig {
+            network: "bitcoin".to_string(),
+            spend_pubkey: None,
+            ..valid_config()
+        };
+        let err = file_save_scan_key(&mut cfg, None, None, &path).unwrap_err();
+        assert!(err.contains("pick the matching network"), "{err}");
+
+        // No usable descriptor anywhere: keep the key file.
+        let mut cfg = valid_config();
+        let none = dir.join("none.toml");
+        assert_eq!(file_save_scan_key(&mut cfg, None, None, &none), Ok(None));
+        for bad in ["", "sp(garbage)"] {
+            fs::write(&path, format!("descriptor = \"{bad}\"\n")).unwrap();
+            assert_eq!(file_save_scan_key(&mut cfg, None, None, &path), Ok(None));
+        }
+    }
+
+    #[test]
+    fn keep_recorded_birthday_adopts_a_height_recorded_since() {
+        let dir = temp_dir("recorded-birthday");
+        let path = dir.join("config.toml");
+        let tip = || DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            ..valid_config()
+        };
+
+        // Still unresolved on disk: stay at the tip.
+        fs::write(&path, "start_at_tip = true\n").unwrap();
+        let mut cfg = tip();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert!(cfg.start_at_tip && cfg.start_height.is_none());
+
+        // Recorded meanwhile for this wallet: adopt it.
+        let recorded =
+            format!("network = \"signet\"\nspend_pubkey = \"{SPEND_HEX}\"\nstart_height = 4321\n");
+        fs::write(&path, &recorded).unwrap();
+        let mut cfg = tip();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert_eq!((cfg.start_at_tip, cfg.start_height), (false, Some(4321)));
+
+        // Another wallet or network in the save: stay at the tip.
+        for other in [
+            DaemonConfig {
+                spend_pubkey: Some(format!("03{}", &SPEND_HEX[2..])),
+                ..tip()
+            },
+            DaemonConfig {
+                network: "testnet".to_string(),
+                ..tip()
+            },
+        ] {
+            let mut cfg = other;
+            keep_recorded_birthday(&mut cfg, &path);
+            assert!(cfg.start_at_tip && cfg.start_height.is_none());
+        }
+
+        // An explicit height in the save wins.
+        let mut cfg = valid_config();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert_eq!(cfg.start_height, valid_config().start_height);
+    }
+
+    #[test]
+    fn read_config_for_editing_applies_a_descriptor() {
+        let dir = temp_dir("read-editing");
+        let path = dir.join("config.toml");
+        let descriptor = format!("{}?bh=4000", TEST_DESCRIPTOR.split('#').next().unwrap());
+        fs::write(&path, format!("descriptor = \"{descriptor}\"\n")).unwrap();
+        let cfg = read_config_for_editing(&path).unwrap();
+        let d = SpDescriptor::parse(TEST_DESCRIPTOR).unwrap();
+        assert_eq!(cfg.spend_pubkey, Some(d.spend_pubkey_hex()));
+        assert_eq!(cfg.start_height, Some(4000));
+
+        // An explicit start height wins over the descriptor's birthday.
+        fs::write(
+            &path,
+            format!("start_height = 123\ndescriptor = \"{descriptor}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_config_for_editing(&path).unwrap().start_height,
+            Some(123)
+        );
     }
 
     #[test]

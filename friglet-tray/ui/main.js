@@ -131,6 +131,7 @@ function render(payload) {
   setText("daemon-log-path", logs.daemon_log ?? "– (not written)");
   setText("tray-log-path", logs.tray_log ?? "– (not written)");
 
+  updateFileMode();
   updateSettingsAvailability();
   // Load the settings form on the first poll that finds the daemon up
   // (retried at poll cadence while loading fails).
@@ -343,6 +344,17 @@ let setupMode = false;
 // Prefill baseline while in setup mode (partial config file over defaults).
 let setupConfig = null;
 
+// File mode: the tray's own daemon has crashed after setup. The form edits
+// the config file through the tray (get_config_file /
+// save_config_file), so a config that keeps the daemon from starting can
+// still be fixed here.
+let fileMode = false;
+// The config file as loaded in file mode; unedited fields are written back.
+let fileConfig = null;
+// Why the config file could not be loaded (shown instead of the form).
+let fileLoadError = null;
+let fileLoadInFlight = false;
+
 // Hosted oracles and default P2P ports per network (from the Rust side, so
 // the daemon and the form agree).
 let networkDefaults = { hosted_oracles: {}, default_ports: {} };
@@ -354,15 +366,21 @@ function updateSettingsAvailability() {
   const unavailable = $("settings-unreachable");
   unavailable.hidden = daemonReachable || setupMode;
   const waiting = ["starting", "reconnecting", "stopping"].includes(daemonState);
-  unavailable.textContent = waiting
-    ? "Waiting for the daemon — settings can be changed once it answers."
-    : daemonState === "stopped"
-      ? "The daemon is stopped — start it on the Status tab to change settings."
-      : "Daemon unreachable — settings cannot be loaded or changed.";
-  unavailable.className = `small ${waiting || daemonState === "stopped" ? "muted" : "error"}`;
+  unavailable.textContent = fileMode
+    ? fileLoadError ??
+      "The daemon is not running — Save writes these settings to the config file and starts it."
+    : waiting
+      ? "Waiting for the daemon — settings can be changed once it answers."
+      : daemonState === "stopped"
+        ? "The daemon is stopped — start it on the Status tab to change settings."
+        : "Daemon unreachable — settings cannot be loaded or changed.";
+  const calm = fileMode ? fileLoadError === null : waiting || daemonState === "stopped";
+  unavailable.className = `small ${calm ? "muted" : "error"}`;
   $("settings-fields").disabled = setupMode
     ? false
-    : !daemonReachable || loadedConfig === null;
+    : fileMode
+      ? fileConfig === null
+      : !daemonReachable || loadedConfig === null;
   $("cfg-scan-key").placeholder = setupMode
     ? "not needed when a descriptor is pasted"
     : "unchanged — enter to replace";
@@ -401,6 +419,51 @@ function exitSetupMode() {
   autostartMessage("", false);
   loadAutostart();
   updateSettingsAvailability();
+}
+
+// Enter file mode once the tray's own daemon has crashed ("restarting"; an
+// external daemon may use another config file); stay in it through restart
+// attempts ("starting…") so edits survive, until the daemon answers again.
+function updateFileMode() {
+  if (setupMode || daemonReachable) {
+    if (fileMode) exitFileMode();
+  } else if (!fileMode && daemonState === "restarting") {
+    enterFileMode();
+  } else if (fileMode && fileConfig === null && !fileLoadInFlight) {
+    loadConfigFile(); // retry until the file can be read
+  }
+}
+
+function enterFileMode() {
+  fileMode = true;
+  // Reload from the daemon once it answers again.
+  loadedConfig = null;
+  // Drop a stale "daemon unreachable" from loading the daemon's settings.
+  settingsMessage("", false);
+  return loadConfigFile();
+}
+
+async function loadConfigFile() {
+  fileLoadInFlight = true;
+  try {
+    const cfg = await invoke("get_config_file");
+    if (!fileMode) return; // the daemon answered meanwhile
+    fileConfig = cfg;
+    fileLoadError = null;
+    fillForm(fileConfig);
+  } catch (e) {
+    if (!fileMode) return;
+    fileLoadError = String(e);
+  } finally {
+    fileLoadInFlight = false;
+  }
+  updateSettingsAvailability();
+}
+
+function exitFileMode() {
+  fileMode = false;
+  fileConfig = null;
+  fileLoadError = null;
 }
 
 // --- network-dependent defaults --------------------------------------------
@@ -498,7 +561,7 @@ async function inspectDescriptor() {
     }
     // A different wallet gets its own birthday (Sparrow's bh=, else "new
     // wallet"); re-pasting the configured wallet keeps the current one.
-    const sameWallet = loadedConfig?.spend_pubkey === s.spend_pubkey;
+    const sameWallet = (loadedConfig ?? fileConfig)?.spend_pubkey === s.spend_pubkey;
     if (firstLook && !sameWallet) {
       if (s.birth_height != null) setBirthday("height", s.birth_height);
       else setBirthday("tip");
@@ -570,7 +633,7 @@ function formConfig() {
   const optional = (id) => text(id) || null;
   const atTip = $("birthday-tip").checked;
   return {
-    ...(loadedConfig ?? setupConfig),
+    ...(loadedConfig ?? fileConfig ?? setupConfig),
     network: $("cfg-network").value,
     oracle_url: text("cfg-oracle-url"),
     p2p_node_addr: optional("cfg-p2p-addr"),
@@ -604,10 +667,13 @@ function settingsMessage(text, isError) {
 async function loadConfig() {
   configLoadInFlight = true;
   try {
-    loadedConfig = await invoke("get_config");
+    const cfg = await invoke("get_config");
+    if (fileMode) return; // the daemon went down meanwhile; the file is edited now
+    loadedConfig = cfg;
     fillForm(loadedConfig);
     settingsMessage("", false);
   } catch (e) {
+    if (fileMode) return;
     loadedConfig = null;
     settingsMessage(String(e), true);
   } finally {
@@ -633,8 +699,10 @@ async function saveSetupConfig() {
       autostart: $("cfg-autostart").checked,
     });
     if (spawnError) {
-      // Files were written; only starting the daemon failed. The next polls
-      // leave setup mode (the config is complete now) and disable the form.
+      // Files were written; only starting the daemon failed. The config is
+      // complete now, so the form edits the file from here on.
+      if (setupMode) exitSetupMode();
+      if (!fileMode) enterFileMode();
       settingsMessage(`Saved, but the daemon failed to start: ${spawnError}`, true);
     } else {
       exitSetupMode();
@@ -648,14 +716,49 @@ async function saveSetupConfig() {
   $("save-btn").disabled = false;
 }
 
+// File-mode save: the tray validates and writes the config file (and a new
+// scan key, if one was entered), then starts the daemon.
+async function saveConfigFile() {
+  const { descriptor, error } = pastedDescriptor();
+  if (error) return settingsMessage(error, true);
+  $("save-btn").disabled = true;
+  settingsMessage("Saving…", false);
+  const key = $("cfg-scan-key").value.trim();
+  try {
+    const spawnError = await invoke("save_config_file", {
+      config: formConfig(),
+      scanKey: key || null,
+      descriptor,
+      // The loaded birthday was "new wallet" and still unresolved: a restart
+      // attempt may record it meanwhile, which the save then keeps.
+      tipUnresolvedAtLoad: fileConfig.start_at_tip === true && fileConfig.start_height == null,
+    });
+    if (spawnError) {
+      // The file was written; show it as it is now (with a birthday the
+      // daemon recorded before exiting) for the next fix.
+      await loadConfigFile();
+      settingsMessage(`Saved, but the daemon failed to start: ${spawnError}`, true);
+    } else {
+      exitFileMode();
+      await loadConfig();
+      await refresh();
+      settingsMessage("Saved — daemon started.", false);
+    }
+  } catch (e) {
+    settingsMessage(String(e), true);
+  }
+  $("save-btn").disabled = false;
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // After a save the daemon restarts in-process; wait until it answers again
-// (a new wallet may first fetch the chain tip from the oracle).
+// (a new wallet may first fetch the chain tip from the oracle). Gives up
+// once the daemon crashed (file mode).
 async function waitForDaemon(timeoutMs = 60000) {
   await sleep(600); // let the old instance go away first
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !fileMode) {
     try {
       return await invoke("get_config");
     } catch (_) {
@@ -668,6 +771,7 @@ async function waitForDaemon(timeoutMs = 60000) {
 async function saveConfig(event) {
   event.preventDefault();
   if (setupMode) return saveSetupConfig();
+  if (fileMode) return saveConfigFile();
   if (loadedConfig === null) return;
   const { descriptor, error } = pastedDescriptor();
   if (error) return settingsMessage(error, true);
@@ -697,6 +801,14 @@ async function saveConfig(event) {
 
   settingsMessage("Saved — restarting the daemon with the new settings…", false);
   const cfg = await waitForDaemon();
+  if (fileMode) {
+    settingsMessage(
+      "Saved, but the daemon exited with the new settings — see the Status tab for the reason, then fix them here.",
+      true
+    );
+    $("save-btn").disabled = false;
+    return;
+  }
   // Reload so loadedConfig matches what the daemon persisted (loadConfig
   // clears the message, so report the outcome afterwards).
   await loadConfig();
@@ -747,7 +859,11 @@ $("cfg-autostart").addEventListener("change", async () => {
 });
 
 $("settings-form").addEventListener("submit", saveConfig);
-$("reload-btn").addEventListener("click", loadConfig);
+$("reload-btn").addEventListener("click", () => {
+  if (!fileMode) return loadConfig();
+  settingsMessage("", false);
+  return loadConfigFile();
+});
 
 loadAutostart();
 
@@ -770,7 +886,7 @@ function showTab(name) {
   $("tab-status").classList.toggle("active", name === "status");
   $("tab-settings").classList.toggle("active", name === "settings");
   $("tab-wallet").classList.toggle("active", name === "wallet");
-  if (name === "settings" && !setupMode && loadedConfig === null && !configLoadInFlight)
+  if (name === "settings" && !setupMode && !fileMode && loadedConfig === null && !configLoadInFlight)
     loadConfig();
 }
 
