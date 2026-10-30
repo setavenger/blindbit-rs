@@ -37,6 +37,11 @@ const FEE_FILTER_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const HEADER_PEERS: usize = 3;
 /// Discovered peers whose fee filters make up the relay fee.
 const FEE_FILTER_PEERS: usize = 5;
+/// Fresh fee filters from this many discovered peers before their median is
+/// reported; with fewer, the lowest (one peer cannot raise the fee).
+const FEE_FILTER_QUORUM: usize = 3;
+/// Connect timeout for a connection opened only to read a fee filter.
+const FEE_SAMPLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The shared header connection and when it was last used.
 type HeaderSlot = Arc<StdMutex<Option<(Peer, Instant)>>>;
@@ -49,6 +54,8 @@ pub struct ChainSource {
     oracle: Mutex<Option<OracleServiceClient<Channel>>>,
     header_peer: HeaderSlot,
     fee_filters: Arc<StdMutex<FeeFilters>>,
+    /// One fee-filter sampling round at a time.
+    fee_sampling: Mutex<()>,
 }
 
 impl ChainSource {
@@ -59,6 +66,7 @@ impl ChainSource {
             oracle: Mutex::new(None),
             header_peer: Arc::new(StdMutex::new(None)),
             fee_filters: Arc::new(StdMutex::new(FeeFilters::default())),
+            fee_sampling: Mutex::new(()),
         }
     }
 
@@ -120,27 +128,80 @@ impl ChainSource {
     }
 
     /// The current mempool minimum fee rate in sat/kvB: the own node's, or
-    /// the median of the latest from up to five discovered peers.
+    /// the median of the latest from at least three (up to five) discovered
+    /// peers; with fewer answering, the lowest of theirs.
     pub async fn fee_filter(&self) -> Result<u64, String> {
-        if let Some(rate) = self.fee_filters.lock().expect("fee filter lock").current() {
+        if self.peers.is_own_node() {
+            if let Some(rate) = self.fee_filters().current(1) {
+                return Ok(rate);
+            }
+            // A fresh connection carries a fresh filter: Bitcoin Core sends
+            // it right after the handshake.
+            self.header_peer.lock().expect("header peer lock").take();
+            self.with_header_peer(
+                Arc::new(|peer: &mut Peer| {
+                    peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
+                    Ok(())
+                }),
+                |_| true,
+            )
+            .await?;
+            return self
+                .fee_filters()
+                .current(1)
+                .ok_or_else(|| "the P2P peer did not send a fee filter".to_string());
+        }
+        if let Some(rate) = self.fee_filters().current(FEE_FILTER_QUORUM) {
             return Ok(rate);
         }
-        // A fresh connection carries a fresh filter: Bitcoin Core sends it
-        // right after the handshake.
-        self.header_peer.lock().expect("header peer lock").take();
-        self.with_header_peer(
-            Arc::new(|peer: &mut Peer| {
-                peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
-                Ok(())
-            }),
-            |_| true,
-        )
-        .await?;
-        self.fee_filters
-            .lock()
-            .expect("fee filter lock")
-            .current()
-            .ok_or_else(|| "the P2P peer did not send a fee filter".to_string())
+        self.sample_fee_filters().await;
+        let filters = self.fee_filters();
+        filters
+            .current(FEE_FILTER_QUORUM)
+            .or_else(|| filters.lowest())
+            .ok_or_else(|| "no P2P peer sent a fee filter".to_string())
+    }
+
+    fn fee_filters(&self) -> std::sync::MutexGuard<'_, FeeFilters> {
+        self.fee_filters.lock().expect("fee filter lock")
+    }
+
+    /// Discovered peers: read the fee filters of enough further peers for a
+    /// quorum, on short connections opened at once. Connections still under
+    /// way when the caller stops waiting finish and count for the next call.
+    async fn sample_fee_filters(&self) {
+        let _one_at_a_time = self.fee_sampling.lock().await;
+        let mut asked = self.fee_filters().fresh_peers();
+        let needed = FEE_FILTER_QUORUM.saturating_sub(asked.len());
+        if needed == 0 {
+            return;
+        }
+        let mut connections = tokio::task::JoinSet::new();
+        // One more than needed: some peers do not answer.
+        for _ in 0..=needed {
+            let Ok(addr) = self.peers.next(Purpose::Relay, &asked).await else {
+                break;
+            };
+            asked.insert(addr.clone());
+            let (peers, filters) = (self.peers.clone(), self.fee_filters.clone());
+            connections.spawn_blocking(move || {
+                match Peer::connect(
+                    peers.dialer(),
+                    &addr,
+                    peers.network(),
+                    false,
+                    FEE_SAMPLE_CONNECT_TIMEOUT,
+                ) {
+                    Ok(mut peer) => {
+                        peers.report(&addr, PeerEvent::Connected(peer.info()));
+                        let _ = peer.wait_until_settled(Instant::now() + SETTLE_WAIT);
+                        note_fee_filter(&filters, &addr, peer.fee_filter());
+                    }
+                    Err(_) => peers.report(&addr, PeerEvent::Unreachable),
+                }
+            });
+        }
+        while connections.join_next().await.is_some() {}
     }
 
     /// Remember a fee filter `peer` sent on any connection.
@@ -275,19 +336,34 @@ impl FeeFilters {
         }
     }
 
-    /// The median of the fresh filters (the higher middle one for an even
-    /// count): one peer's outlier, such as a node in initial block download
-    /// that announces it wants no transactions at all, does not decide. With
-    /// one peer (the own node), its filter.
-    fn current(&self) -> Option<u64> {
-        let mut rates: Vec<u64> = self
-            .0
-            .values()
-            .filter(|(_, at)| at.elapsed() < FEE_FILTER_MAX_AGE)
-            .map(|(rate, _)| *rate)
-            .collect();
+    fn fresh(&self) -> impl Iterator<Item = (&PeerAddr, u64)> {
+        self.0
+            .iter()
+            .filter(|(_, (_, at))| at.elapsed() < FEE_FILTER_MAX_AGE)
+            .map(|(peer, (rate, _))| (peer, *rate))
+    }
+
+    fn fresh_peers(&self) -> HashSet<PeerAddr> {
+        self.fresh().map(|(peer, _)| peer.clone()).collect()
+    }
+
+    /// The median of the fresh filters (the lower middle one for an even
+    /// count), once at least `quorum` peers sent one: one peer's outlier,
+    /// such as a node in initial block download that announces it wants no
+    /// transactions at all, does not decide. With one peer (the own node)
+    /// and a quorum of one, its filter.
+    fn current(&self, quorum: usize) -> Option<u64> {
+        let mut rates: Vec<u64> = self.fresh().map(|(_, rate)| rate).collect();
+        if rates.len() < quorum.max(1) {
+            return None;
+        }
         rates.sort_unstable();
-        rates.get(rates.len() / 2).copied()
+        Some(rates[(rates.len() - 1) / 2])
+    }
+
+    /// The lowest fresh filter.
+    fn lowest(&self) -> Option<u64> {
+        self.fresh().map(|(_, rate)| rate).min()
     }
 }
 
@@ -379,26 +455,66 @@ mod tests {
         let peer =
             |n: u8| -> PeerAddr { std::net::SocketAddr::from(([192, 0, 2, n], 8333)).into() };
         let mut filters = FeeFilters::default();
-        assert_eq!(filters.current(), None);
+        assert_eq!(filters.current(1), None);
         filters.note(&peer(1), 1_000, now);
-        assert_eq!(filters.current(), Some(1_000), "one peer: its filter");
-        filters.note(&peer(2), 2_000, now);
+        assert_eq!(filters.current(1), Some(1_000), "the own node: its filter");
+        assert_eq!(filters.current(FEE_FILTER_QUORUM), None, "no quorum yet");
         filters.note(&peer(3), 100_000, now);
-        assert_eq!(filters.current(), Some(2_000), "an outlier does not decide");
+        assert_eq!(filters.current(FEE_FILTER_QUORUM), None);
+        assert_eq!(filters.lowest(), Some(1_000), "below quorum: the lowest");
+        filters.note(&peer(2), 2_000, now);
+        assert_eq!(
+            filters.current(FEE_FILTER_QUORUM),
+            Some(2_000),
+            "an outlier does not decide"
+        );
         // A peer's newer filter replaces its older one.
         filters.note(&peer(3), 1_500, now);
-        assert_eq!(filters.current(), Some(1_500));
+        assert_eq!(filters.current(FEE_FILTER_QUORUM), Some(1_500));
+        // Even count: the lower middle.
+        filters.note(&peer(4), 900_000, now);
+        assert_eq!(filters.current(FEE_FILTER_QUORUM), Some(1_500));
         // At most five peers, the latest; stale filters do not count.
         let stale = now - FEE_FILTER_MAX_AGE - Duration::from_secs(1);
         let mut filters = FeeFilters::default();
         filters.note(&peer(9), 50_000, stale);
         filters.note(&peer(10), 50_000, stale);
         filters.note(&peer(11), 1_000, now);
-        assert_eq!(filters.current(), Some(1_000));
+        assert_eq!(filters.current(1), Some(1_000));
+        assert_eq!(filters.fresh_peers(), HashSet::from([peer(11)]));
         for n in 20..30 {
             filters.note(&peer(n), 3_000, now);
         }
         assert_eq!(filters.0.len(), FEE_FILTER_PEERS);
-        assert_eq!(filters.current(), Some(3_000));
+        assert_eq!(filters.current(FEE_FILTER_QUORUM), Some(3_000));
+    }
+
+    /// Discovered peers: the relay fee comes from three of them, sampled
+    /// at once when fewer have sent one.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn the_relay_fee_samples_a_quorum_of_discovered_peers() {
+        let rates = [1_000, 2_000, 100_000];
+        let fakes: Vec<FakePeer> = rates
+            .iter()
+            .enumerate()
+            .map(|(i, rate)| {
+                FakePeer::spawn_on(
+                    [127, 0, 0, 43 + i as u8].into(),
+                    Script {
+                        fee_filter: *rate,
+                        ..Script::default()
+                    },
+                    2,
+                )
+            })
+            .collect();
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            Dialer::Direct,
+            Seeds::Static(fakes.iter().map(|fake| fake.addr.into()).collect()),
+        );
+        let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+        assert_eq!(chain.fee_filter().await.unwrap(), 2_000);
     }
 }

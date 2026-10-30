@@ -42,9 +42,14 @@ const WANT_ADDRS_BELOW: usize = 200;
 /// Core's `MAX_ADDR_TO_SEND`).
 const MAX_GOSSIP_PER_MESSAGE: usize = 1_000;
 /// A peer that could not be reached rests this long, and is forgotten after
-/// [`MAX_UNREACHABLE`] failures in a row.
+/// [`MAX_UNREACHABLE`] failures in a row: the seeds and gossip cannot bring
+/// it back for [`FORGET_FOR`].
 const UNREACHABLE_REST: Duration = Duration::from_secs(10 * 60);
 const MAX_UNREACHABLE: u8 = 3;
+const FORGET_FOR: Duration = Duration::from_secs(60 * 60);
+/// After an IPv6 connection found no route, IPv6 peers are skipped this long
+/// (the network may change).
+const IPV6_DEAD_FOR: Duration = Duration::from_secs(30 * 60);
 /// A peer that connected but did not help (no block, closed, stalled).
 const UNHELPFUL_REST: Duration = Duration::from_secs(10 * 60);
 /// A peer whose chain is below the block asked for: it may catch up soon.
@@ -294,8 +299,9 @@ struct Inner {
     meta: HashMap<PeerAddr, Meta>,
     /// The peer that served the last block.
     preferred: Option<PeerAddr>,
-    /// An IPv6 connection found no route: IPv6 peers are skipped.
-    ipv6_dead: bool,
+    /// When an IPv6 connection found no route: IPv6 peers are skipped for
+    /// [`IPV6_DEAD_FOR`].
+    ipv6_dead_since: Option<Instant>,
     /// When the seeds were last asked, and how many new addresses they gave.
     last_seed: Option<(Instant, usize)>,
     /// Peers that gossiped addresses this session.
@@ -313,7 +319,7 @@ impl PeerPool {
                 tried: Box::default(),
                 meta: HashMap::new(),
                 preferred: None,
-                ipv6_dead: false,
+                ipv6_dead_since: None,
                 last_seed: None,
                 gossiped: HashSet::new(),
             }),
@@ -361,7 +367,7 @@ impl PeerPool {
                 Seeds::Static(_) | Seeds::None => "no peer addresses to start from".to_string(),
             };
         }
-        let skipped_v6 = if inner.ipv6_dead {
+        let skipped_v6 = if inner.ipv6_dead() {
             inner
                 .meta
                 .iter()
@@ -394,10 +400,16 @@ impl PeerPool {
         let found = self.seeds.resolve(port).await;
         let mut inner = self.lock();
         let mut added = 0;
+        let from_dns = matches!(self.seeds, Seeds::Dns(_));
         for seeded in &found {
             let Some(ip) = seeded.addr.ip() else {
                 continue;
             };
+            // A DNS answer naming this computer or a local network is not a
+            // Bitcoin peer (a captive portal, a hijacked resolver).
+            if from_dns && !is_public(ip) {
+                continue;
+            }
             let record = Record::new(
                 addrv2(ip),
                 seeded.addr.port,
@@ -442,13 +454,13 @@ impl PeerPool {
                 }
             }
             PeerEvent::NoRoute if peer.is_ipv6() => {
-                if !inner.ipv6_dead {
+                if !inner.ipv6_dead() {
                     tracing::info!(
                         %peer,
-                        "no IPv6 route from this computer: skipping IPv6 peers from now on"
+                        "no IPv6 route from this computer: skipping IPv6 peers for 30 min"
                     );
                 }
-                inner.ipv6_dead = true;
+                inner.ipv6_dead_since = Some(now);
             }
             PeerEvent::Unreachable | PeerEvent::NoRoute => inner.failed(peer, now),
             PeerEvent::Unhelpful => inner.rest(peer, now + UNHELPFUL_REST),
@@ -477,7 +489,7 @@ impl PeerPool {
                 // Tor, I2P and CJDNS peers need a proxy.
                 _ => continue,
             };
-            if message.port == 0
+            if !plausible_port(message.port, self.network)
                 || !message.services.has(required_services())
                 || ip.is_unspecified()
                 || ip.is_multicast()
@@ -547,6 +559,21 @@ impl PeerPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn age_rest(&self, addr: &PeerAddr, by: Duration) {
+        if let Some(meta) = self.lock().meta.get_mut(addr) {
+            meta.resting_until = meta.resting_until.and_then(|until| until.checked_sub(by));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_ipv6_dead(&self, by: Duration) {
+        let mut inner = self.lock();
+        inner.ipv6_dead_since = inner
+            .ipv6_dead_since
+            .and_then(|since| since.checked_sub(by));
+    }
+
+    #[cfg(test)]
     pub(crate) fn age_last_seed(&self, by: Duration) {
         let mut inner = self.lock();
         if let Some((at, added)) = inner.last_seed {
@@ -556,6 +583,11 @@ impl PeerPool {
 }
 
 impl Inner {
+    fn ipv6_dead(&self) -> bool {
+        self.ipv6_dead_since
+            .is_some_and(|since| since.elapsed() < IPV6_DEAD_FOR)
+    }
+
     fn known(&self) -> usize {
         self.meta
             .values()
@@ -583,7 +615,7 @@ impl Inner {
         meta.table.is_some()
             && !meta.ignored
             && !exclude.contains(addr)
-            && !(self.ipv6_dead && addr.is_ipv6())
+            && !(self.ipv6_dead() && addr.is_ipv6())
             && meta.resting_until.is_none_or(|until| until <= now)
     }
 
@@ -639,7 +671,7 @@ impl Inner {
                 meta.table.is_some()
                     && !meta.ignored
                     && !exclude.contains(*addr)
-                    && !(self.ipv6_dead && addr.is_ipv6())
+                    && !(self.ipv6_dead() && addr.is_ipv6())
             })
             .min_by_key(|(_, meta)| meta.resting_until)
             .map(|(addr, _)| addr.clone())
@@ -648,8 +680,19 @@ impl Inner {
     /// Add a new address to the "new" table. A colliding record that keeps
     /// failing gives way; otherwise the new one is dropped.
     fn add(&mut self, addr: PeerAddr, record: Record) -> bool {
-        if self.meta.contains_key(&addr) {
-            return false;
+        match self.meta.get(&addr) {
+            // Forgotten after failing, long enough ago: may come back.
+            Some(meta)
+                if meta.table.is_none()
+                    && !meta.ignored
+                    && meta
+                        .resting_until
+                        .is_none_or(|until| until <= Instant::now()) =>
+            {
+                self.meta.remove(&addr);
+            }
+            Some(_) => return false,
+            None => {}
         }
         if let Some(conflict) = self.new.add(&record) {
             if !conflict.is_terrible(TERRIBLE_TRIES, TERRIBLE_WEEKLY_TRIES) {
@@ -713,7 +756,7 @@ impl Inner {
     }
 
     fn failed(&mut self, addr: &PeerAddr, now: Instant) {
-        let Some(meta) = self.meta.get_mut(addr) else {
+        let Some(meta) = self.meta.get_mut(addr).filter(|meta| meta.table.is_some()) else {
             return;
         };
         meta.failures = meta.failures.saturating_add(1);
@@ -725,8 +768,13 @@ impl Inner {
             None => return,
         }
         if failures >= MAX_UNREACHABLE {
+            // Out of the tables; the entry stays so the seeds and gossip
+            // cannot add it back right away.
             self.remove_from_table(addr);
-            self.meta.remove(addr);
+            if let Some(meta) = self.meta.get_mut(addr) {
+                meta.table = None;
+                meta.resting_until = Some(now + FORGET_FOR);
+            }
         }
     }
 
@@ -825,6 +873,11 @@ pub(crate) fn is_public(ip: IpAddr) -> bool {
                 || ip.is_multicast()
                 // 100.64.0.0/10, carrier-grade NAT.
                 || (a == 100 && (b & 0xc0) == 64)
+                // 192.0.0.0/24 (protocol assignments), 198.18.0.0/15
+                // (benchmarking), 240.0.0.0/4 (reserved).
+                || (a == 192 && b == 0 && ip.octets()[2] == 0)
+                || (a == 198 && (b & 0xfe) == 18)
+                || a >= 240
                 || a == 0)
         }
         IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
@@ -840,6 +893,13 @@ pub(crate) fn is_public(ip: IpAddr) -> bool {
             }
         },
     }
+}
+
+/// A port a gossiped peer may be dialled on: the network's own, or one
+/// above the well-known range, so gossip cannot point friglet at other
+/// services (ssh, mail, web).
+fn plausible_port(port: u16, network: Network) -> bool {
+    port == default_port(network) || port >= 1024
 }
 
 /// The network's default P2P port (Bitcoin Core's `-port` default).

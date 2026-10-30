@@ -169,6 +169,9 @@ fn without_an_ipv6_route_ipv6_peers_are_skipped() {
     let asked = HashSet::from([addr(PEERS[0])]);
     let err = run(source.next(Purpose::Block, &asked)).expect_err("only IPv6 left");
     assert!(err.0.contains("no IPv6 route"), "{err}");
+    // The network may change: IPv6 is tried again after 30 min.
+    pool(&source).age_ipv6_dead(Duration::from_secs(30 * 60));
+    assert_eq!(run(source.next(Purpose::Block, &asked)).unwrap(), addr(v6));
     // An IPv6 peer that cannot be reached for another reason is not the
     // whole family.
     let other = seeded(&["[2001:db8::2]:18444", "[2001:db8::3]:18444"]);
@@ -180,26 +183,34 @@ fn without_an_ipv6_route_ipv6_peers_are_skipped() {
 }
 
 #[test]
-fn the_seeds_are_asked_again_only_after_a_while() {
-    let only = addr(PEERS[0]);
-    let source = seeded(&[PEERS[0]]);
+fn the_seeds_are_asked_again_only_after_a_while_and_forgotten_peers_stay_away() {
+    let (forgotten, other) = (addr(PEERS[0]), addr(PEERS[1]));
+    let source = seeded(&PEERS[..2]);
     let pool = pool(&source);
     let first = pool.seeded_at().expect("seeded");
     for _ in 0..3 {
-        source.report(&only, PeerEvent::Unreachable);
+        source.report(&forgotten, PeerEvent::Unreachable);
     }
-    assert_eq!(source.known(), 0);
-    let err = run(source.next(Purpose::Block, &none())).expect_err("forgotten, not reseeded");
-    assert!(err.0.contains("no peer addresses"), "{err}");
+    assert_eq!(source.known(), 1);
+    let asked = HashSet::from([other.clone()]);
+    run(source.next(Purpose::Block, &asked)).expect_err("forgotten, not reseeded");
     assert_eq!(
         pool.seeded_at(),
         Some(first),
         "not asked again within 5 min"
     );
 
+    // Asked again after 5 min, but a forgotten peer stays out for an hour.
     pool.age_last_seed(Duration::from_secs(5 * 60));
-    assert_eq!(run(source.next(Purpose::Block, &none())).unwrap(), only);
-    assert_ne!(pool.seeded_at(), Some(first), "asked again");
+    let err = run(source.next(Purpose::Block, &asked)).expect_err("still forgotten");
+    assert!(err.0.contains("all 1 known peers were tried"), "{err}");
+    let second = pool.seeded_at().expect("seeded");
+    assert_ne!(second, first, "asked again");
+
+    pool.age_rest(&forgotten, Duration::from_secs(60 * 60));
+    pool.age_last_seed(Duration::from_secs(5 * 60));
+    assert_eq!(run(source.next(Purpose::Block, &asked)).unwrap(), forgotten);
+    assert_eq!(source.known(), 2);
 }
 
 #[test]
@@ -251,6 +262,11 @@ fn gossip_keeps_full_nodes_and_public_peers_cannot_name_local_ones() {
             message([93, 184, 216, 36], ServiceFlags::NETWORK),
             // Local addresses from a public peer.
             message([127, 0, 0, 1], full),
+            // A well-known port of another service.
+            AddrV2Message {
+                port: 22,
+                ..message([93, 184, 216, 37], full)
+            },
             message([192, 168, 1, 10], full),
             AddrV2Message {
                 time: 0,
