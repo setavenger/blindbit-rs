@@ -286,11 +286,21 @@ dbus-run-session -- bash -c '
   that served the last block, and asks for addresses while < 200 are known.
   Headers try up to 3 peers; `blockchain.relayfee` is the median of fresh
   feefilters from >= 3 (up to 5) peers, sampled at Electrum start, the lowest
-  until then; broadcast (until SNB-856) goes to one relay peer. DNS seed
+  until then. Broadcast (SNB-856, `friglet/src/electrum/net_broadcast.rs`):
+  3 observers (relay=true, settled, their version relays txs) first, then 2
+  senders (relay=false, inv → getdata → tx → ping/pong, then listen), all in
+  distinct netgroups (`PeerAddr::netgroup`: /16, /32); success only when an
+  observer serves the tx, rejection only when every sender gave the same
+  signal; rechecks ask 2 peers outside `PendingTx.sent_to` and hand a lost tx
+  to one of them. Own node: `relay::broadcast`/`recheck`, unchanged. DNS seed
   answers must be public IPs; gossip may name local IPs only when it comes
   from a local peer, and only the network's port or ports >= 1024.
 - Tests: `blindbit-lib/src/net/pool_tests.rs` (pure),
   `scanner/discovery_tests.rs` (fake nodes on 127.0.0.x; not on macOS),
+  broadcast scenarios in `friglet/src/electrum/net_broadcast.rs` and
+  `electrum::tests::discovered` (`FakeNet` peers on 127.N.0.1, one /16 each;
+  the address book hashes deterministically, so a slot collision fails
+  `known() == n` every time: move the addresses),
   `blindbit-lib/tests/thread_soak.rs` (Linux; thread count after 50
   fetches). `fetch_block` example: peer `dns` = discovery.
 

@@ -10,11 +10,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::{OutPoint, Transaction};
+use blindbit_lib::net::PeerAddr;
 use blindbit_lib::scanner::WalletElectrumIndex;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,35 @@ pub struct PendingTx {
     /// Re-announcements after it went missing from the peer's mempool.
     #[serde(default)]
     pub reannounced: u32,
+    /// Discovered peers it was handed to, oldest first (at most
+    /// [`MAX_SENT_TO`]): a recheck asks other peers, whose word is not
+    /// their own echo. Empty with an own node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sent_to: Vec<String>,
+}
+
+/// Peers remembered per pending transaction in [`PendingTx::sent_to`].
+pub const MAX_SENT_TO: usize = 16;
+
+impl PendingTx {
+    /// The peers it was handed to (addresses that do not parse are skipped).
+    pub fn sent_to(&self) -> HashSet<PeerAddr> {
+        self.sent_to
+            .iter()
+            .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+            .map(PeerAddr::from)
+            .collect()
+    }
+
+    /// Remember that it was handed to `peer`, forgetting the oldest beyond
+    /// [`MAX_SENT_TO`].
+    pub fn note_sent_to(&mut self, peer: &PeerAddr) {
+        let peer = peer.to_string();
+        self.sent_to.retain(|known| *known != peer);
+        self.sent_to.push(peer);
+        let excess = self.sent_to.len().saturating_sub(MAX_SENT_TO);
+        self.sent_to.drain(..excess);
+    }
 }
 
 #[derive(Debug)]
@@ -82,17 +113,20 @@ impl PendingStore {
         self.txs.get_mut(txid)
     }
 
-    pub fn insert(&mut self, txid: String, raw_hex: String) {
+    /// Remember an accepted broadcast and the peers it was handed to.
+    pub fn insert(&mut self, txid: String, raw_hex: String, sent_to: &[PeerAddr]) {
         let now = now_secs();
-        self.txs.insert(
-            txid,
-            PendingTx {
-                raw_hex,
-                accepted_at: now,
-                last_in_mempool: now,
-                reannounced: 0,
-            },
-        );
+        let mut pending = PendingTx {
+            raw_hex,
+            accepted_at: now,
+            last_in_mempool: now,
+            reannounced: 0,
+            sent_to: Vec::new(),
+        };
+        for peer in sent_to {
+            pending.note_sent_to(peer);
+        }
+        self.txs.insert(txid, pending);
     }
 
     pub fn remove(&mut self, txid: &str) -> Option<PendingTx> {
@@ -215,7 +249,8 @@ mod tests {
         let path = temp_path("roundtrip");
         let mut store = PendingStore::load(path.clone());
         assert!(store.is_empty());
-        store.insert("aa".into(), "0100".into());
+        let sender: PeerAddr = "203.0.113.5:38333".parse::<SocketAddr>().unwrap().into();
+        store.insert("aa".into(), "0100".into(), std::slice::from_ref(&sender));
         store.save();
 
         let reloaded = PendingStore::load(path.clone());
@@ -223,6 +258,16 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "aa");
         assert_eq!(entries[0].1.raw_hex, "0100");
+        assert_eq!(entries[0].1.sent_to(), HashSet::from([sender]));
+
+        // A file from before `sent_to` existed still loads.
+        fs::write(
+            &path,
+            br#"{"bb":{"raw_hex":"0100","accepted_at":1,"last_in_mempool":1}}"#,
+        )
+        .unwrap();
+        let old = PendingStore::load(path.clone());
+        assert!(old.entries().all(|(_, pending)| pending.sent_to.is_empty()));
 
         fs::write(&path, b"{broken").unwrap();
         assert!(PendingStore::load(path.clone()).is_empty());
@@ -267,5 +312,25 @@ mod tests {
             .scripthash_history
             .insert("sh2".into(), vec![entry("tx", 321)]);
         assert_eq!(confirmed_height(&index, "tx"), Some(321));
+    }
+
+    #[test]
+    fn sent_to_keeps_the_latest_sixteen_peers() {
+        let mut pending = PendingTx {
+            raw_hex: String::new(),
+            accepted_at: 0,
+            last_in_mempool: 0,
+            reannounced: 0,
+            sent_to: Vec::new(),
+        };
+        let peer = |n: u8| -> PeerAddr { SocketAddr::from(([203, 0, 113, n], 38333)).into() };
+        for n in 0..20 {
+            pending.note_sent_to(&peer(n));
+        }
+        pending.note_sent_to(&peer(19));
+        assert_eq!(pending.sent_to.len(), MAX_SENT_TO);
+        assert!(!pending.sent_to().contains(&peer(3)));
+        assert!(pending.sent_to().contains(&peer(4)));
+        assert_eq!(pending.sent_to.last().unwrap(), "203.0.113.19:38333");
     }
 }
