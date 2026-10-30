@@ -147,7 +147,8 @@ What to expect from it:
 - **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
   with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
   minimum fee rate that the P2P peer's mempool currently accepts (with
-  random peers: the median of the last few peers' minimums). Keep
+  random peers: the median of at least three peers' minimums, so one peer
+  cannot raise it). Keep
   Sparrow's fee rate source on an external service (mempool.space by
   default), or set fee rates by hand.
 

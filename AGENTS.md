@@ -284,8 +284,11 @@ dbus-run-session -- bash -c '
   requires `NETWORK|WITNESS`, skips peers below the block height, ignores a
   peer that sends a bad/stripped block for the session, prefers the peer
   that served the last block, and asks for addresses while < 200 are known.
-  Headers try up to 3 peers; `blockchain.relayfee` is the median of the last
-  5 peers' feefilters; broadcast (until SNB-856) goes to one relay peer.
+  Headers try up to 3 peers; `blockchain.relayfee` is the median of fresh
+  feefilters from >= 3 (up to 5) peers, sampled at Electrum start, the lowest
+  until then; broadcast (until SNB-856) goes to one relay peer. DNS seed
+  answers must be public IPs; gossip may name local IPs only when it comes
+  from a local peer, and only the network's port or ports >= 1024.
 - Tests: `blindbit-lib/src/net/pool_tests.rs` (pure),
   `scanner/discovery_tests.rs` (fake nodes on 127.0.0.x; not on macOS),
   `blindbit-lib/tests/thread_soak.rs` (Linux; thread count after 50
