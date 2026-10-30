@@ -197,6 +197,7 @@ impl ChainSource {
                         let _ = peer.wait_until_settled(Instant::now() + SETTLE_WAIT);
                         note_fee_filter(&filters, &addr, peer.fee_filter());
                     }
+                    Err(e) if e.proxy_down() => {}
                     Err(_) => peers.report(&addr, PeerEvent::Unreachable),
                 }
             });
@@ -255,7 +256,14 @@ impl ChainSource {
                     self.peers.report(&addr, PeerEvent::Behind);
                     last_answer = Some(value);
                 }
-                Err((error, _)) => last_error = Some(error.to_string()),
+                Err((error, _)) => {
+                    // Every other peer would fail the same way.
+                    let proxy_down = error.proxy_down();
+                    last_error = Some(error.to_string());
+                    if proxy_down {
+                        break;
+                    }
+                }
             }
         }
         match last_answer {
@@ -289,7 +297,11 @@ fn ask_header_peer<T>(
             false,
             P2P_CONNECT_TIMEOUT,
         )
-        .inspect_err(|_| peers.report(addr, PeerEvent::Unreachable))?;
+        .inspect_err(|e| {
+            if !e.proxy_down() {
+                peers.report(addr, PeerEvent::Unreachable);
+            }
+        })?;
         peers.report(addr, PeerEvent::Connected(peer.info()));
         *slot = Some((peer, Instant::now()));
     }
@@ -404,6 +416,50 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Through `p2p_proxy` the Electrum server's own connections go through
+    /// the proxy too, the node's name unresolved, each with its own login;
+    /// with the proxy down the peer is not blamed.
+    #[tokio::test]
+    async fn header_connections_go_through_the_proxy() {
+        use blindbit_lib::net::testing::FakeSocks5;
+        use blindbit_lib::net::{PeerAddr, PeerHost};
+
+        let known = fake_peer::header(3);
+        let script = Script {
+            headers: vec![known],
+            ..Script::default()
+        };
+        let peer = FakePeer::spawn(script, 2);
+        let proxy = FakeSocks5::start();
+        proxy.route("node.invalid", peer.addr);
+        let node = PeerAddr {
+            host: PeerHost::Name("node.invalid".to_string()),
+            port: 18444,
+        };
+        let peers = PeerSource::own_node(node.clone(), proxy.dialer(), Network::Regtest);
+        let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+        assert_eq!(chain.header(known.block_hash()).await.unwrap(), known);
+        let requests = proxy.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, node);
+        assert!(requests[0].credentials.is_some());
+
+        // Nothing listens on port 1, and no parallel test can take it.
+        let down = "127.0.0.1:1".parse().unwrap();
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            Dialer::Socks5 { proxy: down },
+            Seeds::Static(vec![peer.addr.into()]),
+        );
+        let chain = ChainSource::new(peers.clone(), "http://127.0.0.1:1".into());
+        // Three failures would forget a peer that was blamed for them.
+        for _ in 0..3 {
+            let err = chain.header(known.block_hash()).await.unwrap_err();
+            assert!(err.contains("p2p_proxy"), "{err}");
+        }
+        assert_eq!(peers.known(), 1, "the peer is not blamed for the proxy");
     }
 
     #[tokio::test]

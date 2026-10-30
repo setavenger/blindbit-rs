@@ -480,6 +480,9 @@ async fn apply_settings(
         Some(d) if !d.is_empty() => Some(setup::keys_from_descriptor(&mut config, d)?),
         _ => scan_key.filter(|k| !k.trim().is_empty()),
     };
+    // The daemon validates the rest; whether the proxy answers is only
+    // known here (2 s).
+    setup::check_proxy_of(&config).await?;
     send_with_note(
         &state.socket_path,
         Request::ApplySettings {
@@ -582,7 +585,7 @@ async fn save_local_config(
         _ => scan_key,
     };
     setup::validate_setup(&config, &scan_key)?;
-    setup::resolve_peer(&config).await?;
+    setup::check_p2p(&config).await?;
     let config_path = friglet_ipc::default_config_path()
         .ok_or("cannot determine the platform config directory")?;
     let key_file = setup::write_local_config(&config_path, &config, &scan_key)?;

@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use blindbit_lib::net::{Dialer, PeerSource, Seeds};
+use blindbit_lib::net::{PeerSource, Seeds};
 use blindbit_lib::scanner;
 
 use config::ScanArgs;
@@ -244,15 +244,31 @@ async fn run(
     config::tighten_state_file_perms(&cfg.state_file);
 
     // Where blocks, headers and broadcasts go: the own node, or peers of
-    // the network found through its DNS seeds (asked from now on). Shared by
-    // the scanner and the Electrum server.
+    // the network found through its DNS seeds (asked from now on, unless
+    // the address book saved beside the wallet state knows enough). Shared
+    // by the scanner and the Electrum server. With p2p_proxy, every one of
+    // these connections goes through the proxy, never directly.
     let peers = PeerSource::new(
         cfg.network,
-        Dialer::Direct,
-        cfg.p2p_node.map(Into::into),
+        cfg.dialer(),
+        cfg.p2p_node.clone(),
         Seeds::for_network(cfg.network),
     );
+    if let Some(dir) = cfg.state_file.parent() {
+        peers.keep_book_in(if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        });
+    }
     peers.start();
+    if let Some(proxy) = cfg.p2p_proxy {
+        tracing::info!(
+            %proxy,
+            "every P2P connection goes through p2p_proxy, none directly; the oracle connection \
+             does not"
+        );
+    }
 
     tracing::info!(
         oracle_url = %cfg.raw.oracle_url,
@@ -455,6 +471,10 @@ async fn run(
         }
     } else {
         control_ctx.save_state().await;
+    }
+    {
+        let peers = peers.clone();
+        let _ = tokio::task::spawn_blocking(move || peers.save_book()).await;
     }
     if owns_socket {
         cleanup_socket(&cfg.control_socket);

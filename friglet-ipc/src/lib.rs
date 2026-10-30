@@ -45,9 +45,16 @@ pub struct DaemonConfig {
     /// BlindBit oracle URL.
     pub oracle_url: String,
     /// Bitcoin P2P node address: `host:port`, `ip:port`, or a bare host/IP
-    /// (the network's default port). Hostnames are resolved at daemon start.
-    /// Required to start scanning.
+    /// (the network's default port). Hostnames are resolved at daemon start
+    /// (through `p2p_proxy` when set, which also reaches `.onion` nodes).
+    /// Empty: random peers of the network; required on regtest.
     pub p2p_node_addr: Option<String>,
+    /// SOCKS5 proxy for every Bitcoin P2P connection, typically Tor:
+    /// `ip:port` or `localhost:port` (no other host names, so finding the
+    /// proxy needs no DNS). When set, friglet never connects to a peer
+    /// directly, also not when the proxy is down. The oracle is not
+    /// proxied.
+    pub p2p_proxy: Option<String>,
     /// Wallet birthday block height. Required to start scanning unless
     /// `start_at_tip` is set.
     pub start_height: Option<u64>,
@@ -88,6 +95,7 @@ impl Default for DaemonConfig {
             network: "bitcoin".to_string(),
             oracle_url: network::MAINNET_ORACLE_URL.to_string(),
             p2p_node_addr: None,
+            p2p_proxy: None,
             start_height: None,
             start_at_tip: false,
             spend_pubkey: None,
@@ -666,6 +674,7 @@ mod tests {
         let path = dir.join("sub").join("config.toml");
         let cfg = DaemonConfig {
             p2p_node_addr: Some("127.0.0.1:38333".to_string()),
+            p2p_proxy: None,
             start_height: Some(1234),
             spend_pubkey: Some("02".repeat(33)),
             ..DaemonConfig::default()
