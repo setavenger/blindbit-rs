@@ -39,6 +39,12 @@ pub fn default_p2p_port(network: &str) -> Option<u16> {
     }
 }
 
+/// Must `network` have an own node (`p2p_node_addr`)? Regtest has no
+/// public peers to find; every other network has DNS seeds.
+pub fn needs_own_node(network: &str) -> bool {
+    network == "regtest"
+}
+
 /// Split a P2P peer address into host and port. Accepts `host:port`,
 /// `[v6]:port`, a bare host or IP (the network's default port is used) and a
 /// bare IPv6 literal. The host is not resolved here.
@@ -128,6 +134,14 @@ mod tests {
             Some("signet")
         );
         assert_eq!(hosted_oracle_network("http://127.0.0.1:7000"), None);
+    }
+
+    #[test]
+    fn only_regtest_needs_an_own_node() {
+        assert!(needs_own_node("regtest"));
+        for network in ["bitcoin", "signet", "testnet", "testnet4"] {
+            assert!(!needs_own_node(network), "{network}");
+        }
     }
 
     #[test]

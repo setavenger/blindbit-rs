@@ -1,16 +1,22 @@
-//! Fetch one full block from a P2P node the way the scanner does, and print
-//! the block or the message the scanner would report.
+//! Fetch one full block over P2P the way the scanner does, and print the
+//! block or the message the scanner would report.
 //!
 //! ```text
-//! cargo run -p blindbit-lib --example fetch_block -- <host:port> <block hash> <height> [mainnet|testnet3|testnet4|signet|regtest]
+//! cargo run -p blindbit-lib --example fetch_block -- <host:port|dns> <block hash> <height> [mainnet|testnet3|testnet4|signet|regtest]
 //! ```
 //!
-//! `RUST_LOG=info` (the default) shows each failed attempt and its retry.
+//! `host:port` asks that node (as with `p2p_node_addr` set); `dns` finds
+//! peers of the network through its DNS seeds and asks them one after
+//! another (as with `p2p_node_addr` empty).
+//!
+//! `RUST_LOG=info` (the default) shows each failed attempt and its retry;
+//! `RUST_LOG=debug` also the seeds' answers and each peer asked.
 
 use std::str::FromStr;
 
 use bitcoin::BlockHash;
 use bitcoin::Network;
+use blindbit_lib::net::{Dialer, PeerSource, Seeds};
 use blindbit_lib::scanner::BlockFetcher;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [peer, hash, height, rest @ ..] = args.as_slice() else {
-        return Err("usage: fetch_block <host:port> <block hash> <height> [network]".into());
+        return Err("usage: fetch_block <host:port|dns> <block hash> <height> [network]".into());
     };
     let network = match rest.first().map(String::as_str).unwrap_or("mainnet") {
         "mainnet" => Network::Bitcoin,
@@ -31,7 +37,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "regtest" => Network::Regtest,
         other => return Err(format!("unknown network {other}").into()),
     };
-    let fetcher = BlockFetcher::new(peer.parse()?, network);
+    let own_node = match peer.as_str() {
+        "dns" => None,
+        addr => Some(addr.parse::<std::net::SocketAddr>()?.into()),
+    };
+    let peers = PeerSource::new(
+        network,
+        Dialer::Direct,
+        own_node,
+        Seeds::for_network(network),
+    );
+    let fetcher = BlockFetcher::new(peers.clone());
     let hash = BlockHash::from_str(hash)?;
     let height: u64 = height.parse()?;
 
@@ -42,11 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match runtime.block_on(fetcher.fetch(hash, height)) {
         Ok(block) => {
             println!(
-                "OK block {} at height {height}: {} transactions, {} bytes, in {:?}",
+                "OK block {} at height {height}: {} transactions, {} bytes, in {:?} ({})",
                 block.block_hash(),
                 block.txdata.len(),
                 bitcoin::consensus::encode::serialize(&block).len(),
-                started.elapsed()
+                started.elapsed(),
+                peers.summary()
             );
             Ok(())
         }

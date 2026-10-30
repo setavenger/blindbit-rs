@@ -63,7 +63,13 @@ impl Default for Script {
 impl FakePeer {
     /// Serve `connections` connections, one after another, with `script`.
     pub fn spawn(script: Script, connections: usize) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::spawn_on([127, 0, 0, 1].into(), script, connections)
+    }
+
+    /// [`Self::spawn`] listening on `ip` (any port): discovered peers are
+    /// told apart by IP only.
+    pub fn spawn_on(ip: std::net::IpAddr, script: Script, connections: usize) -> Self {
+        let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let mempool = Arc::new(Mutex::new(script.mempool.clone()));

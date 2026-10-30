@@ -68,7 +68,7 @@ pub(crate) fn restore_or_create(
     }
     match Scanner::from_changeset(
         client.clone(),
-        config.p2p_socket_addr,
+        config.peers.clone(),
         changeset,
         config.state_file.clone(),
         config.network,
@@ -119,7 +119,7 @@ fn create_new_scanner(
 ) -> Scanner {
     Scanner::new(
         client,
-        config.p2p_socket_addr,
+        config.peers.clone(),
         config.secret_scan,
         config.public_spend,
         config.max_label_num,

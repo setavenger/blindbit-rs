@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 #[cfg(feature = "serde")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bdk_sp::bitcoin::key::Secp256k1;
 use bitcoin::Network;
@@ -15,6 +15,7 @@ use bitcoin::secp256k1::{PublicKey, SecretKey};
 use tonic::transport::Channel;
 
 use super::Scanner;
+use crate::net::{Dialer, PeerSource};
 
 pub(super) fn secret(byte: u8) -> SecretKey {
     SecretKey::from_slice(&[byte; 32]).expect("valid secret")
@@ -56,10 +57,15 @@ pub(super) fn oracle_client() -> crate::OracleServiceClient<Channel> {
     lazy()
 }
 
-/// The P2P peer of the tests' scanners; nothing listens there, so a test
-/// that needs a node sets `p2p_peer` to its own.
-fn p2p_peer() -> SocketAddr {
-    "127.0.0.1:1".parse().expect("socket address")
+/// `addr` as the own node of a regtest scanner.
+pub(super) fn own_node(addr: SocketAddr) -> Arc<PeerSource> {
+    PeerSource::own_node(addr.into(), Dialer::Direct, Network::Regtest)
+}
+
+/// The P2P peers of the tests' scanners: an own node where nothing listens,
+/// so a test that needs a node sets `peers` to its own.
+fn p2p_peer() -> Arc<PeerSource> {
+    own_node("127.0.0.1:1".parse().expect("socket address"))
 }
 
 /// A state-file path in the temp dir that no other call returns, so tests

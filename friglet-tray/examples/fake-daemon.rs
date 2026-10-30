@@ -99,6 +99,10 @@ async fn main() -> std::io::Result<()> {
                         log_file: None,
                         oracle_error: None,
                         oracle_down_since_unix: None,
+                        p2p: Some(match &config.lock().unwrap().p2p_node_addr {
+                            Some(node) => format!("your node {node}"),
+                            None => "random peers: 37 known, 1 ignored".to_string(),
+                        }),
                     }),
                     Request::Start => {
                         scanning.store(true, Ordering::Relaxed);

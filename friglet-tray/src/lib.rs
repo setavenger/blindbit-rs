@@ -435,11 +435,13 @@ async fn get_config(state: State<'_, Arc<AppState>>) -> Result<DaemonConfig, Str
 struct NetworkDefaults {
     hosted_oracles: std::collections::BTreeMap<&'static str, &'static str>,
     default_ports: std::collections::BTreeMap<&'static str, u16>,
+    /// Networks without public peers, where the Bitcoin node is required.
+    needs_own_node: Vec<&'static str>,
 }
 
 #[tauri::command]
 fn network_defaults() -> NetworkDefaults {
-    use friglet_ipc::network::{NETWORKS, default_p2p_port, hosted_oracle_url};
+    use friglet_ipc::network::{NETWORKS, default_p2p_port, hosted_oracle_url, needs_own_node};
     NetworkDefaults {
         hosted_oracles: NETWORKS
             .into_iter()
@@ -449,6 +451,7 @@ fn network_defaults() -> NetworkDefaults {
             .into_iter()
             .filter_map(|n| default_p2p_port(n).map(|p| (n, p)))
             .collect(),
+        needs_own_node: NETWORKS.into_iter().filter(|n| needs_own_node(n)).collect(),
     }
 }
 

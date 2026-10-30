@@ -55,7 +55,8 @@ pub struct ScanArgs {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub start_at_tip: bool,
 
-    /// Bitcoin P2P node address (host:port)
+    /// Your Bitcoin node's P2P address (host:port); empty: random peers of
+    /// the network, found through its DNS seeds (regtest needs a node)
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_node_addr: Option<String>,
@@ -257,7 +258,8 @@ pub struct ResolvedConfig {
     /// The merged plain config, kept for `GetConfig` / `--print-config`.
     pub raw: DaemonConfig,
     pub network: Network,
-    pub p2p_addr: SocketAddr,
+    /// The own node, when one is configured; `None`: discovered peers.
+    pub p2p_node: Option<SocketAddr>,
     pub start_height: u64,
     pub spend_pubkey: PublicKey,
     /// The wallet's state file; `raw.state_file` keeps the configured path.
@@ -294,14 +296,30 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
         ));
     }
 
-    let p2p = raw
+    // Empty means unset: blocks then come from discovered peers.
+    let mut raw = raw;
+    if raw
         .p2p_node_addr
-        .clone()
-        .ok_or_else(|| missing("p2p_node_addr"))?;
-    // Accepts host:port, ip:port and a bare host (network default port);
-    // hostnames are resolved here, i.e. at every daemon (re)start.
-    let p2p_addr = friglet_ipc::network::resolve_peer_addr(&p2p, &raw.network)
-        .map_err(|e| format!("invalid p2p_node_addr `{p2p}`: {e}"))?;
+        .as_deref()
+        .is_some_and(|addr| addr.trim().is_empty())
+    {
+        raw.p2p_node_addr = None;
+    }
+    let p2p_node = match raw.p2p_node_addr.as_deref() {
+        // Accepts host:port, ip:port and a bare host (network default port);
+        // hostnames are resolved here, i.e. at every daemon (re)start.
+        Some(p2p) => Some(
+            friglet_ipc::network::resolve_peer_addr(p2p, &raw.network)
+                .map_err(|e| format!("invalid p2p_node_addr `{p2p}`: {e}"))?,
+        ),
+        None if friglet_ipc::network::needs_own_node(&raw.network) => {
+            return Err(format!(
+                "{} has no public peers: set p2p_node_addr to your {} node",
+                raw.network, raw.network
+            ));
+        }
+        None => None,
+    };
 
     let start_height = match raw.start_height {
         Some(h) => h,
@@ -337,7 +355,6 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
     // Belt-and-suspenders: old configs / CWD-relative defaults land state
     // next to the tray binary's CWD. Rewrite the bare default name to the
     // platform config-dir path when available.
-    let mut raw = raw;
     if raw.state_file.as_os_str() == "scanner_state.json"
         && let Some(absolute) = friglet_ipc::default_state_file()
     {
@@ -346,7 +363,7 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 
     Ok(ResolvedConfig {
         network,
-        p2p_addr,
+        p2p_node,
         start_height,
         spend_pubkey,
         state_file: raw.state_file.clone(),
@@ -909,15 +926,16 @@ mod tests {
     #[test]
     fn p2p_peer_accepts_hostnames_and_default_ports() {
         let r = resolve(resolvable("signet", "http://127.0.0.1:1", "127.0.0.1")).unwrap();
-        assert_eq!(r.p2p_addr, "127.0.0.1:38333".parse().unwrap());
+        assert_eq!(r.p2p_node, Some("127.0.0.1:38333".parse().unwrap()));
         let r = resolve(resolvable(
             "regtest",
             "http://127.0.0.1:1",
             "localhost:18444",
         ))
         .unwrap();
-        assert!(r.p2p_addr.ip().is_loopback());
-        assert_eq!(r.p2p_addr.port(), 18444);
+        let node = r.p2p_node.unwrap();
+        assert!(node.ip().is_loopback());
+        assert_eq!(node.port(), 18444);
         let err = resolve(resolvable("signet", "http://127.0.0.1:1", "host:notaport")).unwrap_err();
         assert!(err.contains("p2p_node_addr"), "{err}");
     }
@@ -1102,7 +1120,29 @@ mod tests {
     #[test]
     fn resolve_reports_missing_required_fields() {
         let err = resolve(DaemonConfig::default()).unwrap_err();
-        assert!(err.contains("p2p_node_addr"), "unexpected error: {err}");
+        assert!(err.contains("start_height"), "unexpected error: {err}");
+    }
+
+    /// No node, or an empty one: random peers, except on regtest.
+    #[test]
+    fn the_p2p_node_is_optional_except_on_regtest() {
+        for unset in [None, Some(""), Some("  ")] {
+            let mut cfg = resolvable("signet", "http://127.0.0.1:1", "x");
+            cfg.p2p_node_addr = unset.map(str::to_string);
+            let r = resolve(cfg).unwrap();
+            assert_eq!(r.p2p_node, None, "{unset:?}");
+            assert_eq!(r.raw.p2p_node_addr, None, "empty is normalised away");
+        }
+        let mut cfg = resolvable("bitcoin", "https://oracle.setor.dev", "x");
+        cfg.p2p_node_addr = None;
+        assert_eq!(resolve(cfg).unwrap().p2p_node, None);
+
+        let mut cfg = resolvable("regtest", "http://127.0.0.1:1", "x");
+        cfg.p2p_node_addr = Some(" ".to_string());
+        assert_eq!(
+            resolve(cfg).unwrap_err(),
+            "regtest has no public peers: set p2p_node_addr to your regtest node"
+        );
     }
 
     #[test]
