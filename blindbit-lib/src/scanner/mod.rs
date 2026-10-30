@@ -37,7 +37,9 @@ pub type ScannerError = Box<dyn std::error::Error + Send + Sync>;
 // Re-export public types and the main Scanner struct
 pub use changeset::{ChangeSet, STATE_FORMAT_VERSION};
 pub use config::ScannerConfig;
-pub use electrum_index::{ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status};
+pub use electrum_index::{
+    ScriptHashEntry, SpHistoryEntry, WalletElectrumIndex, electrum_scripthash, electrum_status,
+};
 pub use health::{
     OracleFloorStart, ScanCancelled, ScanHealth, ScanStall, ScanStopped, StateFileReset,
     StateRescan, oracle_block_hash,

@@ -15,6 +15,10 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use super::Scanner;
+use super::scanning::BlockScanDataStream;
+use super::test_support::{keys, run, scanner, secret};
+use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 use bdk_sp::bitcoin::key::Secp256k1;
 use bdk_sp::receive::get_silentpayment_pubkey;
 use bitcoin::absolute::LockTime;
@@ -28,10 +32,6 @@ use bitcoin::{
 };
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-use super::Scanner;
-use super::scanning::BlockScanDataStream;
-use super::test_support::{keys, run, scanner, secret};
-use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
 static SERVED_BLOCKS: Mutex<Option<HashMap<BlockHash, Block>>> = Mutex::new(None);
 

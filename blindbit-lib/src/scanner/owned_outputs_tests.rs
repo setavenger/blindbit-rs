@@ -23,9 +23,9 @@ use indexer::bdk_chain::BlockId;
 use super::Scanner;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 use crate::scanner::OwnedOutputRecord;
+use crate::scanner::test_support::{keys, scanner_at, secret, state_file};
 #[cfg(feature = "serde")]
 use crate::scanner::test_support::{restore_from, run};
-use crate::scanner::test_support::{keys, scanner_at, secret, state_file};
 
 const RECEIVE_HEIGHT: u32 = 100;
 const SPEND_HEIGHT: u32 = 200;

@@ -261,8 +261,12 @@ impl Scanner {
         let spend_pk = *self.internal_indexer.spend_pk();
         self.stage.indexer.scan_sk = Some(scan_sk);
         self.stage.indexer.spend_pk = Some(spend_pk);
-        self.internal_indexer =
-            restored_indexer(scan_sk, spend_pk, self.max_label_num, self.stage.indexer.clone());
+        self.internal_indexer = restored_indexer(
+            scan_sk,
+            spend_pk,
+            self.max_label_num,
+            self.stage.indexer.clone(),
+        );
 
         // Owned-output records and spent marks are derived from the graph;
         // rebuild them so no record or spend from a disconnected block stays.

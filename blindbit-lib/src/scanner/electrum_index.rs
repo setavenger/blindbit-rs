@@ -48,7 +48,6 @@ pub struct WalletElectrumIndex {
     // --- Silent Payments subscription data --------------------------------
     // Stored here so push_notifications never needs to lock the Scanner
     // (the scan task holds the scanner lock for its entire duration).
-
     /// Bech32m SP address derived from wallet keys.
     pub sp_address: String,
 

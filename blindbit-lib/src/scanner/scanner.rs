@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use bitcoin::BlockHash;
 use bitcoin::Network as BTCNetwork;
-use bitcoin::{OutPoint, Txid};
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+use bitcoin::{OutPoint, Txid};
 use bitcoin_rev::Network;
 use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
@@ -21,11 +21,11 @@ use tonic::transport::Channel;
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use indexer::bdk_chain::ConfirmationBlockTime;
 
-use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
-use super::types::OwnedOutputRecord;
-use super::electrum_index::{WalletElectrumIndex, WalletView};
 use super::ScannerError;
+use super::changeset::{ChangeSet, STATE_FORMAT_VERSION};
+use super::electrum_index::{WalletElectrumIndex, WalletView};
 use super::p2p;
+use super::types::OwnedOutputRecord;
 
 /// Main scanner struct for scanning the blockchain for Silent Payments outputs
 pub struct Scanner {
@@ -374,7 +374,11 @@ impl Scanner {
         tracing::warn!(
             from_height = oldest_unspent,
             previous_height,
-            unspent_outputs = self.owned_outputs.values().filter(|r| !r.is_spent()).count(),
+            unspent_outputs = self
+                .owned_outputs
+                .values()
+                .filter(|r| !r.is_spent())
+                .count(),
             "state file predates owned-output records, so spends in blocks it never fetched \
              can be missing; rescanning from the oldest unspent output"
         );
@@ -439,9 +443,7 @@ impl Scanner {
     ///
     /// Requires the `serde` feature to be enabled.
     #[cfg(feature = "serde")]
-    pub fn load_from_file<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<ChangeSet, ScannerError> {
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<ChangeSet, ScannerError> {
         let json = std::fs::read_to_string(path)?;
         let mut json_value: serde_json::Value =
             serde_json::from_str(&json).map_err(|e| format!("Failed to parse JSON: {}", e))?;
@@ -519,8 +521,14 @@ impl Scanner {
         changeset.public_spend_hex = Some(public_spend_hex);
         let format_version = changeset.format_version;
 
-        let mut scanner =
-            Self::from_stage(client, p2p_socket_addr, indexer, changeset, state_file, network);
+        let mut scanner = Self::from_stage(
+            client,
+            p2p_socket_addr,
+            indexer,
+            changeset,
+            state_file,
+            network,
+        );
         // Records older state files never had, spends already in the graph,
         // and the prefix lookup, all derived from the restored indexer.
         scanner.sync_owned_outputs();
