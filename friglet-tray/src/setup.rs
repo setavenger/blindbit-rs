@@ -182,11 +182,28 @@ pub fn keys_from_descriptor(cfg: &mut DaemonConfig, text: &str) -> Result<String
     Ok(d.scan_secret_hex())
 }
 
-/// Validate a setup-mode save tray-side, mirroring the daemon's own startup
+/// Validate a setup-mode save tray-side: [`validate_config`] plus the scan
+/// key, which setup mode requires.
+pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> {
+    validate_config(cfg)?;
+    let key = scan_key.trim();
+    if key.is_empty() {
+        return Err(
+            "paste your Sparrow wallet descriptor (or enter the scan key under Advanced)"
+                .to_string(),
+        );
+    }
+    if key.len() != 64 || !is_hex(key) {
+        return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
+    }
+    Ok(())
+}
+
+/// Validate settings tray-side, mirroring the daemon's own startup
 /// validation with friendlier messages. Hex fields are checked for length
 /// only; full secp256k1 validation happens daemon-side at startup. The P2P
 /// host is checked for syntax only (see [`resolve_peer`] for DNS).
-pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> {
+pub fn validate_config(cfg: &DaemonConfig) -> Result<(), String> {
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!(
             "invalid network `{}`: must be one of {}",
@@ -244,17 +261,6 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         return Err("invalid spend public key: must be 66 hex characters (33 bytes)".to_string());
     }
 
-    let key = scan_key.trim();
-    if key.is_empty() {
-        return Err(
-            "paste your Sparrow wallet descriptor (or enter the scan key under Advanced)"
-                .to_string(),
-        );
-    }
-    if key.len() != 64 || !is_hex(key) {
-        return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
-    }
-
     SocketAddr::from_str(&cfg.electrum_addr)
         .map_err(|e| format!("invalid Electrum bind address `{}`: {e}", cfg.electrum_addr))?;
     if cfg.state_file.as_os_str().is_empty() {
@@ -309,6 +315,47 @@ pub fn write_local_config(
     friglet_ipc::write_key_file(&key_file, scan_key.trim(), true)?;
     friglet_ipc::write_config_toml(config_path, cfg)?;
     Ok(key_file)
+}
+
+/// The config file at `path`, for the settings form while the daemon is
+/// down. A `descriptor` key fills in the spend key and, without a start
+/// height, its `bh=` birthday, as the daemon applies them: the form shows
+/// the wallet the daemon would run, and a save (which writes no
+/// `descriptor` key) keeps it.
+pub fn read_config_for_editing(path: &Path) -> Result<DaemonConfig, String> {
+    let mut cfg = friglet_ipc::read_config_toml(path)?;
+    if let Some(d) = file_descriptor(path).and_then(|d| SpDescriptor::parse(&d).ok()) {
+        cfg.spend_pubkey.get_or_insert_with(|| d.spend_pubkey_hex());
+        if cfg.start_height.is_none() {
+            cfg.start_height = d.birth_height;
+        }
+    }
+    Ok(cfg)
+}
+
+/// Persist a settings save made while the daemon is down. With a new scan
+/// key this is [`write_local_config`]; without one the config file is
+/// rewritten and the existing key file kept, which must exist.
+pub fn write_config_file(
+    config_path: &Path,
+    cfg: &DaemonConfig,
+    scan_key: Option<&str>,
+) -> Result<(), String> {
+    if let Some(key) = scan_key {
+        return write_local_config(config_path, cfg, key).map(drop);
+    }
+    let key_file = cfg
+        .key_file
+        .clone()
+        .or_else(friglet_ipc::default_key_file)
+        .ok_or("cannot determine a key file location; set the key file path")?;
+    if !key_file.exists() {
+        return Err(format!(
+            "no scan key at {}: paste your Sparrow wallet descriptor (or enter the scan key under Advanced)",
+            key_file.display()
+        ));
+    }
+    friglet_ipc::write_config_toml(config_path, cfg)
 }
 
 #[cfg(test)]
@@ -724,6 +771,56 @@ mod tests {
 
         // The pair now passes the configured check.
         assert!(is_configured(Some(&config_path), None, &no_env));
+    }
+
+    #[test]
+    fn write_config_file_keeps_the_key_file_without_a_new_key() {
+        let dir = temp_dir("write-file");
+        let config_path = dir.join("config.toml");
+        let key_path = dir.join("scan.key");
+        let cfg = DaemonConfig {
+            key_file: Some(key_path.clone()),
+            ..valid_config()
+        };
+
+        // No key file and no new key: refused, nothing written.
+        let err = write_config_file(&config_path, &cfg, None).unwrap_err();
+        assert!(err.contains("no scan key"), "{err}");
+        assert!(!config_path.exists());
+
+        // With the key file in place the config is rewritten, the key kept.
+        fs::write(&key_path, KEY_HEX).unwrap();
+        write_config_file(&config_path, &cfg, None).unwrap();
+        assert_eq!(friglet_ipc::read_config_toml(&config_path).unwrap(), cfg);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), KEY_HEX);
+
+        // A new key replaces it.
+        let other = "00".repeat(31) + "02";
+        write_config_file(&config_path, &cfg, Some(&other)).unwrap();
+        assert_eq!(fs::read_to_string(&key_path).unwrap().trim(), other);
+    }
+
+    #[test]
+    fn read_config_for_editing_applies_a_descriptor() {
+        let dir = temp_dir("read-editing");
+        let path = dir.join("config.toml");
+        let descriptor = format!("{}?bh=4000", TEST_DESCRIPTOR.split('#').next().unwrap());
+        fs::write(&path, format!("descriptor = \"{descriptor}\"\n")).unwrap();
+        let cfg = read_config_for_editing(&path).unwrap();
+        let d = SpDescriptor::parse(TEST_DESCRIPTOR).unwrap();
+        assert_eq!(cfg.spend_pubkey, Some(d.spend_pubkey_hex()));
+        assert_eq!(cfg.start_height, Some(4000));
+
+        // An explicit start height wins over the descriptor's birthday.
+        fs::write(
+            &path,
+            format!("start_height = 123\ndescriptor = \"{descriptor}\"\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            read_config_for_editing(&path).unwrap().start_height,
+            Some(123)
+        );
     }
 
     #[test]

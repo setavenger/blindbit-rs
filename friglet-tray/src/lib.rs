@@ -597,6 +597,62 @@ async fn save_local_config(
     Ok(attach_and_record(&state).await)
 }
 
+/// The config file, for the settings form while the daemon is down (no
+/// daemon answers `GetConfig`).
+#[tauri::command]
+fn get_config_file() -> Result<DaemonConfig, String> {
+    let config_path = friglet_ipc::default_config_path()
+        .ok_or("cannot determine the platform config directory")?;
+    setup::read_config_for_editing(&config_path)
+}
+
+/// Settings save while the daemon is down (crashed, or not running): no
+/// daemon can persist the settings, so the tray validates and writes the
+/// config file itself, then starts the daemon. A config that keeps the
+/// daemon from starting can so be fixed in the form. Without a new scan key
+/// (or descriptor) the existing key file is kept.
+///
+/// Same results as [`save_local_config`].
+#[tauri::command]
+async fn save_config_file(
+    state: State<'_, Arc<AppState>>,
+    mut config: DaemonConfig,
+    scan_key: Option<String>,
+    descriptor: Option<String>,
+) -> Result<Option<String>, String> {
+    let scan_key = match descriptor.as_deref().map(str::trim) {
+        Some(d) if !d.is_empty() => Some(setup::keys_from_descriptor(&mut config, d)?),
+        _ => scan_key.filter(|k| !k.trim().is_empty()),
+    };
+    match &scan_key {
+        Some(key) => setup::validate_setup(&config, key)?,
+        None => setup::validate_config(&config)?,
+    }
+    setup::resolve_peer(&config).await?;
+    let config_path = friglet_ipc::default_config_path()
+        .ok_or("cannot determine the platform config directory")?;
+    {
+        // No restart attempt runs while we hold the lifecycle lock, so none
+        // reads the file mid-save. A daemon that answers owns its settings.
+        let _lc = state.lifecycle.lock().await;
+        if lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT)
+            .await
+            .is_some()
+        {
+            return Err(
+                "the daemon is running again: the form now loads its settings, save them there"
+                    .to_string(),
+            );
+        }
+        setup::write_config_file(&config_path, &config, scan_key.as_deref())?;
+    }
+    tracing::info!(
+        config = %config_path.display(),
+        "settings written to the config file while the daemon was down"
+    );
+    Ok(attach_and_record(&state).await)
+}
+
 /// Send one request to the daemon. Connection and protocol failures, and
 /// the daemon's own `Error` answer, become the `Err` message.
 async fn daemon_request(socket_path: &str, req: &Request) -> Result<Response, String> {
@@ -1391,6 +1447,8 @@ pub fn run() {
             get_config,
             get_setup_state,
             save_local_config,
+            get_config_file,
+            save_config_file,
             inspect_descriptor,
             apply_settings,
             network_defaults,
