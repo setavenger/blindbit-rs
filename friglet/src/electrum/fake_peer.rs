@@ -8,16 +8,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bitcoin_p2p::p2p_message_types::message::{
-    HeadersMessage, InventoryPayload, NetworkMessage, RawNetworkMessage,
-};
-use bitcoin_p2p::p2p_message_types::message_blockdata::Inventory;
-use bitcoin_p2p::p2p_message_types::message_network::{
-    ClientSoftwareVersion, UserAgent, UserAgentVersion, VersionMessage,
-};
-use bitcoin_p2p::p2p_message_types::{Address, NetworkExt, ProtocolVersion, ServiceFlags};
-use bitcoin_rev::Network;
-use bitcoin_rev::consensus::encode;
+use bitcoin::Network;
+use bitcoin::block::Header;
+use bitcoin::consensus::encode;
+use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_blockdata::Inventory;
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::{Address, ServiceFlags};
 
 /// What the peer does with a transaction handed to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +43,7 @@ pub struct Script {
     /// Transactions already in the mempool (raw bytes).
     pub mempool: Vec<Vec<u8>>,
     /// Block headers the peer knows.
-    pub headers: Vec<bitcoin_rev::block::Header>,
+    pub headers: Vec<Header>,
     /// Advertised fee filter, sat/kvB.
     pub fee_filter: u32,
 }
@@ -94,7 +91,7 @@ struct Wire {
 
 impl Wire {
     fn send(&mut self, message: NetworkMessage) -> std::io::Result<()> {
-        let raw = RawNetworkMessage::new(Network::Regtest.default_network_magic(), message);
+        let raw = RawNetworkMessage::new(Network::Regtest.magic(), message);
         self.stream.write_all(&encode::serialize(&raw))
     }
 
@@ -134,21 +131,20 @@ fn serve(
     let NetworkMessage::Version(_) = wire.recv()? else {
         return Ok(());
     };
+    let useless = Address {
+        services: ServiceFlags::NONE,
+        address: [0; 8],
+        port: 0,
+    };
     wire.send(NetworkMessage::Version(VersionMessage {
-        version: ProtocolVersion::WTXID_RELAY_VERSION,
+        // BIP 339's `WTXID_RELAY_VERSION`.
+        version: 70016,
         services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
         timestamp: 0,
-        receiver: Address::useless(),
-        sender: Address::useless(),
+        receiver: useless.clone(),
+        sender: useless,
         nonce: 7,
-        user_agent: UserAgent::new(
-            "Fake",
-            UserAgentVersion::new(ClientSoftwareVersion::SemVer {
-                major: 1,
-                minor: 0,
-                revision: 0,
-            }),
-        ),
+        user_agent: "/Fake:1.0.0/".to_string(),
         start_height: 0,
         relay: true,
     }))?;
@@ -160,9 +156,7 @@ fn serve(
         }
     }
     wire.send(NetworkMessage::Ping(1))?;
-    wire.send(NetworkMessage::FeeFilter(
-        bitcoin_rev::FeeRate::from_sat_per_kvb(script.fee_filter),
-    ))?;
+    wire.send(NetworkMessage::FeeFilter(i64::from(script.fee_filter)))?;
 
     let wtxid_of = |raw: &[u8]| {
         let tx: bitcoin::Transaction = bitcoin::consensus::encode::deserialize(raw).unwrap();
@@ -179,7 +173,7 @@ fn serve(
                     .iter()
                     .find(|h| h.block_hash() == request.stop_hash)
                 {
-                    wire.send(NetworkMessage::Headers(HeadersMessage(vec![*header])))?;
+                    wire.send(NetworkMessage::Headers(vec![*header]))?;
                 }
             }
             NetworkMessage::Inv(items) if script.request_announced => {
@@ -187,7 +181,7 @@ fn serve(
             }
             NetworkMessage::GetData(items) => {
                 let mut missing = Vec::new();
-                for item in items.0 {
+                for item in items {
                     let found = mempool.lock().unwrap().iter().find_map(|raw| {
                         let (txid, wtxid) = wtxid_of(raw);
                         super::p2p::inventory_matches(&item, txid, wtxid).then(|| raw.clone())
@@ -200,7 +194,7 @@ fn serve(
                     }
                 }
                 if !missing.is_empty() {
-                    wire.send(NetworkMessage::NotFound(InventoryPayload(missing)))?;
+                    wire.send(NetworkMessage::NotFound(missing))?;
                 }
             }
             NetworkMessage::Tx(tx) => match script.policy {
@@ -208,10 +202,10 @@ fn serve(
                 TxPolicy::Ignore => {}
                 TxPolicy::Disconnect => return Ok(()),
                 TxPolicy::Orphan => {
-                    let parent = tx.inputs[0].previous_output.txid;
-                    wire.send(NetworkMessage::GetData(InventoryPayload(vec![
+                    let parent = tx.input[0].previous_output.txid;
+                    wire.send(NetworkMessage::GetData(vec![
                         Inventory::WitnessTransaction(parent),
-                    ])))?;
+                    ]))?;
                 }
             },
             _ => {}
@@ -220,10 +214,8 @@ fn serve(
 }
 
 /// A regtest-style header that is not on any real chain.
-pub fn header(nonce: u32) -> bitcoin_rev::block::Header {
-    let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
-    let mut header: bitcoin_rev::block::Header =
-        encode::deserialize(&bitcoin::consensus::encode::serialize(&genesis)).unwrap();
+pub fn header(nonce: u32) -> Header {
+    let mut header = bitcoin::constants::genesis_block(Network::Regtest).header;
     header.nonce = nonce;
     header
 }

@@ -43,7 +43,7 @@ use bdk_sp::encoding::SilentPaymentCode;
 use bdk_sp::hashes::{get_label_tweak, get_shared_secret};
 use bdk_sp::receive::error::SpReceiveError;
 use bdk_sp::receive::{compute_tweak_data, extract_pubkey, get_silentpayment_pubkey};
-use bitcoin_rev::Network;
+use bitcoin::Network;
 use indexer::v2::SpIndexerV2;
 use serde::Deserialize;
 

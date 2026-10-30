@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use bitcoin_rev::Network;
+use bitcoin::Network;
 
 use super::Scanner;
 use super::config::ScannerConfig;

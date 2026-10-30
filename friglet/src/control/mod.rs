@@ -635,7 +635,7 @@ mod tests {
             PublicKey::from_str(wallet["public_spend_hex"].as_str().unwrap()).unwrap(),
             0,
             path,
-            bitcoin_rev::Network::Regtest,
+            bitcoin::Network::Regtest,
         );
         let scanner = scanner::load_scanner(&config).await.unwrap();
         accept.abort();
@@ -787,7 +787,7 @@ mod tests {
             label_addresses: derive_label_addresses(
                 secret,
                 resolved.spend_pubkey,
-                scanner::convert_network(resolved.network),
+                resolved.network,
                 resolved.raw.max_label_num,
             ),
             state_file: resolved.state_file.clone(),
@@ -1004,7 +1004,7 @@ mod tests {
         let ctx = test_ctx_with_scan(&dir, move |cancel| {
             Box::pin(async move {
                 let hash = bitcoin::BlockHash::from_byte_array([7; 32]);
-                let fetched = BlockFetcher::new(node_addr, bitcoin_rev::Network::Regtest)
+                let fetched = BlockFetcher::new(node_addr, bitcoin::Network::Regtest)
                     .with_cancel(cancel)
                     .fetch(hash, 1)
                     .await;

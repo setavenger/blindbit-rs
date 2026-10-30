@@ -6,12 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use bitcoin::BlockHash;
-use bitcoin::Network as BTCNetwork;
+use bitcoin::Network;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{OutPoint, Txid};
-use bitcoin_rev::Network;
-use bitcoin_rev::TestnetVersion;
 use indexer::bdk_chain::bdk_core::Merge;
 use indexer::v2::SpIndexerV2;
 use tokio::sync::{Mutex, broadcast};
@@ -139,7 +137,7 @@ impl Scanner {
         block_checkpoints.entry(0).or_insert_with(genesis_hash);
         let max_label_num = stage.max_label_num;
         let mut electrum_index = WalletElectrumIndex::new();
-        electrum_index.sp_address = indexer.get_address(convert_network(network)).to_string();
+        electrum_index.sp_address = indexer.get_address(network).to_string();
         electrum_index.sp_labels = (0..=max_label_num).collect();
         electrum_index.scan_health.oracle_floor_start = stage.oracle_floor_start;
 
@@ -536,19 +534,6 @@ impl Scanner {
             scanner.rescan_for_missed_spends();
         }
         Ok(scanner)
-    }
-}
-
-/// The `bitcoin` crate's network for a wallet on `nw` (the scanner takes the
-/// `bitcoin_rev` network; addresses and the wallet graph use `bitcoin`'s).
-pub fn convert_network(nw: Network) -> BTCNetwork {
-    match nw {
-        Network::Bitcoin => BTCNetwork::Bitcoin,
-        Network::Signet => BTCNetwork::Signet,
-        Network::Regtest => BTCNetwork::Regtest,
-        // if Testnet V4 is sepcified otherwise we use V3
-        Network::Testnet(TestnetVersion::V4) => BTCNetwork::Testnet4,
-        Network::Testnet(_) => BTCNetwork::Testnet,
     }
 }
 

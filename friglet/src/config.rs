@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin_rev::Network;
 use clap::Args;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
