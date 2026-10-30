@@ -725,27 +725,18 @@ async function saveConfigFile() {
   settingsMessage("Saving…", false);
   const key = $("cfg-scan-key").value.trim();
   try {
-    const config = formConfig();
-    // "New wallet" unchanged for the same wallet: keep a birthday a restart
-    // attempt recorded in the file meanwhile (checked when writing).
-    const keepRecordedBirthday =
-      config.start_at_tip &&
-      fileConfig.start_at_tip &&
-      !descriptor &&
-      config.network === fileConfig.network &&
-      config.spend_pubkey === fileConfig.spend_pubkey;
     const spawnError = await invoke("save_config_file", {
-      config,
+      config: formConfig(),
       scanKey: key || null,
       descriptor,
-      keepRecordedBirthday,
+      // The loaded birthday was "new wallet" and still unresolved: a restart
+      // attempt may record it meanwhile, which the save then keeps.
+      tipUnresolvedAtLoad: fileConfig.start_at_tip === true && fileConfig.start_height == null,
     });
     if (spawnError) {
-      // The file was written; the form stays editable for the next fix. What
-      // we wrote is its baseline, not the file now: the daemon may have
-      // recorded the tip as start_height before it exited, and the next
-      // save must keep that.
-      fileConfig = config;
+      // The file was written; show it as it is now (with a birthday the
+      // daemon recorded before exiting) for the next fix.
+      await loadConfigFile();
       settingsMessage(`Saved, but the daemon failed to start: ${spawnError}`, true);
     } else {
       exitFileMode();

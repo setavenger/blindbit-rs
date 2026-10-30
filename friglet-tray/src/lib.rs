@@ -617,9 +617,9 @@ async fn get_config_file() -> Result<DaemonConfig, String> {
 /// Settings save while the tray's daemon has crashed: no daemon can persist
 /// the settings, so the tray validates and writes the config file itself,
 /// then starts the daemon. A config that keeps the daemon from starting can
-/// so be fixed in the form. Keys: see [`setup::file_save_scan_key`];
-/// `keep_recorded_birthday`: see [`setup::keep_recorded_birthday`] (the
-/// form sets it when "new wallet" is unchanged for the same wallet).
+/// so be fixed in the form. Keys: see [`setup::file_save_scan_key`].
+/// `tip_unresolved_at_load`: the form loaded the file with an unresolved
+/// "new wallet" birthday (see [`setup::keep_recorded_birthday`]).
 ///
 /// Same results as [`save_local_config`]; starts the daemon like Start
 /// daemon (clears a user stop, resets the restart backoff).
@@ -629,7 +629,7 @@ async fn save_config_file(
     mut config: DaemonConfig,
     scan_key: Option<String>,
     descriptor: Option<String>,
-    keep_recorded_birthday: bool,
+    tip_unresolved_at_load: bool,
 ) -> Result<Option<String>, String> {
     let config_path = friglet_ipc::default_config_path()
         .ok_or("cannot determine the platform config directory")?;
@@ -639,6 +639,9 @@ async fn save_config_file(
         None => setup::validate_config(&config)?,
     }
     setup::resolve_peer(&config).await?;
+    // Before the lock: a missing key file must fail the save before our
+    // child is stopped below.
+    setup::ensure_key_file(&config, scan_key.as_deref())?;
     {
         // No restart attempt runs while we hold the lifecycle lock, so none
         // reads the file mid-save. A daemon that answers owns its settings.
@@ -653,16 +656,16 @@ async fn save_config_file(
                     .to_string(),
             );
         }
+        if let Some((report, _)) = reap_exited(&mut lc) {
+            tracing::warn!(status = %report.status, "previously spawned daemon exited");
+        }
         // Our own child that does not answer may still be starting and
         // could record a birthday into the file: stop it before writing (the
         // start below would kill it anyway).
-        if let Some(mut child) = lc.child.take() {
-            if child.kill().await.is_err() {
-                let _ = child.wait().await;
-            }
-            lc.spawned_by_tray = false;
+        if lc.child.is_some() {
+            kill_child(&mut lc).await;
         }
-        if keep_recorded_birthday {
+        if tip_unresolved_at_load {
             setup::keep_recorded_birthday(&mut config, &config_path);
         }
         setup::write_config_file(&config_path, &config, scan_key.as_deref())?;
@@ -698,6 +701,21 @@ async fn send_with_note(socket_path: &str, req: Request) -> Result<Option<String
         Response::OkWithNote(note) => Ok(Some(note)),
         other => Err(format!("unexpected response: {other:?}")),
     }
+}
+
+/// Kill our own child and wait until it is gone. tokio's `Child::kill` is
+/// `start_kill` + `wait`: it resolves only after the child has fully exited
+/// and been reaped, so whatever follows can never run concurrently with the
+/// old daemon (they share config/key/state paths).
+async fn kill_child(lc: &mut LifecycleState) {
+    if let Some(mut child) = lc.child.take()
+        && child.kill().await.is_err()
+    {
+        // `start_kill` fails when the child exited in the meantime; reap it
+        // so the exit is still complete before proceeding.
+        let _ = child.wait().await;
+    }
+    lc.spawned_by_tray = false;
 }
 
 /// Probe-spawn-or-setup, recording the outcome in [`LifecycleState`] and the
@@ -746,18 +764,7 @@ where
             "spawned daemon is alive but its control socket is unreachable; \
              killing it and starting over"
         );
-        if let Some(mut child) = lc.child.take() {
-            // tokio's `Child::kill` is `start_kill` + `wait`: it resolves
-            // only after the child has fully exited and been reaped, so the
-            // attach-or-spawn below can never run concurrently with the old
-            // daemon (they share config/key/state paths).
-            if child.kill().await.is_err() {
-                // `start_kill` fails when the child exited in the meantime;
-                // reap it so the exit is still complete before proceeding.
-                let _ = child.wait().await;
-            }
-        }
-        lc.spawned_by_tray = false;
+        kill_child(&mut lc).await;
     }
 
     match lifecycle::attach_spawn_or_setup_with(&state.socket_path, locate, needs_setup).await {

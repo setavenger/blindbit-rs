@@ -379,32 +379,35 @@ pub fn file_save_scan_key(
     keys_from_descriptor(cfg, text.trim()).map(Some)
 }
 
-/// "New wallet" kept as loaded: a restart attempt may have resolved the
-/// tip and recorded it as `start_height` in the file at `config_path`
-/// since. Keep that birthday rather than take a later tip, which would skip
-/// the blocks in between.
+/// For a save made after loading the file with an unresolved "new wallet"
+/// birthday: a restart attempt may have resolved the tip since and recorded
+/// it as `start_height` in the file at `config_path`. A save that still asks
+/// for the tip, for the same wallet and network, keeps that birthday rather
+/// than take a later tip, which would skip the blocks in between.
 pub fn keep_recorded_birthday(cfg: &mut DaemonConfig, config_path: &Path) {
     if !cfg.start_at_tip || cfg.start_height.is_some() {
         return;
     }
-    if let Ok(on_disk) = friglet_ipc::read_config_toml(config_path)
-        && let Some(height) = on_disk.start_height
+    let Ok(on_disk) = read_config_for_editing(config_path) else {
+        return;
+    };
+    let same_wallet = match (&on_disk.spend_pubkey, &cfg.spend_pubkey) {
+        (Some(a), Some(b)) => a.trim().eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    };
+    if let Some(height) = on_disk.start_height
+        && same_wallet
+        && on_disk.network == cfg.network
     {
         cfg.start_height = Some(height);
         cfg.start_at_tip = false;
     }
 }
 
-/// Persist a settings save made while the daemon is down. With a new scan
-/// key this is [`write_local_config`]; without one the config file is
-/// rewritten and the existing key file kept, which must exist.
-pub fn write_config_file(
-    config_path: &Path,
-    cfg: &DaemonConfig,
-    scan_key: Option<&str>,
-) -> Result<(), String> {
-    if let Some(key) = scan_key {
-        return write_local_config(config_path, cfg, key).map(drop);
+/// A save without a new scan key keeps the key file, which must exist.
+pub fn ensure_key_file(cfg: &DaemonConfig, scan_key: Option<&str>) -> Result<(), String> {
+    if scan_key.is_some() {
+        return Ok(());
     }
     let key_file = cfg
         .key_file
@@ -417,7 +420,22 @@ pub fn write_config_file(
             key_file.display()
         ));
     }
-    friglet_ipc::write_config_toml(config_path, cfg)
+    Ok(())
+}
+
+/// Persist a settings save made while the daemon is down. With a new scan
+/// key this is [`write_local_config`]; without one the config file is
+/// rewritten and the existing key file kept ([`ensure_key_file`]).
+pub fn write_config_file(
+    config_path: &Path,
+    cfg: &DaemonConfig,
+    scan_key: Option<&str>,
+) -> Result<(), String> {
+    ensure_key_file(cfg, scan_key)?;
+    match scan_key {
+        Some(key) => write_local_config(config_path, cfg, key).map(drop),
+        None => friglet_ipc::write_config_toml(config_path, cfg),
+    }
 }
 
 #[cfg(test)]
@@ -905,9 +923,11 @@ mod tests {
         // The file's descriptor must match the network.
         let mut cfg = DaemonConfig {
             network: "bitcoin".to_string(),
+            spend_pubkey: None,
             ..valid_config()
         };
-        assert!(file_save_scan_key(&mut cfg, None, None, &path).is_err());
+        let err = file_save_scan_key(&mut cfg, None, None, &path).unwrap_err();
+        assert!(err.contains("pick the matching network"), "{err}");
 
         // No usable descriptor anywhere: keep the key file.
         let mut cfg = valid_config();
@@ -935,11 +955,29 @@ mod tests {
         keep_recorded_birthday(&mut cfg, &path);
         assert!(cfg.start_at_tip && cfg.start_height.is_none());
 
-        // Recorded meanwhile: adopt it.
-        fs::write(&path, "start_height = 4321\n").unwrap();
+        // Recorded meanwhile for this wallet: adopt it.
+        let recorded =
+            format!("network = \"signet\"\nspend_pubkey = \"{SPEND_HEX}\"\nstart_height = 4321\n");
+        fs::write(&path, &recorded).unwrap();
         let mut cfg = tip();
         keep_recorded_birthday(&mut cfg, &path);
         assert_eq!((cfg.start_at_tip, cfg.start_height), (false, Some(4321)));
+
+        // Another wallet or network in the save: stay at the tip.
+        for other in [
+            DaemonConfig {
+                spend_pubkey: Some(format!("03{}", &SPEND_HEX[2..])),
+                ..tip()
+            },
+            DaemonConfig {
+                network: "testnet".to_string(),
+                ..tip()
+            },
+        ] {
+            let mut cfg = other;
+            keep_recorded_birthday(&mut cfg, &path);
+            assert!(cfg.start_at_tip && cfg.start_height.is_none());
+        }
 
         // An explicit height in the save wins.
         let mut cfg = valid_config();
