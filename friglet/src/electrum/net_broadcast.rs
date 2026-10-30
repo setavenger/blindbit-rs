@@ -214,11 +214,21 @@ impl Job {
     /// Take one of the [`SENDERS`] hand-over slots; `false` when they are
     /// all taken.
     fn claim_hand_over(&self) -> bool {
-        self.hand_overs
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |taken| {
-                (taken < SENDERS).then_some(taken + 1)
-            })
-            .is_ok()
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (not on older ones).
+        let mut taken = self.hand_overs.load(Ordering::SeqCst);
+        while taken < SENDERS {
+            match self.hand_overs.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => taken = current,
+            }
+        }
+        false
     }
 
     /// Give a slot back: the sender did not hand the transaction over.
