@@ -399,6 +399,13 @@ impl<S: tracing::Subscriber> Layer<S> for BalanceLogs {
 /// confirmed, not as pending.
 #[test]
 fn balance_after_scan_counts_earlier_outputs_as_confirmed() {
+    // tracing caches whether anyone listens to a log call site when the call
+    // site is first hit. While exactly one scoped dispatcher exists, it asks
+    // only the current thread's dispatcher, so a call site first hit by another
+    // test's scan (no subscriber on that thread) is cached as "never" and this
+    // test's events are dropped. A second live dispatcher makes tracing ask
+    // every dispatcher, which keeps the interest at "sometimes".
+    let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let logs = BalanceLogs::default();
     let subscriber = tracing_subscriber::registry().with(logs.clone());
     tracing::subscriber::with_default(subscriber, || {

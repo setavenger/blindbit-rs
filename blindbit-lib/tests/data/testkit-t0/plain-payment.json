@@ -1,0 +1,84 @@
+{
+  "format": "blindbit-testkit/t0-fixture/1",
+  "scenario": "plain-payment",
+  "scenario_sha256": "495ce0358fac9d90730d2701744f00c9b35bea7f798c898cb2e3dcd5235636b8",
+  "configuration": "full-basic",
+  "network": "regtest",
+  "wallets": [
+    {
+      "id": "alice",
+      "scan_secret": "ad63c28889ad7ff380f7074702a8741acaaf151a14082c6953b377bfa41e1b4b",
+      "spend_pubkey": "025686035a6d65a6ce575e5ca17b5424c2170ce0fcbac484296f10d12f1cb5c849",
+      "labels": []
+    },
+    {
+      "id": "bob",
+      "scan_secret": "8ce64ceefa2ccfecc2a4792c243bd893b0c16a9f390543af9a92cfa095d77b7f",
+      "spend_pubkey": "024a1a773548136fd37aa0d64631bd513d02bbef2b195282a20d4a71be8e4874e2",
+      "labels": []
+    }
+  ],
+  "actions": [
+    {
+      "index": 0,
+      "kind": "fund",
+      "blocks": [
+        1
+      ]
+    },
+    {
+      "index": 1,
+      "kind": "send",
+      "blocks": [
+        2
+      ]
+    },
+    {
+      "index": 2,
+      "kind": "restart",
+      "component": "oracle",
+      "blocks": []
+    }
+  ],
+  "blocks": [
+    {
+      "height": 1,
+      "txs": [
+        {
+          "txid": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904",
+          "hex": "02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2f626c696e646269742d746573746b69742f6c69622f66756e642f302f616c6963652f616c6963652d66756e64696e67ffffffff0100e1f5050000000022512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc9600000000",
+          "prevouts": [],
+          "go_tweak": null
+        }
+      ]
+    },
+    {
+      "height": 2,
+      "txs": [
+        {
+          "txid": "a810164fe13b98c0f9172f14a23b6695fdd33388a31e9e4e670a95ac738bf9c5",
+          "hex": "0200000000010104994c76f39b21dc21956632f3997e0adcac3973939287a04d942971ffb4be7f0000000000ffffffff0250c3000000000000225120db6ac3688f2f287163a5ff48845f78b68bb8874692ad64d563197f9a9e72c93fb01df50500000000160014dde5bccf279ebfbfa10e2566f58b8928ea6f615c014067b0576c9a97d8438d0b94ece3e2833dc20a0eae78d07d61f59a620b696851205390cc121583d01c7092cdb593db20e7b5ab7816a920c05c1212c00ea186b76700000000",
+          "prevouts": [
+            {
+              "outpoint": "7fbeb4ff7129944da08792937339acdc0a7e99f332669521dc219bf3764c9904:0",
+              "value_sats": 100000000,
+              "script_pubkey": "512052063e146379ec976777c8a50e233bb7cff148b8c64847f3ca41d2e76254cc96"
+            }
+          ],
+          "go_tweak": "02bd63b9f6daddfabb7be1b35f23e163aa15bae136feeafc9ce6ff52c30b7fa271"
+        }
+      ]
+    }
+  ],
+  "expected": [
+    {
+      "ref": "pay-bob",
+      "wallet": "bob",
+      "outpoint": "a810164fe13b98c0f9172f14a23b6695fdd33388a31e9e4e670a95ac738bf9c5:0",
+      "amount_sats": 50000,
+      "label": null,
+      "spent": false,
+      "outcome": "must_find"
+    }
+  ]
+}
