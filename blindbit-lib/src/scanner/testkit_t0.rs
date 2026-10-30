@@ -81,7 +81,8 @@ use tonic::transport::Channel;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem};
 
 use super::Scanner;
-use crate::scanner::stream_safety_tests::{TempState, TestStream, run, serve};
+use crate::scanner::stream_safety_tests::{TestStream, serve};
+use crate::scanner::test_support::{TempState, run};
 
 // ---------------------------------------------------------------------------
 // Pinned fixtures
