@@ -176,7 +176,6 @@ impl Peer {
 
     /// Whether the peer relays transactions to friglet (its `version`
     /// message's `fRelay`); a blocks-only node does not.
-    #[allow(dead_code)] // for choosing broadcast peers (SNB-856)
     pub fn relays(&self) -> bool {
         self.their_relay
     }
