@@ -231,8 +231,10 @@ fn addresses_a_peer_gossips_land_in_the_book() {
     let block = genesis();
     let gossiping = node(33, &block, vec![Conn::ServeWithAddr]);
     let source = discovering(&[&gossiping]);
-    assert!(source.wants_addr());
+    let peer: PeerAddr = gossiping.addr.into();
+    assert!(source.wants_addr(&peer));
     fetch(&source, block.block_hash(), 100).expect("served");
+    assert!(!source.wants_addr(&peer), "asked once per peer");
     assert!(gossiping.commands().iter().any(|c| c == "getaddr"));
     assert_eq!(source.known(), 1 + GOSSIP.len());
     for gossiped in GOSSIP {
@@ -315,7 +317,7 @@ fn an_own_node_source_never_asks_the_seeds() {
         assert_eq!(got.block_hash(), block.block_hash());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!crate::net::seeds_asked("own-node-never-seeds"));
-        assert!(!source.wants_addr());
+        assert!(!source.wants_addr(&own.addr.into()));
         assert!(!own.commands().iter().any(|c| c == "getaddr"));
     });
 }

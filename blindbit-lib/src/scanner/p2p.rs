@@ -899,7 +899,7 @@ impl BlockFetcher {
             asked.insert(peer.clone());
             let discovery = Discovery {
                 peers: self.peers.clone(),
-                request_addr: self.peers.wants_addr(),
+                request_addr: self.peers.wants_addr(&peer),
                 min_height: height,
             };
             tracing::debug!(%peer, height, %block_hash, attempt, "asking a peer for the block");
