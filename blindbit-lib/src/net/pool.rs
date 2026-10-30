@@ -26,7 +26,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin_address_book::{Record, Table};
 
 use super::seeds::Seeds;
-use super::{Dialer, PeerAddr, PeerHost, Purpose};
+use super::{Dialer, NetGroup, PeerAddr, PeerHost, Purpose};
 use crate::scanner::PeerInfo;
 
 // Kyoto's table sizes: 16 x 16 new slots, a source reaches 8 of the 16
@@ -86,6 +86,10 @@ pub enum PeerEvent {
     Behind,
     /// Sent a block that fails its checks, or speaks another network.
     Misbehaved,
+    /// Completed the handshake but relays no transactions (its `version`
+    /// says so: a blocks-only node): not used for relaying again this
+    /// session. Blocks may still come from it.
+    NoTxRelay,
 }
 
 /// No peer to connect to: why.
@@ -197,9 +201,28 @@ impl PeerSource {
         purpose: Purpose,
         exclude: &HashSet<PeerAddr>,
     ) -> Result<PeerAddr, NoPeers> {
+        self.next_outside(purpose, exclude, &HashSet::new()).await
+    }
+
+    /// [`Self::next`], also passing over every peer in one of `groups`
+    /// (see [`NetGroup`]): for connections that must go to different
+    /// operators. An own node is always it.
+    pub async fn next_outside(
+        &self,
+        purpose: Purpose,
+        exclude: &HashSet<PeerAddr>,
+        groups: &HashSet<NetGroup>,
+    ) -> Result<PeerAddr, NoPeers> {
         match self {
             Self::OwnNode { addr, .. } => Ok(addr.clone()),
-            Self::Discovered(pool) => pool.next(purpose, exclude).await,
+            Self::Discovered(pool) => {
+                pool.next(Want {
+                    purpose,
+                    exclude,
+                    groups,
+                })
+                .await
+            }
         }
     }
 
@@ -290,6 +313,24 @@ struct Meta {
     /// Ignored for the rest of the session; kept so gossip cannot add it
     /// back.
     ignored: bool,
+    /// Said it relays no transactions: never handed out for relaying.
+    no_tx_relay: bool,
+}
+
+/// What a caller of [`PeerSource::next_outside`] asks for and rules out.
+#[derive(Clone, Copy)]
+struct Want<'a> {
+    purpose: Purpose,
+    exclude: &'a HashSet<PeerAddr>,
+    groups: &'a HashSet<NetGroup>,
+}
+
+impl Want<'_> {
+    /// Not ruled out by the caller (the pool's own judgement aside).
+    fn allows(&self, addr: &PeerAddr) -> bool {
+        !self.exclude.contains(addr)
+            && (self.groups.is_empty() || !self.groups.contains(&addr.netgroup()))
+    }
 }
 
 struct Inner {
@@ -332,14 +373,10 @@ impl PeerPool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    async fn next(
-        &self,
-        purpose: Purpose,
-        exclude: &HashSet<PeerAddr>,
-    ) -> Result<PeerAddr, NoPeers> {
+    async fn next(&self, want: Want<'_>) -> Result<PeerAddr, NoPeers> {
         let mut seeded = false;
         loop {
-            if let Some(addr) = self.lock().pick(purpose, exclude) {
+            if let Some(addr) = self.lock().pick(want) {
                 return Ok(addr);
             }
             if !seeded && self.lock().may_seed() {
@@ -348,14 +385,15 @@ impl PeerPool {
                 continue;
             }
             // Only resting peers left: better one of them than none.
-            if let Some(addr) = self.lock().resting(exclude) {
+            if let Some(addr) = self.lock().resting(want) {
                 return Ok(addr);
             }
-            return Err(NoPeers(self.no_peers_reason(exclude)));
+            return Err(NoPeers(self.no_peers_reason(want)));
         }
     }
 
-    fn no_peers_reason(&self, exclude: &HashSet<PeerAddr>) -> String {
+    fn no_peers_reason(&self, want: Want<'_>) -> String {
+        let exclude = want.exclude;
         let inner = self.lock();
         let known = inner.known();
         if known == 0 {
@@ -379,6 +417,12 @@ impl PeerPool {
         let mut reason = format!("all {known} known peers were tried");
         if !exclude.is_empty() {
             reason.push_str(&format!(" ({} of them just now)", exclude.len()));
+        }
+        if !want.groups.is_empty() {
+            reason.push_str(&format!(
+                ", or are in one of the {} network groups already in use",
+                want.groups.len()
+            ));
         }
         if skipped_v6 > 0 {
             reason.push_str(&format!(
@@ -439,8 +483,10 @@ impl PeerPool {
     fn report(&self, peer: &PeerAddr, event: PeerEvent) {
         let mut inner = self.lock();
         let now = Instant::now();
-        if !matches!(event, PeerEvent::Served | PeerEvent::Connected(_))
-            && inner.preferred.as_ref() == Some(peer)
+        if !matches!(
+            event,
+            PeerEvent::Served | PeerEvent::Connected(_) | PeerEvent::NoTxRelay
+        ) && inner.preferred.as_ref() == Some(peer)
         {
             inner.preferred = None;
         }
@@ -466,6 +512,11 @@ impl PeerPool {
             PeerEvent::Unhelpful => inner.rest(peer, now + UNHELPFUL_REST),
             PeerEvent::Behind => inner.rest(peer, now + BEHIND_REST),
             PeerEvent::Misbehaved => inner.ignore(peer),
+            PeerEvent::NoTxRelay => {
+                if let Some(meta) = inner.meta.get_mut(peer) {
+                    meta.no_tx_relay = true;
+                }
+            }
         }
     }
 
@@ -607,31 +658,40 @@ impl Inner {
         }
     }
 
-    /// Worth connecting to now?
-    fn usable(&self, addr: &PeerAddr, exclude: &HashSet<PeerAddr>, now: Instant) -> bool {
+    /// Known, not ignored, fit for `want` and reachable from here, resting
+    /// or not.
+    fn eligible(&self, addr: &PeerAddr, want: Want<'_>) -> bool {
         let Some(meta) = self.meta.get(addr) else {
             return false;
         };
         meta.table.is_some()
             && !meta.ignored
-            && !exclude.contains(addr)
+            && !(want.purpose == Purpose::Relay && meta.no_tx_relay)
+            && want.allows(addr)
             && !(self.ipv6_dead() && addr.is_ipv6())
-            && meta.resting_until.is_none_or(|until| until <= now)
     }
 
-    fn pick(&self, purpose: Purpose, exclude: &HashSet<PeerAddr>) -> Option<PeerAddr> {
+    /// Worth connecting to now?
+    fn usable(&self, addr: &PeerAddr, want: Want<'_>, now: Instant) -> bool {
+        self.eligible(addr, want)
+            && self.meta[addr]
+                .resting_until
+                .is_none_or(|until| until <= now)
+    }
+
+    fn pick(&self, want: Want<'_>) -> Option<PeerAddr> {
         let now = Instant::now();
+        let purpose = want.purpose;
         let preferred = self.preferred.as_ref();
         if purpose != Purpose::Relay
             && let Some(addr) = preferred
-            && self.usable(addr, exclude, now)
+            && self.usable(addr, want, now)
         {
             return Some(addr.clone());
         }
         // Blocks and relay go to different peers when there is a choice.
         let wanted = |addr: &PeerAddr| {
-            self.usable(addr, exclude, now)
-                && (purpose != Purpose::Relay || Some(addr) != preferred)
+            self.usable(addr, want, now) && (purpose != Purpose::Relay || Some(addr) != preferred)
         };
         for _ in 0..MAX_DRAWS {
             let record = if random_u64() & 1 == 0 {
@@ -656,7 +716,7 @@ impl Inner {
         }
         // Relay: the block peer is the only one left.
         match preferred {
-            Some(addr) if purpose == Purpose::Relay && self.usable(addr, exclude, now) => {
+            Some(addr) if purpose == Purpose::Relay && self.usable(addr, want, now) => {
                 Some(addr.clone())
             }
             _ => None,
@@ -664,15 +724,10 @@ impl Inner {
     }
 
     /// The resting peer whose rest ends first.
-    fn resting(&self, exclude: &HashSet<PeerAddr>) -> Option<PeerAddr> {
+    fn resting(&self, want: Want<'_>) -> Option<PeerAddr> {
         self.meta
             .iter()
-            .filter(|(addr, meta)| {
-                meta.table.is_some()
-                    && !meta.ignored
-                    && !exclude.contains(*addr)
-                    && !(self.ipv6_dead() && addr.is_ipv6())
-            })
+            .filter(|(addr, _)| self.eligible(addr, want))
             .min_by_key(|(_, meta)| meta.resting_until)
             .map(|(addr, _)| addr.clone())
     }
@@ -714,6 +769,7 @@ impl Inner {
                 resting_until: None,
                 failures: 0,
                 ignored: false,
+                no_tx_relay: false,
             },
         );
         true
@@ -809,6 +865,7 @@ impl Inner {
                             resting_until: None,
                             failures: 0,
                             ignored: true,
+                            no_tx_relay: false,
                         },
                     );
                 }
