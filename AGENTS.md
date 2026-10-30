@@ -98,13 +98,15 @@ cargo fmt --all -- --check
   `write_config_toml`/`write_key_file`, which `friglet/src/config.rs` also
   delegates to) — then reruns attach-or-spawn, which now starts the daemon
   and flips the UI to the normal daemon-backed mode.
-- File mode (configured, but the daemon crashed or is not running; Status
-  shows "crashed — restarting" or "not running"): the form loads the config
-  file (`get_config_file`) and Save writes it through the tray
-  (`save_config_file`: same validation, scan key optional — the key file is
-  kept), then starts the daemon. A config that makes the daemon exit at
-  startup can so be fixed in the UI. The form stays in file mode through
-  restart attempts until the daemon answers.
+- File mode (configured, but the tray's own daemon crashed; Status shows
+  "crashed — restarting"): the form loads the config file
+  (`get_config_file`) and Save writes it through the tray
+  (`save_config_file`: same validation, scan key optional — a `descriptor`
+  in the file supplies it, else the key file is kept), then starts the
+  daemon like Start daemon. A config that makes the daemon exit at startup
+  can so be fixed in the UI. The form stays in file mode through restart
+  attempts until the daemon answers. External daemons never enter file
+  mode: they may use another config file.
 - Headless test: run the tray under the Xvfb recipe below but with a fresh
   `HOME` (and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_RUNTIME_DIR` unset)
   and no `FRIGLET_*` env — no fake daemon, no

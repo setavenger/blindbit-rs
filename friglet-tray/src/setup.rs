@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use bitcoin::secp256k1::{PublicKey, SecretKey};
 use friglet_ipc::DaemonConfig;
 use friglet_ipc::descriptor::SpDescriptor;
 use friglet_ipc::network::{self, NETWORKS};
@@ -85,7 +86,7 @@ pub fn is_configured(
 }
 
 /// The `descriptor` key of the TOML file at `path`, if any.
-fn file_descriptor(path: &Path) -> Option<String> {
+pub fn file_descriptor(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = toml::from_str(&text).ok()?;
     table.get("descriptor")?.as_str().map(str::to_string)
@@ -196,6 +197,8 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
     if key.len() != 64 || !is_hex(key) {
         return Err("invalid scan key: must be 64 hex characters (32 bytes)".to_string());
     }
+    // Checked here so a bad key never replaces a working key file.
+    SecretKey::from_str(key).map_err(|_| "invalid scan key: not a valid secp256k1 secret key")?;
     Ok(())
 }
 
@@ -260,6 +263,8 @@ pub fn validate_config(cfg: &DaemonConfig) -> Result<(), String> {
     if spend.len() != 66 || !is_hex(spend) {
         return Err("invalid spend public key: must be 66 hex characters (33 bytes)".to_string());
     }
+    PublicKey::from_str(spend)
+        .map_err(|_| "invalid spend public key: not a valid secp256k1 public key")?;
 
     SocketAddr::from_str(&cfg.electrum_addr)
         .map_err(|e| format!("invalid Electrum bind address `{}`: {e}", cfg.electrum_addr))?;
@@ -331,6 +336,29 @@ pub fn read_config_for_editing(path: &Path) -> Result<DaemonConfig, String> {
         }
     }
     Ok(cfg)
+}
+
+/// The scan key a settings save made while the daemon is down writes, with
+/// `cfg.spend_pubkey` filled from a descriptor: a pasted descriptor, else a
+/// manual key, else the `descriptor` in the config file at `config_path`
+/// (the save writes no `descriptor` key, and the daemon may have exited
+/// before copying its scan key to the key file). `None`: keep the key file.
+pub fn file_save_scan_key(
+    cfg: &mut DaemonConfig,
+    scan_key: Option<String>,
+    descriptor: Option<String>,
+    config_path: &Path,
+) -> Result<Option<String>, String> {
+    let scan_key = scan_key.filter(|k| !k.trim().is_empty());
+    let descriptor = match descriptor.filter(|d| !d.trim().is_empty()) {
+        Some(d) => Some(d),
+        None if scan_key.is_none() => file_descriptor(config_path),
+        None => None,
+    };
+    match descriptor {
+        Some(d) => keys_from_descriptor(cfg, d.trim()).map(Some),
+        None => Ok(scan_key),
+    }
 }
 
 /// Persist a settings save made while the daemon is down. With a new scan
@@ -515,6 +543,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_fields_with_friendly_messages() {
+        // 64 hex characters, but zero is not a valid secret key.
+        const ZERO_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
         let cases: Vec<(DaemonConfig, &str, &str)> = vec![
             (
                 DaemonConfig {
@@ -589,8 +619,17 @@ mod tests {
                 KEY_HEX,
                 "invalid spend public key",
             ),
+            (
+                DaemonConfig {
+                    spend_pubkey: Some(format!("04{}", &SPEND_HEX[2..])),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "not a valid secp256k1 public key",
+            ),
             (valid_config(), "", "paste your Sparrow wallet descriptor"),
             (valid_config(), "zz", "invalid scan key"),
+            (valid_config(), ZERO_KEY, "not a valid secp256k1 secret key"),
             (
                 DaemonConfig {
                     electrum_addr: "nope".to_string(),
@@ -798,6 +837,43 @@ mod tests {
         let other = "00".repeat(31) + "02";
         write_config_file(&config_path, &cfg, Some(&other)).unwrap();
         assert_eq!(fs::read_to_string(&key_path).unwrap().trim(), other);
+    }
+
+    #[test]
+    fn file_save_takes_the_keys_from_the_files_descriptor() {
+        let dir = temp_dir("file-save-keys");
+        let path = dir.join("config.toml");
+        fs::write(&path, format!("descriptor = \"{TEST_DESCRIPTOR}\"\n")).unwrap();
+        let d = SpDescriptor::parse(TEST_DESCRIPTOR).unwrap();
+        let testnet = || DaemonConfig {
+            network: "testnet".to_string(),
+            spend_pubkey: Some(SPEND_HEX.to_string()),
+            ..valid_config()
+        };
+
+        // Nothing entered: the file's descriptor supplies both keys.
+        let mut cfg = testnet();
+        let key = file_save_scan_key(&mut cfg, None, Some(" ".into()), &path).unwrap();
+        assert_eq!(key, Some(d.scan_secret_hex()));
+        assert_eq!(cfg.spend_pubkey, Some(d.spend_pubkey_hex()));
+
+        // A manual key wins; the spend key is left as entered.
+        let mut cfg = testnet();
+        let key = file_save_scan_key(&mut cfg, Some(KEY_HEX.into()), None, &path).unwrap();
+        assert_eq!(key.as_deref(), Some(KEY_HEX));
+        assert_eq!(cfg.spend_pubkey.as_deref(), Some(SPEND_HEX));
+
+        // The file's descriptor must match the network.
+        let mut cfg = DaemonConfig {
+            network: "bitcoin".to_string(),
+            ..valid_config()
+        };
+        assert!(file_save_scan_key(&mut cfg, None, None, &path).is_err());
+
+        // No descriptor anywhere: keep the key file.
+        let mut cfg = valid_config();
+        let none = dir.join("none.toml");
+        assert_eq!(file_save_scan_key(&mut cfg, None, None, &none), Ok(None));
     }
 
     #[test]

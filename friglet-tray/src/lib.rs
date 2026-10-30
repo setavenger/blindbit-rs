@@ -609,10 +609,11 @@ fn get_config_file() -> Result<DaemonConfig, String> {
 /// Settings save while the daemon is down (crashed, or not running): no
 /// daemon can persist the settings, so the tray validates and writes the
 /// config file itself, then starts the daemon. A config that keeps the
-/// daemon from starting can so be fixed in the form. Without a new scan key
-/// (or descriptor) the existing key file is kept.
+/// daemon from starting can so be fixed in the form. Keys: see
+/// [`setup::file_save_scan_key`].
 ///
-/// Same results as [`save_local_config`].
+/// Same results as [`save_local_config`]; starts the daemon like Start
+/// daemon (clears a user stop, resets the restart backoff).
 #[tauri::command]
 async fn save_config_file(
     state: State<'_, Arc<AppState>>,
@@ -620,17 +621,14 @@ async fn save_config_file(
     scan_key: Option<String>,
     descriptor: Option<String>,
 ) -> Result<Option<String>, String> {
-    let scan_key = match descriptor.as_deref().map(str::trim) {
-        Some(d) if !d.is_empty() => Some(setup::keys_from_descriptor(&mut config, d)?),
-        _ => scan_key.filter(|k| !k.trim().is_empty()),
-    };
+    let config_path = friglet_ipc::default_config_path()
+        .ok_or("cannot determine the platform config directory")?;
+    let scan_key = setup::file_save_scan_key(&mut config, scan_key, descriptor, &config_path)?;
     match &scan_key {
         Some(key) => setup::validate_setup(&config, key)?,
         None => setup::validate_config(&config)?,
     }
     setup::resolve_peer(&config).await?;
-    let config_path = friglet_ipc::default_config_path()
-        .ok_or("cannot determine the platform config directory")?;
     {
         // No restart attempt runs while we hold the lifecycle lock, so none
         // reads the file mid-save. A daemon that answers owns its settings.
@@ -640,7 +638,8 @@ async fn save_config_file(
             .is_some()
         {
             return Err(
-                "the daemon is running again: the form now loads its settings, save them there"
+                "the daemon is running again: the form now shows its settings, \
+                 make your changes there and save again"
                     .to_string(),
             );
         }
@@ -650,7 +649,7 @@ async fn save_config_file(
         config = %config_path.display(),
         "settings written to the config file while the daemon was down"
     );
-    Ok(attach_and_record(&state).await)
+    Ok(start_daemon_now(&state).await.err())
 }
 
 /// Send one request to the daemon. Connection and protocol failures, and
