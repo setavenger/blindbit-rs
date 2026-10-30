@@ -173,8 +173,9 @@ or from the wallet), block headers, and broadcasts over Bitcoin P2P.
   probably pay or spend from your wallet. friglet keeps asking the peer that
   served the last block first, so that peer sees most of them. A broadcast
   hands the transaction to two random peers straight from this computer's
-  IP address, so they can tell it comes from here. Use your own node, or
-  (planned) Tor, if that matters to you.
+  IP address, and asks three more for it before it has spread, so all five
+  can tell it comes from here. Use your own node, or (planned) Tor, if that
+  matters to you.
 - Regtest has no public peers: it needs `p2p_node_addr`.
 
 ---

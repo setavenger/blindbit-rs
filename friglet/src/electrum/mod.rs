@@ -823,7 +823,7 @@ async fn in_mempool_now(
     }
     let exclude = sent_to.iter().cloned().collect();
     let candidates = Arc::new(vec![Candidate::clone(candidate)]);
-    match net_broadcast::ask_mempools(&peers, candidates, &exclude, 1).await {
+    match net_broadcast::ask_mempools(&peers, candidates, &exclude, true, 1).await {
         Ok(asked) => {
             for (peer, rate) in &asked.fee_filters {
                 state.chain.note_fee_filter(peer, Some(*rate));
@@ -934,6 +934,15 @@ async fn broadcast_to_network(
         Verdict::Rejected(message) => {
             tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast rejected");
             RecentBroadcast::Final(Err((1, message)))
+        }
+        // Probably invalid, but peers can also just go away: a resend
+        // looks again.
+        Verdict::Dropped(message) => {
+            tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast dropped by every peer it was handed to");
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+                sent_to,
+            }
         }
         Verdict::Unconfirmed { waited } => {
             let message = net_broadcast::unconfirmed_message(
@@ -1190,14 +1199,23 @@ async fn recheck_on_network(
             .map(|(candidate, _)| candidate)
             .collect(),
     );
-    let asked = match net_broadcast::ask_mempools(
-        &peers,
-        candidates.clone(),
-        &sent_to,
-        RECHECK_PEERS,
-    )
-    .await
-    {
+    // Many pending transactions can rule out every group the pool knows:
+    // then only the peers themselves are passed over.
+    let mut asked = Err(String::new());
+    for avoid_groups in [true, false] {
+        asked = net_broadcast::ask_mempools(
+            &peers,
+            candidates.clone(),
+            &sent_to,
+            avoid_groups,
+            RECHECK_PEERS,
+        )
+        .await;
+        if asked.is_ok() {
+            break;
+        }
+    }
+    let asked = match asked {
         Ok(asked) => asked,
         Err(error) => {
             tracing::warn!(%error, "could not recheck pending broadcasts");
@@ -2232,6 +2250,42 @@ mod tests {
             assert_eq!(response["result"], json!(txid));
             assert!(fakes[0].conns().is_empty(), "the sender was not asked");
             assert_eq!(fakes[1].conns().len(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// With every other network group ruled out, a recheck still asks a
+        /// peer it was not handed to, in a group that one shares.
+        #[tokio::test]
+        async fn a_recheck_falls_back_to_a_peer_in_a_senders_group() {
+            let dir = temp_dir("net-recheck-groups");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let net = FakeNet::new();
+            let sender = net.peer([127, 160, 0, 1].into(), Script::default());
+            let neighbour = net.peer(
+                [127, 160, 0, 2].into(),
+                Script {
+                    mempool: vec![raw.clone()],
+                    ..Script::default()
+                },
+            );
+            let fakes = [sender, neighbour];
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), hex::encode(&raw), &[fakes[0].addr.into()]);
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            recheck_pending(&state).await;
+            assert!(fakes[0].conns().is_empty(), "the sender was not asked");
+            assert_eq!(fakes[1].conns().len(), 1);
+            let store = state.pending.lock().await;
+            let (_, pending) = store.entries().next().unwrap();
+            assert_eq!(pending.reannounced, 0, "it had it");
+            drop(store);
             std::fs::remove_dir_all(dir).unwrap();
         }
 
