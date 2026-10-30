@@ -344,8 +344,8 @@ let setupMode = false;
 // Prefill baseline while in setup mode (partial config file over defaults).
 let setupConfig = null;
 
-// File mode: the daemon is down (crashed or not running) after setup. The
-// form edits the config file through the tray (get_config_file /
+// File mode: the tray's own daemon has crashed after setup. The form edits
+// the config file through the tray (get_config_file /
 // save_config_file), so a config that keeps the daemon from starting can
 // still be fixed here.
 let fileMode = false;
@@ -726,23 +726,26 @@ async function saveConfigFile() {
   const key = $("cfg-scan-key").value.trim();
   try {
     const config = formConfig();
-    if (config.start_at_tip && fileConfig.start_at_tip) {
-      // "New wallet" as loaded: a restart attempt may have recorded the tip
-      // as start_height since. Keep that birthday rather than a later tip,
-      // which would skip the blocks in between.
-      const current = await invoke("get_config_file");
-      if (current.start_height != null) {
-        config.start_height = current.start_height;
-        config.start_at_tip = false;
-      }
-    }
+    // "New wallet" unchanged for the same wallet: keep a birthday a restart
+    // attempt recorded in the file meanwhile (checked when writing).
+    const keepRecordedBirthday =
+      config.start_at_tip &&
+      fileConfig.start_at_tip &&
+      !descriptor &&
+      config.network === fileConfig.network &&
+      config.spend_pubkey === fileConfig.spend_pubkey;
     const spawnError = await invoke("save_config_file", {
       config,
       scanKey: key || null,
       descriptor,
+      keepRecordedBirthday,
     });
     if (spawnError) {
-      // The file was written; the form stays editable for the next fix.
+      // The file was written; the form stays editable for the next fix. What
+      // we wrote is its baseline, not the file now: the daemon may have
+      // recorded the tip as start_height before it exited, and the next
+      // save must keep that.
+      fileConfig = config;
       settingsMessage(`Saved, but the daemon failed to start: ${spawnError}`, true);
     } else {
       exitFileMode();

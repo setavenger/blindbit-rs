@@ -597,20 +597,29 @@ async fn save_local_config(
     Ok(attach_and_record(&state).await)
 }
 
-/// The config file, for the settings form while the daemon is down (no
-/// daemon answers `GetConfig`).
+/// The config file, for the settings form while the tray's daemon has
+/// crashed (no daemon answers `GetConfig`). Async: kept off the main thread,
+/// the window retries it every poll while it fails.
 #[tauri::command]
-fn get_config_file() -> Result<DaemonConfig, String> {
+async fn get_config_file() -> Result<DaemonConfig, String> {
     let config_path = friglet_ipc::default_config_path()
         .ok_or("cannot determine the platform config directory")?;
+    if !config_path.exists() {
+        return Err(format!(
+            "no config file at {}: the daemon is configured through FRIGLET_* \
+             environment variables, change them there",
+            config_path.display()
+        ));
+    }
     setup::read_config_for_editing(&config_path)
 }
 
-/// Settings save while the daemon is down (crashed, or not running): no
-/// daemon can persist the settings, so the tray validates and writes the
-/// config file itself, then starts the daemon. A config that keeps the
-/// daemon from starting can so be fixed in the form. Keys: see
-/// [`setup::file_save_scan_key`].
+/// Settings save while the tray's daemon has crashed: no daemon can persist
+/// the settings, so the tray validates and writes the config file itself,
+/// then starts the daemon. A config that keeps the daemon from starting can
+/// so be fixed in the form. Keys: see [`setup::file_save_scan_key`];
+/// `keep_recorded_birthday`: see [`setup::keep_recorded_birthday`] (the
+/// form sets it when "new wallet" is unchanged for the same wallet).
 ///
 /// Same results as [`save_local_config`]; starts the daemon like Start
 /// daemon (clears a user stop, resets the restart backoff).
@@ -620,6 +629,7 @@ async fn save_config_file(
     mut config: DaemonConfig,
     scan_key: Option<String>,
     descriptor: Option<String>,
+    keep_recorded_birthday: bool,
 ) -> Result<Option<String>, String> {
     let config_path = friglet_ipc::default_config_path()
         .ok_or("cannot determine the platform config directory")?;
@@ -632,7 +642,7 @@ async fn save_config_file(
     {
         // No restart attempt runs while we hold the lifecycle lock, so none
         // reads the file mid-save. A daemon that answers owns its settings.
-        let _lc = state.lifecycle.lock().await;
+        let mut lc = state.lifecycle.lock().await;
         if lifecycle::probe(&state.socket_path, lifecycle::PROBE_TIMEOUT)
             .await
             .is_some()
@@ -642,6 +652,18 @@ async fn save_config_file(
                  make your changes there and save again"
                     .to_string(),
             );
+        }
+        // Our own child that does not answer may still be starting and
+        // could record a birthday into the file: stop it before writing (the
+        // start below would kill it anyway).
+        if let Some(mut child) = lc.child.take() {
+            if child.kill().await.is_err() {
+                let _ = child.wait().await;
+            }
+            lc.spawned_by_tray = false;
+        }
+        if keep_recorded_birthday {
+            setup::keep_recorded_birthday(&mut config, &config_path);
         }
         setup::write_config_file(&config_path, &config, scan_key.as_deref())?;
     }

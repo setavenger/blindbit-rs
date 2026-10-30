@@ -203,9 +203,9 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
 }
 
 /// Validate settings tray-side, mirroring the daemon's own startup
-/// validation with friendlier messages. Hex fields are checked for length
-/// only; full secp256k1 validation happens daemon-side at startup. The P2P
-/// host is checked for syntax only (see [`resolve_peer`] for DNS).
+/// validation with friendlier messages. The spend key is checked as a
+/// secp256k1 public key. The P2P host is checked for syntax only (see
+/// [`resolve_peer`] for DNS).
 pub fn validate_config(cfg: &DaemonConfig) -> Result<(), String> {
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!(
@@ -342,22 +342,56 @@ pub fn read_config_for_editing(path: &Path) -> Result<DaemonConfig, String> {
 /// `cfg.spend_pubkey` filled from a descriptor: a pasted descriptor, else a
 /// manual key, else the `descriptor` in the config file at `config_path`
 /// (the save writes no `descriptor` key, and the daemon may have exited
-/// before copying its scan key to the key file). `None`: keep the key file.
+/// before copying its scan key to the key file). `None`: keep the key file,
+/// also when the file's descriptor is empty or does not parse (the save
+/// drops it, which may be what fixes the daemon).
 pub fn file_save_scan_key(
     cfg: &mut DaemonConfig,
     scan_key: Option<String>,
     descriptor: Option<String>,
     config_path: &Path,
 ) -> Result<Option<String>, String> {
+    if let Some(d) = descriptor.filter(|d| !d.trim().is_empty()) {
+        return keys_from_descriptor(cfg, d.trim()).map(Some);
+    }
     let scan_key = scan_key.filter(|k| !k.trim().is_empty());
-    let descriptor = match descriptor.filter(|d| !d.trim().is_empty()) {
-        Some(d) => Some(d),
-        None if scan_key.is_none() => file_descriptor(config_path),
-        None => None,
+    if scan_key.is_some() {
+        return Ok(scan_key);
+    }
+    let Some(text) = file_descriptor(config_path) else {
+        return Ok(None);
     };
-    match descriptor {
-        Some(d) => keys_from_descriptor(cfg, d.trim()).map(Some),
-        None => Ok(scan_key),
+    let Ok(d) = SpDescriptor::parse(&text) else {
+        return Ok(None);
+    };
+    // The form shows an explicit spend_pubkey over the descriptor's: never
+    // swap it for the descriptor's behind the user's back.
+    let spend = d.spend_pubkey_hex();
+    if let Some(shown) = cfg.spend_pubkey.as_deref().map(str::trim)
+        && !shown.is_empty()
+        && !shown.eq_ignore_ascii_case(&spend)
+    {
+        return Err(format!(
+            "the config file's descriptor is for spend key {spend}, not {shown}: paste the \
+             descriptor of the wallet to use (or enter its scan key under Advanced)"
+        ));
+    }
+    keys_from_descriptor(cfg, text.trim()).map(Some)
+}
+
+/// "New wallet" kept as loaded: a restart attempt may have resolved the
+/// tip and recorded it as `start_height` in the file at `config_path`
+/// since. Keep that birthday rather than take a later tip, which would skip
+/// the blocks in between.
+pub fn keep_recorded_birthday(cfg: &mut DaemonConfig, config_path: &Path) {
+    if !cfg.start_at_tip || cfg.start_height.is_some() {
+        return;
+    }
+    if let Ok(on_disk) = friglet_ipc::read_config_toml(config_path)
+        && let Some(height) = on_disk.start_height
+    {
+        cfg.start_height = Some(height);
+        cfg.start_at_tip = false;
     }
 }
 
@@ -845,20 +879,25 @@ mod tests {
         let path = dir.join("config.toml");
         fs::write(&path, format!("descriptor = \"{TEST_DESCRIPTOR}\"\n")).unwrap();
         let d = SpDescriptor::parse(TEST_DESCRIPTOR).unwrap();
-        let testnet = || DaemonConfig {
+        let testnet = |spend: Option<String>| DaemonConfig {
             network: "testnet".to_string(),
-            spend_pubkey: Some(SPEND_HEX.to_string()),
+            spend_pubkey: spend,
             ..valid_config()
         };
 
         // Nothing entered: the file's descriptor supplies both keys.
-        let mut cfg = testnet();
+        let mut cfg = testnet(None);
         let key = file_save_scan_key(&mut cfg, None, Some(" ".into()), &path).unwrap();
         assert_eq!(key, Some(d.scan_secret_hex()));
         assert_eq!(cfg.spend_pubkey, Some(d.spend_pubkey_hex()));
 
+        // The form showed another spend key: refused, not swapped.
+        let mut cfg = testnet(Some(SPEND_HEX.into()));
+        let err = file_save_scan_key(&mut cfg, None, None, &path).unwrap_err();
+        assert!(err.contains("descriptor is for spend key"), "{err}");
+
         // A manual key wins; the spend key is left as entered.
-        let mut cfg = testnet();
+        let mut cfg = testnet(Some(SPEND_HEX.into()));
         let key = file_save_scan_key(&mut cfg, Some(KEY_HEX.into()), None, &path).unwrap();
         assert_eq!(key.as_deref(), Some(KEY_HEX));
         assert_eq!(cfg.spend_pubkey.as_deref(), Some(SPEND_HEX));
@@ -870,10 +909,42 @@ mod tests {
         };
         assert!(file_save_scan_key(&mut cfg, None, None, &path).is_err());
 
-        // No descriptor anywhere: keep the key file.
+        // No usable descriptor anywhere: keep the key file.
         let mut cfg = valid_config();
         let none = dir.join("none.toml");
         assert_eq!(file_save_scan_key(&mut cfg, None, None, &none), Ok(None));
+        for bad in ["", "sp(garbage)"] {
+            fs::write(&path, format!("descriptor = \"{bad}\"\n")).unwrap();
+            assert_eq!(file_save_scan_key(&mut cfg, None, None, &path), Ok(None));
+        }
+    }
+
+    #[test]
+    fn keep_recorded_birthday_adopts_a_height_recorded_since() {
+        let dir = temp_dir("recorded-birthday");
+        let path = dir.join("config.toml");
+        let tip = || DaemonConfig {
+            start_height: None,
+            start_at_tip: true,
+            ..valid_config()
+        };
+
+        // Still unresolved on disk: stay at the tip.
+        fs::write(&path, "start_at_tip = true\n").unwrap();
+        let mut cfg = tip();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert!(cfg.start_at_tip && cfg.start_height.is_none());
+
+        // Recorded meanwhile: adopt it.
+        fs::write(&path, "start_height = 4321\n").unwrap();
+        let mut cfg = tip();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert_eq!((cfg.start_at_tip, cfg.start_height), (false, Some(4321)));
+
+        // An explicit height in the save wins.
+        let mut cfg = valid_config();
+        keep_recorded_birthday(&mut cfg, &path);
+        assert_eq!(cfg.start_height, valid_config().start_height);
     }
 
     #[test]
