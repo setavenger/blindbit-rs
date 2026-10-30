@@ -114,9 +114,83 @@ pub fn resolve_peer_addr(addr: &str, network: &str) -> Result<std::net::SocketAd
         .ok_or_else(|| format!("cannot resolve P2P node `{host}`: no addresses"))
 }
 
+/// Is `host` a Tor onion service name? Only a proxy (Tor) can reach one.
+pub fn is_onion(host: &str) -> bool {
+    host.trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .ends_with(".onion")
+}
+
+/// Parse a `p2p_proxy` value: `ip:port`, `[v6]:port` or `localhost:port`
+/// (taken as 127.0.0.1). The port is required, and no other host name is
+/// accepted: looking up the proxy's name would ask the local resolver.
+pub fn parse_proxy_addr(addr: &str) -> Result<std::net::SocketAddr, String> {
+    let addr = addr.trim();
+    if let Ok(socket) = addr.parse::<std::net::SocketAddr>()
+        && socket.port() != 0
+    {
+        return Ok(socket);
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(format!(
+            "invalid p2p_proxy `{addr}`: expected ip:port, e.g. 127.0.0.1:9050 for Tor"
+        ));
+    };
+    let port = match port.parse::<u16>() {
+        Ok(port) if port != 0 => port,
+        _ => {
+            return Err(format!(
+                "invalid p2p_proxy `{addr}`: `{port}` is not a valid port (expected ip:port, \
+                 e.g. 127.0.0.1:9050)"
+            ));
+        }
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return Err(format!(
+            "invalid p2p_proxy `{addr}`: expected ip:port, e.g. 127.0.0.1:9050"
+        ));
+    }
+    Err(format!(
+        "invalid p2p_proxy `{addr}`: give the proxy's IP address (or localhost), not a host \
+         name, so finding it needs no DNS lookup"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_addresses_are_ips_or_localhost_with_a_port() {
+        let ok = |a: &str| parse_proxy_addr(a).unwrap();
+        assert_eq!(ok("127.0.0.1:9050"), "127.0.0.1:9050".parse().unwrap());
+        assert_eq!(ok(" localhost:9150 "), "127.0.0.1:9150".parse().unwrap());
+        assert_eq!(ok("[::1]:9050"), "[::1]:9050".parse().unwrap());
+        assert_eq!(ok("10.0.0.2:1080"), "10.0.0.2:1080".parse().unwrap());
+        for (bad, says) in [
+            ("127.0.0.1", "expected ip:port"),
+            ("localhost", "expected ip:port"),
+            ("tor.example:9050", "not a host name"),
+            ("127.0.0.1:0", "not a valid port"),
+            ("127.0.0.1:tor", "not a valid port"),
+            ("", "expected ip:port"),
+        ] {
+            let err = parse_proxy_addr(bad).expect_err(bad);
+            assert!(err.contains(says), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn onion_names() {
+        assert!(is_onion("abcdefghijklmnop.onion"));
+        assert!(is_onion("ABC.ONION."));
+        assert!(!is_onion("onion.example"));
+        assert!(!is_onion("127.0.0.1"));
+    }
 
     #[test]
     fn hosted_oracles_round_trip() {

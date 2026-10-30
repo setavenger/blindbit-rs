@@ -47,6 +47,7 @@ async fn main() -> std::io::Result<()> {
     let scanning = Arc::new(AtomicBool::new(false));
     let config = Arc::new(Mutex::new(DaemonConfig {
         p2p_node_addr: Some("127.0.0.1:38333".to_string()),
+        p2p_proxy: None,
         start_height: Some(890_000),
         network: "signet".to_string(),
         ..DaemonConfig::default()

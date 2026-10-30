@@ -29,10 +29,13 @@
 //! ([`ask_mempools`], [`hand_over`]).
 //!
 //! Every connection goes through the pool's [`Dialer`](blindbit_lib::net::Dialer):
-//! [`connect`] is the only place one is opened.
+//! [`connect`] is the only place one is opened. Through a proxy (Tor,
+//! `p2p_proxy`) each one gets a circuit of its own, so no exit relay sees
+//! both an observer and a sender, and the waits are longer ([`Timing`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
@@ -48,21 +51,15 @@ use super::relay::{self, Candidate, Signals};
 const OBSERVERS: usize = 3;
 /// Peers the transaction is handed to.
 const SENDERS: usize = 2;
-/// Connection attempts per role in one broadcast, replacements included.
-const OBSERVER_TRIES: usize = 9;
-const SENDER_TRIES: usize = 6;
+/// Raised to the dialer's `PROXY_CONNECT_TIMEOUT` (20 s) through a proxy.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Senders start once every observer is ready, or with at least one ready
-/// this long after the start.
-const OBSERVER_WINDOW: Duration = Duration::from_secs(5);
-/// With no observer ready by then, the broadcast ends without sending.
-const OBSERVER_LIMIT: Duration = Duration::from_secs(12);
 /// How often an observer is asked for the transaction.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Bitcoin Core requests an announced transaction after 2 s from an inbound
 /// peer, later when it is busy; also the wait for a mempool answer.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
-/// How long a sender waits for the pong that follows the transaction.
+/// How long a sender waits for the pong that follows the transaction
+/// (directly; see [`Timing::flush_wait`]).
 const FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// How often blocking loops look at the stop token.
 const STOP_CHECK: Duration = Duration::from_millis(250);
@@ -93,6 +90,73 @@ pub enum Verdict {
     Unconfirmed { waited: Duration },
 }
 
+/// How a broadcast paces its connections.
+///
+/// Through a proxy (Tor) a connection first gets a circuit (1 to 5 s to a
+/// live peer, measured on signet), and an address nobody answers at costs
+/// the dialer's whole 20 s connect timeout: Tor keeps trying instead of
+/// failing fast, and many gossiped addresses are dead. So more observers
+/// are opened at once, more are added while too few are up ("hedging",
+/// senders too), senders wait longer for observers, and the broadcast
+/// itself gets a longer budget (`PROXIED_BROADCAST_BUDGET` in the Electrum
+/// server, 45 s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Timing {
+    /// Observer connections opened at the start.
+    observers_at_start: usize,
+    /// Connection attempts per role, replacements and hedges included.
+    observer_tries: usize,
+    sender_tries: usize,
+    /// Senders start once every observer is ready, or with at least one
+    /// ready this long after the start.
+    observer_window: Duration,
+    /// With no observer ready by then, the broadcast ends without sending.
+    observer_limit: Duration,
+    /// While too few observers are ready, or too few senders have handed
+    /// the transaction over, start more this often: a connection not up
+    /// by then is probably to a dead address.
+    hedge_every: Option<Duration>,
+    /// How long a sender waits for the pong that follows the transaction:
+    /// a sender that gets none says nothing about the transaction.
+    flush_wait: Duration,
+}
+
+impl Timing {
+    const DIRECT: Self = Self {
+        observers_at_start: OBSERVERS,
+        observer_tries: 9,
+        sender_tries: 6,
+        observer_window: Duration::from_secs(5),
+        observer_limit: Duration::from_secs(12),
+        hedge_every: None,
+        flush_wait: FLUSH_WAIT,
+    };
+
+    /// Through Tor: six observers at the start and more every 6 s while
+    /// fewer than three are ready (a live peer is up in 1 to 5 s plus the
+    /// 2 s settle wait); senders likewise. The window covers a slower
+    /// circuit; the limit, two rounds of hedging after the first dead
+    /// addresses time out (20 s). The pong crosses a circuit (on signet one
+    /// took over 5 s).
+    const PROXIED: Self = Self {
+        observers_at_start: 2 * OBSERVERS,
+        observer_tries: 18,
+        sender_tries: 8,
+        observer_window: Duration::from_secs(15),
+        observer_limit: Duration::from_secs(30),
+        hedge_every: Some(Duration::from_secs(6)),
+        flush_wait: Duration::from_secs(15),
+    };
+
+    fn for_peers(peers: &PeerSource) -> Self {
+        if peers.dialer().proxy().is_some() {
+            Self::PROXIED
+        } else {
+            Self::DIRECT
+        }
+    }
+}
+
 /// What one connection reports to the broadcast.
 #[derive(Debug)]
 enum Event {
@@ -107,6 +171,9 @@ enum Event {
     HandedOver { addr: PeerAddr },
     /// A sender's peer refused the transaction.
     Refused { addr: PeerAddr, signal: Signal },
+    /// The proxy every connection goes through failed (`p2p_proxy`): no
+    /// peer can be reached, and none is to blame.
+    ProxyDown { error: String },
     /// The connection ended (failed, closed, or stopped).
     Gone { addr: PeerAddr },
 }
@@ -129,6 +196,9 @@ struct Job {
     stop: CancellationToken,
     deadline: Instant,
     events: mpsc::UnboundedSender<Event>,
+    /// Senders that took a hand-over slot ([`Job::claim_hand_over`]): with
+    /// hedged senders, no more than [`SENDERS`] hand the transaction over.
+    hand_overs: Arc<AtomicUsize>,
 }
 
 impl Job {
@@ -139,6 +209,31 @@ impl Job {
 
     fn over(&self) -> bool {
         self.stop.is_cancelled() || Instant::now() >= self.deadline
+    }
+
+    /// Take one of the [`SENDERS`] hand-over slots; `false` when they are
+    /// all taken.
+    fn claim_hand_over(&self) -> bool {
+        // A compare-exchange loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (not on older ones).
+        let mut taken = self.hand_overs.load(Ordering::SeqCst);
+        while taken < SENDERS {
+            match self.hand_overs.compare_exchange_weak(
+                taken,
+                taken + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => taken = current,
+            }
+        }
+        false
+    }
+
+    /// Give a slot back: the sender did not hand the transaction over.
+    fn release_hand_over(&self) {
+        self.hand_overs.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -153,6 +248,7 @@ enum State {
 
 /// The broadcast's book-keeping, driven by [`Event`]s.
 struct Round {
+    timing: Timing,
     started: Instant,
     peers: HashMap<PeerAddr, State>,
     /// Peers in the order they were handed the transaction.
@@ -167,11 +263,14 @@ struct Round {
     seen_by: Option<PeerAddr>,
     /// Why the pool had no further peer, if it ran out.
     no_peers: Option<String>,
+    /// The proxy failed: nothing more is tried.
+    proxy_down: Option<String>,
 }
 
 impl Round {
-    fn new() -> Self {
+    fn new(timing: Timing) -> Self {
         Self {
+            timing,
             started: Instant::now(),
             peers: HashMap::new(),
             sent_to: Vec::new(),
@@ -183,6 +282,7 @@ impl Round {
             senders_started: false,
             seen_by: None,
             no_peers: None,
+            proxy_down: None,
         }
     }
 
@@ -221,10 +321,13 @@ impl Round {
 
     /// Start one more observer or sender, if the pool has a fitting peer.
     async fn launch(&mut self, job: &Job, observer: bool) -> bool {
+        if self.proxy_down.is_some() {
+            return false;
+        }
         let (tries, max) = if observer {
-            (&mut self.observer_tries, OBSERVER_TRIES)
+            (&mut self.observer_tries, self.timing.observer_tries)
         } else {
-            (&mut self.sender_tries, SENDER_TRIES)
+            (&mut self.sender_tries, self.timing.sender_tries)
         };
         if *tries >= max {
             return false;
@@ -281,6 +384,10 @@ impl Round {
                 tracing::debug!(peer = %addr, ?signal, "broadcast: a sender's peer refused the transaction");
                 self.refused.insert(addr, signal);
             }
+            Event::ProxyDown { error } => {
+                tracing::warn!(%error, "broadcast: the P2P proxy failed");
+                self.proxy_down.get_or_insert(error);
+            }
             Event::Gone { addr } => match self.peers.get(&addr).copied() {
                 Some(State::Watching { .. }) => {
                     self.peers.insert(addr, State::ObserverGone);
@@ -301,6 +408,26 @@ impl Round {
         }
     }
 
+    /// Through a proxy: start more connections alongside the ones not up
+    /// yet, which are probably to dead addresses. Observers until enough
+    /// are ready; then senders until enough have handed it over (a hedged
+    /// sender hands nothing over once [`SENDERS`] slots are taken).
+    async fn hedge(&mut self, job: &Job) {
+        if self.seen_by.is_some() {
+            return;
+        }
+        let (observer, missing) = if self.senders_started {
+            (false, SENDERS.saturating_sub(self.sent_to.len()))
+        } else {
+            (true, OBSERVERS.saturating_sub(self.observers_ready()))
+        };
+        for _ in 0..missing {
+            if !self.launch(job, observer).await {
+                break;
+            }
+        }
+    }
+
     fn should_start_senders(&self) -> bool {
         let ready = self.observers_ready();
         !self.senders_started
@@ -308,7 +435,7 @@ impl Round {
             && ready > 0
             && (ready >= OBSERVERS
                 || self.observers_connecting() == 0
-                || self.started.elapsed() >= OBSERVER_WINDOW)
+                || self.started.elapsed() >= self.timing.observer_window)
     }
 
     /// The broadcast's end, once it is decided. `Err` is a message for the
@@ -326,7 +453,7 @@ impl Round {
         let observers_left = self.observers_ready() + self.observers_connecting() > 0;
         if !self.senders_started {
             let gave_up = Instant::now() >= deadline
-                || self.started.elapsed() >= OBSERVER_LIMIT
+                || self.started.elapsed() >= self.timing.observer_limit
                 || !observers_left;
             return gave_up.then(|| Err(self.unreachable("to confirm the broadcast")));
         }
@@ -338,8 +465,10 @@ impl Round {
             return Some(unconfirmed());
         }
         // Every sender that got it refused it the same way, and no other
-        // sender may still get it.
-        if self.senders_connecting() == 0 {
+        // sender may still get it: none is connecting, or all the hand-over
+        // slots are taken (hedged senders still connecting hand nothing
+        // over then).
+        if self.senders_connecting() == 0 || self.sent_to.len() >= SENDERS {
             let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
             let first = signals.next().flatten().copied()?;
             if signals.all(|signal| signal == Some(&first)) {
@@ -354,6 +483,13 @@ impl Round {
     }
 
     fn unreachable(&self, what: &str) -> String {
+        if let Some(error) = &self.proxy_down {
+            return format!(
+                "no Bitcoin peers reachable {what}: {error}. Check that Tor (or the SOCKS5 \
+                 proxy) is running and that p2p_proxy names its SOCKS port; friglet never \
+                 connects to peers directly while p2p_proxy is set"
+            );
+        }
         let mut message = format!("no Bitcoin peers reachable {what}");
         if let Some(reason) = &self.no_peers {
             message.push_str(&format!(" ({reason})"));
@@ -371,6 +507,7 @@ pub async fn broadcast(
     budget: Duration,
 ) -> Result<Report, String> {
     let deadline = Instant::now() + budget;
+    let timing = Timing::for_peers(&peers);
     let stop = CancellationToken::new();
     // Every connection of this broadcast ends when it returns.
     let _stop_all = stop.clone().drop_guard();
@@ -381,13 +518,15 @@ pub async fn broadcast(
         stop,
         deadline,
         events,
+        hand_overs: Arc::new(AtomicUsize::new(0)),
     };
-    let mut round = Round::new();
-    for _ in 0..OBSERVERS {
+    let mut round = Round::new(timing);
+    for _ in 0..timing.observers_at_start {
         if !round.launch(&job, true).await {
             break;
         }
     }
+    let mut next_hedge = timing.hedge_every.map(|every| Instant::now() + every);
     loop {
         if round.should_start_senders() {
             round.senders_started = true;
@@ -396,6 +535,13 @@ pub async fn broadcast(
                     break;
                 }
             }
+            next_hedge = timing.hedge_every.map(|every| Instant::now() + every);
+        }
+        if let (Some(at), Some(every)) = (next_hedge, timing.hedge_every)
+            && Instant::now() >= at
+        {
+            round.hedge(&job).await;
+            next_hedge = Some(Instant::now() + every);
         }
         if let Some(end) = round.end(deadline) {
             let verdict = end?;
@@ -408,8 +554,11 @@ pub async fn broadcast(
         let mut wake = deadline;
         if !round.senders_started {
             wake = wake
-                .min(round.started + OBSERVER_WINDOW)
-                .min(round.started + OBSERVER_LIMIT);
+                .min(round.started + timing.observer_window)
+                .min(round.started + timing.observer_limit);
+        }
+        if let Some(at) = next_hedge {
+            wake = wake.min(at);
         }
         tokio::select! {
             event = received.recv() => {
@@ -443,6 +592,8 @@ fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2p
             }
             Ok(peer)
         }
+        // The proxy failed, not the peer.
+        Err(error) if error.proxy_down() => Err(error),
         Err(error) => {
             let no_route = matches!(
                 &error,
@@ -451,7 +602,7 @@ fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2p
             let event = if no_route {
                 PeerEvent::NoRoute
             } else {
-                PeerEvent::Unreachable
+                error.peer_event()
             };
             peers.report(addr, event);
             Err(error)
@@ -483,6 +634,9 @@ fn observe(job: Job, addr: PeerAddr) {
             announced,
         }),
         Ok(None) => {}
+        Err(error) if error.proxy_down() => job.tell(Event::ProxyDown {
+            error: error.to_string(),
+        }),
         Err(error) => tracing::debug!(peer = %addr, %error, "broadcast: observer lost"),
     }
     job.tell(Event::Gone { addr });
@@ -603,8 +757,14 @@ fn send(job: Job, addr: PeerAddr) {
     let mut signals = Signals::default();
     let mut flushed = false;
     let mut told_missing = false;
+    let mut claimed = false;
     let result = (|| {
         let mut peer = connect_sender(&job.peers, &addr)?;
+        // Enough senders have it already (hedged senders through a proxy).
+        if !job.claim_hand_over() {
+            return Ok(());
+        }
+        claimed = true;
         if announce_and_hand_over(&mut peer, &candidate, &mut signals, || job.over())?.is_none() {
             return Ok(());
         }
@@ -613,7 +773,8 @@ fn send(job: Job, addr: PeerAddr) {
             &mut peer,
             &candidate,
             &mut signals,
-            job.deadline.min(Instant::now() + FLUSH_WAIT),
+            job.deadline
+                .min(Instant::now() + Timing::for_peers(&job.peers).flush_wait),
         )?;
         flushed = true;
         // A parent request comes seconds later (Bitcoin Core delays
@@ -639,6 +800,9 @@ fn send(job: Job, addr: PeerAddr) {
         }
         Ok::<_, P2pError>(())
     })();
+    if claimed && !signals.sent {
+        job.release_hand_over();
+    }
     if signals.missing_inputs && !told_missing {
         job.tell(Event::Refused {
             addr: addr.clone(),
@@ -654,6 +818,11 @@ fn send(job: Job, addr: PeerAddr) {
         });
     }
     if let Err(error) = &result {
+        if error.proxy_down() {
+            job.tell(Event::ProxyDown {
+                error: error.to_string(),
+            });
+        }
         tracing::debug!(peer = %addr, %error, handed_over = signals.sent, "broadcast: sender connection ended");
     }
     job.tell(Event::Gone { addr });
@@ -728,8 +897,9 @@ pub struct Asked {
 /// Ask up to `count` peers that are not in `exclude` (nor, with
 /// `avoid_groups`, in its network groups), each in a group of its own,
 /// whether each candidate is in their mempool, on observer connections
-/// opened at once. Unreachable peers are replaced a few times. `Err` when
-/// none answered.
+/// opened at once. Unreachable peers are replaced a few times; through a
+/// proxy two more connections race from the start (a dead address costs
+/// 20 s there). `Err` when none answered.
 pub async fn ask_mempools(
     peers: &Arc<PeerSource>,
     candidates: Arc<Vec<Candidate>>,
@@ -747,14 +917,21 @@ pub async fn ask_mempools(
     let mut tries = 0;
     let mut answers: Vec<(PeerAddr, Vec<bool>, Option<u64>)> = Vec::new();
     let mut last_error = None;
-    loop {
-        while asking.len() + answers.len() < count && tries < count * 3 {
+    let racing = if peers.dialer().proxy().is_some() {
+        2
+    } else {
+        0
+    };
+    let max_tries = count * 3 + racing;
+    let mut proxy_down = false;
+    while answers.len() < count {
+        while !proxy_down && asking.len() + answers.len() < count + racing && tries < max_tries {
             tries += 1;
             let addr = match peers.next_outside(Purpose::Relay, &used, &groups).await {
                 Ok(addr) => addr,
                 Err(no_peers) => {
                     last_error = Some(no_peers.to_string());
-                    tries = count * 3;
+                    tries = max_tries;
                     break;
                 }
             };
@@ -772,6 +949,10 @@ pub async fn ask_mempools(
         let (addr, answer) = joined.map_err(|error| format!("mempool check failed: {error}"))?;
         match answer {
             Ok((present, fee_filter)) => answers.push((addr, present, fee_filter)),
+            Err(error) if error.proxy_down() => {
+                proxy_down = true;
+                last_error = Some(error.to_string());
+            }
             Err(error) => {
                 tracing::debug!(peer = %addr, %error, "mempool check: peer could not be asked");
                 last_error = Some(format!("{addr}: {error}"));
@@ -835,7 +1016,7 @@ pub fn hand_over(
             &mut peer,
             candidate,
             &mut signals,
-            Instant::now() + FLUSH_WAIT,
+            Instant::now() + Timing::for_peers(peers).flush_wait,
         )?;
     }
     Ok(requested)
@@ -883,9 +1064,14 @@ mod tests {
 
     /// A discovering source that knows exactly `addrs`.
     async fn pool(addrs: &[SocketAddr]) -> Arc<PeerSource> {
+        pool_via(addrs, Dialer::Direct).await
+    }
+
+    /// [`pool`], connecting through `dialer`.
+    async fn pool_via(addrs: &[SocketAddr], dialer: Dialer) -> Arc<PeerSource> {
         let peers = PeerSource::discover(
             Network::Regtest,
-            Dialer::Direct,
+            dialer,
             Seeds::Static(addrs.iter().map(|addr| (*addr).into()).collect()),
         );
         peers.next(Purpose::Block, &HashSet::new()).await.unwrap();
@@ -1140,6 +1326,7 @@ mod tests {
             stop: CancellationToken::new(),
             deadline: Instant::now() + Duration::from_secs(10),
             events,
+            hand_overs: Arc::new(AtomicUsize::new(0)),
         };
         job.stop.cancel();
         let addr = PeerAddr::from(fake.addr);
@@ -1193,5 +1380,136 @@ mod tests {
             .unwrap();
         assert!(!hand_over_conn.version.relay);
         assert!(!hand_over_conn.commands.iter().any(|c| c == "getdata"));
+    }
+
+    /// Through a proxy (Tor) every connection logs in with its own
+    /// credentials, so each gets a circuit of its own: no exit relay sees
+    /// both senders, or a sender and an observer. Nothing goes around it.
+    #[tokio::test]
+    async fn through_a_proxy_every_connection_is_on_its_own_circuit() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        // Peers that keep the transaction to themselves: the broadcast runs
+        // its whole budget, so both senders hand it over.
+        let net = FakeNet::new();
+        let silent = Script {
+            policy: TxPolicy::Ignore,
+            ..Script::default()
+        };
+        let fakes = net_of(&net, 150, vec![silent; 8]);
+        let proxy = FakeSocks5::start();
+        let peers = pool_via(&addrs(&fakes), proxy.dialer()).await;
+        let report = broadcast(peers, candidate(15), Duration::from_secs(6))
+            .await
+            .unwrap();
+        assert!(
+            matches!(report.verdict, Verdict::Unconfirmed { .. }),
+            "{report:?}"
+        );
+        assert_eq!(report.sent_to.len(), SENDERS);
+        let requests = proxy.requests();
+        let sender_logins: Vec<_> = requests
+            .iter()
+            .filter(|request| report.sent_to.contains(&request.target))
+            .map(|request| request.credentials.clone().expect("logged in"))
+            .collect();
+        assert_eq!(sender_logins.len(), SENDERS);
+        assert_ne!(
+            sender_logins[0], sender_logins[1],
+            "the two senders used different credentials"
+        );
+        let logins: HashSet<_> = requests.iter().map(|r| r.credentials.clone()).collect();
+        assert_eq!(logins.len(), requests.len(), "one login per connection");
+        // Every connection a fake peer saw came through the proxy.
+        for fake in &fakes {
+            let through_proxy = requests
+                .iter()
+                .filter(|request| request.target == PeerAddr::from(fake.addr))
+                .count();
+            assert_eq!(fake.conns().len(), through_proxy, "{}", fake.addr);
+        }
+    }
+
+    /// The proxy is down: the error names it, no peer is blamed and none is
+    /// contacted.
+    #[tokio::test]
+    async fn with_the_proxy_down_a_broadcast_says_so_and_blames_no_peer() {
+        let net = FakeNet::new();
+        let fakes = net_of(&net, 170, vec![Script::default(); 5]);
+        // Nothing listens on port 1, and no parallel test can take it.
+        let down = Dialer::Socks5 {
+            proxy: "127.0.0.1:1".parse().unwrap(),
+        };
+        let peers = pool_via(&addrs(&fakes), down).await;
+        let error = broadcast(peers.clone(), candidate(16), Duration::from_secs(20))
+            .await
+            .unwrap_err();
+        for expected in [
+            "no Bitcoin peers reachable to confirm the broadcast",
+            "p2p_proxy 127.0.0.1:1",
+            "Check that Tor",
+        ] {
+            assert!(error.contains(expected), "{expected:?} in {error}");
+        }
+        let error = ask_mempools(
+            &peers,
+            Arc::new(vec![Candidate::clone(&candidate(16))]),
+            &HashSet::new(),
+            true,
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("p2p_proxy"), "{error}");
+        assert_eq!(peers.known(), fakes.len(), "no peer blamed");
+        for fake in &fakes {
+            assert!(fake.conns().is_empty());
+        }
+    }
+
+    /// Through Tor a dead address keeps a connection waiting the whole
+    /// 20 s: more observers and senders are started alongside, so the
+    /// broadcast succeeds long before, and still hands the transaction to
+    /// no more than two peers.
+    #[test]
+    fn through_a_proxy_dead_addresses_are_hedged_around() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let net = FakeNet::new();
+        let fakes = net_of(&net, 190, vec![Script::default(); 7]);
+        let proxy = FakeSocks5::start();
+        let mut all = addrs(&fakes);
+        for n in 0..7u8 {
+            // Addresses Tor never gets an answer from.
+            let dead = SocketAddr::from(([10, 100 + n, 0, 1], 18444));
+            proxy.stall(dead.into());
+            all.push(dead);
+        }
+        // The stalled connects outlive the broadcast; a plain runtime drop
+        // would wait for them.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (report, waited) = runtime.block_on(async {
+            let peers = pool_via(&all, proxy.dialer()).await;
+            let started = Instant::now();
+            let report = broadcast(peers, candidate(17), Duration::from_secs(45))
+                .await
+                .unwrap();
+            (report, started.elapsed())
+        });
+        runtime.shutdown_background();
+        assert!(
+            matches!(report.verdict, Verdict::InMempool { .. }),
+            "{report:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(19),
+            "waited {waited:?}: a dead address costs 20 s"
+        );
+        assert!((1..=SENDERS).contains(&report.sent_to.len()), "{report:?}");
+        let handed = fakes.iter().filter(|fake| got_tx(fake)).count();
+        assert!(handed <= SENDERS, "{handed} peers got the transaction");
     }
 }

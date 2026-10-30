@@ -199,7 +199,8 @@ pub fn keys_from_descriptor(cfg: &mut DaemonConfig, text: &str) -> Result<String
 /// Validate a setup-mode save tray-side, mirroring the daemon's own startup
 /// validation with friendlier messages. Hex fields are checked for length
 /// only; full secp256k1 validation happens daemon-side at startup. The P2P
-/// host is checked for syntax only (see [`resolve_peer`] for DNS).
+/// host and the proxy are checked for syntax only (see [`check_p2p`] for
+/// the network check).
 pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> {
     if !NETWORKS.contains(&cfg.network.as_str()) {
         return Err(format!(
@@ -230,6 +231,7 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         ));
     }
 
+    let proxy = proxy_of(cfg)?;
     match cfg
         .p2p_node_addr
         .as_deref()
@@ -237,8 +239,15 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         .filter(|s| !s.is_empty())
     {
         Some(p2p) => {
-            network::split_peer_addr(p2p, &cfg.network)
+            let (host, _) = network::split_peer_addr(p2p, &cfg.network)
                 .map_err(|e| format!("invalid Bitcoin node address: {e}"))?;
+            if proxy.is_none() && network::is_onion(&host) {
+                return Err(
+                    "an onion node address needs Tor: enter Tor's SOCKS port as the proxy \
+                     (e.g. 127.0.0.1:9050)"
+                        .to_string(),
+                );
+            }
         }
         None if network::needs_own_node(&cfg.network) => {
             return Err(format!(
@@ -288,9 +297,57 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// DNS check for the P2P node so a typo fails at Save instead of as a
-/// daemon that never connects.
-pub async fn resolve_peer(cfg: &DaemonConfig) -> Result<(), String> {
+/// The configured `p2p_proxy`, if any (empty: none).
+fn proxy_of(cfg: &DaemonConfig) -> Result<Option<SocketAddr>, String> {
+    cfg.p2p_proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(network::parse_proxy_addr)
+        .transpose()
+}
+
+/// How long Save waits for the proxy to accept a connection.
+const PROXY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Network check at Save, so a typo fails there instead of as a daemon that
+/// never connects: with a proxy, that it accepts a TCP connection (2 s);
+/// without one, that the P2P node's name resolves. Through a proxy the
+/// node's name is not looked up: the proxy resolves it, and a local lookup
+/// would tell the local resolver what Tor is meant to hide.
+pub async fn check_p2p(cfg: &DaemonConfig) -> Result<(), String> {
+    match proxy_of(cfg)? {
+        Some(proxy) => check_proxy(proxy).await,
+        None => resolve_peer(cfg).await,
+    }
+}
+
+/// The proxy part of [`check_p2p`]: settings saved to a running daemon,
+/// which validates (and resolves) the rest itself.
+pub async fn check_proxy_of(cfg: &DaemonConfig) -> Result<(), String> {
+    match proxy_of(cfg)? {
+        Some(proxy) => check_proxy(proxy).await,
+        None => Ok(()),
+    }
+}
+
+async fn check_proxy(proxy: SocketAddr) -> Result<(), String> {
+    match tokio::time::timeout(PROXY_CHECK_TIMEOUT, tokio::net::TcpStream::connect(proxy)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!(
+            "cannot reach the proxy at {proxy} ({e}): start Tor (or the SOCKS5 proxy), or \
+             clear the proxy field"
+        )),
+        Err(_) => Err(format!(
+            "the proxy at {proxy} did not accept a connection within {} s: start Tor (or the \
+             SOCKS5 proxy), or clear the proxy field",
+            PROXY_CHECK_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// DNS check for the P2P node.
+async fn resolve_peer(cfg: &DaemonConfig) -> Result<(), String> {
     let Some(p2p) = cfg
         .p2p_node_addr
         .as_deref()
@@ -370,6 +427,7 @@ mod tests {
             network: "signet".to_string(),
             oracle_url: "https://signet.oracle.setor.dev".to_string(),
             p2p_node_addr: Some("127.0.0.1:38333".to_string()),
+            p2p_proxy: None,
             start_height: Some(274010),
             spend_pubkey: Some(SPEND_HEX.to_string()),
             ..DaemonConfig::default()
@@ -472,6 +530,7 @@ mod tests {
 
         let cfg = DaemonConfig {
             p2p_node_addr: None,
+            p2p_proxy: None,
             ..valid_config()
         };
         assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()));
@@ -550,6 +609,7 @@ mod tests {
                     network: "regtest".to_string(),
                     oracle_url: "http://127.0.0.1:7000".to_string(),
                     p2p_node_addr: Some("  ".to_string()),
+                    p2p_proxy: None,
                     ..valid_config()
                 },
                 KEY_HEX,
@@ -558,6 +618,7 @@ mod tests {
             (
                 DaemonConfig {
                     p2p_node_addr: Some("node.example:notaport".to_string()),
+                    p2p_proxy: None,
                     ..valid_config()
                 },
                 KEY_HEX,
@@ -614,6 +675,30 @@ mod tests {
                 KEY_HEX,
                 "invalid Electrum bind address",
             ),
+            (
+                DaemonConfig {
+                    p2p_proxy: Some("tor.example:9050".to_string()),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "invalid p2p_proxy",
+            ),
+            (
+                DaemonConfig {
+                    p2p_proxy: Some("127.0.0.1".to_string()),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "expected ip:port",
+            ),
+            (
+                DaemonConfig {
+                    p2p_node_addr: Some("abcdef.onion:38333".to_string()),
+                    ..valid_config()
+                },
+                KEY_HEX,
+                "an onion node address needs Tor",
+            ),
         ];
         for (cfg, key, expected) in cases {
             let err = validate_setup(&cfg, key).unwrap_err();
@@ -635,6 +720,7 @@ mod tests {
         ] {
             let cfg = DaemonConfig {
                 p2p_node_addr: Some(p2p.to_string()),
+                p2p_proxy: None,
                 ..valid_config()
             };
             assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()), "{p2p}");
@@ -746,14 +832,41 @@ mod tests {
     async fn resolve_peer_reports_dns_failures() {
         let cfg = |p2p: &str| DaemonConfig {
             p2p_node_addr: Some(p2p.to_string()),
+            p2p_proxy: None,
             ..valid_config()
         };
-        assert_eq!(resolve_peer(&cfg("127.0.0.1:38333")).await, Ok(()));
-        assert_eq!(resolve_peer(&cfg("localhost")).await, Ok(()));
-        let err = resolve_peer(&cfg("no-such-host.invalid"))
+        assert_eq!(check_p2p(&cfg("127.0.0.1:38333")).await, Ok(()));
+        assert_eq!(check_p2p(&cfg("localhost")).await, Ok(()));
+        let err = check_p2p(&cfg("no-such-host.invalid")).await.unwrap_err();
+        assert!(err.contains("no-such-host.invalid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn with_a_proxy_save_checks_the_proxy_and_resolves_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let cfg = |proxy: String| DaemonConfig {
+            // Would fail a DNS check: through the proxy it is never looked up.
+            p2p_node_addr: Some("no-such-host.invalid".to_string()),
+            p2p_proxy: Some(proxy),
+            ..valid_config()
+        };
+        assert_eq!(validate_setup(&cfg(proxy.to_string()), KEY_HEX), Ok(()));
+        assert_eq!(check_p2p(&cfg(proxy.to_string())).await, Ok(()));
+        // Nothing listens on port 1, and no parallel test can take it.
+        let err = check_p2p(&cfg("127.0.0.1:1".to_string()))
             .await
             .unwrap_err();
-        assert!(err.contains("no-such-host.invalid"), "{err}");
+        assert!(
+            err.contains("cannot reach the proxy") && err.contains("start Tor"),
+            "{err}"
+        );
+        // An onion node with the proxy set is fine.
+        let onion = DaemonConfig {
+            p2p_node_addr: Some("abcdef.onion".to_string()),
+            ..cfg("127.0.0.1:9050".to_string())
+        };
+        assert_eq!(validate_setup(&onion, KEY_HEX), Ok(()));
     }
 
     #[test]

@@ -458,6 +458,16 @@ impl ControlCtx {
             if let Err(e) = friglet_ipc::write_config_toml(config_path, &new_cfg) {
                 return Response::Error(e);
             }
+            // An older tray does not know p2p_proxy and drops it when it
+            // saves: Tor would go off without anyone asking for it.
+            if let (Some(proxy), None) = (&old_cfg.p2p_proxy, &resolved.p2p_proxy) {
+                tracing::warn!(
+                    previous = %proxy,
+                    "this settings change clears p2p_proxy: P2P connections no longer go \
+                     through the proxy (Tor). An older friglet-tray drops p2p_proxy when it saves \
+                     settings; if that was not meant, set p2p_proxy again"
+                );
+            }
             tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
             *self.settings.lock().unwrap() = new_cfg;
         }
@@ -734,6 +744,7 @@ mod tests {
             network: "regtest".to_string(),
             oracle_url: "http://127.0.0.1:1".to_string(),
             p2p_node_addr: Some("127.0.0.1:18444".to_string()),
+            p2p_proxy: None,
             start_height: Some(100),
             start_at_tip: false,
             spend_pubkey: Some(SPEND_PK.to_string()),
@@ -776,8 +787,8 @@ mod tests {
         let secret = config::resolve_scan_secret(None, &resolved.key_file).unwrap();
         let peers = blindbit_lib::net::PeerSource::new(
             resolved.network,
-            blindbit_lib::net::Dialer::Direct,
-            resolved.p2p_node.map(Into::into),
+            resolved.dialer(),
+            resolved.p2p_node.clone(),
             blindbit_lib::net::Seeds::for_network(resolved.network),
         );
         let scanner_config = scanner::ScannerConfig::new(
@@ -1182,6 +1193,7 @@ mod tests {
             (
                 DaemonConfig {
                     p2p_node_addr: Some("not-an-addr".to_string()),
+                    p2p_proxy: None,
                     ..test_config(&dir)
                 },
                 "p2p_node_addr",
