@@ -4,8 +4,10 @@
 # the Apple secrets are set. Tests and lints live in ci.yml.
 name: Release bundles
 
-# Runs only for a release tag (vX.Y.Z, matching friglet-tray's version) or
-# when started by hand from the Actions tab; never on pushes or PRs.
+# Runs only for a release tag (vX.Y.Z, matching friglet-tray's version),
+# which drafts the GitHub release, or when started by hand from the Actions
+# tab, which only builds and checks (bundles stay in the run's artifacts).
+# Never on pushes or PRs.
 on:
   push:
     tags:
@@ -342,11 +344,11 @@ jobs:
   draft-release:
     name: Draft GitHub release
     needs: [linux, linux-install, macos, windows]
-    # Windows is best effort, so only Linux (built and installed on every
-    # listed distro) and macOS are required; Windows assets are attached
-    # when that job succeeded.
+    # Release tags only. Windows is best effort, so only Linux (built and
+    # installed on every listed distro) and macOS are required; Windows
+    # assets are attached when that job succeeded.
     if: >-
-      !cancelled() &&
+      !cancelled() && github.ref_type == 'tag' &&
       needs.linux.result == 'success' && needs.linux-install.result == 'success' &&
       needs.macos.result == 'success'
     runs-on: ubuntu-24.04
@@ -369,18 +371,10 @@ jobs:
           MACOS_SIGNING: ${{ needs.macos.outputs.signing }}
         run: |
           version=$(jq -r .version friglet-tray/tauri.conf.json)
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            tag=$GITHUB_REF_NAME
-            if [ "$tag" != "v$version" ]; then
-              echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
-              exit 1
-            fi
-            create_args=(--verify-tag)
-          else
-            # Manual runs get a clearly non-release name; no tag is created
-            # because the release stays a draft.
-            tag="friglet-tray-dev-${GITHUB_SHA::12}"
-            create_args=(--target "$GITHUB_SHA")
+          tag=$GITHUB_REF_NAME
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag does not match friglet-tray version $version (friglet-tray/tauri.conf.json)"
+            exit 1
           fi
 
           # Multi-path artifacts keep their bundle/<kind>/ subfolders.
@@ -411,7 +405,7 @@ jobs:
             fi
             gh release upload "$tag" dist/* --clobber
           else
-            gh release create "$tag" dist/* --draft "${create_args[@]}" \
+            gh release create "$tag" dist/* --draft --verify-tag \
               --title "friglet-tray $version ($tag)" --notes "$notes"
           fi
           echo "Draft release: $(gh release view "$tag" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"

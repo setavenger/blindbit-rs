@@ -431,15 +431,15 @@ those pass.
 
 It runs only when a release tag `vX.Y.Z` is pushed, or when started by hand
 (Actions → Release bundles → Run workflow); never on ordinary pushes or pull
-requests. The Windows job is `continue-on-error`.
+requests. A manual run builds and checks everything but releases nothing:
+the bundles are in the run's Artifacts. The Windows job is
+`continue-on-error`.
 
 To cut a release: set the version in `friglet-tray/tauri.conf.json` (and
 `friglet-tray/Cargo.toml`), then push a matching tag, e.g.
 `git tag v0.1.0 && git push origin v0.1.0`. The workflow attaches the bundles
 and a `SHA256SUMS` file to a **draft** release for that tag; review it and
-publish it by hand. A manual `workflow_dispatch` run creates or updates the
-draft `friglet-tray-dev-<commit>` instead; delete it when you're done.
-Nothing is ever published automatically.
+publish it by hand. Nothing is ever published automatically.
 
 ### Installing a release
 
@@ -474,8 +474,7 @@ The macOS job signs with a Developer ID certificate and notarizes when all
 five of these repository secrets are set (Settings → Secrets and variables
 → Actions); with none set it falls back to an ad-hoc signed dmg, and with
 only some set it fails. To test signing before a release, run the workflow
-by hand on the branch; that creates a draft `friglet-tray-dev-<commit>`
-release to delete afterwards.
+by hand on the branch and take the dmg from the run's Artifacts.
 
 | Secret | Value |
 |--------|-------|

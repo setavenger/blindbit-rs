@@ -53,9 +53,11 @@ rpm)
             ${SCREENSHOT:+ImageMagick}
     else
         # The rpm is not GPG-signed; zypper refuses it without this flag.
-        # zypper cannot resolve file paths, hence package names here.
+        # zypper cannot resolve file paths, hence package names here. Fonts
+        # come with any desktop install but nothing here pulls them in.
         zypper -n -q install --no-recommends --allow-unsigned-rpm \
-            "$bundle" xorg-x11-server-Xvfb dbus-1-daemon xdotool ${SCREENSHOT:+ImageMagick}
+            "$bundle" xorg-x11-server-Xvfb dbus-1-daemon xdotool dejavu-fonts \
+            ${SCREENSHOT:+ImageMagick}
     fi
     tray=(/usr/bin/friglet-tray)
     daemon=/usr/bin/friglet
@@ -82,6 +84,11 @@ if [ "$kind" != appimage ] && ldd /usr/bin/friglet-tray /usr/bin/friglet | grep 
     exit 1
 fi
 "$daemon" --help > /dev/null
+# Without any font the window renders with no text at all.
+if [ -z "$(fc-list 2> /dev/null)" ]; then
+    echo "::error::no fonts installed on $PRETTY_NAME; the window would show no text"
+    exit 1
+fi
 
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp > /tmp/xvfb.log 2>&1 &
 for _ in $(seq 50); do

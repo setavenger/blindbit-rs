@@ -193,8 +193,11 @@ dbus-run-session -- bash -c '
   sidecar to be universal too), Windows msi+nsis best effort
   (`continue-on-error`). Each job checks the daemon is inside the bundle.
   Triggers: only `vX.Y.Z` tags (must equal the `tauri.conf.json` version)
-  and manual `workflow_dispatch` → DRAFT release only; no push or
-  pull_request triggers (the user's rule). `TAURI_CLI_VERSION` there is
+  → DRAFT release, and manual `workflow_dispatch` → build + checks only,
+  bundles left as run artifacts; no push or pull_request triggers (the
+  user's rule). Manual runs used to draft a `friglet-tray-dev-<sha>`
+  release, but the GITHUB_TOKEN got HTTP 403 creating that new tag on a
+  branch commit. `TAURI_CLI_VERSION` there is
   pinned to the locked `tauri` crate version — bump both together.
 - macOS signing (README "macOS signing"): with all five `APPLE_*` repo
   secrets set, the build step exports them for Tauri, which imports the
