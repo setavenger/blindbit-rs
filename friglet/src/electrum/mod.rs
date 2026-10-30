@@ -56,6 +56,13 @@ use self::relay::{Candidate, Outcome};
 /// with longer timeouts (8, 16, 34 s), and a resend is answered from
 /// [`ElectrumServerState::recent_broadcasts`] as soon as this one finishes.
 const BROADCAST_BUDGET: Duration = Duration::from_secs(25);
+/// The budget of a broadcast to discovered peers through a proxy (Tor),
+/// where circuits and dead addresses (20 s each) make observers ready
+/// later. Sparrow sends a request up to 5 times (read timeouts 3, 8, 16, 34,
+/// 34 s, 0 to 2 s apart), so its requests end at about 3, 12, 29, 64 and
+/// 99 s: an answer at 45 s comes during the fourth one, with ~19 s to spare
+/// (and a later resend is answered from the recent outcome).
+const PROXIED_BROADCAST_BUDGET: Duration = Duration::from_secs(45);
 /// How long a broadcast outcome answers a resend of the same transaction.
 const BROADCAST_OUTCOME_TTL: Duration = Duration::from_secs(120);
 /// Retry delay after the tip header could not be fetched.
@@ -898,16 +905,18 @@ async fn broadcast_to_network(
 ) -> Result<RecentBroadcast, (i32, String)> {
     let txid = candidate.txid.to_string();
     let started = Instant::now();
-    let report = net_broadcast::broadcast(
-        state.chain.peers().clone(),
-        candidate.clone(),
-        BROADCAST_BUDGET,
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(%txid, %error, "broadcast failed");
-        (2, format!("broadcast failed: {error}"))
-    })?;
+    let peers = state.chain.peers().clone();
+    let budget = if peers.dialer().proxy().is_some() {
+        PROXIED_BROADCAST_BUDGET
+    } else {
+        BROADCAST_BUDGET
+    };
+    let report = net_broadcast::broadcast(peers, candidate.clone(), budget)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%txid, %error, "broadcast failed");
+            (2, format!("broadcast failed: {error}"))
+        })?;
     for (peer, rate) in &report.fee_filters {
         state.chain.note_fee_filter(peer, Some(*rate));
     }

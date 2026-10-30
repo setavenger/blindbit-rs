@@ -202,7 +202,11 @@ Peers then see a Tor exit's address instead of this computer's.
   DNS seed lookups friglet connects through Tor to three of the network's
   seed names, asks the node there for addresses and disconnects.
 - Each connection logs in to Tor with random credentials, so Tor gives it a
-  circuit of its own and no single exit sees all of friglet's peers.
+  circuit of its own and no single exit sees all of friglet's peers: the two
+  peers a broadcast hands the transaction to and the ones that watch for it
+  each see a different exit.
+- A broadcast to random peers through Tor may take up to 45 seconds before
+  Sparrow gets the answer (25 directly): Tor connections are slower to open.
 - Not proxied: the BlindBit oracle (gRPC over HTTPS to `oracle_url`; the
   oracle sees this computer's IP, but the requests do not depend on your
   keys), and the Electrum server, which only listens locally.
