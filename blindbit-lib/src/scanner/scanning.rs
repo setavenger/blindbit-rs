@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use bdk_sp::receive::SpOut;
-use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin::{BlockHash, Txid};
 use indexer::bdk_chain::bdk_core::Merge;
@@ -12,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::oracle_grpc::oracle_service_client::OracleServiceClient;
 use crate::oracle_grpc::{
-    BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem, FullTxItem,
+    BlockIdentifier, BlockScanDataShortResponse, ComputeIndexTxItem,
     RangedBlockHeightRequestFiltered,
 };
 
@@ -25,14 +23,19 @@ use super::reorg::{
 };
 use super::scanner::Scanner;
 use super::types::ProbableMatch;
-use super::utils::{byte_array_to_txid, construct_dummy_tx, match_short_pubkey};
+use super::utils::{byte_array_to_txid, match_short_pubkey};
 use super::ScannerError;
 
 /// BIP-352 limits one recipient group to this many matched outputs.
 ///
-/// Only [`Scanner::scan_transaction_full`] applies it, and that function has no
-/// production caller (see its doc comment); the live receive path does not
-/// enforce a K_max.
+/// The live receive path (`scan_transaction_short`, then `apply_block_relevant`
+/// on the external indexer) does not enforce it yet (SNB-540).
+#[expect(
+    dead_code,
+    reason = "the live receive path does not enforce BIP-352 K_max yet; SNB-540 (PR #18) \
+              adds the enforcement and a compile-time assert against bdk_sp::K_MAX that \
+              uses this constant, which makes this expectation fail and forces its removal"
+)]
 const BIP352_K_MAX: usize = 2323;
 
 /// Insert or upgrade a scripthash history entry.
@@ -1046,92 +1049,6 @@ impl Scanner {
         }
 
         Ok(false)
-    }
-
-    /// Scans a transaction for outputs which definitely belong to us
-    /// returns the matched outputs as `SpOut`s
-    ///
-    /// No production code calls this today: the daemon receives through
-    /// [`Self::scan_transaction_short`] plus `apply_block_relevant` on the
-    /// external indexer. It is kept (and covered by the BIP-352 vector tests in
-    /// `bip352_vectors.rs`) as the entry point for scanning full block
-    /// responses again.
-    pub fn scan_transaction_full(
-        &mut self,
-        item: &FullTxItem,
-    ) -> Result<Vec<SpOut>, ScannerError> {
-        let tweak =
-            PublicKey::from_slice(&item.tweak).expect("tweak must be a valid secp256k1 public key");
-
-        let ecdh_shared_secret: PublicKey =
-            bdk_sp::compute_shared_secret(self.internal_indexer.scan_sk(), &tweak);
-
-        let dummy_tx = construct_dummy_tx(item);
-
-        match bdk_sp::receive::scan_txouts(
-            *self.internal_indexer.spend_pk(),
-            &self.internal_indexer.index().label_lookup,
-            &dummy_tx,
-            ecdh_shared_secret,
-        ) {
-            Ok(mut spouts) => {
-                // Scope, stated plainly: `scan_transaction_full` currently has no
-                // production caller. It is exercised by the BIP-352 vector tests in
-                // `bip352_vectors.rs` and is the intended entry point if/when full
-                // block responses are scanned again. The live receive path is
-                // `scan_transaction_short` plus `apply_block_relevant` on the
-                // external indexer (see `scan_blocks`), and that path enforces no
-                // K_max at all. The truncation below therefore does NOT today
-                // constrain live scanning; it is here so the full-block entry point
-                // is correct whenever it is used again.
-                //
-                // `bdk_sp` derives one candidate for every matching output. The BIP-352
-                // receiver limit is protocol-visible: accepting a 2324th candidate would
-                // desynchronise a sender and receiver that correctly stop at K_max.
-                //
-                // Truncating is equivalent to stopping the scan at K_max because
-                // `bdk_sp::receive::scan_txouts` returns its matches in ascending
-                // derivation order: it pushes into `spouts_found` from a `while let`
-                // loop whose `matched_tweaks` counter starts at 0 and increments once
-                // per match, so element `i` is always the match for `k = i`. That
-                // holds no matter which candidate a given `k` picks up. Several
-                // candidates *can* satisfy one `k` — two identical output scripts, or
-                // a transaction carrying both `P_k` and `P_k + m*G` — and
-                // `find_spout_for_tweak` then returns whichever comes first in the
-                // *candidate pool*, whose order earlier `swap_remove`s have already
-                // scrambled. But `swap_remove` mutates only that pool, never the
-                // results vector, so pool order can change *which* output is reported
-                // for a `k`, not the index it is reported at. `truncate` therefore
-                // keeps exactly `k = 0..=K_max-1` and drops the highest `k`, never an
-                // arbitrary match. Covered by
-                // `bip352_vectors::official_vectors_enforce_k_max_at_the_blindbit_boundary`,
-                // which asserts the per-index tweak identity, not just the count.
-                spouts.truncate(BIP352_K_MAX);
-
-                // todo: come back here if something does not work due to wrong txids being used in
-                // spuot outpoints
-
-                // Ensure we have exactly 32 bytes
-                let mut reversed_txid_slice = item.txid.clone();
-                reversed_txid_slice.reverse();
-                let txid_array: [u8; 32] = reversed_txid_slice
-                    .try_into()
-                    .expect("Vec<u8> must be exactly 32 bytes long");
-
-                // Construct Txid directly from the byte array (preserves byte order)
-                let txid = bitcoin::Txid::from_byte_array(txid_array);
-
-                // we need to change the txid to match the item's txid
-                for spout in &mut spouts {
-                    spout.outpoint = bitcoin::OutPoint {
-                        txid,
-                        vout: spout.outpoint.vout,
-                    };
-                }
-                Ok(spouts)
-            }
-            Err(e) => Err(e.into()),
-        }
     }
 }
 
