@@ -98,12 +98,22 @@ pub(super) fn stripped(block: &Block) -> Block {
 impl Node {
     /// A full node at `height` serving the default block.
     pub(super) fn full(height: i32, script: Vec<Conn>) -> Self {
-        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, height, &block(), script)
+        Self::spawn(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            height,
+            &block(),
+            script,
+        )
     }
 
     /// A full node at height 1,000 serving `block`.
     pub(super) fn serving(block: &Block, script: Vec<Conn>) -> Self {
-        Self::spawn(ServiceFlags::NETWORK | ServiceFlags::WITNESS, 1_000, block, script)
+        Self::spawn(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            1_000,
+            block,
+            script,
+        )
     }
 
     /// A node advertising `services` and `height` and serving `block` that

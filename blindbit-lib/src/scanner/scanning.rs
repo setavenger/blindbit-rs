@@ -14,17 +14,17 @@ use crate::oracle_grpc::{
     RangedBlockHeightRequestFiltered,
 };
 
+use super::ScannerError;
 use super::electrum_index::WalletView;
+use super::health::{OracleProbe, indexed_block_hash};
 use super::health::{ScanCancelled, ScanStopped};
 use super::p2p;
-use super::health::{OracleProbe, indexed_block_hash};
 use super::reorg::{
     BlockCheck, OracleView, POST_STREAM_CHECK, ReorgBelowStreamStart, ReorgTooDeep,
 };
 use super::scanner::Scanner;
 use super::types::ProbableMatch;
 use super::utils::{byte_array_to_txid, match_short_pubkey};
-use super::ScannerError;
 
 /// BIP-352 limits one recipient group to this many matched outputs.
 ///
@@ -113,7 +113,11 @@ async fn next_block<S: BlockScanDataStream>(
     stream.next_message().await.map_err(|status| {
         Box::new(ScanStopped {
             height,
-            reason: format!("oracle stream error {:?}: {}", status.code(), status.message()),
+            reason: format!(
+                "oracle stream error {:?}: {}",
+                status.code(),
+                status.message()
+            ),
             not_indexed: status.code() == tonic::Code::NotFound,
         }) as ScannerError
     })
@@ -191,11 +195,7 @@ impl Scanner {
     /// `scanner/reorg.rs`). `start = end + 1` only runs that check, which
     /// streams nothing unless the chain changed. A reorganisation deeper than
     /// [`super::REORG_LOOKBACK`] is a [`ReorgTooDeep`] error.
-    pub async fn scan_block_range(
-        &mut self,
-        start: u64,
-        end: u64,
-    ) -> Result<(), ScannerError> {
+    pub async fn scan_block_range(&mut self, start: u64, end: u64) -> Result<(), ScannerError> {
         self.scan_range_from(start, end, self.client.clone()).await
     }
 
@@ -466,9 +466,8 @@ impl Scanner {
                     // spent in this block counts.
                     let wallet = WalletView::of(&self.internal_indexer);
 
-                    let header_hex = hex::encode(
-                        bitcoin::consensus::encode::serialize(&block.header),
-                    );
+                    let header_hex =
+                        hex::encode(bitcoin::consensus::encode::serialize(&block.header));
 
                     let mut idx = self.electrum_index.lock().await;
                     idx.headers.insert(block_height_u32, header_hex.clone());
@@ -879,16 +878,13 @@ impl Scanner {
                 .collect()
         };
         // Apply block to indexer and stage the changes
-        let indexer_changes = self
-            .internal_indexer
-            .apply_block_relevant(block, partial_secrets, height);
+        let indexer_changes =
+            self.internal_indexer
+                .apply_block_relevant(block, partial_secrets, height);
         self.stage.indexer.merge(indexer_changes);
     }
 
-    fn probabilistic_match(
-        &mut self,
-        item: &ComputeIndexTxItem,
-    ) -> Result<bool, ScannerError> {
+    fn probabilistic_match(&mut self, item: &ComputeIndexTxItem) -> Result<bool, ScannerError> {
         let tweak_len = item.tweak.len();
         let tweak_data: [u8; 33] = item.tweak.clone().try_into().map_err(|_| {
             std::io::Error::new(

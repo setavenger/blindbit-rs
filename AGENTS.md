@@ -20,12 +20,12 @@ Rust Cargo workspace (edition 2024) for BlindBit BIP-352 Silent Payments. Crates
 cargo build --workspace            # all crates, incl. friglet-tray (Tauri v2)
 cargo test --workspace
 cargo clippy --no-deps -p friglet -p friglet-ipc -p friglet-tray --all-targets -- -D warnings   # CI's lint
-cargo fmt -p friglet -p friglet-ipc -p friglet-tray -- --check
+cargo fmt --all -- --check
 ```
 
 - CI (`.github/workflows/ci.yml`) runs the test and clippy lines.
 - `blindbit-lib` has unit tests in `src/scanner/` (some need its `serde` feature, which `cargo test --workspace` turns on through friglet). `blindbit-cli` has none. `friglet`, `friglet-ipc` and `friglet-tray` have unit and integration tests.
-- `blindbit-lib` is not clippy- or fmt-clean and there is no clippy/rustfmt config: do not fix its pre-existing style unless asked; scope `cargo fmt`/`clippy` with `-p` as above.
+- `blindbit-lib` is not clippy-clean and there is no clippy config: do not fix its pre-existing clippy warnings unless asked; scope `clippy` with `-p` as above. The whole workspace is fmt-clean, so `cargo fmt --all` is safe.
 
 ## Running against signet
 
@@ -360,8 +360,6 @@ dbus-run-session -- bash -c '
 
 - Do NOT modify `blindbit-lib` (or `blindbit-cli` / Electrum behavior)
   in tray-project work; the tray talks to the daemon only via `friglet-ipc`.
-- Workspace-wide `cargo fmt` reformats `blindbit-lib` files that are not
-  fmt-clean; run fmt scoped with `-p` to avoid unrelated diffs.
 
 ## Linear — no hardcoded links, always update issue status
 
