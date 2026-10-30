@@ -322,14 +322,20 @@ dbus-run-session -- bash -c '
   (≤ 20 s). The tray's Save does a 2 s TCP check of the proxy instead of a
   DNS lookup of the node.
 - Through a proxy: connect ≥ 20 s (`PROXY_CONNECT_TIMEOUT`, enforced in the
-  dialer), block deadline ≥ 60 s (`RetryPolicy::through_proxy`).
+  dialer), block deadline ≥ 60 s (`RetryPolicy::through_proxy`). Tor keeps
+  trying a dead address for the whole connect timeout, so a discovered-peer
+  fetch races `PROXY_RACE` (3) connects at once and uses the first to open
+  (the losers finish on blocking threads within the timeout), and a seed
+  node's addresses enter the book most recently seen first (half of a
+  signet node's `getaddr` answer is > 5 days old).
 - An older tray drops `p2p_proxy` on Save (unknown field); the daemon logs a
   warning when an apply clears it.
 - Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
   down / not SOCKS5), `net/proxy_tests.rs` (seeding by name, no local
   lookup), `scanner/proxy_tests.rs` (own node `node.invalid` through the
   proxy, proxy down/refusing → no direct connection), `electrum/chain.rs`
-  (headers through the proxy). `net::testing::FakeSocks5` (feature
+  (headers through the proxy); `scanner/proxy_tests.rs` also races past
+  stalled peers. `net::testing::FakeSocks5` (feature
   `test-util`, on in friglet's dev-dependencies) routes names to local
   listeners and records methods, credentials and targets. Closed-proxy tests
   use 127.0.0.1:1 (a port freed by dropping a listener can be taken by a

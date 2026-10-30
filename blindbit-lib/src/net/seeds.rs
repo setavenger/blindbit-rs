@@ -186,12 +186,17 @@ async fn through_proxy(
             continue;
         };
         match answer {
-            Ok(addrs) => {
+            Ok(mut addrs) => {
                 tracing::debug!(
                     seed,
                     addresses = addrs.len(),
                     "a seed's node answered through the proxy"
                 );
+                // Most recently seen first: they take the book's slots
+                // before older ones collide with them. Many addresses a node
+                // knows are days old and gone, and through Tor each dead one
+                // costs the whole connect timeout.
+                addrs.sort_by_key(|message| std::cmp::Reverse(message.time));
                 seeding
                     .found
                     .extend(addrs.into_iter().filter_map(|message| {

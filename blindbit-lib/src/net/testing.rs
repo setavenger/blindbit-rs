@@ -1,7 +1,7 @@
 //! Test doubles for code that connects through a [`Dialer`] (feature
 //! `test-util`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,8 @@ struct State {
     routes: HashMap<String, SocketAddr>,
     /// A SOCKS5 error code every CONNECT is answered with, if set.
     refuse_with: Option<u8>,
+    /// Targets whose CONNECT is never answered.
+    stalled: HashSet<PeerAddr>,
     requests: Vec<Socks5Request>,
 }
 
@@ -82,6 +84,12 @@ impl FakeSocks5 {
     /// Answer every CONNECT from now on with SOCKS5 error `code`.
     pub fn refuse_with(&self, code: u8) {
         self.lock().refuse_with = Some(code);
+    }
+
+    /// Never answer a CONNECT to `target`, as Tor keeps trying a peer
+    /// nobody answers at.
+    pub fn stall(&self, target: PeerAddr) {
+        self.lock().stalled.insert(target);
     }
 
     /// Every connection asked for, in order.
@@ -172,10 +180,20 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
             PeerHost::Ip(ip) => Some(SocketAddr::new(*ip, target.port)),
             PeerHost::Name(name) => state.routes.get(name).copied(),
         };
-        (state.refuse_with, destination)
+        (
+            state.refuse_with,
+            destination.filter(|_| !state.stalled.contains(&target)),
+        )
     };
     if let Some(code) = refuse_with {
         return reply(&mut client, code);
+    }
+    if destination.is_none() && matches!(target.host, PeerHost::Ip(_)) {
+        // Stalled: say nothing until the client gives up.
+        client.set_read_timeout(None)?;
+        let mut sink = [0u8; 64];
+        while client.read(&mut sink)? > 0 {}
+        return Ok(());
     }
     let Some(destination) = destination else {
         return reply(&mut client, 4);

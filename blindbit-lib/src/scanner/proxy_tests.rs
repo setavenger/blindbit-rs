@@ -126,3 +126,38 @@ fn discovered_peers_are_reached_through_the_proxy() {
     let targets: Vec<PeerAddr> = proxy.requests().into_iter().map(|r| r.target).collect();
     assert_eq!(targets, vec![PeerAddr::from(node.addr)]);
 }
+
+/// Through Tor a dead address costs the whole connect timeout; the
+/// connections race, so a live peer serves the block at once anyway.
+#[test]
+fn through_a_proxy_connections_race_past_dead_peers() {
+    let node = Node::full(200, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    let dead: Vec<PeerAddr> = ["203.0.113.5:18444", "198.51.100.9:18444"]
+        .iter()
+        .map(|addr| addr.parse::<SocketAddr>().unwrap().into())
+        .collect();
+    for addr in &dead {
+        proxy.stall(addr.clone());
+    }
+    let mut seeds = dead.clone();
+    seeds.push(node.addr.into());
+    let source = PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
+    // The losing connects stay under way until the proxy timeout; a plain
+    // runtime drop would wait for them.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let block = runtime.block_on(BlockFetcher::new(source).fetch(genesis().block_hash(), 0));
+    let waited = started.elapsed();
+    runtime.shutdown_background();
+    let block = block.expect("the live peer serves it");
+    assert_eq!(block.block_hash(), genesis().block_hash());
+    assert!(
+        waited < std::time::Duration::from_secs(10),
+        "waited {waited:?} (a dead peer costs 20 s)"
+    );
+    assert_eq!(node.connections(), 1);
+}
