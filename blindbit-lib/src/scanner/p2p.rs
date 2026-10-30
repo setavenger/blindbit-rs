@@ -1027,9 +1027,13 @@ impl BlockFetcher {
         };
 
         let (answer, answered) = tokio::sync::oneshot::channel();
+        // Set by the thread once the handshake completes, so a connection
+        // that times out afterwards still counts as handshaken.
+        let handshaken = Arc::new(std::sync::OnceLock::new());
         let (peer_addr, network, deadline) =
             (peer.clone(), self.network(), self.policy.block_deadline);
         let cancel = self.cancel.clone();
+        let thread_handshaken = handshaken.clone();
         std::thread::Builder::new()
             .name("p2p-block-fetch".to_string())
             .spawn(move || {
@@ -1043,6 +1047,7 @@ impl BlockFetcher {
                     deadline,
                     &cancel,
                     discovery,
+                    &thread_handshaken,
                     answer,
                 )
             })
@@ -1058,16 +1063,13 @@ impl BlockFetcher {
                 ))
                 .into())
             }
-            answered = answered => {
-                let (info, result) = answered.map_err(|_| {
-                    FetchFailure::Broken("the download ended without an answer".to_string())
-                })?;
-                if info.is_some() {
-                    *peer_info = info;
-                }
-                result
-            }
+            answered = answered => answered.unwrap_or_else(|_| {
+                Err(FetchFailure::Broken("the download ended without an answer".to_string()).into())
+            }),
         };
+        if let Some(info) = handshaken.get() {
+            *peer_info = Some(*info);
+        }
         // The thread keeps the connection a moment to collect the peer's
         // addresses; it closes it itself.
         if result.is_ok() && lingers {
@@ -1098,27 +1100,29 @@ fn download(
     deadline: Duration,
     cancel: &CancellationToken,
     discovery: Option<Discovery>,
-    answer: tokio::sync::oneshot::Sender<(Option<PeerInfo>, Result<Block, AttemptFailure>)>,
+    handshaken: &std::sync::OnceLock<PeerInfo>,
+    answer: tokio::sync::oneshot::Sender<Result<Block, AttemptFailure>>,
 ) {
     let mut connection =
         match P2pConnection::handshake(stream, peer, network, read_timeout, opened, &discovery) {
             Ok(connection) => connection,
             Err(failure) => {
-                let _ = answer.send((None, Err(failure.into())));
+                let _ = answer.send(Err(failure.into()));
                 return;
             }
         };
     let info = connection.info;
+    let _ = handshaken.set(info);
     if let Some(discovery) = &discovery
         && i64::from(info.height) < discovery.min_height as i64
     {
-        let _ = answer.send((Some(info), Err(FetchFailure::Behind(info.height).into())));
+        let _ = answer.send(Err(FetchFailure::Behind(info.height).into()));
         return;
     }
     let gossip = discovery.as_ref().map(|d| d.peers.as_ref());
     let result = connection.fetch_block(block_hash, deadline, cancel, gossip);
     let served = result.is_ok();
-    if answer.send((Some(info), result)).is_err() {
+    if answer.send(result).is_err() {
         return;
     }
     if served

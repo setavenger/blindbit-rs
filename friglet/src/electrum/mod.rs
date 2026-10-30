@@ -236,6 +236,15 @@ pub async fn run(
     // unconfirmed again, as they were.
     restore_pending(&state).await;
 
+    // Discovered peers: collect fee filters from a few of them now, so the
+    // first `blockchain.relayfee` already has its median.
+    if !state.chain.peers().is_own_node() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let _ = state.chain.fee_filter().await;
+        });
+    }
+
     // Background push task: receives a signal whenever the scanner updates the
     // index and broadcasts pre-serialised JSON notifications to all clients.
     //

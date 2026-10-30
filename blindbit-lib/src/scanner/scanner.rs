@@ -134,6 +134,11 @@ impl Scanner {
         state_file: PathBuf,
         network: Network,
     ) -> Self {
+        debug_assert_eq!(
+            peers.network(),
+            network,
+            "the scanner and its peers must be on one network"
+        );
         let mut block_checkpoints = stage.block_checkpoints.clone();
         block_checkpoints.entry(0).or_insert_with(genesis_hash);
         let max_label_num = stage.max_label_num;
