@@ -5,23 +5,36 @@
 //!   how it went ([`PeerEvent`]). With an own node it always names that node
 //!   and never looks anything up; otherwise it keeps an address book
 //!   ([`pool`]) seeded from the network's DNS seeds ([`seeds`]).
-//! - [`Dialer`] opens the TCP connection, so a proxy can slot in below every
-//!   P2P protocol on top of it.
+//! - [`Dialer`] opens the TCP connection: directly, or through a SOCKS5
+//!   proxy such as Tor ([`socks5`]), below every P2P protocol on top of it.
+//!   Through a proxy nothing is looked up locally: host names, the own
+//!   node's and the seeds', go to the proxy as names.
 
 mod dialer;
 pub(crate) mod pool;
 #[cfg(test)]
 mod pool_tests;
+#[cfg(test)]
+mod proxy_tests;
 mod seeds;
+mod socks5;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::net::{IpAddr, SocketAddr};
 
-pub use dialer::Dialer;
+use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin::p2p::message::NetworkMessage;
+
+pub use dialer::{Dialer, PROXY_CONNECT_TIMEOUT};
 pub use pool::{NoPeers, PeerEvent, PeerPool, PeerSource};
 pub use seeds::Seeds;
 #[cfg(test)]
 pub(crate) use seeds::lookups::asked as seeds_asked;
+pub use socks5::{Socks5Error, is_proxy_down};
 
 /// The user agent of every P2P connection friglet opens, block downloads and
 /// the Electrum server's own peer alike, so a node sees one client. It is the
@@ -101,4 +114,42 @@ pub enum Purpose {
     /// Relaying a transaction, or asking a mempool about one: never the
     /// peer blocks are downloaded from, so it does not see both.
     Relay,
+}
+
+/// The addresses an `addr` or `addrv2` message gossips, in `addrv2` form;
+/// `None` for any other message.
+pub(crate) fn gossiped_addrs(message: &NetworkMessage) -> Option<Vec<AddrV2Message>> {
+    match message {
+        NetworkMessage::AddrV2(list) => Some(list.clone()),
+        NetworkMessage::Addr(list) => Some(
+            list.iter()
+                .filter_map(|(time, address)| {
+                    let socket = address.socket_addr().ok()?;
+                    let addr = match socket.ip() {
+                        IpAddr::V4(ip) => AddrV2::Ipv4(ip),
+                        IpAddr::V6(ip) => AddrV2::Ipv6(ip),
+                    };
+                    Some(AddrV2Message {
+                        time: *time,
+                        services: address.services,
+                        addr,
+                        port: socket.port(),
+                    })
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// A random number, different on every call (not for keys).
+pub(crate) fn random_u64() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    hasher.finish()
 }

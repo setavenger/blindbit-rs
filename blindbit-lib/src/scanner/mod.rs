@@ -14,6 +14,8 @@ mod oracle_floor_tests;
 mod p2p;
 #[cfg(test)]
 mod p2p_tests;
+#[cfg(test)]
+mod proxy_tests;
 mod reorg;
 #[cfg(test)]
 mod reorg_tests;

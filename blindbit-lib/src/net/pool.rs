@@ -11,22 +11,28 @@
 //! one that cannot be reached or does not help rests for a while; one that
 //! sends a bad block is ignored for the rest of the session; and the peer
 //! that served the last block is asked first for the next one.
+//!
+//! The tables can be kept on disk ([`PeerSource::keep_book_in`]), so a
+//! restart knows its peers without asking the seeds again.
 
-use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher};
+use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{self, BufReader, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use bitcoin::Network;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
+use bitcoin_address_book::io::FileExt;
 use bitcoin_address_book::{Record, Table};
 
 use super::seeds::Seeds;
-use super::{Dialer, PeerAddr, PeerHost, Purpose};
+use super::{Dialer, PeerAddr, PeerHost, Purpose, random_u64};
 use crate::scanner::PeerInfo;
 
 // Kyoto's table sizes: 16 x 16 new slots, a source reaches 8 of the 16
@@ -58,6 +64,11 @@ const BEHIND_REST: Duration = Duration::from_secs(2 * 60);
 const RESEED_EVERY: Duration = Duration::from_secs(5 * 60);
 /// …or this often while they have given nothing.
 const RESEED_EVERY_WHILE_EMPTY: Duration = Duration::from_secs(30);
+/// At start, the seeds are asked only while fewer addresses are known
+/// (from the address book on disk).
+const SEED_BELOW: usize = 50;
+/// A kept address book is saved this often while it changes, and at exit.
+const SAVE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Kyoto's limits for replacing a colliding record that keeps failing.
 const TERRIBLE_TRIES: u8 = 2;
 const TERRIBLE_WEEKLY_TRIES: u8 = 1;
@@ -144,21 +155,66 @@ impl PeerSource {
     }
 
     /// Start finding peers now (in a task on the current Tokio runtime), so
-    /// the first download does not wait for the DNS seeds. Without it the
-    /// first [`Self::next`] asks them. Does nothing for an own node.
+    /// the first download does not wait for the DNS seeds; skipped while the
+    /// address book loaded from disk knows enough peers. Without it the
+    /// first [`Self::next`] asks them. A kept address book
+    /// ([`Self::keep_book_in`]) is saved every 10 minutes from now on, when
+    /// it changed. Does nothing for an own node.
     pub fn start(self: &Arc<Self>) {
-        let Self::Discovered(_) = **self else {
+        let Self::Discovered(pool) = &**self else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let this = self.clone();
-        runtime.spawn(async move {
-            if let Self::Discovered(pool) = &*this {
-                pool.seed().await;
-            }
-        });
+        let known = pool.lock().known();
+        if known < SEED_BELOW {
+            let this = self.clone();
+            runtime.spawn(async move {
+                if let Self::Discovered(pool) = &*this {
+                    pool.seed().await;
+                }
+            });
+        } else {
+            tracing::info!(
+                known,
+                "peer discovery: the saved address book knows enough peers"
+            );
+        }
+        if pool.book.get().is_some() {
+            let this = self.clone();
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(SAVE_EVERY).await;
+                    let this = this.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Self::Discovered(pool) = &*this {
+                            pool.save(true);
+                        }
+                    })
+                    .await;
+                }
+            });
+        }
+    }
+
+    /// Keep the address book of discovered peers in `dir`, as
+    /// `peers-<network>-new.book` and `peers-<network>-tried.book`: load it
+    /// now (an unreadable file is ignored with a warning) and save it with
+    /// [`Self::save_book`] and, after [`Self::start`], every 10 minutes
+    /// while it changes. Call it once, before [`Self::start`]. Does nothing
+    /// for an own node.
+    pub fn keep_book_in(&self, dir: &Path) {
+        if let Self::Discovered(pool) = self {
+            pool.keep_book_in(dir);
+        }
+    }
+
+    /// Save the kept address book now (blocking file I/O), if it changed.
+    pub fn save_book(&self) {
+        if let Self::Discovered(pool) = self {
+            pool.save(true);
+        }
     }
 
     pub fn network(&self) -> Network {
@@ -242,9 +298,13 @@ impl PeerSource {
     /// One line for status displays: "your node 1.2.3.4:38333", "random
     /// peers: 37 known, 1 ignored".
     pub fn summary(&self) -> String {
-        match self {
+        let summary = match self {
             Self::OwnNode { addr, .. } => format!("your node {addr}"),
             Self::Discovered(pool) => pool.summary(),
+        };
+        match self.dialer() {
+            Dialer::Direct => summary,
+            proxied => format!("{summary}, {proxied}"),
         }
     }
 }
@@ -254,6 +314,8 @@ pub struct PeerPool {
     network: Network,
     dialer: Dialer,
     seeds: Seeds,
+    /// Where the tables are kept on disk, if they are.
+    book: OnceLock<BookFiles>,
     /// Never held across an `.await`.
     inner: Mutex<Inner>,
     /// One seeding at a time; callers that need peers wait for it.
@@ -306,6 +368,17 @@ struct Inner {
     last_seed: Option<(Instant, usize)>,
     /// Peers that gossiped addresses this session.
     gossiped: HashSet<PeerAddr>,
+    /// The proxy failed the last time the seeds were asked: why.
+    seed_error: Option<String>,
+    /// The tables changed since they were last saved.
+    changed: bool,
+}
+
+/// The files a kept address book lives in.
+#[derive(Debug, Clone)]
+struct BookFiles {
+    new: PathBuf,
+    tried: PathBuf,
 }
 
 impl PeerPool {
@@ -314,6 +387,7 @@ impl PeerPool {
             network,
             dialer,
             seeds,
+            book: OnceLock::new(),
             inner: Mutex::new(Inner {
                 new: Box::default(),
                 tried: Box::default(),
@@ -322,6 +396,8 @@ impl PeerPool {
                 ipv6_dead_since: None,
                 last_seed: None,
                 gossiped: HashSet::new(),
+                seed_error: None,
+                changed: false,
             }),
             seeding: tokio::sync::Mutex::new(()),
         }
@@ -359,12 +435,22 @@ impl PeerPool {
         let inner = self.lock();
         let known = inner.known();
         if known == 0 {
-            return match &self.seeds {
-                Seeds::Dns(names) => format!(
+            if let Some(error) = &inner.seed_error {
+                return format!("no peer addresses: the seeds could not be asked: {error}");
+            }
+            return match (&self.seeds, self.dialer.proxy()) {
+                (Seeds::Dns(names), None) => format!(
                     "no peer addresses: the network's DNS seeds ({}) gave none",
                     names.join(", ")
                 ),
-                Seeds::Static(_) | Seeds::None => "no peer addresses to start from".to_string(),
+                (Seeds::Dns(names), Some(proxy)) => format!(
+                    "no peer addresses: the nodes of the network's seeds ({}), asked through \
+                     p2p_proxy {proxy}, gave none",
+                    names.join(", ")
+                ),
+                (Seeds::Static(_) | Seeds::None, _) => {
+                    "no peer addresses to start from".to_string()
+                }
             };
         }
         let skipped_v6 = if inner.ipv6_dead() {
@@ -397,8 +483,10 @@ impl PeerPool {
         }
         let port = default_port(self.network);
         let started = Instant::now();
-        let found = self.seeds.resolve(port).await;
+        let seeding = self.seeds.resolve(port, &self.dialer, self.network).await;
+        let found = seeding.found;
         let mut inner = self.lock();
+        inner.seed_error = seeding.proxy_error;
         let mut added = 0;
         let from_dns = matches!(self.seeds, Seeds::Dns(_));
         for seeded in &found {
@@ -408,6 +496,11 @@ impl PeerPool {
             // A DNS answer naming this computer or a local network is not a
             // Bitcoin peer (a captive portal, a hijacked resolver).
             if from_dns && !is_public(ip) {
+                continue;
+            }
+            // What a seed's node gossiped is checked like any gossip.
+            if seeded.gossiped && !self.worth_keeping(ip, seeded.addr.port, seeded.services, false)
+            {
                 continue;
             }
             let record = Record::new(
@@ -428,12 +521,16 @@ impl PeerPool {
         };
         tracing::info!(
             seeds = %seeds.join(", "),
+            via = %self.dialer,
             addresses = found.len(),
             added,
             known = inner.known(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "peer discovery: asked the DNS seeds"
         );
+        if let Some(error) = &inner.seed_error {
+            tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+        }
     }
 
     fn report(&self, peer: &PeerAddr, event: PeerEvent) {
@@ -489,12 +586,7 @@ impl PeerPool {
                 // Tor, I2P and CJDNS peers need a proxy.
                 _ => continue,
             };
-            if !plausible_port(message.port, self.network)
-                || !message.services.has(required_services())
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || (!local_source && !is_public(ip))
-            {
+            if !self.worth_keeping(ip, message.port, message.services, local_source) {
                 continue;
             }
             let addr = PeerAddr::from(SocketAddr::new(ip, message.port));
@@ -514,6 +606,83 @@ impl PeerPool {
             known = inner.known(),
             "peer gossiped addresses"
         );
+    }
+
+    /// A gossiped address worth a place in the book: a full node (every
+    /// block, with witnesses) on a plausible port, at an address a peer can
+    /// have. A local one only from a local source (`local_ok`: a test, a
+    /// LAN node): a peer on the internet cannot point friglet at this
+    /// computer or its network.
+    fn worth_keeping(&self, ip: IpAddr, port: u16, services: ServiceFlags, local_ok: bool) -> bool {
+        plausible_port(port, self.network)
+            && services.has(required_services())
+            && !ip.is_unspecified()
+            && !ip.is_multicast()
+            && (local_ok || is_public(ip))
+    }
+
+    fn keep_book_in(&self, dir: &Path) {
+        let network = self.network.to_string();
+        let files = BookFiles {
+            new: dir.join(format!("peers-{network}-new.book")),
+            tried: dir.join(format!("peers-{network}-tried.book")),
+        };
+        if self.book.set(files.clone()).is_err() {
+            return;
+        }
+        let mut inner = self.lock();
+        let mut loaded = 0;
+        // "tried" first: an address in both files stays tried.
+        for (path, place) in [(&files.tried, Where::Tried), (&files.new, Where::New)] {
+            match read_book(path) {
+                Ok(records) => {
+                    for record in records {
+                        if inner.add_saved(record, place) {
+                            loaded += 1;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "ignoring an unreadable peer address book"
+                ),
+            }
+        }
+        if loaded > 0 {
+            tracing::info!(
+                known = inner.known(),
+                dir = %dir.display(),
+                "peer discovery: loaded the saved address book"
+            );
+        }
+    }
+
+    /// Write the tables to the kept address book's files, if there is one
+    /// (and, with `only_if_changed`, only when they changed). A failure is
+    /// logged; the book stays in memory.
+    fn save(&self, only_if_changed: bool) {
+        let Some(files) = self.book.get() else {
+            return;
+        };
+        let mut inner = self.lock();
+        if only_if_changed && !inner.changed {
+            return;
+        }
+        let result = write_book(&files.new, |file| file.write_table(&*inner.new))
+            .and_then(|()| write_book(&files.tried, |file| file.write_table(&*inner.tried)));
+        match result {
+            Ok(()) => {
+                inner.changed = false;
+                tracing::debug!(known = inner.known(), "peer address book saved");
+            }
+            Err(e) => tracing::warn!(
+                path = %files.new.display(),
+                error = %e,
+                "cannot save the peer address book"
+            ),
+        }
     }
 
     fn summary(&self) -> String {
@@ -546,6 +715,11 @@ impl PeerPool {
             .get(addr)
             .and_then(|meta| meta.resting_until)
             .is_some_and(|until| until > Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changed(&self) -> bool {
+        self.lock().changed
     }
 
     #[cfg(test)]
@@ -716,6 +890,36 @@ impl Inner {
                 ignored: false,
             },
         );
+        self.changed = true;
+        true
+    }
+
+    /// Put a record from a saved address book back in its table. A slot
+    /// taken already (by an address seen in both files) drops it.
+    fn add_saved(&mut self, record: Record, place: Where) -> bool {
+        let Some(addr) = peer_addr(&record) else {
+            return false;
+        };
+        if self.meta.contains_key(&addr) {
+            return false;
+        }
+        let conflict = match place {
+            Where::New => self.new.add(&record),
+            Where::Tried => self.tried.add(&record),
+        };
+        if conflict.is_some() {
+            return false;
+        }
+        self.meta.insert(
+            addr,
+            Meta {
+                record,
+                table: Some(place),
+                resting_until: None,
+                failures: 0,
+                ignored: false,
+            },
+        );
         true
     }
 
@@ -725,6 +929,7 @@ impl Inner {
         let Some(meta) = self.meta.get_mut(addr) else {
             return;
         };
+        self.changed = true;
         meta.failures = 0;
         meta.record.update_service_flags(services);
         let (record, table) = (meta.record.clone(), meta.table);
@@ -767,6 +972,7 @@ impl Inner {
             Some(Where::Tried) => self.tried.failed_connection(&record),
             None => return,
         }
+        self.changed = true;
         if failures >= MAX_UNREACHABLE {
             // Out of the tables; the entry stays so the seeds and gossip
             // cannot add it back right away.
@@ -824,9 +1030,57 @@ impl Inner {
         match meta.table {
             Some(Where::New) => self.new.remove(&meta.record),
             Some(Where::Tried) => self.tried.remove(&meta.record),
-            None => {}
+            None => return,
         }
+        self.changed = true;
     }
+}
+
+/// The first bytes of a `bitcoin-address-book` file (`io::FileExt`).
+const BOOK_MAGIC: [u8; 4] = *b"ADBK";
+
+/// The records of an address book file written with `io::FileExt`. The
+/// crate's `Table` cannot list its records, and the pool needs each one to
+/// index it, so the file is read record by record here.
+fn read_book(path: &Path) -> io::Result<Vec<Record>> {
+    let mut file = BufReader::new(File::open(path)?);
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic)?;
+    if magic != BOOK_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a peer address book",
+        ));
+    }
+    let mut count = [0u8; 8];
+    file.read_exact(&mut count)?;
+    let count = u64::from_le_bytes(count);
+    let mut records = Vec::new();
+    for _ in 0..count {
+        records.push(Record::deserialize(&mut file)?);
+    }
+    let mut rest = [0u8; 1];
+    if file.read(&mut rest)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "data after the last record",
+        ));
+    }
+    Ok(records)
+}
+
+/// Write `path` through a temporary file, so a crash leaves the old file.
+fn write_book(path: &Path, write: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("book.tmp");
+    let mut file = File::create(&tmp)?;
+    write(&mut file)?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 /// The address a table record names.
@@ -911,8 +1165,4 @@ pub(crate) fn default_port(network: Network) -> u16 {
         Network::Signet => 38333,
         Network::Regtest => 18444,
     }
-}
-
-fn random_u64() -> u64 {
-    RandomState::new().build_hasher().finish()
 }

@@ -304,3 +304,111 @@ fn an_own_node_is_the_only_peer_and_learns_nothing() {
     assert!(!source.wants_addr(&node));
     assert_eq!(source.summary(), "your node 192.0.2.1:8333");
 }
+
+/// A fresh, empty directory for one test's files.
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("blindbit-pool-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A discovering regtest source that keeps its book in `dir`, seeded with
+/// `addrs` unless the book already knows enough.
+fn kept_in(dir: &std::path::Path, addrs: &[&str]) -> Arc<PeerSource> {
+    let source = PeerSource::discover(
+        Network::Regtest,
+        Dialer::Direct,
+        Seeds::Static(addrs.iter().map(|a| addr(a)).collect()),
+    );
+    source.keep_book_in(dir);
+    source
+}
+
+#[test]
+fn the_address_book_survives_a_restart() {
+    let dir = temp_dir("round-trip");
+    let source = kept_in(&dir, &PEERS);
+    assert_eq!(source.known(), 0, "nothing saved yet");
+    run(source.next(Purpose::Block, &none())).unwrap();
+    assert_eq!(source.known(), PEERS.len());
+    let (tried, ignored) = (addr(PEERS[0]), addr(PEERS[1]));
+    source.report(&tried, PeerEvent::Connected(info()));
+    source.report(&ignored, PeerEvent::Misbehaved);
+    assert!(pool(&source).changed());
+    source.save_book();
+    assert!(!pool(&source).changed(), "saved");
+    for table in ["new", "tried"] {
+        assert!(dir.join(format!("peers-regtest-{table}.book")).exists());
+    }
+
+    // The next run: no seeds at all, the book alone.
+    let restarted = kept_in(&dir, &[]);
+    assert_eq!(restarted.known(), 2);
+    assert_eq!(pool(&restarted).place(&tried), Some(Where::Tried));
+    assert_eq!(pool(&restarted).place(&addr(PEERS[2])), Some(Where::New));
+    assert_eq!(
+        pool(&restarted).place(&ignored),
+        None,
+        "an ignored peer is not saved"
+    );
+    assert!(!pool(&restarted).changed(), "loading changes nothing");
+    let peer = run(restarted.next(Purpose::Block, &none())).unwrap();
+    assert!(peer == tried || peer == addr(PEERS[2]), "{peer}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unreadable_address_book_is_ignored() {
+    let dir = temp_dir("corrupt");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    source.report(&addr(PEERS[0]), PeerEvent::Connected(info()));
+    source.save_book();
+
+    // "new" cut short, "tried" garbage: both are ignored, nothing panics.
+    let new = dir.join("peers-regtest-new.book");
+    let bytes = std::fs::read(&new).unwrap();
+    std::fs::write(&new, &bytes[..bytes.len() - 3]).unwrap();
+    std::fs::write(dir.join("peers-regtest-tried.book"), b"not an address book").unwrap();
+    let restarted = kept_in(&dir, &PEERS);
+    assert_eq!(restarted.known(), 0);
+    // The seeds still work, and the next save replaces the bad files.
+    run(restarted.next(Purpose::Block, &none())).unwrap();
+    assert_eq!(restarted.known(), PEERS.len());
+    restarted.save_book();
+    assert_eq!(kept_in(&dir, &[]).known(), PEERS.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_saved_book_that_knows_enough_peers_is_not_seeded_at_start() {
+    let dir = temp_dir("enough");
+    // Gossip from 120 different (local) peers, one address each.
+    let source = kept_in(&dir, &[]);
+    for i in 0..120u32 {
+        let from = addr(&format!("198.18.{}.{}:18444", i / 200, i % 200 + 1));
+        let ip = std::net::Ipv4Addr::from(0x2d00_0000u32 + i * 0x0101_0101 % 0x00ff_ffff);
+        source.add_gossip(
+            &from,
+            [AddrV2Message {
+                time: 0,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                addr: AddrV2::Ipv4(ip),
+                port: 18444,
+            }],
+        );
+    }
+    let known = source.known();
+    assert!(known >= 50, "only {known} addresses fit; pick others");
+    source.save_book();
+
+    let restarted = kept_in(&dir, &["203.0.113.99:18444"]);
+    run(async {
+        restarted.start();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    });
+    assert_eq!(restarted.known(), known, "the seeds were not asked");
+    assert!(pool(&restarted).seeded_at().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
