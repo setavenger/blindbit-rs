@@ -216,27 +216,31 @@ fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
     );
 }
 
-/// A connect the proxy gave no clear answer about (a general failure, a
+/// How the proxy's refusals count: no clear answer (a general failure, a
 /// timeout) is reported as such, for the peer source to weigh by whether
-/// the proxy works; a refusal is the peer's.
+/// the proxy works; a refusal is the peer's; and the proxy having no route
+/// to an IPv6 peer (Tor's exit has none) is not this computer lacking one,
+/// which would stop it using IPv6 peers.
 #[test]
-fn an_unclear_answer_of_the_proxy_is_reported_as_unclear() {
+fn refusals_through_the_proxy_count_for_what_they_say() {
     let proxy = FakeSocks5::start();
-    let peer: PeerAddr = "203.0.113.79:18444".parse::<SocketAddr>().unwrap().into();
-    for (code, event) in [
-        (0x01, PeerEvent::ProxyUnclear),
-        (0x06, PeerEvent::ProxyUnclear),
-        (0x05, PeerEvent::Unreachable),
+    let v4: PeerAddr = "203.0.113.79:18444".parse::<SocketAddr>().unwrap().into();
+    let v6: PeerAddr = "[2001:db8::79]:18444".parse::<SocketAddr>().unwrap().into();
+    for (code, peer, event) in [
+        (0x01, &v4, PeerEvent::ProxyUnclear),
+        (0x06, &v4, PeerEvent::ProxyUnclear),
+        (0x05, &v4, PeerEvent::Unreachable),
+        (0x03, &v6, PeerEvent::Unreachable),
     ] {
         proxy.refuse_with(code);
         let err = proxy
             .dialer()
-            .connect(&peer, Duration::from_secs(5))
+            .connect(peer, Duration::from_secs(5))
             .unwrap_err();
         assert_eq!(
-            connect_failure(err).peer_event(false),
+            connect_failure(err, peer).peer_event(false),
             event,
-            "SOCKS5 reply {code}"
+            "SOCKS5 reply {code} for {peer}"
         );
     }
 }

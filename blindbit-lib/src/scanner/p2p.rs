@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::net::{
     PROXY_CONNECT_TIMEOUT, PeerAddr, PeerEvent, PeerSource, Purpose, ShutdownOnDrop, USER_AGENT,
-    is_proxy_down, is_proxy_unclear,
+    is_no_route, is_proxy_down, is_proxy_unclear,
 };
 
 // ---------------------------------------------------------------------------
@@ -1113,7 +1113,7 @@ impl BlockFetcher {
         let stream = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled.into()),
-            connected = connect => connected.map_err(connect_failure)?,
+            connected = connect => connected.map_err(|e| connect_failure(e, peer))?,
         };
         self.attempt_on(
             stream,
@@ -1296,7 +1296,7 @@ async fn prepare(
             .dialer()
             .open(&peer, policy.connect_timeout)
             .await
-            .map_err(|e| (connect_failure(e), None))?;
+            .map_err(|e| (connect_failure(e, &peer), None))?;
         let opened = Instant::now();
         // Through a proxy the peer sees the proxy's (the exit's) address,
         // not this one.
@@ -1364,12 +1364,12 @@ fn too_slow(cap: Duration) -> AttemptFailure {
 /// How a failed connect counts: the proxy failing, the proxy saying nothing
 /// clear about the peer, no route to the peer's network, or the peer
 /// unreachable.
-pub(super) fn connect_failure(error: io::Error) -> AttemptFailure {
+pub(super) fn connect_failure(error: io::Error, peer: &PeerAddr) -> AttemptFailure {
     if is_proxy_down(&error) {
         FetchFailure::Proxy(error.to_string()).into()
     } else if is_proxy_unclear(&error) {
         AttemptFailure::ProxyUnclear(error.to_string())
-    } else if is_no_route(&error) {
+    } else if is_no_route(&error, peer) {
         AttemptFailure::NoRoute(error.to_string())
     } else {
         FetchFailure::Connect(error.to_string()).into()
@@ -1751,12 +1751,6 @@ fn is_closed(e: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::BrokenPipe
     )
-}
-
-/// This computer has no route to the peer's network (typically IPv6 on a
-/// host without IPv6 connectivity).
-fn is_no_route(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::NetworkUnreachable
 }
 
 fn network_name(network: Network) -> &'static str {

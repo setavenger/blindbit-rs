@@ -210,6 +210,35 @@ fn once_the_proxy_stopped_working_an_unclear_connect_only_rests_the_peer() {
     assert!(pool(&source).is_resting(&last));
 }
 
+/// The errors that mean this computer has no route to a peer's network:
+/// the ones a host without IPv6 gives for an IPv6 peer, never one through
+/// the proxy.
+#[test]
+fn no_route_is_this_computer_lacking_one() {
+    use std::io::{Error, ErrorKind};
+    let (v4, v6) = (addr(PEERS[0]), addr("[2001:db8::5]:18444"));
+    for kind in [
+        ErrorKind::NetworkUnreachable,
+        ErrorKind::HostUnreachable,
+        ErrorKind::AddrNotAvailable,
+    ] {
+        assert!(super::is_no_route(&Error::from(kind), &v6), "{kind:?}");
+    }
+    assert!(super::is_no_route(
+        &Error::from(ErrorKind::NetworkUnreachable),
+        &v4
+    ));
+    // An IPv4 host that does not answer is the peer, not the route.
+    assert!(!super::is_no_route(
+        &Error::from(ErrorKind::HostUnreachable),
+        &v4
+    ));
+    assert!(!super::is_no_route(
+        &Error::from(ErrorKind::ConnectionRefused),
+        &v6
+    ));
+}
+
 #[test]
 fn without_an_ipv6_route_ipv6_peers_are_skipped() {
     let v6 = "[2001:db8::1]:18444";

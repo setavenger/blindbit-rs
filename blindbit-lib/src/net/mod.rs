@@ -196,6 +196,26 @@ pub(crate) fn gossiped_addrs(message: &NetworkMessage) -> Option<Vec<AddrV2Messa
     }
 }
 
+/// Did connecting to `peer` fail because this computer has no route to the
+/// peer's network (typically an IPv6 peer on a host without IPv6)? Never
+/// for an error through the proxy: its "network unreachable" is about the
+/// proxy's routes (Tor's exit), not this computer's. Hosts without IPv6
+/// also answer an IPv6 connect with "host unreachable" or "address not
+/// available".
+pub fn is_no_route(error: &io::Error, peer: &PeerAddr) -> bool {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<Socks5Error>())
+    {
+        return false;
+    }
+    match error.kind() {
+        io::ErrorKind::NetworkUnreachable => true,
+        io::ErrorKind::HostUnreachable | io::ErrorKind::AddrNotAvailable => peer.is_ipv6(),
+        _ => false,
+    }
+}
+
 /// A second handle on a connection's socket that shuts the connection down
 /// when dropped. A shutdown ends a read or write blocked on the socket in
 /// another thread at once (it then sees the connection closed), so the
