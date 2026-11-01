@@ -73,6 +73,74 @@ fn the_own_node_is_reached_by_name_through_the_proxy() {
     assert_eq!(requests[0].target, node_invalid(node.addr.port()));
 }
 
+/// An own node on this computer is reached through a proxy that can reach
+/// it (a SOCKS5 proxy other than Tor, such as `ssh -D`): the proxy is used,
+/// never bypassed.
+#[test]
+fn a_local_own_node_is_reached_through_the_proxy() {
+    let node = Node::full(200, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    let block = fetch(PeerSource::own_node(
+        node.addr.into(),
+        proxy.dialer(),
+        Network::Regtest,
+    ))
+    .expect("served through the proxy");
+    assert_eq!(block.block_hash(), genesis().block_hash());
+    let targets: Vec<PeerAddr> = proxy.requests().into_iter().map(|r| r.target).collect();
+    assert_eq!(targets, vec![PeerAddr::from(node.addr)]);
+}
+
+/// When the proxy cannot connect to a local own node, the message says
+/// why that may be: Tor cannot reach this computer or the local network.
+/// A node elsewhere gets the usual message.
+#[test]
+fn a_local_own_node_the_proxy_cannot_reach_gets_a_word_about_tor() {
+    let proxy = FakeSocks5::start();
+    let hint = "Tor cannot: it connects from the internet";
+    // Nothing listens on port 1; `localhost` is a name the proxy cannot
+    // resolve.
+    for node in [
+        "127.0.0.1:1".parse::<SocketAddr>().unwrap().into(),
+        PeerAddr {
+            host: PeerHost::Name("localhost".to_string()),
+            port: 18444,
+        },
+    ] {
+        let err = fetch(PeerSource::own_node(
+            node.clone(),
+            proxy.dialer(),
+            Network::Regtest,
+        ))
+        .expect_err("the proxy cannot connect");
+        let message = err.to_string();
+        assert!(matches!(err.failure, FetchFailure::Connect(_)), "{message}");
+        for expected in [
+            "Check that bitcoind is running",
+            hint,
+            &format!("through p2p_proxy {}", proxy.addr()),
+            "clear p2p_proxy",
+            ".onion address",
+        ] {
+            assert!(message.contains(expected), "{expected:?} in {message}");
+        }
+    }
+    let refusing = FakeSocks5::start();
+    refusing.refuse_with(0x05);
+    let err = fetch(PeerSource::own_node(
+        "192.0.2.1:18444".parse::<SocketAddr>().unwrap().into(),
+        refusing.dialer(),
+        Network::Regtest,
+    ))
+    .expect_err("refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("Check that bitcoind is running"),
+        "{message}"
+    );
+    assert!(!message.contains(hint), "{message}");
+}
+
 /// Through the proxy the handshake gives nothing away either, to the own
 /// node and to a discovered peer: placeholder addresses, no height, the
 /// shared user agent.

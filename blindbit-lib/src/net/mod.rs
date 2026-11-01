@@ -81,6 +81,33 @@ impl PeerAddr {
         matches!(self.host, PeerHost::Ip(IpAddr::V6(_)))
     }
 
+    /// On this computer or the local network: a loopback, private or
+    /// link-local address, `localhost`, or a `.local` (mDNS) name. Tor's
+    /// exits connect from the internet and cannot reach such a peer.
+    pub fn is_local(&self) -> bool {
+        let ip = match &self.host {
+            PeerHost::Ip(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map_or(IpAddr::V6(*v6), IpAddr::V4),
+            PeerHost::Ip(ip) => *ip,
+            PeerHost::Name(name) => {
+                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                return name == "localhost"
+                    || name.ends_with(".localhost")
+                    || name.ends_with(".local");
+            }
+        };
+        match ip {
+            IpAddr::V4(ip) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+                    || ip.is_unspecified()
+            }
+        }
+    }
+
     /// The peer's network group; see [`NetGroup`].
     pub fn netgroup(&self) -> NetGroup {
         match &self.host {

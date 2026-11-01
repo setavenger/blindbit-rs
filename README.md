@@ -224,9 +224,10 @@ Peers then see a Tor exit's address instead of this computer's.
   oracle sees this computer's IP, but the requests do not depend on your
   keys), and the Electrum server, which only listens locally.
 - Your own node on this computer or your local network does not need Tor,
-  and Tor cannot reach it (its exits only connect to public addresses), so
-  friglet refuses that combination. Leave `p2p_proxy` empty for it, or give
-  the node's onion address.
+  and Tor cannot reach it (its exits only connect to public addresses):
+  leave `p2p_proxy` empty for it, or give the node's onion address. Another
+  SOCKS5 proxy that can reach it (such as `ssh -D`) works; if the
+  connection fails, the error mentions this.
 - Through Tor a block takes longer (connections get 20 s, a block 60 s),
   and the first download waits for the seeds' answers through Tor.
 - An older friglet-tray does not know `p2p_proxy`: saving its settings

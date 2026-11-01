@@ -398,19 +398,12 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 
 /// The own node's address. Without a proxy a host name is resolved here,
 /// i.e. at every daemon (re)start; through one it is left for the proxy to
-/// resolve (no local DNS), which also reaches a Tor onion service. A node
-/// on this computer or the local network cannot be reached through a
-/// proxy.
+/// resolve (no local DNS), which also reaches a Tor onion service. Through
+/// a proxy the address is the proxy's to reach: Tor cannot reach this
+/// computer or the local network, other SOCKS5 proxies (`ssh -D`) can, so a
+/// local node is accepted and a failed connection says why.
 fn own_node_addr(addr: &str, network: &str, proxy: Option<SocketAddr>) -> Result<PeerAddr, String> {
     let (host, port) = friglet_ipc::network::split_peer_addr(addr, network)?;
-    if proxy.is_some() && friglet_ipc::network::is_local_host(&host) {
-        return Err(
-            "a node on this computer or the local network cannot be reached through \
-             p2p_proxy (Tor connects from the internet): clear p2p_proxy (with your own node \
-             every P2P connection stays on your network), or use the node's .onion address"
-                .to_string(),
-        );
-    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port).into());
     }
@@ -1102,34 +1095,49 @@ mod tests {
         assert!(!peers.is_own_node());
     }
 
+    /// Through a proxy the own node may be on this computer or the local
+    /// network: a SOCKS5 proxy other than Tor (`ssh -D`) can reach it. The
+    /// proxy stays in use and a name stays a name, for the proxy to resolve.
     #[test]
-    fn a_node_on_the_local_network_is_refused_with_a_proxy() {
-        for local in [
-            "127.0.0.1",
-            "192.168.1.20:8333",
-            "[fe80::1]:38333",
-            "localhost",
-            "bitcoin.local",
+    fn a_node_on_the_local_network_is_reached_through_the_proxy() {
+        let by_name = |name: &str| PeerAddr {
+            host: PeerHost::Name(name.to_string()),
+            port: 38333,
+        };
+        let by_ip = |addr: &str| PeerAddr::from(addr.parse::<SocketAddr>().unwrap());
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        for (local, node) in [
+            ("127.0.0.1", by_ip("127.0.0.1:38333")),
+            ("192.168.1.20:8333", by_ip("192.168.1.20:8333")),
+            ("[fe80::1]:38333", by_ip("[fe80::1]:38333")),
+            ("localhost", by_name("localhost")),
+            ("bitcoin.local", by_name("bitcoin.local")),
         ] {
             let mut cfg = resolvable("signet", "http://127.0.0.1:1", local);
-            cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
-            let err = resolve(cfg).unwrap_err();
-            for expected in [
-                "p2p_node_addr",
-                "local network",
-                "clear p2p_proxy",
-                ".onion",
-            ] {
-                assert!(err.contains(expected), "{expected:?} in {err}");
-            }
-            // Without the proxy it is fine.
-            if local != "bitcoin.local" {
-                assert!(
-                    resolve(resolvable("signet", "http://127.0.0.1:1", local)).is_ok(),
-                    "{local}"
-                );
-            }
+            cfg.p2p_proxy = Some(proxy.to_string());
+            let r = resolve(cfg).unwrap_or_else(|e| panic!("{local}: {e}"));
+            assert_eq!(r.p2p_node, Some(node), "{local}");
+            assert_eq!(r.dialer(), Dialer::Socks5 { proxy });
         }
+
+        // The daemon's connection to a node on this computer, through a
+        // proxy that reaches it.
+        use blindbit_lib::net::testing::FakeSocks5;
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = FakeSocks5::start();
+        let node_addr = node.local_addr().unwrap().to_string();
+        let mut cfg = resolvable("regtest", "http://127.0.0.1:1", &node_addr);
+        cfg.p2p_proxy = Some(proxy.addr().to_string());
+        let peers = resolve(cfg).unwrap().peer_source();
+        let own = peers.own_node_addr().expect("the own node").clone();
+        peers
+            .dialer()
+            .connect(&own, std::time::Duration::from_secs(5))
+            .expect("connected through the proxy");
+        let targets: Vec<PeerAddr> = proxy.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(targets, vec![own]);
+        node.set_nonblocking(true).unwrap();
+        assert!(node.accept().is_ok(), "the proxy connected to the node");
     }
 
     #[test]

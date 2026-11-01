@@ -364,9 +364,11 @@ dbus-run-session -- bash -c '
   `p2p_proxy`.
 - No local DNS through the proxy: `ResolvedConfig.p2p_node` is a `PeerAddr`
   whose host name stays a name (resolved locally only without a proxy; an
-  `.onion` node without a proxy is a config error, and so is an own node on
-  the local network with one: loopback/private/link-local IP, `localhost`,
-  `.local`; `friglet_ipc::network::is_local_host`, daemon and tray setup);
+  `.onion` node without a proxy is a config error; an own node on the local
+  network is allowed with one, a SOCKS5 proxy other than Tor can reach it,
+  and a failed connect to it through the proxy adds a Tor hint to the
+  error: `PeerAddr::is_local`, loopback/private/link-local IP, `localhost`,
+  `.local`);
   `Seeds::resolve` with a proxy connects to `x9.<seed>` (then the bare
   name) of 3 random seeds through it, handshakes with `getaddr` and keeps
   the `addr`/`addrv2` answer (≤ 20 s, ≤ 100 messages; of single-address

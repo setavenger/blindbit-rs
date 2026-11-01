@@ -248,14 +248,6 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
                         .to_string(),
                 );
             }
-            if proxy.is_some() && network::is_local_host(&host) {
-                return Err(
-                    "a Bitcoin node on this computer or your local network cannot be reached \
-                     through the Tor proxy: clear the proxy field (with your own node every \
-                     connection stays on your network), or enter the node's .onion address"
-                        .to_string(),
-                );
-            }
         }
         None if network::needs_own_node(&cfg.network) => {
             return Err(format!(
@@ -707,24 +699,6 @@ mod tests {
                 KEY_HEX,
                 "an onion node address needs Tor",
             ),
-            (
-                DaemonConfig {
-                    p2p_node_addr: Some("192.168.1.20:38333".to_string()),
-                    p2p_proxy: Some("127.0.0.1:9050".to_string()),
-                    ..valid_config()
-                },
-                KEY_HEX,
-                "cannot be reached through the Tor proxy",
-            ),
-            (
-                DaemonConfig {
-                    p2p_node_addr: Some("localhost".to_string()),
-                    p2p_proxy: Some("127.0.0.1:9050".to_string()),
-                    ..valid_config()
-                },
-                KEY_HEX,
-                "cannot be reached through the Tor proxy",
-            ),
         ];
         for (cfg, key, expected) in cases {
             let err = validate_setup(&cfg, key).unwrap_err();
@@ -757,6 +731,25 @@ mod tests {
             ..valid_config()
         };
         assert_eq!(validate_setup(&new_wallet, KEY_HEX), Ok(()));
+    }
+
+    /// A node on this computer or the local network with a proxy: a SOCKS5
+    /// proxy other than Tor (`ssh -D`) can reach it.
+    #[test]
+    fn validate_accepts_a_local_node_with_a_proxy() {
+        for p2p in [
+            "192.168.1.20:38333",
+            "localhost",
+            "127.0.0.1",
+            "bitcoin.local",
+        ] {
+            let cfg = DaemonConfig {
+                p2p_node_addr: Some(p2p.to_string()),
+                p2p_proxy: Some("127.0.0.1:9050".to_string()),
+                ..valid_config()
+            };
+            assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()), "{p2p}");
+        }
     }
 
     #[test]

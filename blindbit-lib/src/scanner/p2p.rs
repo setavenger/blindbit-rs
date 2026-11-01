@@ -587,12 +587,28 @@ impl fmt::Display for BlockFetchError {
             self.height, self.block_hash, node
         )?;
         match &self.failure {
-            FetchFailure::Connect(error) => write!(
-                f,
-                "cannot connect ({error}){tries}. Check that bitcoind is running and accepts \
-                 P2P connections on that address (listen=1, and bind= if set), that no firewall \
-                 blocks it, and that p2p_node_addr is right (the {net} P2P port is usually {port})."
-            )?,
+            FetchFailure::Connect(error) => {
+                write!(
+                    f,
+                    "cannot connect ({error}){tries}. Check that bitcoind is running and accepts \
+                     P2P connections on that address (listen=1, and bind= if set), that no \
+                     firewall blocks it, and that p2p_node_addr is right (the {net} P2P port is \
+                     usually {port})."
+                )?;
+                // Allowed for a SOCKS5 proxy that can reach it (`ssh -D`).
+                if let Some(proxy) = self.proxy
+                    && node.is_local()
+                {
+                    write!(
+                        f,
+                        " The connection goes through p2p_proxy {proxy}, which must reach that \
+                         address itself. Tor cannot: it connects from the internet, never to \
+                         this computer or your local network. With Tor, clear p2p_proxy (your \
+                         own node keeps every P2P connection on your network) or use the \
+                         node's .onion address."
+                    )?;
+                }
+            }
             FetchFailure::WrongNetwork(Some(theirs)) => write!(
                 f,
                 "it is a {} node, but friglet scans {net}. Point p2p_node_addr at a {net} node \

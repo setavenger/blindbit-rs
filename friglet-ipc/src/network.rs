@@ -122,31 +122,6 @@ pub fn is_onion(host: &str) -> bool {
         .ends_with(".onion")
 }
 
-/// Is `host` on this computer or the local network: a loopback, private or
-/// link-local address, `localhost`, or a `.local` (mDNS) name? A proxy
-/// cannot reach a node there: Tor's connections leave from the internet.
-pub fn is_local_host(host: &str) -> bool {
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => {
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-        }
-        Ok(std::net::IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
-            Some(v4) => is_local_host(&v4.to_string()),
-            None => {
-                ip.is_loopback()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    || ip.is_unspecified()
-            }
-        },
-        Err(_) => {
-            let name = host.trim_end_matches('.').to_ascii_lowercase();
-            name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local")
-        }
-    }
-}
-
 /// Parse a `p2p_proxy` value: `ip:port`, `[v6]:port` or `localhost:port`
 /// (taken as 127.0.0.1). The port is required, and no other host name is
 /// accepted: looking up the proxy's name would ask the local resolver.
@@ -206,37 +181,6 @@ mod tests {
         ] {
             let err = parse_proxy_addr(bad).expect_err(bad);
             assert!(err.contains(says), "{bad:?}: {err}");
-        }
-    }
-
-    #[test]
-    fn local_hosts_are_this_computer_and_the_local_network() {
-        for local in [
-            "127.0.0.1",
-            "10.0.0.2",
-            "172.16.4.1",
-            "192.168.1.20",
-            "169.254.3.3",
-            "::1",
-            "[::1]",
-            "fe80::1",
-            "fd12:3456::1",
-            "::ffff:192.168.1.20",
-            "localhost",
-            "LOCALHOST.",
-            "node.localhost",
-            "bitcoin.local",
-        ] {
-            assert!(is_local_host(local), "{local}");
-        }
-        for remote in [
-            "152.53.151.148",
-            "2a01:4f8::1",
-            "node.example",
-            "abcdefghijklmnop.onion",
-            "local.example",
-        ] {
-            assert!(!is_local_host(remote), "{remote}");
         }
     }
 
