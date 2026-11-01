@@ -170,6 +170,9 @@ struct Timing {
     /// the transaction over, start more this often: a connection not up
     /// by then is probably to a dead address.
     hedge_every: Option<Duration>,
+    /// How long an observer waits for the answer to its `getdata` before
+    /// it asks again (a slow answer is no answer yet).
+    answer_wait: Duration,
     /// How long a sender waits for the pong that follows the transaction:
     /// a sender that gets none says nothing about the transaction.
     flush_wait: Duration,
@@ -193,6 +196,7 @@ impl Timing {
         observer_window: Duration::from_secs(5),
         observer_limit: Duration::from_secs(12),
         hedge_every: None,
+        answer_wait: ANNOUNCE_WAIT,
         flush_wait: FLUSH_WAIT,
         rotate_after: Duration::from_secs(10),
     };
@@ -212,6 +216,7 @@ impl Timing {
         observer_window: Duration::from_secs(15),
         observer_limit: Duration::from_secs(30),
         hedge_every: Some(Duration::from_secs(6)),
+        answer_wait: ANNOUNCE_WAIT,
         flush_wait: Duration::from_secs(15),
         rotate_after: Duration::from_secs(12),
     };
@@ -1078,7 +1083,7 @@ fn watch(peer: &mut Peer, job: &Job) -> Result<Option<bool>, P2pError> {
             return Ok(None);
         }
         let mut heard = false;
-        let ask_until = job.deadline.min(Instant::now() + ANNOUNCE_WAIT);
+        let ask_until = job.deadline.min(Instant::now() + job.timing.answer_wait);
         match peer.mempool_has(txid, wtxid, ask_until, |_, message| {
             heard |= announces(&message, txid, wtxid);
             Ok(())
@@ -2123,19 +2128,39 @@ mod tests {
 
     /// A job for `fake` alone, as one connection of a broadcast sees it.
     async fn job_for(fake: &FakePeer, seed: u8) -> (Job, mpsc::UnboundedReceiver<Event>) {
+        job_at(fake, seed, Timing::DIRECT).await
+    }
+
+    /// [`job_for`] at the pace of `timing`, with a budget of a minute.
+    async fn job_at(
+        fake: &FakePeer,
+        seed: u8,
+        timing: Timing,
+    ) -> (Job, mpsc::UnboundedReceiver<Event>) {
         let peers = pool(&[fake.addr]).await;
         let (events, received) = mpsc::unbounded_channel();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let job = Job::new(
             peers,
             candidate(seed),
             History::default(),
-            Timing::DIRECT,
+            timing,
             deadline,
             events,
         );
         (job, received)
     }
+
+    /// Waits for an answer or a pong that last the job's whole budget: a
+    /// connection that ends within [`AT_ONCE`] was shut down.
+    const WAITING_LONG: Timing = Timing {
+        answer_wait: Duration::from_secs(120),
+        flush_wait: Duration::from_secs(120),
+        ..Timing::DIRECT
+    };
+
+    /// "At once", with room for a loaded machine.
+    const AT_ONCE: Duration = Duration::from_secs(10);
 
     /// Wait (up to 10 s) until `done` holds.
     async fn wait_for(what: &str, done: impl Fn() -> bool) {
@@ -2146,13 +2171,13 @@ mod tests {
         }
     }
 
-    /// The next event that is not `Ready`/`HandedOver`, within 10 s.
+    /// The next event that is not `Ready`/`HandedOver`, within [`AT_ONCE`].
     async fn next_end(received: &mut mpsc::UnboundedReceiver<Event>) -> Event {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + AT_ONCE;
         loop {
             let event = tokio::time::timeout_at(deadline.into(), received.recv())
                 .await
-                .expect("an event within 10 s")
+                .expect("an event at once")
                 .expect("the connection reports");
             if !matches!(event, Event::Ready { .. } | Event::HandedOver { .. }) {
                 return event;
@@ -2174,7 +2199,8 @@ mod tests {
     }
 
     /// The end of a broadcast shuts an observer's connection: one waiting
-    /// for an answer ends at once instead of after its 5 s wait.
+    /// for an answer ends at once instead of when its wait is over (here
+    /// with the job's budget, a minute on).
     #[tokio::test]
     async fn the_end_of_a_broadcast_shuts_a_waiting_observer_down() {
         let net = FakeNet::new();
@@ -2183,7 +2209,7 @@ mod tests {
             ..Script::default()
         };
         let fake = net.peer(ip(101, 0), quiet);
-        let (job, mut received) = job_for(&fake, 12).await;
+        let (job, mut received) = job_at(&fake, 12, WAITING_LONG).await;
         tokio::spawn(observe(job.clone(), PeerAddr::from(fake.addr)));
         assert!(matches!(received.recv().await, Some(Event::Ready { .. })));
         wait_for("the observer's request", || {
@@ -2195,7 +2221,7 @@ mod tests {
         let end = next_end(&mut received).await;
         assert!(matches!(end, Event::Gone { .. }), "{end:?}");
         assert!(
-            closed.elapsed() < Duration::from_secs(1),
+            closed.elapsed() < AT_ONCE,
             "ended {:?} after the broadcast",
             closed.elapsed()
         );
@@ -2210,7 +2236,7 @@ mod tests {
             ..Script::default()
         };
         let fake = net.peer(ip(102, 0), quiet);
-        let (job, mut received) = job_for(&fake, 13).await;
+        let (job, mut received) = job_at(&fake, 13, WAITING_LONG).await;
         tokio::spawn(send(job.clone(), PeerAddr::from(fake.addr)));
         wait_for("the ping after the hand-over", || {
             let commands = fake.commands();
@@ -2226,7 +2252,7 @@ mod tests {
         let end = next_end(&mut received).await;
         assert!(matches!(end, Event::Gone { .. }), "{end:?}");
         assert!(
-            closed.elapsed() < Duration::from_secs(1),
+            closed.elapsed() < AT_ONCE,
             "ended {:?} after the broadcast",
             closed.elapsed()
         );
