@@ -66,6 +66,10 @@ const DISCOVERED_SLACK: Duration = Duration::from_secs(15);
 /// wait.
 const GOSSIP_WAIT: Duration = Duration::from_secs(3);
 
+/// The connection is shut down this long after [`GOSSIP_WAIT`] at the
+/// latest, whatever the peer sends.
+const LINGER_SLACK: Duration = Duration::from_millis(500);
+
 /// Bitcoin Core's `NODE_NETWORK_LIMITED_MIN_BLOCKS`: a pruned node serves
 /// only this many of the newest blocks, and disconnects peers that ask for
 /// older ones.
@@ -1198,17 +1202,20 @@ impl BlockFetcher {
     async fn fetch_on(&self, ready: Ready, block_hash: BlockHash) -> Result<Block, AttemptFailure> {
         let Ready {
             mut connection,
-            mut shutdown,
+            shutdown,
             discovery,
             ..
         } = ready;
         let (opened, lingers) = (connection.opened, discovery.request_addr);
         let cap = self.policy.connection_cap();
         let (answer, answered) = tokio::sync::oneshot::channel();
+        // Dropped when the thread is done with the connection.
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
         let (cancel, deadline) = (self.cancel.clone(), self.policy.block_deadline);
         std::thread::Builder::new()
             .name("p2p-block-fetch".to_string())
             .spawn(move || {
+                let _done = done;
                 let peers = discovery.peers.as_ref();
                 let result = connection.fetch_block(block_hash, deadline, &cancel, Some(peers));
                 let served = result.is_ok();
@@ -1231,12 +1238,32 @@ impl BlockFetcher {
             }),
         };
         // The thread keeps the connection a moment to collect the peer's
-        // addresses; it closes it itself.
+        // addresses.
         if result.is_ok() && lingers {
-            shutdown.disarm();
+            linger(shutdown, finished, self.cancel.clone());
         }
         result
     }
+}
+
+/// Own the deadline of a connection the download thread keeps after the
+/// block to collect the peer's addresses: shut it down once the thread is
+/// done with it, the wait is over or the fetch is cancelled. The thread's
+/// reads cannot see the deadline while a message arrives, so a peer that
+/// trickles one would otherwise hold the thread and its socket.
+fn linger(
+    shutdown: ShutdownOnDrop,
+    finished: tokio::sync::oneshot::Receiver<()>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = finished => {}
+            () = cancel.cancelled() => {}
+            () = tokio::time::sleep(GOSSIP_WAIT + LINGER_SLACK) => {}
+        }
+        drop(shutdown);
+    });
 }
 
 /// A connection to a discovered peer that completed its handshake, ready for
@@ -1605,14 +1632,20 @@ impl P2pConnection {
 
     /// After the block: wait up to `wait` for the addresses the handshake
     /// asked for (Bitcoin Core may send them after the block), then close.
-    /// Nothing else is read; a read that times out part way through a
-    /// message ends the wait, since the connection closes anyway.
+    /// Each read may take all the time left, so a pause in the middle of a
+    /// message does not cut it; a read that times out ends the wait. The
+    /// caller shuts the connection down at the deadline (or on cancellation)
+    /// in case a message trickles in for longer.
     fn wait_for_addr(&mut self, wait: Duration, cancel: &CancellationToken, peers: &PeerSource) {
         let until = Instant::now() + wait;
-        if let Some(socket) = &self.socket {
-            let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
-        }
-        while Instant::now() < until && !cancel.is_cancelled() {
+        while !cancel.is_cancelled() {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if let Some(socket) = &self.socket {
+                let _ = socket.set_read_timeout(Some(left));
+            }
             match self.reader.read_message() {
                 Ok(Some(NetworkMessage::Ping(nonce))) => {
                     let _ = self.writer.send_message(NetworkMessage::Pong(nonce));
@@ -1623,7 +1656,6 @@ impl P2pConnection {
                     }
                 }
                 Ok(None) => {}
-                Err(e) if is_read_timeout(&e) => {}
                 Err(_) => break,
             }
         }

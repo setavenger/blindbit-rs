@@ -56,6 +56,12 @@ pub(super) enum Conn {
     Http,
     /// Close without answering the version message.
     CloseBeforeVersion,
+    /// [`Conn::Serve`], then answer `getaddr` with [`GOSSIP`] in a message
+    /// that pauses for 400 ms halfway through.
+    ServeThenSplitAddr,
+    /// [`Conn::Serve`], then start a message and send one byte of it every
+    /// 100 ms (for at most 15 s), never completing it.
+    ServeThenTrickle,
 }
 
 /// What a [`Conn::ServeWithAddr`] node gossips: two loopback peers (that
@@ -65,13 +71,21 @@ pub(super) const GOSSIP: [&str; 2] = ["127.0.0.61:18444", "127.0.0.62:18444"];
 pub(super) struct Node {
     pub(super) addr: SocketAddr,
     connections: Arc<AtomicUsize>,
-    /// When a [`Conn::StallMidBlock`] connection went silent.
-    stalled: Arc<Mutex<Option<Instant>>>,
+    moments: Arc<Moments>,
     /// Every command received after the handshake, on every connection.
     commands: Arc<Mutex<Vec<String>>>,
     /// Per connection: when it was accepted, and how long the client then
     /// took to send its `version` (none if it never did).
     connected: Arc<Mutex<Vec<Accepted>>>,
+}
+
+/// When things happened on a [`Node`]'s connections.
+#[derive(Default)]
+struct Moments {
+    /// A [`Conn::StallMidBlock`] connection went silent.
+    stalled: Mutex<Option<Instant>>,
+    /// The client hung up on a [`Conn::ServeThenTrickle`] connection.
+    hung_up: Mutex<Option<Instant>>,
 }
 
 /// One connection a [`Node`] accepted.
@@ -154,8 +168,8 @@ impl Node {
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = connections.clone();
-        let stalled = Arc::new(Mutex::new(None));
-        let stalled_at = stalled.clone();
+        let moments = Arc::new(Moments::default());
+        let moments_at = moments.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let received = commands.clone();
         let connected = Arc::new(Mutex::new(Vec::new()));
@@ -176,9 +190,9 @@ impl Node {
                 };
                 // Each connection on a thread of its own, so a client that
                 // keeps one open never holds up the next.
-                let (served, stalled_at, received, accepted) = (
+                let (served, moments_at, received, accepted) = (
                     served.clone(),
-                    stalled_at.clone(),
+                    moments_at.clone(),
                     received.clone(),
                     accepted.clone(),
                 );
@@ -189,7 +203,7 @@ impl Node {
                         services,
                         height,
                         &served,
-                        &stalled_at,
+                        &moments_at,
                         &received,
                         &|| {
                             let mut accepted = accepted.lock().unwrap();
@@ -202,10 +216,15 @@ impl Node {
         Node {
             addr,
             connections,
-            stalled,
+            moments,
             commands,
             connected,
         }
+    }
+
+    /// When the client hung up on a [`Conn::ServeThenTrickle`] connection.
+    pub(super) fn hung_up(&self) -> Option<Instant> {
+        *self.moments.hung_up.lock().unwrap()
     }
 
     /// The connections accepted so far, in order.
@@ -224,7 +243,7 @@ impl Node {
 
     /// When the node went silent in the middle of the block, if it did.
     pub(super) fn stalled(&self) -> Option<Instant> {
-        *self.stalled.lock().unwrap()
+        *self.moments.stalled.lock().unwrap()
     }
 }
 
@@ -283,7 +302,7 @@ fn serve(
     services: ServiceFlags,
     height: i32,
     served: &Served,
-    stalled: &Mutex<Option<Instant>>,
+    moments: &Arc<Moments>,
     commands: &Mutex<Vec<String>>,
     got_version: &dyn Fn(),
 ) -> std::io::Result<()> {
@@ -336,6 +355,22 @@ fn serve(
         Conn::Serve | Conn::ServeWithAddr | Conn::ServeStripped => {
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
+        Conn::ServeThenSplitAddr => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::AddrV2(gossip()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            wire.stream.flush()?;
+            std::thread::sleep(Duration::from_millis(400));
+            wire.stream.write_all(rest)?;
+        }
+        Conn::ServeThenTrickle => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            trickle(&mut wire.stream, magic, moments)?;
+        }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
         Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
@@ -353,7 +388,7 @@ fn serve(
             ));
             wire.stream.write_all(&bytes[..bytes.len() / 2])?;
             wire.stream.flush()?;
-            *stalled.lock().unwrap() = Some(Instant::now());
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
         }
         Conn::Ignore => loop {
             if let NetworkMessage::Ping(nonce) = wire.recv()? {
@@ -363,6 +398,43 @@ fn serve(
         _ => {}
     }
     wire.drain()
+}
+
+/// Start a large `addrv2` message and send one byte of it every 100 ms,
+/// for at most 15 s; note when the client hangs up.
+fn trickle(stream: &mut TcpStream, magic: Magic, moments: &Arc<Moments>) -> std::io::Result<()> {
+    let watch = stream.try_clone()?;
+    let watcher_moments = moments.clone();
+    std::thread::spawn(move || {
+        let mut watch = watch;
+        let mut sink = [0u8; 1024];
+        loop {
+            match watch.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        *watcher_moments.hung_up.lock().unwrap() = Some(Instant::now());
+    });
+    let many: Vec<AddrV2Message> = (0..200u8).flat_map(|_| gossip()).collect();
+    let bytes = encode::serialize(&RawNetworkMessage::new(magic, NetworkMessage::AddrV2(many)));
+    let started = Instant::now();
+    stream.write_all(&bytes[..30])?;
+    for byte in &bytes[30..] {
+        if started.elapsed() > Duration::from_secs(15) || moments.hung_up.lock().unwrap().is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&[*byte])?;
+    }
+    Ok(())
 }
 
 /// [`GOSSIP`] as an `addrv2` message.

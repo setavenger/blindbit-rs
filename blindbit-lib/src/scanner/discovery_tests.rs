@@ -243,6 +243,96 @@ fn addresses_a_peer_gossips_land_in_the_book() {
     }
 }
 
+/// Polls `condition` every 20 ms for up to `within`; whether it came true.
+async fn comes_true(within: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !condition() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// The addresses a peer sends after the block arrive whole even when the
+/// message pauses halfway (400 ms, longer than a short poll would wait).
+#[test]
+fn addresses_that_pause_halfway_after_the_block_still_land_in_the_book() {
+    run(async {
+        let block = genesis();
+        let gossiping = node(36, &block, vec![Conn::ServeThenSplitAddr]);
+        let source = discovering(&[&gossiping]);
+        BlockFetcher::new(source.clone())
+            .with_policy(quick())
+            .fetch(block.block_hash(), 100)
+            .await
+            .expect("served");
+        assert!(
+            comes_true(Duration::from_secs(5), || source.known()
+                == 1 + GOSSIP.len())
+            .await,
+            "known: {}",
+            source.known()
+        );
+    });
+}
+
+/// A peer that trickles a message after the block cannot keep the
+/// connection: it closes when the wait for addresses is over (3 s).
+#[test]
+fn a_peer_that_trickles_after_the_block_is_hung_up_on_in_time() {
+    run(async {
+        let block = genesis();
+        let trickling = node(37, &block, vec![Conn::ServeThenTrickle]);
+        let source = discovering(&[&trickling]);
+        BlockFetcher::new(source)
+            .with_policy(quick())
+            .fetch(block.block_hash(), 100)
+            .await
+            .expect("served");
+        let served = Instant::now();
+        assert!(
+            comes_true(Duration::from_secs(15), || trickling.hung_up().is_some()).await,
+            "still connected after 15 s"
+        );
+        let after = trickling.hung_up().unwrap() - served;
+        assert!(
+            after < Duration::from_secs(5),
+            "hung up {after:?} after the block"
+        );
+    });
+}
+
+/// A stop while such a peer trickles closes the connection at once.
+#[test]
+fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
+    run(async {
+        let block = genesis();
+        let trickling = node(38, &block, vec![Conn::ServeThenTrickle]);
+        let source = discovering(&[&trickling]);
+        let cancel = CancellationToken::new();
+        BlockFetcher::new(source)
+            .with_policy(quick())
+            .with_cancel(cancel.clone())
+            .fetch(block.block_hash(), 100)
+            .await
+            .expect("served");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        let stopped = Instant::now();
+        assert!(
+            comes_true(Duration::from_secs(15), || trickling.hung_up().is_some()).await,
+            "still connected after 15 s"
+        );
+        let after = trickling.hung_up().unwrap() - stopped;
+        assert!(
+            after < Duration::from_secs(1),
+            "hung up {after:?} after the stop"
+        );
+    });
+}
+
 #[test]
 fn without_peers_the_error_says_so_and_what_to_do() {
     let source = PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(Vec::new()));
