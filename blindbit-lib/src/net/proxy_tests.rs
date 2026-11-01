@@ -14,7 +14,7 @@ use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, ServiceFlags};
 
-use super::testing::FakeSocks5;
+use super::testing::{FakeSocks5, Gate};
 use super::{Dialer, PeerAddr, PeerHost, PeerSource, Purpose, Seeds, USER_AGENT, seeds_asked};
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
@@ -43,10 +43,11 @@ fn gossip_of(first: u8, count: u8) -> Vec<AddrV2Message> {
 }
 
 /// How a seed's node answers `getaddr`.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Answer {
     Now,
-    After(Duration),
+    /// Once the gate opens (or 30 s pass).
+    Once(Arc<Gate>),
     /// In a message that pauses for 700 ms halfway through.
     Split,
     /// One byte every 100 ms, for at most 15 s, never complete.
@@ -68,9 +69,9 @@ fn seed_node(
     let got = versions.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (addrs, got) = (addrs.clone(), got.clone());
+            let (answer, addrs, got) = (answer.clone(), addrs.clone(), got.clone());
             std::thread::spawn(move || {
-                let _ = serve(stream, answer, addrs, &got);
+                let _ = serve(stream, &answer, addrs, &got);
             });
         }
     });
@@ -92,7 +93,7 @@ fn silent_node() -> SocketAddr {
 
 fn serve(
     mut stream: TcpStream,
-    answer: Answer,
+    answer: &Answer,
     addrs: Vec<AddrV2Message>,
     versions: &Mutex<Vec<VersionMessage>>,
 ) -> std::io::Result<()> {
@@ -123,8 +124,8 @@ fn serve(
                 let answer_bytes = bytes(NetworkMessage::AddrV2(addrs.clone()));
                 match answer {
                     Answer::Now => stream.write_all(&answer_bytes)?,
-                    Answer::After(wait) => {
-                        std::thread::sleep(wait);
+                    Answer::Once(gate) => {
+                        gate.wait(Duration::from_secs(30));
                         stream.write_all(&answer_bytes)?;
                     }
                     Answer::Split => {
@@ -145,7 +146,7 @@ fn serve(
                     }
                     Answer::SinglesFirst(count) => {
                         let single = bytes(NetworkMessage::AddrV2(addrs[..1].to_vec()));
-                        for _ in 0..count {
+                        for _ in 0..*count {
                             stream.write_all(&single)?;
                         }
                         stream.write_all(&answer_bytes)?;
@@ -315,17 +316,19 @@ fn a_seed_node_sending_single_addresses_gets_one_of_them_kept() {
 
 /// Seeding through the proxy returns once one seed's node has given enough
 /// addresses; a slower seed's answer joins the book later, and one that
-/// never answers holds up nothing.
+/// never answers holds up nothing. The slower seed answers only once
+/// seeding has returned.
 #[test]
 fn proxied_seeding_does_not_wait_for_the_slowest_seed() {
     let proxy = FakeSocks5::start();
+    let slow_answers = Gate::new();
     proxy.route(
         "x9.quick-seed.invalid",
         seed_node(Answer::Now, gossip_of(1, 25)).0,
     );
     proxy.route(
         "x9.slow-seed.invalid",
-        seed_node(Answer::After(Duration::from_millis(800)), gossip_of(101, 5)).0,
+        seed_node(Answer::Once(slow_answers.clone()), gossip_of(101, 5)).0,
     );
     proxy.route("x9.mute-seed.invalid", silent_node());
     let source = PeerSource::discover(
@@ -344,14 +347,20 @@ fn proxied_seeding_does_not_wait_for_the_slowest_seed() {
             .await
             .expect("seeded");
         let took = started.elapsed();
-        assert!(took < Duration::from_secs(5), "seeding took {took:?}");
+        // Waiting for the other two would take 20 s, the wait for a seed's
+        // node.
+        assert!(took < Duration::from_secs(10), "seeding took {took:?}");
         let first = source.known();
         assert!(first > 0 && first <= 25, "{first} known");
-        tokio::time::sleep(Duration::from_millis(1_500)).await;
-        source
-            .next(Purpose::Block, &HashSet::new())
-            .await
-            .expect("a peer");
+        slow_answers.open();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while source.known() == first && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            source
+                .next(Purpose::Block, &HashSet::new())
+                .await
+                .expect("a peer");
+        }
         assert!(source.known() > first, "the slow seed's addresses joined");
     });
 }

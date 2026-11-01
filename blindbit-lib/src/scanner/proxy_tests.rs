@@ -297,41 +297,54 @@ fn through_a_proxy_connections_race_past_dead_peers() {
 
 /// A racer that opens while another connection downloads completes its
 /// handshake at once, so when the download fails it is ready, not a socket
-/// left idle that the peer may have dropped meanwhile.
+/// left idle that the peer may have dropped meanwhile. The stalling peer
+/// keeps its download going until the serving peer has the racer's
+/// `version` (or 20 s pass); a racer that waited for its turn to
+/// handshake would get there only after that.
 #[test]
 fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
     let block = genesis();
     let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
-    let stalls = Node::spawn_on(ip(81), full, 200, &block, vec![Conn::StallMidBlock]);
+    let stalls = Node::spawn_on(
+        ip(81),
+        full,
+        200,
+        &block,
+        vec![Conn::StallMidBlockUntilOpened],
+    );
     let serves = Node::spawn_on(ip(82), full, 200, &block, vec![Conn::Serve]);
     let proxy = FakeSocks5::start();
-    // The serving peer opens half a second after the stalling one, which is
-    // asked for the block first.
-    proxy.delay(serves.addr.into(), Duration::from_millis(500));
+    // The serving peer's connection opens once the stalling peer, asked for
+    // the block first, has stalled.
+    let serves_opens = proxy.hold(serves.addr.into());
     let source = PeerSource::discover(
         Network::Regtest,
         proxy.dialer(),
         Seeds::Static(vec![stalls.addr.into(), serves.addr.into()]),
     );
-    let fetcher = BlockFetcher::new(source).with_policy(RetryPolicy {
-        block_deadline: Duration::from_millis(1_500),
-        ..RetryPolicy::discovered()
+    let fetcher = BlockFetcher::new(source);
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || stalls.stalled().is_some()));
+            serves_opens.open();
+            if comes_true(GATE_LIMIT, || got_version(&serves)) {
+                stalls.open();
+            }
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
     });
-    let got = run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
-        .expect("the second peer serves it");
+    let got = got.expect("the second peer serves it");
     assert_eq!(got.block_hash(), block.block_hash());
     assert!(
         stalls.stalled().is_some(),
         "the stalling peer was asked first"
     );
-    let [serving] = serves.accepted()[..] else {
-        panic!("one connection to the serving peer");
-    };
-    let version_after = serving.version_after.expect("it got a version");
-    assert!(
-        version_after < Duration::from_millis(300),
-        "the handshake started {version_after:?} after the connection opened"
+    assert_eq!(
+        stalls.opened_in_time(),
+        Some(true),
+        "the racer's handshake waited until the stalled download ended"
     );
+    assert_eq!(serves.connections(), 1);
 }
 
 /// A racer whose handshake completed while another connection downloaded

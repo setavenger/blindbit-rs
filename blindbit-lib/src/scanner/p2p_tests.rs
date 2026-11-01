@@ -40,6 +40,9 @@ pub(super) enum Conn {
     /// Start sending the block and go silent halfway through it, keeping
     /// the connection open until the client hangs up (or 10 s pass).
     StallMidBlock,
+    /// [`Conn::StallMidBlock`] until the node's gate opens
+    /// ([`Node::open`], or [`GATE_LIMIT`] passes), then close.
+    StallMidBlockUntilOpened,
     /// Start sending the block, then send one more byte of it every
     /// 250 ms (the rest of the default block takes 38 s), until the client
     /// hangs up (or a minute passes).
@@ -104,13 +107,18 @@ pub(super) const GATE_LIMIT: Duration = Duration::from_secs(20);
 /// When things happened on a [`Node`]'s connections.
 #[derive(Default)]
 struct Moments {
-    /// A [`Conn::StallMidBlock`] connection went silent, or a
-    /// [`Conn::TrickleMidBlock`] one started trickling.
+    /// A [`Conn::StallMidBlock`] (or `…UntilOpened`) connection went
+    /// silent, or a [`Conn::TrickleMidBlock`] one started trickling.
     stalled: Mutex<Option<Instant>>,
+    /// A [`Conn::ServeThenTrickle`] connection started trickling.
+    trickling: Mutex<Option<Instant>>,
     /// The client hung up on a [`Conn::ServeThenTrickle`] connection.
     hung_up: Mutex<Option<Instant>>,
     /// What gated connections wait for.
     gate: Gate,
+    /// Whether the gate opened while a [`Conn::StallMidBlockUntilOpened`]
+    /// connection waited for it.
+    opened_in_time: Mutex<Option<bool>>,
 }
 
 /// One connection a [`Node`] accepted.
@@ -277,9 +285,20 @@ impl Node {
         *self.moments.hung_up.lock().unwrap()
     }
 
+    /// When a [`Conn::ServeThenTrickle`] connection started trickling.
+    pub(super) fn trickling(&self) -> Option<Instant> {
+        *self.moments.trickling.lock().unwrap()
+    }
+
     /// Let the gated connections go on.
     pub(super) fn open(&self) {
         self.moments.gate.open();
+    }
+
+    /// Whether the gate opened while a [`Conn::StallMidBlockUntilOpened`]
+    /// connection waited for it (`None`: none waited yet).
+    pub(super) fn opened_in_time(&self) -> Option<bool> {
+        *self.moments.opened_in_time.lock().unwrap()
     }
 
     /// The connections accepted so far, in order.
@@ -471,6 +490,18 @@ fn serve(
             wire.stream.flush()?;
             *moments.stalled.lock().unwrap() = Some(Instant::now());
         }
+        Conn::StallMidBlockUntilOpened => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            wire.stream.write_all(&bytes[..bytes.len() / 2])?;
+            wire.stream.flush()?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            let opened = moments.gate.wait(GATE_LIMIT);
+            *moments.opened_in_time.lock().unwrap() = Some(opened);
+            return wire.stream.shutdown(Shutdown::Both);
+        }
         Conn::TrickleMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(
                 magic,
@@ -527,6 +558,7 @@ fn trickle(stream: &mut TcpStream, magic: Magic, moments: &Arc<Moments>) -> std:
     let bytes = encode::serialize(&RawNetworkMessage::new(magic, NetworkMessage::AddrV2(many)));
     let started = Instant::now();
     stream.write_all(&bytes[..30])?;
+    *moments.trickling.lock().unwrap() = Some(Instant::now());
     for byte in &bytes[30..] {
         if started.elapsed() > Duration::from_secs(15) || moments.hung_up.lock().unwrap().is_some()
         {

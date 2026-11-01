@@ -487,7 +487,8 @@ mod tests {
 
     /// A proxy that answers its CONNECT reply one byte every 400 ms, each
     /// byte well within the 1 s timeout: the connection still ends at its
-    /// deadline, not when the last byte drips in (4 s).
+    /// deadline, not when the last byte drips in (11 s; the limit below
+    /// leaves room for a busy machine).
     #[test]
     fn a_proxy_that_drips_its_reply_cannot_stretch_the_timeout() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -505,7 +506,11 @@ mod tests {
             {
                 return;
             }
-            for byte in [VERSION, 0, 0, ATYP_IPV4, 127, 0, 0, 1, 0, 1] {
+            // Bound to a 20-byte name: a 27-byte reply.
+            let mut reply = vec![VERSION, 0, 0, ATYP_DOMAIN, 20];
+            reply.extend(b"exit.proxy.invalid.x");
+            reply.extend([0, 1]);
+            for byte in reply {
                 std::thread::sleep(Duration::from_millis(400));
                 if client.write_all(&[byte]).is_err() {
                     return;
@@ -518,9 +523,9 @@ mod tests {
             &"192.0.2.7:8333".parse::<SocketAddr>().unwrap().into(),
             Duration::from_secs(1),
         )
-        .expect_err("the reply takes 4 s");
+        .expect_err("the reply takes 11 s");
         let took = started.elapsed();
-        assert!(took < Duration::from_millis(1_800), "took {took:?}");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
         assert!(is_proxy_unclear(&err), "{err}");
     }

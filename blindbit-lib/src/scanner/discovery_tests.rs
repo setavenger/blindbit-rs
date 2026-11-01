@@ -409,7 +409,8 @@ fn a_peer_that_trickles_after_the_block_is_hung_up_on_in_time() {
     });
 }
 
-/// A stop while such a peer trickles closes the connection at once.
+/// A stop while such a peer trickles closes the connection at once, not
+/// when the wait for addresses ends (3 s after the block).
 #[test]
 fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
     run(async {
@@ -423,16 +424,24 @@ fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
             .fetch(block.block_hash(), 100)
             .await
             .expect("served");
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        cancel.cancel();
+        assert!(
+            comes_true(Duration::from_secs(15), || trickling.trickling().is_some()).await,
+            "the peer never started trickling"
+        );
         let stopped = Instant::now();
+        cancel.cancel();
         assert!(
             comes_true(Duration::from_secs(15), || trickling.hung_up().is_some()).await,
             "still connected after 15 s"
         );
-        let after = trickling.hung_up().unwrap() - stopped;
+        let hung_up = trickling.hung_up().unwrap();
         assert!(
-            after < Duration::from_secs(1),
+            hung_up >= stopped,
+            "the connection closed before the stop, so the stop was not what closed it"
+        );
+        let after = hung_up - stopped;
+        assert!(
+            after < Duration::from_secs(2),
             "hung up {after:?} after the stop"
         );
     });
