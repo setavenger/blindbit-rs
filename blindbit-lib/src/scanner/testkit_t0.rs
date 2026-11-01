@@ -71,10 +71,9 @@ use bdk_sp::receive::compute_tweak_data;
 use bitcoin::hashes::{Hash, sha256};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{
-    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-    TxMerkleNode, TxOut, Witness, absolute::LockTime, transaction::Version,
+    Amount, Block, BlockHash, CompactTarget, Network, OutPoint, ScriptBuf, Sequence, Transaction,
+    TxIn, TxMerkleNode, TxOut, Witness, absolute::LockTime, transaction::Version,
 };
-use bitcoin_rev::Network;
 use serde::Deserialize;
 use tonic::transport::Channel;
 
