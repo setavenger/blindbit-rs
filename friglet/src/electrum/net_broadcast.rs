@@ -884,14 +884,13 @@ fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2p
         // The proxy failed, not the peer.
         Err(error) if error.proxy_down() => Err(error),
         Err(error) => {
-            // Only a direct connect says this computer has no route there;
-            // through a proxy "network unreachable" (SOCKS reply 0x03) is
-            // about the proxy's network.
-            let no_route = peers.dialer().proxy().is_none()
-                && matches!(
-                    &error,
-                    P2pError::Io(io) if io.kind() == std::io::ErrorKind::NetworkUnreachable
-                );
+            // No route from this computer to the peer's network, by the
+            // scanner's rule: never through the proxy, whose "network
+            // unreachable" (SOCKS reply 0x03) is about its own routes.
+            let no_route = matches!(
+                &error,
+                P2pError::Io(io) if blindbit_lib::net::is_no_route(io, addr)
+            );
             let event = if no_route {
                 PeerEvent::NoRoute
             } else {
