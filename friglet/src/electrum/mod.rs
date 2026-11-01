@@ -11,14 +11,15 @@
 //! - `blockchain.block.header`               — block header fetch from index
 //! - `blockchain.silentpayments.subscribe/unsubscribe` — SP scanning
 //! - `blockchain.transaction.broadcast`      — relay via P2P; succeeds only once
-//!   the peer has the transaction in its mempool (see [`relay`])
+//!   the own node has the transaction in its mempool (see [`relay`]), or a
+//!   discovered peer it was not handed to (see [`net_broadcast`])
 //! - `blockchain.relayfee`                   — the P2P peer's mempool minimum
 //! - `blockchain.estimatefee`                — `-1`: friglet has no fee estimator
 //! - `mempool.get_fee_histogram`             — empty: friglet has no mempool view
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +31,7 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 use bitcoin::BlockHash;
 use bitcoin::Network;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
-use blindbit_lib::net::{Dialer, PeerAddr, PeerEvent, PeerSource, Purpose};
+use blindbit_lib::net::{Dialer, PeerAddr, PeerSource};
 use blindbit_lib::scanner::{WalletElectrumIndex, electrum_scripthash, electrum_status};
 
 use crate::blockheader;
@@ -38,11 +39,13 @@ use crate::blockheader;
 mod chain;
 #[cfg(test)]
 mod fake_peer;
+mod net_broadcast;
 mod p2p;
 mod pending;
 mod relay;
 
 use self::chain::ChainSource;
+use self::net_broadcast::Verdict;
 use self::p2p::P2pError;
 use self::pending::PendingStore;
 pub(crate) use self::pending::now_secs;
@@ -57,8 +60,8 @@ const BROADCAST_BUDGET: Duration = Duration::from_secs(25);
 const BROADCAST_OUTCOME_TTL: Duration = Duration::from_secs(120);
 /// Retry delay after the tip header could not be fetched.
 const TIP_RETRY: Duration = Duration::from_secs(15);
-/// Discovered peers tried for one relay job when a peer cannot be asked.
-const RELAY_PEERS: usize = 3;
+/// Discovered peers a pending recheck asks.
+const RECHECK_PEERS: usize = 2;
 /// How often pending broadcasts are checked against the peer's mempool.
 const PENDING_RECHECK: Duration = Duration::from_secs(10 * 60);
 /// Bitcoin Core's long-standing default minimum relay fee (1 sat/vB),
@@ -736,12 +739,17 @@ type BroadcastResult = Result<String, (i32, String)>;
 enum RecentBroadcast {
     /// Accepted, or refused for a reason that does not go away.
     Final(BroadcastResult),
-    /// Not in the peer's mempool when the wait ended.
-    Inconclusive((i32, String)),
+    /// Not seen in a mempool when the wait ended; `sent_to` are the
+    /// discovered peers it was handed to.
+    Inconclusive {
+        error: (i32, String),
+        sent_to: Vec<PeerAddr>,
+    },
 }
 
-/// Relay a transaction and answer with its txid only once the P2P peer has
-/// it in its mempool; otherwise with an error that says what is known.
+/// Relay a transaction and answer with its txid only once it is in a
+/// mempool: the own node's, or one of a discovered peer it was not handed
+/// to; otherwise with an error that says what is known.
 async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> BroadcastResult {
     let raw = hex::decode(raw_hex.trim())
         .map_err(|error| (1, format!("TX decode failed: invalid hex: {error}")))?;
@@ -760,20 +768,15 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     };
     let mut candidate = match cached {
         Some(RecentBroadcast::Final(result)) => return result,
-        // The peer may have accepted it after the wait ended: one quick look
+        // It may have been accepted after the wait ended: one quick look
         // before repeating the answer.
-        Some(RecentBroadcast::Inconclusive(error)) => {
+        Some(RecentBroadcast::Inconclusive { error, sent_to }) => {
             let candidate = Arc::new(candidate);
-            let task_candidate = candidate.clone();
-            let now_in_mempool = with_relay_peer(state, move |dialer, addr, network| {
-                relay::in_mempool(dialer, addr, network, &task_candidate)
-            })
-            .await;
-            if !matches!(now_in_mempool, Ok((true, _))) {
+            if !in_mempool_now(state, &candidate, &sent_to).await {
                 return Err(error);
             }
-            tracing::info!(%txid, "broadcast reached the peer's mempool after the wait ended");
-            accept_pending(state, &candidate).await;
+            tracing::info!(%txid, "broadcast reached a mempool after the wait ended");
+            accept_pending(state, &candidate, &sent_to).await;
             remember_broadcast(state, &txid, RecentBroadcast::Final(Ok(txid.clone()))).await;
             return Ok(txid);
         }
@@ -790,32 +793,79 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     }
 
     let candidate = Arc::new(candidate);
+    let remembered = match state.chain.peers().own_node_addr() {
+        Some(_) => broadcast_to_own_node(state, &candidate).await?,
+        None => broadcast_to_network(state, &candidate).await?,
+    };
+    let result = match &remembered {
+        RecentBroadcast::Final(result) => result.clone(),
+        RecentBroadcast::Inconclusive { error, .. } => Err(error.clone()),
+    };
+    remember_broadcast(state, &txid, remembered).await;
+    result
+}
+
+/// Is `candidate` in a mempool now? The own node's, or that of one
+/// discovered peer outside `sent_to`.
+async fn in_mempool_now(
+    state: &ElectrumServerState,
+    candidate: &Arc<Candidate>,
+    sent_to: &[PeerAddr],
+) -> bool {
+    let peers = state.chain.peers().clone();
+    if peers.is_own_node() {
+        let task_candidate = candidate.clone();
+        let answer = with_own_node(state, move |dialer, addr, network| {
+            relay::in_mempool(dialer, addr, network, &task_candidate)
+        })
+        .await;
+        return matches!(answer, Ok((true, _)));
+    }
+    let exclude = sent_to.iter().cloned().collect();
+    let candidates = Arc::new(vec![Candidate::clone(candidate)]);
+    match net_broadcast::ask_mempools(&peers, candidates, &exclude, true, 1).await {
+        Ok(asked) => {
+            for (peer, rate) in &asked.fee_filters {
+                state.chain.note_fee_filter(peer, Some(*rate));
+            }
+            asked.present[0]
+        }
+        Err(error) => {
+            tracing::debug!(txid = %candidate.txid, %error, "could not look for the broadcast again");
+            false
+        }
+    }
+}
+
+/// The own node takes the transaction and is asked whether its mempool has
+/// it. `Err` is the answer when the node cannot be asked (not remembered
+/// for resends).
+async fn broadcast_to_own_node(
+    state: &ElectrumServerState,
+    candidate: &Arc<Candidate>,
+) -> Result<RecentBroadcast, (i32, String)> {
+    let txid = candidate.txid.to_string();
     let task_candidate = candidate.clone();
     let started = Instant::now();
-    let result = with_relay_peer(state, move |dialer, addr, network| {
+    let result = with_own_node(state, move |dialer, addr, network| {
         relay::broadcast(dialer, addr, network, &task_candidate, BROADCAST_BUDGET)
     })
     .await;
     let ((outcome, fee_filter), addr) = match result {
         Ok(answer) => answer,
-        // The peer could not be asked: not an answer about the transaction,
-        // so it is not remembered for resends either.
         Err(RelayFailure::Unavailable { peer, error }) => {
-            tracing::warn!(%txid, peer = ?peer.as_ref().map(ToString::to_string), %error, "broadcast failed");
-            let message = match peer {
-                Some(addr) if state.chain.peers().is_own_node() => {
-                    format!("broadcast failed: P2P peer {addr} unavailable: {error}")
-                }
-                _ => format!("broadcast failed: no Bitcoin peer could be asked: {error}"),
-            };
-            return Err((2, message));
+            tracing::warn!(%txid, %peer, %error, "broadcast failed");
+            return Err((
+                2,
+                format!("broadcast failed: P2P peer {peer} unavailable: {error}"),
+            ));
         }
         Err(RelayFailure::Task(error)) => {
             return Err((-32603, format!("broadcast task failed: {error}")));
         }
     };
     state.chain.note_fee_filter(&addr, fee_filter);
-    let remembered = match outcome {
+    Ok(match outcome {
         Outcome::InMempool => {
             tracing::info!(
                 %txid,
@@ -823,8 +873,8 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "broadcast accepted into the peer's mempool"
             );
-            accept_pending(state, &candidate).await;
-            RecentBroadcast::Final(Ok(txid.clone()))
+            accept_pending(state, candidate, &[]).await;
+            RecentBroadcast::Final(Ok(txid))
         }
         Outcome::Rejected(message) => {
             tracing::warn!(%txid, peer = %addr, reason = %message, "broadcast rejected");
@@ -832,70 +882,114 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
         }
         Outcome::NotAccepted(message) => {
             tracing::warn!(%txid, peer = %addr, reason = %message, "broadcast not accepted");
-            RecentBroadcast::Inconclusive((1, message))
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+                sent_to: Vec::new(),
+            }
         }
-    };
-    let result = match &remembered {
-        RecentBroadcast::Final(result) => result.clone(),
-        RecentBroadcast::Inconclusive(error) => Err(error.clone()),
-    };
-    remember_broadcast(state, &txid, remembered).await;
-    result
+    })
 }
 
-/// Why a relay job got no answer.
+/// Discovered peers take the transaction, and others confirm it (see
+/// [`net_broadcast`]).
+async fn broadcast_to_network(
+    state: &ElectrumServerState,
+    candidate: &Arc<Candidate>,
+) -> Result<RecentBroadcast, (i32, String)> {
+    let txid = candidate.txid.to_string();
+    let started = Instant::now();
+    let report = net_broadcast::broadcast(
+        state.chain.peers().clone(),
+        candidate.clone(),
+        BROADCAST_BUDGET,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(%txid, %error, "broadcast failed");
+        (2, format!("broadcast failed: {error}"))
+    })?;
+    for (peer, rate) in &report.fee_filters {
+        state.chain.note_fee_filter(peer, Some(*rate));
+    }
+    let sent_to = report.sent_to;
+    let senders = sent_to
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(match report.verdict {
+        Verdict::InMempool { by } => {
+            tracing::info!(
+                %txid,
+                confirmed_by = %by,
+                handed_to = sent_to.len(),
+                sent_to = %senders,
+                elapsed_ms,
+                "broadcast accepted: a peer it was not handed to has it in its mempool"
+            );
+            accept_pending(state, candidate, &sent_to).await;
+            RecentBroadcast::Final(Ok(txid))
+        }
+        Verdict::Rejected(message) => {
+            tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast rejected");
+            RecentBroadcast::Final(Err((1, message)))
+        }
+        // Probably invalid, but peers can also just go away: a resend
+        // looks again.
+        Verdict::Dropped(message) => {
+            tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast dropped by every peer it was handed to");
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+                sent_to,
+            }
+        }
+        Verdict::Unconfirmed { waited } => {
+            let message = net_broadcast::unconfirmed_message(
+                candidate,
+                state.chain.known_fee_filter(),
+                waited,
+                sent_to.len(),
+            );
+            tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast not confirmed");
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+                sent_to,
+            }
+        }
+    })
+}
+
+/// Why a relay job got no answer from the own node.
 enum RelayFailure {
-    /// No peer could be asked; the last one tried, if any, and why.
-    Unavailable {
-        peer: Option<PeerAddr>,
-        error: String,
-    },
+    /// The node could not be asked.
+    Unavailable { peer: PeerAddr, error: String },
     /// The blocking task itself failed.
     Task(String),
 }
 
-/// Run `job` (blocking) against a peer for relaying: the own node, or a
-/// discovered peer, moving on to another (up to [`RELAY_PEERS`]) when one
-/// cannot be asked. Returns the answer and the peer that gave it.
-async fn with_relay_peer<T: Send + 'static>(
+/// Run `job` (blocking) against the own node. Returns the answer and the
+/// node's address.
+async fn with_own_node<T: Send + 'static>(
     state: &ElectrumServerState,
-    job: impl Fn(&Dialer, &PeerAddr, Network) -> Result<T, P2pError> + Send + Sync + 'static,
+    job: impl FnOnce(&Dialer, &PeerAddr, Network) -> Result<T, P2pError> + Send + 'static,
 ) -> Result<(T, PeerAddr), RelayFailure> {
     let peers = state.chain.peers().clone();
-    let tries = if peers.is_own_node() { 1 } else { RELAY_PEERS };
-    let job = Arc::new(job);
-    let mut asked = std::collections::HashSet::new();
-    let mut last = None;
-    for _ in 0..tries {
-        let addr = match peers.next(Purpose::Relay, &asked).await {
-            Ok(addr) => addr,
-            Err(no_peers) => {
-                return Err(RelayFailure::Unavailable {
-                    peer: last.map(|(peer, _)| peer),
-                    error: no_peers.to_string(),
-                });
-            }
-        };
-        asked.insert(addr.clone());
-        let (task_peers, task_addr, task_job) = (peers.clone(), addr.clone(), job.clone());
-        let answer = tokio::task::spawn_blocking(move || {
-            task_job(task_peers.dialer(), &task_addr, task_peers.network())
-        })
-        .await
-        .map_err(|error| RelayFailure::Task(error.to_string()))?;
-        match answer {
-            Ok(value) => return Ok((value, addr)),
-            Err(error) => {
-                peers.report(&addr, PeerEvent::Unreachable);
-                tracing::debug!(peer = %addr, %error, "relay peer could not be asked");
-                last = Some((addr, error.to_string()));
-            }
+    let addr = peers
+        .own_node_addr()
+        .expect("only called with an own node")
+        .clone();
+    let task_addr = addr.clone();
+    let answer =
+        tokio::task::spawn_blocking(move || job(peers.dialer(), &task_addr, peers.network()))
+            .await
+            .map_err(|error| RelayFailure::Task(error.to_string()))?;
+    answer.map(|value| (value, addr.clone())).map_err(|error| {
+        tracing::debug!(peer = %addr, %error, "own node could not be asked");
+        RelayFailure::Unavailable {
+            peer: addr,
+            error: error.to_string(),
         }
-    }
-    let (peer, error) = last.expect("at least one try");
-    Err(RelayFailure::Unavailable {
-        peer: Some(peer),
-        error,
     })
 }
 
@@ -923,9 +1017,10 @@ fn fee_from_index(index: &WalletElectrumIndex, tx: &bitcoin::Transaction) -> Opt
     input_sum.checked_sub(output_sum)
 }
 
-/// The peer accepted `candidate`: show it as unconfirmed, remember it until
-/// it confirms, and retire pending broadcasts it replaced.
-async fn accept_pending(state: &ElectrumServerState, candidate: &Candidate) {
+/// `candidate` is in a mempool: show it as unconfirmed, remember it (and
+/// the discovered peers it was handed to) until it confirms, and retire
+/// pending broadcasts it replaced.
+async fn accept_pending(state: &ElectrumServerState, candidate: &Candidate, sent_to: &[PeerAddr]) {
     let txid = candidate.txid.to_string();
     let raw_hex = hex::encode(&candidate.raw);
     index_unconfirmed_tx(&state.index, &raw_hex, &txid).await;
@@ -938,7 +1033,7 @@ async fn accept_pending(state: &ElectrumServerState, candidate: &Candidate) {
         for other in &replaced {
             store.remove(other);
         }
-        store.insert(txid.clone(), raw_hex);
+        store.insert(txid.clone(), raw_hex, sent_to);
         store.save();
         replaced
     };
@@ -1002,7 +1097,7 @@ async fn recheck_pending(state: &ElectrumServerState) {
                 ));
                 continue;
             }
-            candidates.push(candidate);
+            candidates.push((candidate, pending_tx.sent_to()));
         }
         for txid in &confirmed {
             store.remove(txid);
@@ -1020,55 +1115,209 @@ async fn recheck_pending(state: &ElectrumServerState) {
     };
 
     if !candidates.is_empty() {
-        let candidates = Arc::new(candidates);
-        let task_candidates = candidates.clone();
-        let result = with_relay_peer(state, move |dialer, addr, network| {
-            relay::recheck(dialer, addr, network, &task_candidates)
-        })
-        .await;
-        match result {
-            Ok(((present, fee_filter), addr)) => {
-                state.chain.note_fee_filter(&addr, fee_filter);
-                let now = pending::now_secs();
-                let mut store = state.pending.lock().await;
-                let mut expired = Vec::new();
-                for (candidate, in_mempool) in candidates.iter().zip(present) {
-                    let txid = candidate.txid.to_string();
-                    let Some(entry) = store.get_mut(&txid) else {
-                        continue;
-                    };
-                    if in_mempool {
-                        entry.last_in_mempool = now;
-                    } else if now.saturating_sub(entry.last_in_mempool) > pending::EXPIRY_SECS {
-                        expired.push(txid);
-                    } else {
-                        entry.reannounced += 1;
-                    }
-                }
-                if !expired.is_empty() {
-                    let mut index = state.index.lock().await;
-                    for txid in &expired {
-                        store.remove(txid);
-                        index_changed |= pending::unindex_unconfirmed(&mut index, txid);
-                        tracing::warn!(
-                            %txid,
-                            "dropped a pending broadcast the peer has not had in its mempool for \
-                             longer than its expiry"
-                        );
-                    }
-                }
-                store.save();
-            }
-            Err(RelayFailure::Unavailable { peer, error }) => {
-                tracing::warn!(peer = ?peer.as_ref().map(ToString::to_string), %error, "could not recheck pending broadcasts")
-            }
-            Err(RelayFailure::Task(error)) => tracing::warn!(%error, "pending recheck task failed"),
+        let checked = if state.chain.peers().is_own_node() {
+            recheck_on_own_node(state, candidates).await
+        } else {
+            recheck_on_network(state, candidates).await
+        };
+        if let Some(checked) = checked {
+            index_changed |= settle_rechecked(state, checked).await;
         }
     }
 
     if index_changed {
         push_notifications(state).await;
     }
+}
+
+/// What a recheck found for one pending transaction.
+struct Rechecked {
+    txid: String,
+    in_mempool: bool,
+    /// The discovered peer it was handed to again.
+    handed_to: Option<PeerAddr>,
+}
+
+/// Ask the own node about each pending transaction, re-announcing what its
+/// mempool lost. `None` when it could not be asked.
+async fn recheck_on_own_node(
+    state: &ElectrumServerState,
+    candidates: Vec<(Candidate, HashSet<PeerAddr>)>,
+) -> Option<Vec<Rechecked>> {
+    let candidates: Arc<Vec<Candidate>> = Arc::new(
+        candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect(),
+    );
+    let task_candidates = candidates.clone();
+    let result = with_own_node(state, move |dialer, addr, network| {
+        relay::recheck(dialer, addr, network, &task_candidates)
+    })
+    .await;
+    match result {
+        Ok(((present, fee_filter), addr)) => {
+            state.chain.note_fee_filter(&addr, fee_filter);
+            Some(
+                candidates
+                    .iter()
+                    .zip(present)
+                    .map(|(candidate, in_mempool)| Rechecked {
+                        txid: candidate.txid.to_string(),
+                        in_mempool,
+                        handed_to: None,
+                    })
+                    .collect(),
+            )
+        }
+        Err(RelayFailure::Unavailable { peer, error }) => {
+            tracing::warn!(%peer, %error, "could not recheck pending broadcasts");
+            None
+        }
+        Err(RelayFailure::Task(error)) => {
+            tracing::warn!(%error, "pending recheck task failed");
+            None
+        }
+    }
+}
+
+/// Discovered peers: ask up to two peers none of the pending transactions
+/// was handed to, so no peer's answer is its own echo, and hand what both
+/// lack to one of them. `None` when no peer could be asked.
+async fn recheck_on_network(
+    state: &ElectrumServerState,
+    candidates: Vec<(Candidate, HashSet<PeerAddr>)>,
+) -> Option<Vec<Rechecked>> {
+    let peers = state.chain.peers().clone();
+    let sent_to: HashSet<PeerAddr> = candidates
+        .iter()
+        .flat_map(|(_, sent_to)| sent_to.iter().cloned())
+        .collect();
+    let candidates: Arc<Vec<Candidate>> = Arc::new(
+        candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect(),
+    );
+    // Many pending transactions can rule out every group the pool knows:
+    // then only the peers themselves are passed over.
+    let mut asked = Err(String::new());
+    for avoid_groups in [true, false] {
+        asked = net_broadcast::ask_mempools(
+            &peers,
+            candidates.clone(),
+            &sent_to,
+            avoid_groups,
+            RECHECK_PEERS,
+        )
+        .await;
+        if asked.is_ok() {
+            break;
+        }
+    }
+    let asked = match asked {
+        Ok(asked) => asked,
+        Err(error) => {
+            tracing::warn!(%error, "could not recheck pending broadcasts");
+            return None;
+        }
+    };
+    for (peer, rate) in &asked.fee_filters {
+        state.chain.note_fee_filter(peer, Some(*rate));
+    }
+    tracing::info!(
+        asked = %asked.peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        not_asked = sent_to.len(),
+        pending = candidates.len(),
+        "pending broadcasts: asked peers they were not handed to"
+    );
+    let lost: Vec<usize> = (0..candidates.len())
+        .filter(|&i| !asked.present[i])
+        .collect();
+    let mut handed_to = None;
+    if !lost.is_empty() {
+        // The first asked peer that takes them.
+        for target in &asked.peers {
+            let (task_peers, task_candidates, task_target, task_lost) = (
+                peers.clone(),
+                candidates.clone(),
+                target.clone(),
+                lost.clone(),
+            );
+            let handed = tokio::task::spawn_blocking(move || {
+                let lost: Vec<&Candidate> =
+                    task_lost.iter().map(|&i| &task_candidates[i]).collect();
+                net_broadcast::hand_over(&task_peers, &task_target, &lost)
+            })
+            .await;
+            match handed {
+                Ok(Ok(requested)) => {
+                    tracing::info!(
+                        peer = %target,
+                        transactions = lost.len(),
+                        requested = requested.iter().filter(|r| **r).count(),
+                        "pending broadcasts were in no asked mempool; handed them to one of those peers"
+                    );
+                    handed_to = Some(target.clone());
+                    break;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(peer = %target, %error, "could not hand pending broadcasts over again")
+                }
+                Err(error) => tracing::warn!(%error, "pending hand-over task failed"),
+            }
+        }
+    }
+    Some(
+        candidates
+            .iter()
+            .zip(asked.present)
+            .map(|(candidate, in_mempool)| Rechecked {
+                txid: candidate.txid.to_string(),
+                in_mempool,
+                handed_to: if in_mempool { None } else { handed_to.clone() },
+            })
+            .collect(),
+    )
+}
+
+/// Record a recheck: seen ones are fresh again, ones out of every mempool
+/// for longer than Bitcoin Core keeps anything are dropped. Returns whether
+/// the index changed.
+async fn settle_rechecked(state: &ElectrumServerState, checked: Vec<Rechecked>) -> bool {
+    let now = pending::now_secs();
+    let mut store = state.pending.lock().await;
+    let mut expired = Vec::new();
+    for rechecked in checked {
+        let Some(entry) = store.get_mut(&rechecked.txid) else {
+            continue;
+        };
+        if rechecked.in_mempool {
+            entry.last_in_mempool = now;
+        } else if now.saturating_sub(entry.last_in_mempool) > pending::EXPIRY_SECS {
+            expired.push(rechecked.txid);
+        } else {
+            entry.reannounced += 1;
+            if let Some(peer) = &rechecked.handed_to {
+                entry.note_sent_to(peer);
+            }
+        }
+    }
+    let mut index_changed = false;
+    if !expired.is_empty() {
+        let mut index = state.index.lock().await;
+        for txid in &expired {
+            store.remove(txid);
+            index_changed |= pending::unindex_unconfirmed(&mut index, txid);
+            tracing::warn!(
+                %txid,
+                "dropped a pending broadcast the peer has not had in its mempool for \
+                 longer than its expiry"
+            );
+        }
+    }
+    store.save();
+    index_changed
 }
 
 /// `blockchain.relayfee`: the lowest fee rate the P2P peer's mempool accepts
@@ -1323,16 +1572,23 @@ mod tests {
         p2p: Option<std::net::SocketAddr>,
         dir: &Path,
     ) -> ElectrumServerState {
+        let node = p2p.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap());
+        state_with(
+            index,
+            PeerSource::own_node(node.into(), Dialer::Direct, Network::Regtest),
+            dir,
+        )
+    }
+
+    /// [`state`] with any peer source.
+    fn state_with(
+        index: WalletElectrumIndex,
+        peers: Arc<PeerSource>,
+        dir: &Path,
+    ) -> ElectrumServerState {
         ElectrumServerState {
             index: Arc::new(Mutex::new(index)),
-            chain: ChainSource::new(
-                PeerSource::own_node(
-                    p2p.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap()).into(),
-                    Dialer::Direct,
-                    Network::Regtest,
-                ),
-                "http://127.0.0.1:1".into(),
-            ),
+            chain: ChainSource::new(peers, "http://127.0.0.1:1".into()),
             block_checkpoints: std::sync::Mutex::new(HashMap::new()),
             header_sidecar: dir.join("state.headers.json"),
             header_fetch_lock: Mutex::new(()),
@@ -1663,7 +1919,10 @@ mod tests {
         remember_broadcast(
             &state,
             &txid,
-            RecentBroadcast::Inconclusive((1, "not accepted".into())),
+            RecentBroadcast::Inconclusive {
+                error: (1, "not accepted".into()),
+                sent_to: Vec::new(),
+            },
         )
         .await;
 
@@ -1687,7 +1946,7 @@ mod tests {
         let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
         {
             let mut store = PendingStore::load(dir.join("state.pending.json"));
-            store.insert(txid.clone(), raw_hex.clone());
+            store.insert(txid.clone(), raw_hex.clone(), &[]);
             store.save();
         }
 
@@ -1744,7 +2003,7 @@ mod tests {
             .pending
             .lock()
             .await
-            .insert(txid.clone(), raw_hex.clone());
+            .insert(txid.clone(), raw_hex.clone(), &[]);
         index_unconfirmed_tx(&state.index, &raw_hex, &txid).await;
 
         // Still scanning: nothing is judged yet.
@@ -1832,5 +2091,267 @@ mod tests {
         persisted.sort();
         assert_eq!(persisted, vec![100, 104], "sidecar rewritten without them");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Discovered peers on 127.N.0.1, one network group each (not on macOS,
+    /// where only 127.0.0.1 is a loopback address).
+    #[cfg(not(target_os = "macos"))]
+    mod discovered {
+        use super::*;
+        use crate::electrum::fake_peer::FakeNet;
+        use blindbit_lib::net::{Purpose, Seeds};
+
+        fn fake_net(net: &FakeNet, base: u8, scripts: Vec<Script>) -> Vec<FakePeer> {
+            scripts
+                .into_iter()
+                .enumerate()
+                .map(|(n, script)| net.peer([127, base + n as u8, 0, 1].into(), script))
+                .collect()
+        }
+
+        async fn discovered(fakes: &[FakePeer]) -> Arc<PeerSource> {
+            let peers = PeerSource::discover(
+                Network::Regtest,
+                Dialer::Direct,
+                Seeds::Static(fakes.iter().map(|fake| fake.addr.into()).collect()),
+            );
+            peers
+                .next(Purpose::Block, &std::collections::HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                peers.known(),
+                fakes.len(),
+                "slot collision: pick other addresses"
+            );
+            peers
+        }
+
+        fn connections(fakes: &[FakePeer]) -> usize {
+            fakes.iter().map(|fake| fake.conns().len()).sum()
+        }
+
+        #[tokio::test]
+        async fn a_broadcast_is_accepted_once_a_peer_it_was_not_handed_to_has_it() {
+            let dir = temp_dir("net-broadcast");
+            let (index, received) = wallet();
+            let net = FakeNet::new();
+            let fakes = fake_net(&net, 110, vec![Script::default(); 5]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert_eq!(response["result"], json!(txid));
+            // The peers it was handed to are kept for rechecks.
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            let (_, pending) = reloaded.entries().next().unwrap();
+            assert_eq!(pending.sent_to.len(), 2);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn no_reachable_peer_is_error_code_2() {
+            let dir = temp_dir("net-broadcast-unreachable");
+            let (index, received) = wallet();
+            let closed: Vec<std::net::SocketAddr> = (0..3)
+                .map(|n| {
+                    let listener = std::net::TcpListener::bind(std::net::SocketAddr::from((
+                        [127, 120 + n, 0, 1],
+                        0,
+                    )))
+                    .unwrap();
+                    listener.local_addr().unwrap()
+                })
+                .collect();
+            let peers = PeerSource::discover(
+                Network::Regtest,
+                Dialer::Direct,
+                Seeds::Static(closed.into_iter().map(Into::into).collect()),
+            );
+            let state = state_with(index, peers, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&spend(
+                &received, 1_000, 0,
+            )));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert_eq!(response["error"]["code"], 2);
+            assert!(
+                response["error"]["message"].as_str().unwrap().starts_with(
+                    "broadcast failed: no Bitcoin peers reachable to confirm the broadcast"
+                ),
+                "{response}"
+            );
+            assert!(state.pending.lock().await.is_empty());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn the_relay_fee_comes_from_the_observers_fee_filters() {
+            let dir = temp_dir("net-broadcast-fee");
+            let (index, received) = wallet();
+            let net = FakeNet::new();
+            // Any three of these have the median 2000.
+            let scripts = [1_000, 2_000, 2_000, 2_000, 100_000]
+                .into_iter()
+                .map(|fee_filter| Script {
+                    fee_filter,
+                    ..Script::default()
+                })
+                .collect();
+            let fakes = fake_net(&net, 130, scripts);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&spend(
+                &received, 1_000, 0,
+            )));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert!(response["result"].is_string(), "{response}");
+            let before = connections(&fakes);
+            let response = call(&state, "blockchain.relayfee", vec![]).await;
+            assert_eq!(response["result"], json!(0.00002));
+            assert_eq!(connections(&fakes), before, "no further peer was asked");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_resend_after_an_inconclusive_wait_asks_a_peer_it_was_not_handed_to() {
+            let dir = temp_dir("net-broadcast-late");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let net = FakeNet::new();
+            let fakes = fake_net(
+                &net,
+                140,
+                vec![
+                    Script {
+                        mempool: vec![raw.clone()],
+                        ..Script::default()
+                    },
+                    Script::default(),
+                ],
+            );
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            remember_broadcast(
+                &state,
+                &txid,
+                RecentBroadcast::Inconclusive {
+                    error: (1, "not confirmed".into()),
+                    sent_to: vec![fakes[0].addr.into()],
+                },
+            )
+            .await;
+            let response = call(
+                &state,
+                "blockchain.transaction.broadcast",
+                vec![json!(hex::encode(raw))],
+            )
+            .await;
+            assert_eq!(response["result"], json!(txid));
+            assert!(fakes[0].conns().is_empty(), "the sender was not asked");
+            assert_eq!(fakes[1].conns().len(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// With every other network group ruled out, a recheck still asks a
+        /// peer it was not handed to, in a group that one shares.
+        #[tokio::test]
+        async fn a_recheck_falls_back_to_a_peer_in_a_senders_group() {
+            let dir = temp_dir("net-recheck-groups");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let net = FakeNet::new();
+            let sender = net.peer([127, 160, 0, 1].into(), Script::default());
+            let neighbour = net.peer(
+                [127, 160, 0, 2].into(),
+                Script {
+                    mempool: vec![raw.clone()],
+                    ..Script::default()
+                },
+            );
+            let fakes = [sender, neighbour];
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), hex::encode(&raw), &[fakes[0].addr.into()]);
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            recheck_pending(&state).await;
+            assert!(fakes[0].conns().is_empty(), "the sender was not asked");
+            assert_eq!(fakes[1].conns().len(), 1);
+            let store = state.pending.lock().await;
+            let (_, pending) = store.entries().next().unwrap();
+            assert_eq!(pending.reannounced, 0, "it had it");
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_recheck_never_asks_a_peer_the_transaction_was_handed_to() {
+            let dir = temp_dir("net-recheck");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let net = FakeNet::new();
+            let fakes = fake_net(&net, 150, vec![Script::default(); 4]);
+            let senders: Vec<PeerAddr> = vec![fakes[0].addr.into(), fakes[1].addr.into()];
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), raw_hex.clone(), &senders);
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+
+            // Lost from every mempool: handed to one of the asked peers.
+            recheck_pending(&state).await;
+            for sender in &fakes[..2] {
+                assert!(sender.conns().is_empty(), "a sender was contacted");
+            }
+            assert!(net.has(tx.compute_txid()));
+            let sent_to = state
+                .pending
+                .lock()
+                .await
+                .entries()
+                .next()
+                .unwrap()
+                .1
+                .sent_to();
+            assert_eq!(sent_to.len(), 3);
+            let handed_to = fakes[2..]
+                .iter()
+                .find(|fake| sent_to.contains(&fake.addr.into()))
+                .expect("one of the asked peers");
+            let reannounced = handed_to
+                .conns()
+                .into_iter()
+                .find(|conn| conn.commands.iter().any(|c| c == "tx"))
+                .expect("handed over");
+            assert!(!reannounced.version.relay, "on a sender connection");
+
+            // Next time only the peer it was not handed to is asked, and
+            // has it.
+            let before = handed_to.conns().len();
+            recheck_pending(&state).await;
+            assert_eq!(
+                handed_to.conns().len(),
+                before,
+                "not asked: it got the transaction"
+            );
+            let store = state.pending.lock().await;
+            let (_, pending) = store.entries().next().unwrap();
+            assert_eq!(pending.sent_to().len(), 3, "nothing handed over again");
+            assert_eq!(pending.reannounced, 1);
+            drop(store);
+            for sender in &fakes[..2] {
+                assert!(sender.conns().is_empty(), "a sender was contacted");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 }

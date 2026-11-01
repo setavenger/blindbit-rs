@@ -7,6 +7,8 @@
 //!   ([`pool`]) seeded from the network's DNS seeds ([`seeds`]).
 //! - [`Dialer`] opens the TCP connection, so a proxy can slot in below every
 //!   P2P protocol on top of it.
+//! - [`NetGroup`] tells apart peers that are likely run by different
+//!   operators, for connections that must not share one.
 
 mod dialer;
 pub(crate) mod pool;
@@ -63,6 +65,57 @@ impl PeerAddr {
 
     pub(crate) fn is_ipv6(&self) -> bool {
         matches!(self.host, PeerHost::Ip(IpAddr::V6(_)))
+    }
+
+    /// The peer's network group; see [`NetGroup`].
+    pub fn netgroup(&self) -> NetGroup {
+        match &self.host {
+            PeerHost::Ip(ip) => NetGroup::of(*ip),
+            PeerHost::Name(name) => NetGroup::Name(name.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// A peer's network group, as Bitcoin Core's default netgroups have it: the
+/// /16 of an IPv4 address, the /32 of an IPv6 one. Addresses in one group
+/// are likely run by one operator (one provider, one data centre), so
+/// connections that must come from different operators, such as the peers a
+/// transaction is handed to and the peers that confirm it, use different
+/// groups.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NetGroup {
+    Ipv4([u8; 2]),
+    Ipv6([u16; 2]),
+    /// A host name stands for itself (only an own node is named).
+    Name(String),
+}
+
+impl NetGroup {
+    pub fn of(ip: IpAddr) -> Self {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+            v4 => v4,
+        };
+        match ip {
+            IpAddr::V4(v4) => {
+                let [a, b, ..] = v4.octets();
+                Self::Ipv4([a, b])
+            }
+            IpAddr::V6(v6) => {
+                let [a, b, ..] = v6.segments();
+                Self::Ipv6([a, b])
+            }
+        }
+    }
+}
+
+impl fmt::Display for NetGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ipv4([a, b]) => write!(f, "{a}.{b}.0.0/16"),
+            Self::Ipv6([a, b]) => write!(f, "{a:x}:{b:x}::/32"),
+            Self::Name(name) => f.write_str(name),
+        }
     }
 }
 
