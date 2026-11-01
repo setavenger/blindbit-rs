@@ -410,9 +410,13 @@ dbus-run-session -- bash -c '
   login (own circuit; separate circuits may still share an exit relay, Tor
   does not promise otherwise). Proxy down → `Event::ProxyDown`, no peer
   blamed, error names `p2p_proxy`.
-  `ask_mempools` races 2 extra connects and header requests race their
-  first connection (`ChainSource::race_header_connection`) through a proxy:
-  a tip header behind three dead addresses otherwise held a broadcast's
+  `ask_mempools` races 2 extra connects through a proxy, and so do header
+  requests unless the shared header connection is fresh
+  (`ChainSource::race_header_connections`): 3 peers connect at once and
+  the `HeaderRace` hands them over in the order they connect; when the
+  first lacks the header or fails, the slower racers are asked in turn
+  before any other peer, and the ones not used close with the request. A
+  tip header behind three dead addresses otherwise held a broadcast's
   answer for 40 s. Senders keep listening after the pong (bounded by the
   budget).
 - An older tray drops `p2p_proxy` on Save (unknown field): a
