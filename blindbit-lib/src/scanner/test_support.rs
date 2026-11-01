@@ -10,8 +10,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bdk_sp::bitcoin::key::Secp256k1;
+use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use bitcoin_rev::Network;
 use tonic::transport::Channel;
 
 use super::Scanner;

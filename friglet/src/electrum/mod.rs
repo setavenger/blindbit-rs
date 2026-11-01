@@ -29,8 +29,8 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use bitcoin::BlockHash;
+use bitcoin::Network;
 use bitcoin::consensus::encode::deserialize as bitcoin_deserialize;
-use bitcoin_rev::Network;
 use blindbit_lib::scanner::{WalletElectrumIndex, electrum_scripthash, electrum_status};
 
 use crate::blockheader;

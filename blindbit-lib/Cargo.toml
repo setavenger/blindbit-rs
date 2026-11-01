@@ -30,12 +30,12 @@ tonic = { version = "0.14.2", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14.2"
 hex = "0.4.3"
 tracing = { workspace = true }
-bitcoin = "0.32.7"
-# due to bitcoin-p2p using a different version
-bitcoin-rev = { git = "https://github.com/rust-bitcoin/rust-bitcoin", rev = "16cc257c3695dea0e7301a5fa9cab44b8ed60598", package = "bitcoin" }
-
-# bitcoin-p2p is on a specific revision of rust-bitcoin which creates some issues
-bitcoin-p2p = { git = "https://github.com/2140-dev/bitcoin-p2p", version = "0.1.0" }
+bitcoin = "0.32.8"
+# Block download over Bitcoin P2P: the `bitcoin-p2p` crate of kernel-node
+# (successor of the archived 2140-dev/bitcoin-p2p), on the same bitcoin 0.32
+# as the rest of the workspace, so its messages, blocks and `Network` are
+# this crate's types. Pinned to a commit: the crate has no releases.
+bitcoin-p2p = { git = "https://github.com/kernel-node/kernel-node", rev = "d421e330d2c3f13050cd4e5abddfa1cce134aa19", version = "0.1.0" }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

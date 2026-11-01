@@ -9,9 +9,9 @@
 //! - **Mempool membership.** `getdata` for a transaction is answered with the
 //!   transaction when it is in the peer's mempool and with `notfound` when it
 //!   is not. Bitcoin Core only serves mempool transactions to peers that asked
-//!   for transaction relay in their `version` message; `bitcoin_p2p`'s
-//!   handshake always sends `relay = false`, so this module performs its own
-//!   handshake.
+//!   for transaction relay in their `version` message; the `bitcoin-p2p`
+//!   crate's handshake always sends `relay = false`, so this module performs
+//!   its own handshake (with bitcoin's `p2p` message types).
 //! - **Announce / request.** A broadcast announces the transaction with `inv`
 //!   and hands it over when the peer asks for it with `getdata`.
 //!
@@ -21,26 +21,24 @@
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::BlockHash;
 use bitcoin::block::Header;
-use bitcoin::hashes::Hash;
-use bitcoin_p2p::p2p_message_types::message::{
-    InventoryPayload, NetworkMessage, RawNetworkMessage, V1MessageHeader,
-};
-use bitcoin_p2p::p2p_message_types::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin_p2p::p2p_message_types::message_network::{
-    ClientSoftwareVersion, UserAgent, UserAgentVersion, VersionMessage,
-};
-use bitcoin_p2p::p2p_message_types::{Address, Magic, NetworkExt, ProtocolVersion, ServiceFlags};
-use bitcoin_rev::Network;
-use bitcoin_rev::consensus::encode;
+use bitcoin::consensus::encode;
+use bitcoin::p2p::message::{CommandString, NetworkMessage, RawNetworkMessage};
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
+use bitcoin::p2p::message_network::VersionMessage;
+use bitcoin::p2p::{Address, Magic, ServiceFlags};
+use bitcoin::{BlockHash, Network, Txid, Wtxid};
 
-/// Same user agent as the scanner's `bitcoin_p2p` connections, so friglet
-/// does not present two different fingerprints to the same peer.
-const CLIENT_NAME: &str = "SwiftSync";
+/// Same user agent as the scanner's block-fetch connections (blindbit-lib's
+/// `USER_AGENT`), so friglet does not present two different fingerprints to
+/// the same peer.
+const USER_AGENT: &str = "/SwiftSync:0.1.0/";
+
+/// BIP 339's `WTXID_RELAY_VERSION`: the protocol version friglet speaks.
+const WTXID_RELAY_VERSION: u32 = 70016;
 
 /// How long one socket read may block before the caller's deadline is
 /// checked again.
@@ -100,14 +98,15 @@ pub fn random_u64() -> u64 {
     hasher.finish()
 }
 
-/// Convert between the two rust-bitcoin versions in the dependency tree.
-fn header_from_wire(header: &bitcoin_rev::block::Header) -> Result<Header, P2pError> {
-    bitcoin::consensus::encode::deserialize(&encode::serialize(header))
-        .map_err(|error| P2pError::Protocol(format!("undecodable header: {error}")))
-}
-
-fn wire_block_hash(hash: BlockHash) -> bitcoin_rev::BlockHash {
-    bitcoin_rev::BlockHash::from_byte_array(*hash.as_byte_array())
+/// The `version` message's address fields: 127.0.0.1:1, so the peer learns
+/// neither friglet's address nor the one friglet sees for it. The same value
+/// the scanner's block-fetch connections send (kernel-node bitcoin-p2p has no
+/// override), so both stacks look alike to a peer.
+fn useless_address() -> Address {
+    Address::new(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        ServiceFlags::NONE,
+    )
 }
 
 /// One open, handshaken P2P connection.
@@ -144,7 +143,7 @@ impl Peer {
         stream.set_nodelay(true)?;
         let mut peer = Peer {
             stream,
-            magic: network.default_network_magic(),
+            magic: network.magic(),
             buf: Vec::new(),
             addr,
             wtxid_relay: false,
@@ -168,20 +167,13 @@ impl Peer {
             .map(|d| d.as_secs() as i64)
             .unwrap_or_default();
         self.send(NetworkMessage::Version(VersionMessage {
-            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            version: WTXID_RELAY_VERSION,
             services: ServiceFlags::NONE,
             timestamp,
-            receiver: Address::useless(),
-            sender: Address::useless(),
+            receiver: useless_address(),
+            sender: useless_address(),
             nonce: random_u64(),
-            user_agent: UserAgent::new(
-                CLIENT_NAME,
-                UserAgentVersion::new(ClientSoftwareVersion::SemVer {
-                    major: 0,
-                    minor: 1,
-                    revision: 0,
-                }),
-            ),
+            user_agent: USER_AGENT.to_string(),
             start_height: 0,
             relay,
         }))?;
@@ -193,7 +185,7 @@ impl Peer {
                 None => return Err(P2pError::Timeout("the version message")),
             }
         };
-        let we_sent_wtxidrelay = their_version.version >= ProtocolVersion::WTXID_RELAY_VERSION;
+        let we_sent_wtxidrelay = their_version.version >= WTXID_RELAY_VERSION;
         // BIP 339: wtxidrelay must come between version and verack.
         if we_sent_wtxidrelay {
             self.send(NetworkMessage::WtxidRelay)?;
@@ -230,7 +222,10 @@ impl Peer {
                         self.send(NetworkMessage::Pong(*nonce))?;
                     }
                     NetworkMessage::FeeFilter(rate) => {
-                        self.fee_filter = Some(rate.to_sat_per_kvb_floor());
+                        // A rate outside 0..=u32::MAX sat/kvB says "relay
+                        // nothing"; it reads as the largest fee rate.
+                        self.fee_filter =
+                            Some(u32::try_from(*rate).map_or(u64::MAX / 1000, u64::from));
                     }
                     _ => {}
                 }
@@ -263,15 +258,21 @@ impl Peer {
             if self.buf.len() < 24 {
                 return Ok(None);
             }
-            let header: V1MessageHeader = encode::deserialize(&self.buf[..24])
-                .map_err(|error| P2pError::Protocol(format!("bad message header: {error}")))?;
-            if header.magic != self.magic {
+            // The v1 message header: magic, command, payload length, checksum.
+            if !self.buf[4..16].is_ascii() {
+                return Err(P2pError::Protocol(
+                    "bad message header: the command is not ASCII".to_string(),
+                ));
+            }
+            let magic = Magic::from_bytes(self.buf[..4].try_into().expect("4 bytes"));
+            if magic != self.magic {
                 return Err(P2pError::Protocol(format!(
-                    "unexpected network magic {:?}",
-                    header.magic
+                    "unexpected network magic {magic:?}"
                 )));
             }
-            let len = header.length as usize;
+            let command: CommandString = encode::deserialize(&self.buf[4..16])
+                .map_err(|error| P2pError::Protocol(format!("bad message header: {error}")))?;
+            let len = u32::from_le_bytes(self.buf[16..20].try_into().expect("4 bytes")) as usize;
             if len > MAX_PAYLOAD {
                 return Err(P2pError::Protocol(format!("oversized {len}-byte message")));
             }
@@ -285,7 +286,7 @@ impl Peer {
                 Err(error) => {
                     tracing::debug!(
                         peer = %self.addr,
-                        command = %header.command,
+                        command = %command,
                         error = %error,
                         "skipping undecodable P2P message"
                     );
@@ -312,22 +313,19 @@ impl Peer {
     /// `on_other` sees every other message that arrives meanwhile.
     pub fn mempool_has(
         &mut self,
-        txid: bitcoin::Txid,
-        wtxid: bitcoin::Wtxid,
+        txid: Txid,
+        wtxid: Wtxid,
         deadline: Instant,
         mut on_other: impl FnMut(&mut Self, NetworkMessage) -> Result<(), P2pError>,
     ) -> Result<bool, P2pError> {
         self.send_getdata(self.tx_inventory(txid, wtxid))?;
         loop {
             match self.recv_until(deadline)? {
-                Some(NetworkMessage::Tx(tx))
-                    if tx.compute_txid().to_byte_array() == txid.to_byte_array() =>
-                {
+                Some(NetworkMessage::Tx(tx)) if tx.compute_txid() == txid => {
                     return Ok(true);
                 }
                 Some(NetworkMessage::NotFound(items))
                     if items
-                        .0
                         .iter()
                         .any(|item| inventory_matches(item, txid, wtxid)) =>
                 {
@@ -348,23 +346,17 @@ impl Peer {
         deadline: Instant,
     ) -> Result<Option<Header>, P2pError> {
         self.send(NetworkMessage::GetHeaders(GetHeadersMessage {
-            version: ProtocolVersion::WTXID_RELAY_VERSION,
+            version: WTXID_RELAY_VERSION,
             locator_hashes: Vec::new(),
-            stop_hash: wire_block_hash(hash),
+            stop_hash: hash,
         }))?;
         let mut found = Vec::new();
         self.sync_with_ping(deadline, "block headers", |message| {
             if let NetworkMessage::Headers(headers) = message {
-                found.extend(headers.0.iter().cloned());
+                found.extend(headers.iter().copied());
             }
         })?;
-        for candidate in &found {
-            let converted = header_from_wire(candidate)?;
-            if converted.block_hash() == hash {
-                return Ok(Some(converted));
-            }
-        }
-        Ok(None)
+        Ok(found.into_iter().find(|header| header.block_hash() == hash))
     }
 
     /// Wait until the peer has processed everything sent so far: it answers
@@ -394,26 +386,24 @@ impl Peer {
     }
 
     /// The inventory item this peer uses for a transaction.
-    pub fn tx_inventory(&self, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid) -> Inventory {
+    pub fn tx_inventory(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
         if self.wtxid_relay {
-            Inventory::WTx(bitcoin_rev::Wtxid::from_byte_array(*wtxid.as_byte_array()))
+            Inventory::WTx(wtxid)
         } else {
-            Inventory::Transaction(bitcoin_rev::Txid::from_byte_array(*txid.as_byte_array()))
+            Inventory::Transaction(txid)
         }
     }
 
     pub fn send_getdata(&mut self, inventory: Inventory) -> Result<(), P2pError> {
-        self.send(NetworkMessage::GetData(InventoryPayload(vec![inventory])))
+        self.send(NetworkMessage::GetData(vec![inventory]))
     }
 }
 
 /// Does an inventory item name this transaction (by txid or wtxid)?
-pub fn inventory_matches(item: &Inventory, txid: bitcoin::Txid, wtxid: bitcoin::Wtxid) -> bool {
+pub fn inventory_matches(item: &Inventory, txid: Txid, wtxid: Wtxid) -> bool {
     match item {
-        Inventory::Transaction(id) | Inventory::WitnessTransaction(id) => {
-            id.to_byte_array() == txid.to_byte_array()
-        }
-        Inventory::WTx(id) => id.to_byte_array() == wtxid.to_byte_array(),
+        Inventory::Transaction(id) | Inventory::WitnessTransaction(id) => *id == txid,
+        Inventory::WTx(id) => *id == wtxid,
         _ => false,
     }
 }
