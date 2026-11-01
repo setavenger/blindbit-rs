@@ -139,19 +139,23 @@ What to expect from it:
   one, friglet first connects to three random peers that relay
   transactions, then hands the transaction to two others, and reports
   success only once one of the first three has it: a peer it was not handed
-  to, in another network (/16) than the peers it was handed to. Otherwise
-  Sparrow shows an error after 25 seconds (45 through [Tor](#tor)). The P2P
-  protocol does not say why a peer refuses a transaction. friglet reports
-  what it can tell: missing or spent inputs, or a fee below the mempool
-  minimum (with random peers, only when every peer it was handed to says
-  so). A peer that drops the connection after receiving the transaction
-  does not prove it invalid, so that is not reported as a rejection.
-  Broadcasts that have not confirmed are kept in
-  `<state file>.pending.json`. While they are pending, friglet re-announces
-  them whenever they drop out of the mempool it asks (with random peers:
-  two peers it never handed them to, in any attempt), including after a
-  restart. It stops when they confirm or when a conflicting transaction
-  confirms.
+  to, in another network (/16) than the peers it was handed to. When none
+  has it 10 seconds after a hand-over (12 through Tor), one more peer gets
+  it, at most four in all. A peer friglet ever handed the transaction to
+  (remembered for 14 days) never counts as having it, and only a copy with
+  the same witness counts. Otherwise Sparrow shows an error after 25
+  seconds (45 through [Tor](#tor)). The P2P protocol does not say why a
+  peer refuses a transaction. friglet reports what it can tell: a fee below
+  the mempool minimum, or missing or spent inputs (with random peers, only
+  when at least two peers it was handed to, and every one, ask for one of
+  its parents; a resend checks again). A peer that drops the connection
+  after receiving the transaction does not prove it invalid, so that is not
+  reported as a rejection. Broadcasts that have not confirmed are kept in
+  `<state file>.pending.json` (`0600`: it also names the peers they went
+  to). While they are pending, friglet re-announces them whenever they drop
+  out of the mempool it asks (with random peers: two peers it never handed
+  them to, in any attempt), including after a restart. It stops when they
+  confirm or when a conflicting transaction confirms.
 - **Fees**: friglet has no fee estimator. It answers `blockchain.estimatefee`
   with `-1`, the Electrum protocol's "no estimate". Its relay fee is the
   minimum fee rate that the P2P peer's mempool currently accepts, as its
@@ -176,13 +180,14 @@ or from the wallet), block headers, and broadcasts over Bitcoin P2P.
   this computer's IP address and which blocks it downloads, and those blocks
   probably pay or spend from your wallet. friglet keeps asking the peer that
   served the last block first, so that peer sees most of them. A broadcast
-  hands the transaction to two random peers straight from this computer's
-  IP address, and asks three more for it before it has spread, so all five
-  can tell it comes from here. While broadcasts are pending (up to 14
-  days), friglet asks two more peers every 10 minutes whether they have
-  them, all pending transactions on one connection per peer, so those peers
-  can tell that these transactions belong together. Use your own node, or
-  [Tor](#tor), if that matters to you.
+  hands the transaction to two random peers (up to four when the first keep
+  it to themselves) straight from this computer's IP address, and asks
+  three more for it before it has spread, so all of them can tell it comes
+  from here. While broadcasts are pending (up to 14 days), friglet asks two
+  more peers every 10 minutes whether they have them, all pending
+  transactions on one connection per peer, so those peers can tell that
+  these transactions belong together. Use your own node, or [Tor](#tor), if
+  that matters to you.
 - Regtest has no public peers: it needs `p2p_node_addr`.
 - The addresses friglet learns are kept beside the wallet state
   (`peers-<network>-new.book`, `peers-<network>-tried.book`; saved every
@@ -206,7 +211,8 @@ Peers then see a Tor exit's address instead of this computer's.
 - Nothing is looked up locally: your node's host name (also an `.onion`
   address, which needs the proxy) goes to Tor unresolved, and instead of
   DNS seed lookups friglet connects through Tor to three of the network's
-  seed names, asks the node there for addresses and disconnects.
+  seed names, asks the node there for addresses and disconnects. Once they
+  have given 20 addresses, friglet does not wait for the slower ones.
 - Each connection logs in to Tor with random credentials, so Tor gives it a
   circuit of its own: the peers a broadcast hands the transaction to and
   the ones that watch for it do not share a circuit. Separate circuits can
@@ -217,9 +223,10 @@ Peers then see a Tor exit's address instead of this computer's.
 - Not proxied: the BlindBit oracle (gRPC over HTTPS to `oracle_url`; the
   oracle sees this computer's IP, but the requests do not depend on your
   keys), and the Electrum server, which only listens locally.
-- Your own node on this computer or your local network does not need Tor;
-  Tor cannot reach it either (its exits only connect to public addresses).
-  Leave `p2p_proxy` empty for it, or give the node's onion address.
+- Your own node on this computer or your local network does not need Tor,
+  and Tor cannot reach it (its exits only connect to public addresses), so
+  friglet refuses that combination. Leave `p2p_proxy` empty for it, or give
+  the node's onion address.
 - Through Tor a block takes longer (connections get 20 s, a block 60 s),
   and the first download waits for the seeds' answers through Tor.
 - An older friglet-tray does not know `p2p_proxy`: saving its settings
