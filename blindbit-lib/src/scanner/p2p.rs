@@ -151,6 +151,13 @@ impl RetryPolicy {
         }
     }
 
+    /// The deadline for a whole connection to a discovered peer, from when
+    /// it opened, so one that trickles bytes (each read within the timeout,
+    /// the message never complete) cannot hold the download.
+    fn connection_cap(&self) -> Duration {
+        self.connect_timeout + self.block_deadline + DISCOVERED_SLACK
+    }
+
     /// The wait before attempt `attempt` (the first attempt has none).
     fn delay_before(&self, attempt: u32) -> Duration {
         let doublings = attempt.saturating_sub(2).min(16);
@@ -755,8 +762,6 @@ struct Discovery {
     peers: Arc<PeerSource>,
     /// Ask the peer for addresses (`getaddr`) and keep what it gossips.
     request_addr: bool,
-    /// Refuse a peer whose chain ends below this height, before asking.
-    min_height: u64,
 }
 
 impl BlockFetcher {
@@ -858,7 +863,6 @@ impl BlockFetcher {
                     read_timeout,
                     &mut peer_info,
                     &mut local_ip,
-                    None,
                 )
                 .await;
             match result {
@@ -941,6 +945,9 @@ impl BlockFetcher {
         let mut tried: Vec<(PeerAddr, FetchFailure)> = Vec::new();
         let mut last = None;
         let mut exhausted = false;
+        // Connections under way, each opening and completing its handshake
+        // on its own, so one that opens while another downloads is ready
+        // when that one fails. Dropping the set closes every one of them.
         let mut connecting = tokio::task::JoinSet::new();
         'round: loop {
             // Keep `width` connections under way while peers and attempts
@@ -969,12 +976,13 @@ impl BlockFetcher {
                     Ok(peer) => {
                         asked.insert(peer.clone());
                         tracing::debug!(%peer, height, %block_hash, attempt = asked.len(), "asking a peer for the block");
-                        let (dialer, timeout) =
-                            (self.peers.dialer().clone(), self.policy.connect_timeout);
-                        connecting.spawn_blocking(move || {
-                            let connected = dialer.connect(&peer, timeout);
-                            (peer, connected)
-                        });
+                        connecting.spawn(prepare(
+                            self.peers.clone(),
+                            peer,
+                            self.policy,
+                            read_timeout,
+                            height,
+                        ));
                     }
                     Err(no_peers) => {
                         tracing::warn!(height, %block_hash, reason = %no_peers, "no peer to ask for the block");
@@ -985,7 +993,7 @@ impl BlockFetcher {
                     }
                 }
             }
-            // The first connection to open (or fail).
+            // The first connection to complete its handshake (or fail).
             let joined = tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
@@ -997,36 +1005,26 @@ impl BlockFetcher {
             let Some(joined) = joined else {
                 break;
             };
-            let Ok((peer, connected)) = joined else {
+            let Ok((peer, prepared)) = joined else {
                 continue;
             };
-            let result = match connected {
-                Ok(stream) => {
-                    let discovery = Discovery {
-                        peers: self.peers.clone(),
-                        request_addr: self.peers.wants_addr(&peer),
-                        min_height: height,
-                    };
-                    let mut connected = None;
-                    let result = self
-                        .attempt_on(
-                            stream,
-                            Instant::now(),
-                            &peer,
-                            block_hash,
-                            read_timeout,
-                            &mut connected,
-                            &mut local_ip,
-                            Some(discovery),
-                        )
-                        .await;
-                    if let Some(info) = connected {
+            let result = match prepared {
+                Ok(ready) => {
+                    let info = ready.connection.info;
+                    peer_info = Some(info);
+                    local_ip = ready.local_ip.or(local_ip);
+                    self.peers.report(&peer, PeerEvent::Connected(info));
+                    self.fetch_on(ready, block_hash)
+                        .await
+                        .map_err(|failure| (failure, true))
+                }
+                Err((failure, info)) => {
+                    if let Some(info) = info {
                         peer_info = Some(info);
                         self.peers.report(&peer, PeerEvent::Connected(info));
                     }
-                    result.map_err(|failure| (failure, connected.is_some()))
+                    Err((failure, info.is_some()))
                 }
-                Err(e) => Err((connect_failure(e), false)),
             };
             match result {
                 Ok(block) => {
@@ -1092,7 +1090,7 @@ impl BlockFetcher {
         }))
     }
 
-    /// One attempt on a fresh connection to `peer`.
+    /// One attempt on a fresh connection to the own node `peer`.
     ///
     /// The connection opens through the source's [`crate::net::Dialer`];
     /// cancelling abandons the connect at once. Then [`Self::attempt_on`].
@@ -1103,14 +1101,10 @@ impl BlockFetcher {
         read_timeout: Duration,
         peer_info: &mut Option<PeerInfo>,
         local_ip: &mut Option<IpAddr>,
-        discovery: Option<Discovery>,
     ) -> Result<Block, AttemptFailure> {
         tracing::debug!(%peer, "opening P2P connection for a block fetch");
         let opened = Instant::now();
-        let connect = self
-            .peers
-            .dialer()
-            .open(peer, self.policy.connect_timeout);
+        let connect = self.peers.dialer().open(peer, self.policy.connect_timeout);
         let stream = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled.into()),
@@ -1124,12 +1118,12 @@ impl BlockFetcher {
             read_timeout,
             peer_info,
             local_ip,
-            discovery,
         )
         .await
     }
 
-    /// The attempt on `stream`, a connection to `peer` opened at `opened`.
+    /// The attempt on `stream`, a connection to the own node `peer` opened
+    /// at `opened`.
     ///
     /// The handshake and the download run on a thread of their own, with
     /// blocking socket I/O and per-read timeouts as before; this future only
@@ -1147,7 +1141,6 @@ impl BlockFetcher {
         read_timeout: Duration,
         peer_info: &mut Option<PeerInfo>,
         local_ip: &mut Option<IpAddr>,
-        discovery: Option<Discovery>,
     ) -> Result<Block, AttemptFailure> {
         // Through a proxy the node sees the proxy's (the exit's) address,
         // not this one.
@@ -1156,15 +1149,8 @@ impl BlockFetcher {
         {
             *local_ip = Some(local.ip());
         }
-        let mut shutdown =
+        let _shutdown =
             ShutdownOnDrop::new(&stream).map_err(|e| FetchFailure::Broken(e.to_string()))?;
-        let lingers = discovery.as_ref().is_some_and(|d| d.request_addr);
-        // A discovered peer gets a deadline for the whole connection.
-        let cap = if discovery.is_some() {
-            self.policy.connect_timeout + self.policy.block_deadline + DISCOVERED_SLACK
-        } else {
-            Duration::MAX
-        };
 
         let (answer, answered) = tokio::sync::oneshot::channel();
         // Set by the thread once the handshake completes, so a connection
@@ -1186,7 +1172,6 @@ impl BlockFetcher {
                     block_hash,
                     deadline,
                     &cancel,
-                    discovery,
                     &thread_handshaken,
                     answer,
                 )
@@ -1196,13 +1181,6 @@ impl BlockFetcher {
         let result = tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(FetchFailure::Cancelled.into()),
-            () = sleep_at_most(cap.saturating_sub(opened.elapsed())) => {
-                Err(FetchFailure::Broken(format!(
-                    "the peer was too slow: no block within {}",
-                    human_duration(cap)
-                ))
-                .into())
-            }
             answered = answered => answered.unwrap_or_else(|_| {
                 Err(FetchFailure::Broken("the download ended without an answer".to_string()).into())
             }),
@@ -1210,6 +1188,48 @@ impl BlockFetcher {
         if let Some(info) = handshaken.get() {
             *peer_info = Some(*info);
         }
+        result
+    }
+
+    /// The block request on `ready`, a handshaken connection to a discovered
+    /// peer: on a thread of its own, as the own node's download, within what
+    /// is left of the connection's overall deadline. On cancellation (or
+    /// when this future is dropped) the connection is shut down.
+    async fn fetch_on(&self, ready: Ready, block_hash: BlockHash) -> Result<Block, AttemptFailure> {
+        let Ready {
+            mut connection,
+            mut shutdown,
+            discovery,
+            ..
+        } = ready;
+        let (opened, lingers) = (connection.opened, discovery.request_addr);
+        let cap = self.policy.connection_cap();
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let (cancel, deadline) = (self.cancel.clone(), self.policy.block_deadline);
+        std::thread::Builder::new()
+            .name("p2p-block-fetch".to_string())
+            .spawn(move || {
+                let peers = discovery.peers.as_ref();
+                let result = connection.fetch_block(block_hash, deadline, &cancel, Some(peers));
+                let served = result.is_ok();
+                if answer.send(result).is_ok()
+                    && served
+                    && discovery.request_addr
+                    && !connection.got_addr
+                {
+                    connection.wait_for_addr(GOSSIP_WAIT, &cancel, peers);
+                }
+            })
+            .map_err(|e| FetchFailure::Broken(format!("cannot start the download: {e}")))?;
+
+        let result = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(FetchFailure::Cancelled.into()),
+            () = sleep_at_most(cap.saturating_sub(opened.elapsed())) => Err(too_slow(cap)),
+            answered = answered => answered.unwrap_or_else(|_| {
+                Err(FetchFailure::Broken("the download ended without an answer".to_string()).into())
+            }),
+        };
         // The thread keeps the connection a moment to collect the peer's
         // addresses; it closes it itself.
         if result.is_ok() && lingers {
@@ -1217,6 +1237,100 @@ impl BlockFetcher {
         }
         result
     }
+}
+
+/// A connection to a discovered peer that completed its handshake, ready for
+/// the block request.
+struct Ready {
+    connection: P2pConnection,
+    /// Shuts the connection down when dropped, so a racer that is not needed
+    /// closes at once.
+    shutdown: ShutdownOnDrop,
+    discovery: Discovery,
+    /// friglet's address on the connection (none through a proxy).
+    local_ip: Option<IpAddr>,
+}
+
+/// Open a connection to the discovered `peer` and complete its handshake on
+/// a blocking thread as soon as it opens, within the connection's overall
+/// deadline; a peer whose chain ends below `min_height` is refused before it
+/// is asked. Dropping the future closes the connection at any point. A
+/// failure after the handshake carries what the peer said about itself.
+async fn prepare(
+    peers: Arc<PeerSource>,
+    peer: PeerAddr,
+    policy: RetryPolicy,
+    read_timeout: Duration,
+    min_height: u64,
+) -> (PeerAddr, Result<Ready, (AttemptFailure, Option<PeerInfo>)>) {
+    let result = async {
+        let stream = peers
+            .dialer()
+            .open(&peer, policy.connect_timeout)
+            .await
+            .map_err(|e| (connect_failure(e), None))?;
+        let opened = Instant::now();
+        // Through a proxy the peer sees the proxy's (the exit's) address,
+        // not this one.
+        let local_ip = match peers.dialer().proxy() {
+            None => stream.local_addr().ok().map(|local| local.ip()),
+            Some(_) => None,
+        };
+        let shutdown = ShutdownOnDrop::new(&stream)
+            .map_err(|e| (FetchFailure::Broken(e.to_string()).into(), None))?;
+        let discovery = Discovery {
+            peers: peers.clone(),
+            request_addr: peers.wants_addr(&peer),
+        };
+        let handshake = {
+            let (peer, network) = (peer.clone(), peers.network());
+            tokio::task::spawn_blocking(move || {
+                P2pConnection::handshake(
+                    stream,
+                    peer,
+                    network,
+                    read_timeout,
+                    opened,
+                    Some(&discovery),
+                )
+                .map(|connection| (connection, discovery))
+            })
+        };
+        let cap = policy.connection_cap();
+        let (connection, discovery) = tokio::select! {
+            joined = handshake => joined
+                .map_err(|e| {
+                    let failure = FetchFailure::Broken(format!("the handshake task failed: {e}"));
+                    (failure.into(), None)
+                })?
+                .map_err(|failure| (failure.into(), None))?,
+            () = sleep_at_most(cap.saturating_sub(opened.elapsed())) => {
+                return Err((too_slow(cap), None));
+            }
+        };
+        let info = connection.info;
+        if i64::from(info.height) < min_height as i64 {
+            return Err((FetchFailure::Behind(info.height).into(), Some(info)));
+        }
+        Ok(Ready {
+            connection,
+            shutdown,
+            discovery,
+            local_ip,
+        })
+    }
+    .await;
+    (peer, result)
+}
+
+/// A discovered peer that has not served the block within the connection's
+/// overall deadline.
+fn too_slow(cap: Duration) -> AttemptFailure {
+    FetchFailure::Broken(format!(
+        "the peer was too slow: no block within {}",
+        human_duration(cap)
+    ))
+    .into()
 }
 
 /// How a failed connect counts: the proxy failing, the proxy saying nothing
@@ -1242,8 +1356,7 @@ async fn sleep_at_most(duration: Duration) {
     }
 }
 
-/// The download thread: handshake, block, then (for a discovered peer that
-/// was asked for addresses) a short wait for them.
+/// The own node's download thread: handshake, then the block.
 #[allow(clippy::too_many_arguments)]
 fn download(
     stream: TcpStream,
@@ -1254,39 +1367,19 @@ fn download(
     block_hash: BlockHash,
     deadline: Duration,
     cancel: &CancellationToken,
-    discovery: Option<Discovery>,
     handshaken: &std::sync::OnceLock<PeerInfo>,
     answer: tokio::sync::oneshot::Sender<Result<Block, AttemptFailure>>,
 ) {
     let mut connection =
-        match P2pConnection::handshake(stream, peer, network, read_timeout, opened, &discovery) {
+        match P2pConnection::handshake(stream, peer, network, read_timeout, opened, None) {
             Ok(connection) => connection,
             Err(failure) => {
                 let _ = answer.send(Err(failure.into()));
                 return;
             }
         };
-    let info = connection.info;
-    let _ = handshaken.set(info);
-    if let Some(discovery) = &discovery
-        && i64::from(info.height) < discovery.min_height as i64
-    {
-        let _ = answer.send(Err(FetchFailure::Behind(info.height).into()));
-        return;
-    }
-    let gossip = discovery.as_ref().map(|d| d.peers.as_ref());
-    let result = connection.fetch_block(block_hash, deadline, cancel, gossip);
-    let served = result.is_ok();
-    if answer.send(result).is_err() {
-        return;
-    }
-    if served
-        && let Some(discovery) = &discovery
-        && discovery.request_addr
-        && !connection.got_addr
-    {
-        connection.wait_for_addr(GOSSIP_WAIT, cancel, &discovery.peers);
-    }
+    let _ = handshaken.set(connection.info);
+    let _ = answer.send(connection.fetch_block(block_hash, deadline, cancel, None));
 }
 
 /// One open, handshaken P2P connection used for a single block fetch.
@@ -1319,7 +1412,7 @@ impl P2pConnection {
         network: Network,
         read_timeout: Duration,
         opened: Instant,
-        discovery: &Option<Discovery>,
+        discovery: Option<&Discovery>,
     ) -> Result<Self, FetchFailure> {
         let handshake_timeout = match discovery {
             Some(_) => read_timeout.min(DISCOVERED_HANDSHAKE_TIMEOUT),

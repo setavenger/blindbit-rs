@@ -2,11 +2,14 @@
 //! name goes to the proxy unresolved, and when the proxy fails nothing is
 //! tried directly and the message names the proxy.
 
-use std::net::SocketAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use bitcoin::Network;
+use bitcoin::p2p::ServiceFlags;
 
-use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure};
+use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy};
 use super::p2p_tests::{Conn, Node, fast};
 use super::test_support::run;
 use crate::net::testing::FakeSocks5;
@@ -16,10 +19,25 @@ fn genesis() -> bitcoin::Block {
     bitcoin::constants::genesis_block(Network::Regtest)
 }
 
+/// A loopback address of its own for a node of this module (the address
+/// book tells peers apart by IP; other modules use other ranges).
+fn ip(last: u8) -> IpAddr {
+    [127, 0, 0, last].into()
+}
+
+/// `fetch`, failing the test after a minute rather than hanging it.
+async fn within_a_minute<T>(fetch: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), fetch)
+        .await
+        .expect("the fetch ended within a minute")
+}
+
 fn fetch(peers: std::sync::Arc<PeerSource>) -> Result<bitcoin::Block, Box<BlockFetchError>> {
-    run(BlockFetcher::new(peers)
-        .with_policy(fast(3))
-        .fetch(genesis().block_hash(), 0))
+    run(within_a_minute(
+        BlockFetcher::new(peers)
+            .with_policy(fast(3))
+            .fetch(genesis().block_hash(), 0),
+    ))
 }
 
 /// An address nothing listens on: a proxy that is not running. Port 1
@@ -128,7 +146,9 @@ fn discovered_peers_are_reached_through_the_proxy() {
 }
 
 /// Through Tor a dead address costs the whole connect timeout; the
-/// connections race, so a live peer serves the block at once anyway.
+/// connections race, so a live peer serves the block at once anyway, and
+/// the losing connects close with the fetch: the runtime shuts down without
+/// waiting for them.
 #[test]
 fn through_a_proxy_connections_race_past_dead_peers() {
     let node = Node::full(200, vec![Conn::Serve]);
@@ -143,23 +163,57 @@ fn through_a_proxy_connections_race_past_dead_peers() {
     let mut seeds = dead.clone();
     seeds.push(node.addr.into());
     let source = PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
-    // The losing connects stay under way until the proxy timeout; a plain
-    // runtime drop would wait for them.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let started = std::time::Instant::now();
-    let block = runtime.block_on(BlockFetcher::new(source).fetch(genesis().block_hash(), 0));
+    let started = Instant::now();
+    let block = run(within_a_minute(
+        BlockFetcher::new(source).fetch(genesis().block_hash(), 0),
+    ));
     let waited = started.elapsed();
-    runtime.shutdown_background();
     let block = block.expect("the live peer serves it");
     assert_eq!(block.block_hash(), genesis().block_hash());
     assert!(
-        waited < std::time::Duration::from_secs(10),
+        waited < Duration::from_secs(10),
         "waited {waited:?} (a dead peer costs 20 s)"
     );
     assert_eq!(node.connections(), 1);
+}
+
+/// A racer that opens while another connection downloads completes its
+/// handshake at once, so when the download fails it is ready, not a socket
+/// left idle that the peer may have dropped meanwhile.
+#[test]
+fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let stalls = Node::spawn_on(ip(81), full, 200, &block, vec![Conn::StallMidBlock]);
+    let serves = Node::spawn_on(ip(82), full, 200, &block, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    // The serving peer opens half a second after the stalling one, which is
+    // asked for the block first.
+    proxy.delay(serves.addr.into(), Duration::from_millis(500));
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![stalls.addr.into(), serves.addr.into()]),
+    );
+    let fetcher = BlockFetcher::new(source).with_policy(RetryPolicy {
+        block_deadline: Duration::from_millis(1_500),
+        ..RetryPolicy::discovered()
+    });
+    let got = run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+        .expect("the second peer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    assert!(
+        stalls.stalled().is_some(),
+        "the stalling peer was asked first"
+    );
+    let [serving] = serves.accepted()[..] else {
+        panic!("one connection to the serving peer");
+    };
+    let version_after = serving.version_after.expect("it got a version");
+    assert!(
+        version_after < Duration::from_millis(300),
+        "the handshake started {version_after:?} after the connection opened"
+    );
 }
 
 /// A refusal through the proxy counts against the peer (forgotten after

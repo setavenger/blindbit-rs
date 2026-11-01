@@ -29,6 +29,8 @@ struct State {
     refuse_with: Option<u8>,
     /// Targets whose CONNECT is never answered.
     stalled: HashSet<PeerAddr>,
+    /// Targets the proxy connects to only after a wait.
+    delayed: HashMap<PeerAddr, Duration>,
     requests: Vec<Socks5Request>,
 }
 
@@ -90,6 +92,12 @@ impl FakeSocks5 {
     /// nobody answers at.
     pub fn stall(&self, target: PeerAddr) {
         self.lock().stalled.insert(target);
+    }
+
+    /// Connect to `target` only `by` after its CONNECT arrives, as Tor
+    /// takes a while to build a circuit.
+    pub fn delay(&self, target: PeerAddr, by: Duration) {
+        self.lock().delayed.insert(target, by);
     }
 
     /// Every connection asked for, in order.
@@ -169,7 +177,7 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
         host,
         port: u16::from_be_bytes(port),
     };
-    let (refuse_with, destination) = {
+    let (refuse_with, destination, delay) = {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.requests.push(Socks5Request {
             methods,
@@ -183,10 +191,14 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
         (
             state.refuse_with,
             destination.filter(|_| !state.stalled.contains(&target)),
+            state.delayed.get(&target).copied(),
         )
     };
     if let Some(code) = refuse_with {
         return reply(&mut client, code);
+    }
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
     }
     if destination.is_none() && matches!(target.host, PeerHost::Ip(_)) {
         // Stalled: say nothing until the client gives up.

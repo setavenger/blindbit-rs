@@ -69,6 +69,16 @@ pub(super) struct Node {
     stalled: Arc<Mutex<Option<Instant>>>,
     /// Every command received after the handshake, on every connection.
     commands: Arc<Mutex<Vec<String>>>,
+    /// Per connection: when it was accepted, and how long the client then
+    /// took to send its `version` (none if it never did).
+    connected: Arc<Mutex<Vec<Accepted>>>,
+}
+
+/// One connection a [`Node`] accepted.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Accepted {
+    pub(super) at: Instant,
+    pub(super) version_after: Option<Duration>,
 }
 
 /// The block a node serves, with and without its witnesses.
@@ -148,16 +158,30 @@ impl Node {
         let stalled_at = stalled.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let received = commands.clone();
+        let connected = Arc::new(Mutex::new(Vec::new()));
+        let accepted = connected.clone();
         std::thread::spawn(move || {
             for conn in script {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
+                let index = {
+                    let mut accepted = accepted.lock().unwrap();
+                    accepted.push(Accepted {
+                        at: Instant::now(),
+                        version_after: None,
+                    });
+                    accepted.len() - 1
+                };
                 // Each connection on a thread of its own, so a client that
                 // keeps one open never holds up the next.
-                let (served, stalled_at, received) =
-                    (served.clone(), stalled_at.clone(), received.clone());
+                let (served, stalled_at, received, accepted) = (
+                    served.clone(),
+                    stalled_at.clone(),
+                    received.clone(),
+                    accepted.clone(),
+                );
                 std::thread::spawn(move || {
                     let _ = serve(
                         stream,
@@ -167,6 +191,10 @@ impl Node {
                         &served,
                         &stalled_at,
                         &received,
+                        &|| {
+                            let mut accepted = accepted.lock().unwrap();
+                            accepted[index].version_after = Some(accepted[index].at.elapsed());
+                        },
                     );
                 });
             }
@@ -176,7 +204,13 @@ impl Node {
             connections,
             stalled,
             commands,
+            connected,
         }
+    }
+
+    /// The connections accepted so far, in order.
+    pub(super) fn accepted(&self) -> Vec<Accepted> {
+        self.connected.lock().unwrap().clone()
     }
 
     /// Commands received after the handshake, across connections.
@@ -242,6 +276,7 @@ fn block() -> Block {
     bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     stream: TcpStream,
     conn: Conn,
@@ -250,6 +285,7 @@ fn serve(
     served: &Served,
     stalled: &Mutex<Option<Instant>>,
     commands: &Mutex<Vec<String>>,
+    got_version: &dyn Fn(),
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
@@ -264,6 +300,7 @@ fn serve(
     let NetworkMessage::Version(_) = wire.recv()? else {
         return Ok(());
     };
+    got_version();
     if let Conn::CloseBeforeVersion = conn {
         return Ok(());
     }
