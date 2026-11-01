@@ -284,9 +284,11 @@ dbus-run-session -- bash -c '
   requires `NETWORK|WITNESS`, skips peers below the block height, ignores a
   peer that sends a bad/stripped block for the session, prefers the peer
   that served the last block, and asks for addresses while < 200 are known.
-  Headers try up to 3 peers; `blockchain.relayfee` is the median of fresh
-  feefilters from >= 3 (up to 5) peers, sampled at Electrum start, the lowest
-  until then. Broadcast (SNB-856, `friglet/src/electrum/net_broadcast.rs`):
+  Headers try up to 3 peers, the peer of the open header connection first
+  while it is fresh; a peer that lacks a header is skipped for that request
+  only (not rested, still the block peer). `blockchain.relayfee` is the
+  median of fresh feefilters from >= 3 (up to 5) peers, sampled at Electrum
+  start, the lowest until then. Broadcast (SNB-856, `friglet/src/electrum/net_broadcast.rs`):
   3 observers (relay=true, settled, their version relays txs) first, then 2
   senders (relay=false, inv → getdata → tx → ping/pong, then listen), all in
   distinct netgroups (`PeerAddr::netgroup`: /16, /32); success only when an
