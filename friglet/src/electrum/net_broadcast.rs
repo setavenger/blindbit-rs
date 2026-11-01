@@ -34,8 +34,8 @@
 //! both an observer and a sender, and the waits are longer ([`Timing`]).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{Shutdown, TcpStream};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
@@ -196,12 +196,44 @@ struct Job {
     stop: CancellationToken,
     deadline: Instant,
     events: mpsc::UnboundedSender<Event>,
-    /// Senders that took a hand-over slot ([`Job::claim_hand_over`]): with
-    /// hedged senders, no more than [`SENDERS`] hand the transaction over.
-    hand_overs: Arc<AtomicUsize>,
+    ledger: Arc<Mutex<Ledger>>,
+}
+
+/// Who may hold the transaction and whether anyone else may get it, for
+/// every connection of one broadcast. A peer goes in before the bytes are
+/// written to it, under the lock that ends the broadcast ([`Job::close`]):
+/// the final list has every peer that may hold it, and nobody gets it
+/// afterwards.
+#[derive(Default)]
+struct Ledger {
+    closed: bool,
+    /// (transaction, peer), in the order they were let through.
+    handed: Vec<(Txid, PeerAddr)>,
+    /// Hand-over slots taken ([`Job::claim_hand_over`]): with hedged
+    /// senders, no more than [`SENDERS`] hand the transaction over.
+    slots_taken: usize,
+    /// Open connections, shut down when the broadcast ends.
+    sockets: Vec<(u64, TcpStream)>,
+    next_socket: u64,
 }
 
 impl Job {
+    fn new(
+        peers: Arc<PeerSource>,
+        candidate: Arc<Candidate>,
+        deadline: Instant,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> Self {
+        Self {
+            peers,
+            candidate,
+            stop: CancellationToken::new(),
+            deadline,
+            events,
+            ledger: Arc::default(),
+        }
+    }
+
     fn tell(&self, event: Event) {
         // The broadcast may have ended already; nobody listens then.
         let _ = self.events.send(event);
@@ -211,29 +243,101 @@ impl Job {
         self.stop.is_cancelled() || Instant::now() >= self.deadline
     }
 
+    fn ledger(&self) -> MutexGuard<'_, Ledger> {
+        // A panic while holding it leaves nothing half-updated that matters.
+        self.ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Take one of the [`SENDERS`] hand-over slots; `false` when they are
-    /// all taken.
+    /// all taken or the broadcast has ended.
     fn claim_hand_over(&self) -> bool {
-        // A compare-exchange loop rather than `fetch_update`, which newer
-        // toolchains deprecate in favour of `try_update` (not on older ones).
-        let mut taken = self.hand_overs.load(Ordering::SeqCst);
-        while taken < SENDERS {
-            match self.hand_overs.compare_exchange_weak(
-                taken,
-                taken + 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return true,
-                Err(current) => taken = current,
-            }
+        let mut ledger = self.ledger();
+        if ledger.closed || ledger.slots_taken >= SENDERS {
+            return false;
         }
-        false
+        ledger.slots_taken += 1;
+        true
     }
 
     /// Give a slot back: the sender did not hand the transaction over.
     fn release_hand_over(&self) {
-        self.hand_overs.fetch_sub(1, Ordering::SeqCst);
+        let mut ledger = self.ledger();
+        ledger.slots_taken = ledger.slots_taken.saturating_sub(1);
+    }
+
+    /// Shut `peer`'s connection down when the broadcast ends, until the
+    /// returned guard drops. An error, and the connection shut down, when
+    /// it has ended already.
+    fn register(&self, peer: &Peer) -> Result<Registered, P2pError> {
+        let socket = peer.closer()?;
+        let mut ledger = self.ledger();
+        if ledger.closed {
+            let _ = socket.shutdown(Shutdown::Both);
+            return Err(P2pError::Protocol("the broadcast has ended".into()));
+        }
+        let id = ledger.next_socket;
+        ledger.next_socket += 1;
+        ledger.sockets.push((id, socket));
+        Ok(Registered {
+            ledger: self.ledger.clone(),
+            id,
+        })
+    }
+
+    /// May `txid` be written to `addr` now? If so, `addr` is in the final
+    /// list from here on.
+    fn may_send(&self, addr: &PeerAddr, txid: Txid) -> bool {
+        let mut ledger = self.ledger();
+        if ledger.closed || self.over() {
+            return false;
+        }
+        let entry = (txid, addr.clone());
+        if !ledger.handed.contains(&entry) {
+            ledger.handed.push(entry);
+        }
+        true
+    }
+
+    /// Signals for a sender to `addr`: the transaction is written only
+    /// through [`Job::may_send`].
+    fn signals_for(&self, addr: &PeerAddr) -> Signals {
+        let (job, addr) = (self.clone(), addr.clone());
+        Signals::gated(Box::new(move |txid| job.may_send(&addr, txid)))
+    }
+
+    /// End the broadcast: nothing more is handed over, and every connection
+    /// still open is shut down. Returns every (transaction, peer) let
+    /// through, in order.
+    fn close(&self) -> Vec<(Txid, PeerAddr)> {
+        let mut ledger = self.ledger();
+        ledger.closed = true;
+        self.stop.cancel();
+        for (_, socket) in ledger.sockets.drain(..) {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        ledger.handed.clone()
+    }
+}
+
+/// A connection [`Job::close`] shuts down; dropped with the connection.
+struct Registered {
+    ledger: Arc<Mutex<Ledger>>,
+    id: u64,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        ledger.sockets.retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// Closes the broadcast's [`Job`] on every way out of [`broadcast`].
+struct CloseOnDrop(Job);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -444,12 +548,6 @@ impl Round {
         if let Some(by) = &self.seen_by {
             return Some(Ok(Verdict::InMempool { by: by.clone() }));
         }
-        let unconfirmed = || {
-            let since = self.handed_over_at.unwrap_or(self.started);
-            Ok(Verdict::Unconfirmed {
-                waited: since.elapsed(),
-            })
-        };
         let observers_left = self.observers_ready() + self.observers_connecting() > 0;
         if !self.senders_started {
             let gave_up = Instant::now() >= deadline
@@ -462,7 +560,7 @@ impl Round {
             return gave_up.then(|| Err(self.unreachable("to take the transaction")));
         }
         if Instant::now() >= deadline {
-            return Some(unconfirmed());
+            return Some(Ok(self.unconfirmed()));
         }
         // Every sender that got it refused it the same way, and no other
         // sender may still get it: none is connecting, or all the hand-over
@@ -480,6 +578,14 @@ impl Round {
             }
         }
         None
+    }
+
+    /// No observer had it: since the first hand-over (or the start).
+    fn unconfirmed(&self) -> Verdict {
+        let since = self.handed_over_at.unwrap_or(self.started);
+        Verdict::Unconfirmed {
+            waited: since.elapsed(),
+        }
     }
 
     fn unreachable(&self, what: &str) -> String {
@@ -508,18 +614,10 @@ pub async fn broadcast(
 ) -> Result<Report, String> {
     let deadline = Instant::now() + budget;
     let timing = Timing::for_peers(&peers);
-    let stop = CancellationToken::new();
-    // Every connection of this broadcast ends when it returns.
-    let _stop_all = stop.clone().drop_guard();
     let (events, mut received) = mpsc::unbounded_channel();
-    let job = Job {
-        peers,
-        candidate,
-        stop,
-        deadline,
-        events,
-        hand_overs: Arc::new(AtomicUsize::new(0)),
-    };
+    let job = Job::new(peers, candidate, deadline, events);
+    // Every connection of this broadcast ends when it returns.
+    let _close = CloseOnDrop(job.clone());
     let mut round = Round::new(timing);
     for _ in 0..timing.observers_at_start {
         if !round.launch(&job, true).await {
@@ -544,10 +642,23 @@ pub async fn broadcast(
             next_hedge = Some(Instant::now() + every);
         }
         if let Some(end) = round.end(deadline) {
-            let verdict = end?;
+            // From here on nothing is handed over, and every peer that may
+            // hold the transaction is in the ledger, including one whose
+            // report is still on its way.
+            let sent_to: Vec<PeerAddr> = job
+                .close()
+                .into_iter()
+                .filter(|(txid, _)| *txid == job.candidate.txid)
+                .map(|(_, addr)| addr)
+                .collect();
+            let verdict = match end {
+                Ok(verdict) => verdict,
+                Err(_) if !sent_to.is_empty() => round.unconfirmed(),
+                Err(message) => return Err(message),
+            };
             return Ok(Report {
                 verdict,
-                sent_to: round.sent_to,
+                sent_to,
                 fee_filters: round.fee_filters,
             });
         }
@@ -621,6 +732,7 @@ fn announces(message: &NetworkMessage, txid: Txid, wtxid: Wtxid) -> bool {
 fn observe(job: Job, addr: PeerAddr) {
     let watched = (|| {
         let mut peer = connect(&job.peers, &addr, true)?;
+        let _registered = job.register(&peer)?;
         peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
         job.tell(Event::Ready {
             addr: addr.clone(),
@@ -688,10 +800,11 @@ fn connect_sender(peers: &PeerSource, addr: &PeerAddr) -> Result<Peer, P2pError>
 
 /// Announce `candidate` and hand it over when the peer asks for it, or
 /// unasked once [`ANNOUNCE_WAIT`] has passed (the peer may know it from
-/// before, or be slow). Nothing is handed over once `stopped` says so: a
-/// broadcast that has ended must not leave a peer it does not know about
-/// holding the transaction. Returns `None` when it was not handed over,
-/// else whether the peer asked for it.
+/// before, or be slow). Nothing is announced once `stopped` says so, and
+/// nothing handed over that `signals`' gate refuses: a broadcast that has
+/// ended must not leave a peer it does not know about holding the
+/// transaction. Returns `None` when it was not handed over, else whether
+/// the peer asked for it.
 fn announce_and_hand_over(
     peer: &mut Peer,
     candidate: &Candidate,
@@ -716,7 +829,7 @@ fn announce_and_hand_over(
     if signals.sent {
         return Ok(Some(true));
     }
-    if stopped() {
+    if stopped() || !signals.may_send(txid) {
         return Ok(None);
     }
     tracing::debug!(peer = %peer.addr(), %txid, "peer did not request the announced transaction; sending it");
@@ -754,12 +867,13 @@ fn flush(
 /// until the broadcast ends.
 fn send(job: Job, addr: PeerAddr) {
     let candidate = job.candidate.clone();
-    let mut signals = Signals::default();
+    let mut signals = job.signals_for(&addr);
     let mut flushed = false;
     let mut told_missing = false;
     let mut claimed = false;
     let result = (|| {
         let mut peer = connect_sender(&job.peers, &addr)?;
+        let _registered = job.register(&peer)?;
         // Enough senders have it already (hedged senders through a proxy).
         if !job.claim_hand_over() {
             return Ok(());
@@ -811,6 +925,8 @@ fn send(job: Job, addr: PeerAddr) {
     } else if let Err(P2pError::Closed) = &result
         && signals.sent
         && !flushed
+        // Not when the broadcast's own end shut the connection.
+        && !job.stop.is_cancelled()
     {
         job.tell(Event::Refused {
             addr: addr.clone(),
@@ -1124,6 +1240,10 @@ mod tests {
         assert_eq!(report.sent_to.len(), SENDERS);
         assert!(!report.sent_to.contains(by), "a sender never confirms");
         assert!(!got_tx(by_addr(&fakes, by)));
+        // Every peer that got it is listed, whenever its report came.
+        for fake in fakes.iter().filter(|fake| got_tx(fake)) {
+            assert!(report.sent_to.contains(&fake.addr.into()), "{}", fake.addr);
+        }
         assert!(net.has(candidate.txid));
         // Observers and senders: five peers in five network groups.
         let groups: HashSet<_> = fakes
@@ -1314,21 +1434,43 @@ mod tests {
         assert!(blocks_only.commands().iter().all(|c| c == "pong"));
     }
 
+    /// A job for `fake` alone, as one connection of a broadcast sees it.
+    async fn job_for(fake: &FakePeer, seed: u8) -> (Job, mpsc::UnboundedReceiver<Event>) {
+        let peers = pool(&[fake.addr]).await;
+        let (events, received) = mpsc::unbounded_channel();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        (Job::new(peers, candidate(seed), deadline, events), received)
+    }
+
+    /// Wait (up to 10 s) until `done` holds.
+    async fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The next event that is not `Ready`/`HandedOver`, within 10 s.
+    async fn next_end(received: &mut mpsc::UnboundedReceiver<Event>) -> Event {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline.into(), received.recv())
+                .await
+                .expect("an event within 10 s")
+                .expect("the connection reports");
+            if !matches!(event, Event::Ready { .. } | Event::HandedOver { .. }) {
+                return event;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_sender_that_connects_after_the_broadcast_ended_hands_nothing_over() {
         let net = FakeNet::new();
         let fake = net.peer(ip(100, 0), Script::default());
-        let peers = pool(&[fake.addr]).await;
-        let (events, mut received) = mpsc::unbounded_channel();
-        let job = Job {
-            peers,
-            candidate: candidate(11),
-            stop: CancellationToken::new(),
-            deadline: Instant::now() + Duration::from_secs(10),
-            events,
-            hand_overs: Arc::new(AtomicUsize::new(0)),
-        };
-        job.stop.cancel();
+        let (job, mut received) = job_for(&fake, 11).await;
+        job.close();
         let addr = PeerAddr::from(fake.addr);
         let task_job = job.clone();
         tokio::task::spawn_blocking(move || send(task_job, addr))
@@ -1337,6 +1479,127 @@ mod tests {
         assert!(!got_tx(&fake));
         assert!(!fake.commands().iter().any(|c| c == "inv"));
         assert!(matches!(received.recv().await, Some(Event::Gone { .. })));
+    }
+
+    /// The end of a broadcast shuts an observer's connection: one waiting
+    /// for an answer ends at once instead of after its 5 s wait.
+    #[tokio::test]
+    async fn the_end_of_a_broadcast_shuts_a_waiting_observer_down() {
+        let net = FakeNet::new();
+        let quiet = Script {
+            unresponsive: true,
+            ..Script::default()
+        };
+        let fake = net.peer(ip(101, 0), quiet);
+        let (job, mut received) = job_for(&fake, 12).await;
+        let (task_job, addr) = (job.clone(), PeerAddr::from(fake.addr));
+        tokio::task::spawn_blocking(move || observe(task_job, addr));
+        assert!(matches!(received.recv().await, Some(Event::Ready { .. })));
+        wait_for("the observer's request", || {
+            fake.commands().iter().any(|c| c == "getdata")
+        })
+        .await;
+        let closed = Instant::now();
+        job.close();
+        let end = next_end(&mut received).await;
+        assert!(matches!(end, Event::Gone { .. }), "{end:?}");
+        assert!(
+            closed.elapsed() < Duration::from_secs(1),
+            "ended {:?} after the broadcast",
+            closed.elapsed()
+        );
+    }
+
+    /// Likewise a sender waiting for the pong after the hand-over.
+    #[tokio::test]
+    async fn the_end_of_a_broadcast_shuts_a_waiting_sender_down() {
+        let net = FakeNet::new();
+        let quiet = Script {
+            unresponsive: true,
+            ..Script::default()
+        };
+        let fake = net.peer(ip(102, 0), quiet);
+        let (job, mut received) = job_for(&fake, 13).await;
+        let (task_job, addr) = (job.clone(), PeerAddr::from(fake.addr));
+        tokio::task::spawn_blocking(move || send(task_job, addr));
+        wait_for("the ping after the hand-over", || {
+            let commands = fake.commands();
+            commands.iter().any(|c| c == "tx") && commands.iter().any(|c| c == "ping")
+        })
+        .await;
+        let closed = Instant::now();
+        let handed = job.close();
+        assert_eq!(
+            handed,
+            vec![(job.candidate.txid, PeerAddr::from(fake.addr))]
+        );
+        let end = next_end(&mut received).await;
+        assert!(matches!(end, Event::Gone { .. }), "{end:?}");
+        assert!(
+            closed.elapsed() < Duration::from_secs(1),
+            "ended {:?} after the broadcast",
+            closed.elapsed()
+        );
+    }
+
+    /// A request that arrives once the broadcast has decided gets no
+    /// transaction: the final list of peers holding it stays complete.
+    #[tokio::test]
+    async fn a_request_after_the_end_is_not_answered_with_the_transaction() {
+        let net = FakeNet::new();
+        let fake = net.peer(ip(103, 0), Script::default());
+        let (job, _received) = job_for(&fake, 14).await;
+        let addr = PeerAddr::from(fake.addr);
+        let (sent, handed) = tokio::task::spawn_blocking(move || {
+            let mut peer = connect_sender(&job.peers, &addr).unwrap();
+            let mut signals = job.signals_for(&addr);
+            // The broadcast decides while the peer's request is on its way.
+            job.close();
+            let candidate = &job.candidate;
+            let request =
+                NetworkMessage::GetData(vec![peer.tx_inventory(candidate.txid, candidate.wtxid)]);
+            signals
+                .observe(
+                    &mut peer,
+                    request,
+                    &candidate.tx,
+                    candidate.txid,
+                    candidate.wtxid,
+                )
+                .unwrap();
+            // Everything sent before the pong has reached the peer.
+            peer.flush(Instant::now() + Duration::from_secs(5)).unwrap();
+            (signals.sent, job.close())
+        })
+        .await
+        .unwrap();
+        assert!(!sent);
+        assert!(handed.is_empty());
+        assert!(!got_tx(&fake));
+    }
+
+    /// A peer goes in the final list before the transaction is written to
+    /// it; once the list is final nobody else gets in.
+    #[tokio::test]
+    async fn the_final_list_has_every_peer_let_through_and_no_later_one() {
+        let net = FakeNet::new();
+        let fake = net.peer(ip(104, 0), Script::default());
+        let (job, _received) = job_for(&fake, 15).await;
+        let txid = job.candidate.txid;
+        let (first, second): (PeerAddr, PeerAddr) = (
+            fake.addr.into(),
+            "127.105.0.1:1".parse::<SocketAddr>().unwrap().into(),
+        );
+        assert!(job.claim_hand_over());
+        assert!(job.may_send(&first, txid));
+        assert_eq!(job.close(), vec![(txid, first.clone())]);
+        assert!(!job.may_send(&second, txid));
+        assert!(!job.claim_hand_over());
+        assert_eq!(
+            job.close(),
+            vec![(txid, first)],
+            "closing again changes nothing"
+        );
     }
 
     #[tokio::test]

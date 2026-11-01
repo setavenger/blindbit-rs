@@ -197,6 +197,12 @@ impl Peer {
         &self.addr
     }
 
+    /// A handle to shut this connection down from another thread: every
+    /// read and write on it fails at once from then on.
+    pub fn closer(&self) -> io::Result<TcpStream> {
+        self.stream.try_clone()
+    }
+
     /// What the peer said about itself in its `version` message.
     pub fn info(&self) -> PeerInfo {
         self.info

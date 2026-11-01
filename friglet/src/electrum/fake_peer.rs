@@ -72,6 +72,9 @@ pub struct Script {
     /// Offer BIP 339 `wtxidrelay`; without it transactions are announced
     /// and requested by txid.
     pub wtxid_relay: bool,
+    /// After the handshake answer no `getdata` and no `ping` (it still
+    /// sends its own and takes transactions): a peer that went quiet.
+    pub unresponsive: bool,
 }
 
 impl Default for Script {
@@ -86,6 +89,7 @@ impl Default for Script {
             announce: true,
             echo_inv: false,
             wtxid_relay: true,
+            unresponsive: false,
         }
     }
 }
@@ -349,6 +353,14 @@ fn serve(
         conns.lock().unwrap()[conn]
             .commands
             .push(message.command().to_string());
+        if script.unresponsive
+            && matches!(
+                message,
+                NetworkMessage::Ping(_) | NetworkMessage::GetData(_)
+            )
+        {
+            continue;
+        }
         match message {
             NetworkMessage::Ping(nonce) => wire.send(NetworkMessage::Pong(nonce))?,
             NetworkMessage::GetHeaders(request) if request.locator_hashes.is_empty() => {

@@ -133,6 +133,10 @@ pub enum Outcome {
     NotAccepted(String),
 }
 
+/// Asked right before a transaction is written to the peer: `false` means
+/// it must not be (the broadcast it belongs to has decided).
+pub(super) type SendGate = Box<dyn FnMut(Txid) -> bool + Send>;
+
 /// What the peer revealed while we waited.
 #[derive(Default)]
 pub(super) struct Signals {
@@ -140,9 +144,24 @@ pub(super) struct Signals {
     pub(super) sent: bool,
     /// The peer asked for another transaction: a parent of ours.
     pub(super) missing_inputs: bool,
+    /// See [`SendGate`]. None (the own node): always written.
+    gate: Option<SendGate>,
 }
 
 impl Signals {
+    /// Signals whose transaction is written only while `gate` allows it.
+    pub(super) fn gated(gate: SendGate) -> Self {
+        Self {
+            gate: Some(gate),
+            ..Self::default()
+        }
+    }
+
+    /// May `txid` be written to the peer now?
+    pub(super) fn may_send(&mut self, txid: Txid) -> bool {
+        self.gate.as_mut().is_none_or(|gate| gate(txid))
+    }
+
     /// React to `message`: hand the transaction over when the peer asks for
     /// it, answer any other request with `notfound`.
     pub(super) fn observe(
@@ -159,8 +178,12 @@ impl Signals {
         let mut unknown = Vec::new();
         for item in items {
             if inventory_matches(&item, txid, wtxid) {
-                peer.send(NetworkMessage::Tx(tx.clone()))?;
-                self.sent = true;
+                // Once the gate is shut the request goes unanswered: the
+                // connection is being closed.
+                if self.may_send(txid) {
+                    peer.send(NetworkMessage::Tx(tx.clone()))?;
+                    self.sent = true;
+                }
             } else {
                 if matches!(
                     item,
@@ -693,7 +716,12 @@ mod tests {
         assert!(!present.unwrap(), "another witness counted as ours");
         // Its own copy is found.
         let theirs = Candidate::decode(bitcoin::consensus::encode::serialize(&theirs)).unwrap();
-        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &theirs);
+        let present = in_mempool(
+            &Dialer::Direct,
+            &peer.addr.into(),
+            Network::Regtest,
+            &theirs,
+        );
         assert!(present.unwrap());
     }
 
