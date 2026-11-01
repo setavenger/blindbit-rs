@@ -32,3 +32,5 @@ bdk_sp = { git = "https://github.com/setavenger/bdk-sp", rev = "94b72f60b0015793
 
 [dev-dependencies]
 figment = { version = "0.10", features = ["toml", "env", "test"] }
+# `net::testing::FakeSocks5`, for the P2P-through-a-proxy tests.
+blindbit-lib = { path = "../blindbit-lib", features = ["serde", "test-util"] }

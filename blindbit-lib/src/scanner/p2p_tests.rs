@@ -482,6 +482,7 @@ fn a_mainnet_scan_pointed_at_a_signet_port_is_told_so() {
         },
         peer_info: None,
         local_ip: Some("192.168.1.20".parse().unwrap()),
+        proxy: None,
         retry: None,
     };
     let message = err.to_string();

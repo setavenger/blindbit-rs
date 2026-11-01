@@ -41,7 +41,7 @@ cargo fmt --all -- --check
     --oracle-url https://signet.oracle.setor.dev \
     --state-file blindbit-test/cli-state.json
   ```
-  `--end-height` is required; `--p2p-node-addr` must be `ip:port` (no hostnames) and may be left out (random peers; not on regtest); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
+  `--end-height` is required; `--p2p-node-addr` must be `ip:port` (hostnames only with `--p2p-proxy`) and may be left out (random peers; not on regtest); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
 - `friglet scan` from `--start-height 274010` to the signet tip is ~50k blocks (minutes); use blindbit-cli for quick checks.
 - State persists to a JSON file (`--state-file`).
 
@@ -303,6 +303,75 @@ dbus-run-session -- bash -c '
   `known() == n` every time: move the addresses),
   `blindbit-lib/tests/thread_soak.rs` (Linux; thread count after 50
   fetches). `fetch_block` example: peer `dns` = discovery.
+- Address book on disk (daemon only): `PeerSource::keep_book_in(<state file
+  dir>)` loads `peers-<network>-{new,tried}.book` (`bitcoin-address-book`
+  `io::FileExt` format, read back record by record because `Table` cannot
+  list them); saved every 10 min when changed and at exit; unreadable file
+  → warning, ignored. `start()` seeds only while < 50 addresses are known.
+
+## Tor / SOCKS5 (`p2p_proxy`, SNB-857)
+
+- `p2p_proxy` (`--p2p-proxy`, `FRIGLET_P2P_PROXY`, TOML, tray field "Tor
+  proxy"): `ip:port` or `localhost:port` (`friglet_ipc::network::
+  parse_proxy_addr`; other host names refused, so finding the proxy needs no
+  DNS). Set → `Dialer::Socks5 { proxy }` for every P2P connection (scanner,
+  Electrum headers/relay/broadcast); fail-closed: never a direct connection,
+  also when the proxy is down. The oracle (gRPC) is not proxied.
+- `blindbit-lib/src/net/socks5.rs`: blocking RFC 1928/1929 client; offers
+  NOAUTH + USERPASS with random credentials per connection (Tor stream
+  isolation); host names go as `ATYP` domain. `net::is_proxy_down(&io::Error)`
+  tells the proxy failing (unreachable, not SOCKS5, login refused) from the
+  peer failing (reply codes → readable `io::ErrorKind`s). Proxy down →
+  `FetchFailure::Proxy`: the round ends at once, no peer is blamed, and the
+  message names `p2p_proxy`; Electrum header requests do the same. No
+  CONNECT reply in time, or reply 0x01/0x06 (`is_proxy_unclear`, what Tor
+  without a working circuit gives) only rests the peer (`Unhelpful`), so a
+  Tor outage cannot empty the saved address book. An empty
+  `FRIGLET_P2P_PROXY` does not override the file's `p2p_proxy`.
+- No local DNS through the proxy: `ResolvedConfig.p2p_node` is a `PeerAddr`
+  whose host name stays a name (resolved locally only without a proxy; an
+  `.onion` node without a proxy is a config error); `Seeds::resolve` with a
+  proxy connects to `x9.<seed>` (then the bare name) of 3 random seeds
+  through it, handshakes with `getaddr` and keeps the `addr`/`addrv2` answer
+  (≤ 20 s). The tray's Save does a 2 s TCP check of the proxy instead of a
+  DNS lookup of the node.
+- Through a proxy: connect ≥ 20 s (`PROXY_CONNECT_TIMEOUT`, enforced in the
+  dialer), block deadline ≥ 60 s (`RetryPolicy::through_proxy`). Tor keeps
+  trying a dead address for the whole connect timeout, so a discovered-peer
+  fetch races `PROXY_RACE` (3) connects at once and uses the first to open
+  (the losers finish on blocking threads within the timeout), and a seed
+  node's addresses enter the book most recently seen first (half of a
+  signet node's `getaddr` answer is > 5 days old).
+- Broadcast through a proxy (`net_broadcast.rs` `Timing::PROXIED`): 6
+  observer connects at the start (3 directly), then every 6 s more
+  observers while < 3 are ready and, once senders start, more senders
+  while < 2 handed over ("hedging"; `Job::claim_hand_over` caps hand-overs
+  at 2); observer window 15 s, limit 30 s, pong wait 15 s (5 s); budget
+  `PROXIED_BROADCAST_BUDGET` 45 s (`electrum/mod.rs`; Sparrow's requests
+  end at ~3, 12, 29, 64, 99 s, so the answer lands in the fourth). Each
+  sender/observer is its own SOCKS login (own circuit). Proxy down →
+  `Event::ProxyDown`, no peer blamed, error names `p2p_proxy`.
+  `ask_mempools` races 2 extra connects and header requests race their
+  first connection (`ChainSource::race_header_connection`) through a proxy:
+  a tip header behind three dead addresses otherwise held a broadcast's
+  answer for 40 s. Senders keep listening after the pong (bounded by the
+  budget).
+- An older tray drops `p2p_proxy` on Save (unknown field); the daemon logs a
+  warning when an apply clears it.
+- Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
+  down / not SOCKS5), `net/proxy_tests.rs` (seeding by name, no local
+  lookup), `scanner/proxy_tests.rs` (own node `node.invalid` through the
+  proxy, proxy down/refusing → no direct connection), `electrum/chain.rs`
+  (headers through the proxy); `scanner/proxy_tests.rs` also races past
+  stalled peers. `net::testing::FakeSocks5` (feature
+  `test-util`, on in friglet's dev-dependencies) routes names to local
+  listeners and records methods, credentials and targets. Closed-proxy tests
+  use 127.0.0.1:1 (a port freed by dropping a listener can be taken by a
+  parallel test).
+- Live: no system Tor on the VM; run it in Docker (`debian:stable-slim` +
+  `apt-get install tor`, `SocksPort 0.0.0.0:9050`, published as
+  `-p 127.0.0.1:9050:9050`), then `fetch_block … signet --proxy
+  127.0.0.1:9050`.
 
 ## SetConfig / SetScanKey / ApplySettings semantics (SNB-624)
 

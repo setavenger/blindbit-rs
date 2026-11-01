@@ -209,7 +209,8 @@ impl ChainSource {
                         let _ = peer.wait_until_settled(Instant::now() + SETTLE_WAIT);
                         note_fee_filter(&filters, &addr, peer.fee_filter());
                     }
-                    Err(_) => peers.report(&addr, PeerEvent::Unreachable),
+                    Err(e) if e.proxy_down() => {}
+                    Err(e) => peers.report(&addr, e.peer_event()),
                 }
             });
         }
@@ -236,8 +237,18 @@ impl ChainSource {
         let mut asked = HashSet::new();
         let mut last_error = None;
         let mut last_answer = None;
+        // Through a proxy, open the connection by racing several peers.
+        let mut raced = if !own_node && self.peers.dialer().proxy().is_some() {
+            self.race_header_connection(&mut asked).await?
+        } else {
+            None
+        };
         for _ in 0..tries {
-            let addr = match self.peers.next(Purpose::Header, &asked).await {
+            let next = match raced.take() {
+                Some(addr) => Ok(addr),
+                None => self.peers.next(Purpose::Header, &asked).await,
+            };
+            let addr = match next {
                 Ok(addr) => addr,
                 Err(no_peers) => {
                     last_error = Some(format!("no P2P peer to ask: {no_peers}"));
@@ -267,13 +278,84 @@ impl ChainSource {
                     self.peers.report(&addr, PeerEvent::Behind);
                     last_answer = Some(value);
                 }
-                Err((error, _)) => last_error = Some(error.to_string()),
+                Err((error, _)) => {
+                    // Every other peer would fail the same way.
+                    let proxy_down = error.proxy_down();
+                    last_error = Some(error.to_string());
+                    if proxy_down {
+                        break;
+                    }
+                }
             }
         }
         match last_answer {
             Some(value) => Ok(value),
             None => Err(last_error.unwrap_or_else(|| "P2P request failed".to_string())),
         }
+    }
+
+    /// Through a proxy (Tor) an address nobody answers at keeps a connect
+    /// waiting the whole 20 s, so trying header peers one after another
+    /// can hold a request (and with it a new-block notification or a
+    /// broadcast's answer) for a minute. Unless the shared connection is
+    /// still fresh, connect to [`HEADER_PEERS`] peers at once and keep the
+    /// first that answers in it. The peer it went to, if any; the others
+    /// are reported as their connects end. `Err` when the proxy is down.
+    async fn race_header_connection(
+        &self,
+        asked: &mut HashSet<PeerAddr>,
+    ) -> Result<Option<PeerAddr>, String> {
+        // Never wait for the lock here (async context): a request holding
+        // it is using the shared connection.
+        let fresh = match self.header_peer.try_lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .is_some_and(|(_, used)| used.elapsed() <= P2P_IDLE_REUSE),
+            Err(_) => true,
+        };
+        if fresh {
+            return Ok(None);
+        }
+        let mut connecting = tokio::task::JoinSet::new();
+        for _ in 0..HEADER_PEERS {
+            let Ok(addr) = self.peers.next(Purpose::Header, asked).await else {
+                break;
+            };
+            asked.insert(addr.clone());
+            let peers = self.peers.clone();
+            connecting.spawn_blocking(move || {
+                let connected = Peer::connect(
+                    peers.dialer(),
+                    &addr,
+                    peers.network(),
+                    false,
+                    P2P_CONNECT_TIMEOUT,
+                );
+                match &connected {
+                    Ok(peer) => peers.report(&addr, PeerEvent::Connected(peer.info())),
+                    Err(e) if e.proxy_down() => {}
+                    Err(e) => peers.report(&addr, e.peer_event()),
+                }
+                (addr, connected)
+            });
+        }
+        // Dropping the set on return leaves the losers running: blocking
+        // connects end on their own, within the connect timeout.
+        while let Some(joined) = connecting.join_next().await {
+            match joined {
+                Ok((addr, Ok(peer))) => {
+                    let Ok(mut slot) = self.header_peer.try_lock() else {
+                        return Ok(None);
+                    };
+                    *slot = Some((peer, Instant::now()));
+                    return Ok(Some(addr));
+                }
+                // Every other peer would fail the same way.
+                Ok((_, Err(error))) if error.proxy_down() => return Err(error.to_string()),
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -301,7 +383,11 @@ fn ask_header_peer<T>(
             false,
             P2P_CONNECT_TIMEOUT,
         )
-        .inspect_err(|_| peers.report(addr, PeerEvent::Unreachable))?;
+        .inspect_err(|e| {
+            if !e.proxy_down() {
+                peers.report(addr, e.peer_event());
+            }
+        })?;
         peers.report(addr, PeerEvent::Connected(peer.info()));
         *slot = Some((peer, Instant::now()));
     }
@@ -416,6 +502,92 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Through a proxy a header request races its first connection, so
+    /// addresses Tor gets no answer from (20 s each) do not hold it up.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn through_a_proxy_header_peers_race_past_dead_addresses() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let known = fake_peer::header(9);
+        let live = FakePeer::spawn_on(
+            [127, 0, 0, 43].into(),
+            Script {
+                headers: vec![known],
+                ..Script::default()
+            },
+            2,
+        );
+        let proxy = FakeSocks5::start();
+        let mut seeds: Vec<PeerAddr> = vec![live.addr.into()];
+        for n in 0..2u8 {
+            let dead: PeerAddr = std::net::SocketAddr::from(([10, 120 + n, 0, 1], 18444)).into();
+            proxy.stall(dead.clone());
+            seeds.push(dead);
+        }
+        // The stalled connects outlive the request; a plain runtime drop
+        // would wait for them.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (header, waited) = runtime.block_on(async {
+            let peers =
+                PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
+            let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+            let started = Instant::now();
+            let header = chain.header(known.block_hash()).await;
+            (header, started.elapsed())
+        });
+        runtime.shutdown_background();
+        assert_eq!(header.unwrap(), known);
+        assert!(waited < Duration::from_secs(10), "waited {waited:?}");
+    }
+
+    /// Through `p2p_proxy` the Electrum server's own connections go through
+    /// the proxy too, the node's name unresolved, each with its own login;
+    /// with the proxy down the peer is not blamed.
+    #[tokio::test]
+    async fn header_connections_go_through_the_proxy() {
+        use blindbit_lib::net::testing::FakeSocks5;
+        use blindbit_lib::net::{PeerAddr, PeerHost};
+
+        let known = fake_peer::header(3);
+        let script = Script {
+            headers: vec![known],
+            ..Script::default()
+        };
+        let peer = FakePeer::spawn(script, 2);
+        let proxy = FakeSocks5::start();
+        proxy.route("node.invalid", peer.addr);
+        let node = PeerAddr {
+            host: PeerHost::Name("node.invalid".to_string()),
+            port: 18444,
+        };
+        let peers = PeerSource::own_node(node.clone(), proxy.dialer(), Network::Regtest);
+        let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+        assert_eq!(chain.header(known.block_hash()).await.unwrap(), known);
+        let requests = proxy.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].target, node);
+        assert!(requests[0].credentials.is_some());
+
+        // Nothing listens on port 1, and no parallel test can take it.
+        let down = "127.0.0.1:1".parse().unwrap();
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            Dialer::Socks5 { proxy: down },
+            Seeds::Static(vec![peer.addr.into()]),
+        );
+        let chain = ChainSource::new(peers.clone(), "http://127.0.0.1:1".into());
+        // Three failures would forget a peer that was blamed for them.
+        for _ in 0..3 {
+            let err = chain.header(known.block_hash()).await.unwrap_err();
+            assert!(err.contains("p2p_proxy"), "{err}");
+        }
+        assert_eq!(peers.known(), 1, "the peer is not blamed for the proxy");
     }
 
     #[tokio::test]

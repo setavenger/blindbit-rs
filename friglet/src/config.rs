@@ -12,12 +12,13 @@
 //! and config rewrites only ever see the derived `spend_pubkey`, and the scan
 //! key is moved into the 0600 key file at startup.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
+use blindbit_lib::net::{Dialer, PeerAddr, PeerHost};
 use clap::Args;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
@@ -60,6 +61,13 @@ pub struct ScanArgs {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_node_addr: Option<String>,
+
+    /// SOCKS5 proxy (Tor) for every P2P connection, ip:port, e.g.
+    /// 127.0.0.1:9050; never a direct P2P connection while set (the oracle
+    /// is not proxied)
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_proxy: Option<String>,
 
     /// Maximum label number [default: 0]
     #[arg(long)]
@@ -228,9 +236,15 @@ fn user_layers(file: Option<&Path>, args: &ScanArgs) -> Figment {
     if let Some(path) = file {
         figment = figment.merge(Toml::file_exact(path));
     }
-    figment
-        .merge(Env::prefixed("FRIGLET_"))
-        .merge(Serialized::defaults(args.clone()))
+    let mut env = Env::prefixed("FRIGLET_");
+    // An empty FRIGLET_P2P_PROXY (a service or container template's
+    // default) must not switch off a proxy the config file sets: P2P
+    // connections would then silently go out directly. Clearing it takes
+    // the file or the flag.
+    if std::env::var("FRIGLET_P2P_PROXY").is_ok_and(|value| value.trim().is_empty()) {
+        env = env.ignore(&["p2p_proxy"]);
+    }
+    figment.merge(env).merge(Serialized::defaults(args.clone()))
 }
 
 fn merge_layers(file: Option<&Path>, args: &ScanArgs) -> Result<DaemonConfig, String> {
@@ -259,7 +273,11 @@ pub struct ResolvedConfig {
     pub raw: DaemonConfig,
     pub network: Network,
     /// The own node, when one is configured; `None`: discovered peers.
-    pub p2p_node: Option<SocketAddr>,
+    /// Resolved to an address here without a proxy; through one, a host
+    /// name stays a name for the proxy to resolve.
+    pub p2p_node: Option<PeerAddr>,
+    /// The SOCKS5 proxy every P2P connection goes through, if set.
+    pub p2p_proxy: Option<SocketAddr>,
     pub start_height: u64,
     pub spend_pubkey: PublicKey,
     /// The wallet's state file; `raw.state_file` keeps the configured path.
@@ -296,20 +314,23 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
         ));
     }
 
-    // Empty means unset: blocks then come from discovered peers.
+    // Empty means unset: blocks then come from discovered peers, and P2P
+    // connections go out directly.
     let mut raw = raw;
-    if raw
-        .p2p_node_addr
-        .as_deref()
-        .is_some_and(|addr| addr.trim().is_empty())
-    {
-        raw.p2p_node_addr = None;
+    for value in [&mut raw.p2p_node_addr, &mut raw.p2p_proxy] {
+        if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+            *value = None;
+        }
     }
+    let p2p_proxy = raw
+        .p2p_proxy
+        .as_deref()
+        .map(friglet_ipc::network::parse_proxy_addr)
+        .transpose()?;
     let p2p_node = match raw.p2p_node_addr.as_deref() {
-        // Accepts host:port, ip:port and a bare host (network default port);
-        // hostnames are resolved here, i.e. at every daemon (re)start.
+        // Accepts host:port, ip:port and a bare host (network default port).
         Some(p2p) => Some(
-            friglet_ipc::network::resolve_peer_addr(p2p, &raw.network)
+            own_node_addr(p2p, &raw.network, p2p_proxy)
                 .map_err(|e| format!("invalid p2p_node_addr `{p2p}`: {e}"))?,
         ),
         None if friglet_ipc::network::needs_own_node(&raw.network) => {
@@ -364,6 +385,7 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
     Ok(ResolvedConfig {
         network,
         p2p_node,
+        p2p_proxy,
         start_height,
         spend_pubkey,
         state_file: raw.state_file.clone(),
@@ -371,6 +393,40 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
         control_socket,
         raw,
     })
+}
+
+/// The own node's address. Without a proxy a host name is resolved here,
+/// i.e. at every daemon (re)start; through one it is left for the proxy to
+/// resolve (no local DNS), which also reaches a Tor onion service.
+fn own_node_addr(addr: &str, network: &str, proxy: Option<SocketAddr>) -> Result<PeerAddr, String> {
+    let (host, port) = friglet_ipc::network::split_peer_addr(addr, network)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port).into());
+    }
+    if proxy.is_some() {
+        return Ok(PeerAddr {
+            host: PeerHost::Name(host),
+            port,
+        });
+    }
+    if friglet_ipc::network::is_onion(&host) {
+        return Err(
+            "an onion address is reachable only through Tor: set p2p_proxy to Tor's SOCKS port \
+             (e.g. 127.0.0.1:9050)"
+                .to_string(),
+        );
+    }
+    friglet_ipc::network::resolve_peer_addr(addr, network).map(Into::into)
+}
+
+impl ResolvedConfig {
+    /// How P2P connections go out: through `p2p_proxy`, else directly.
+    pub fn dialer(&self) -> Dialer {
+        match self.p2p_proxy {
+            Some(proxy) => Dialer::Socks5 { proxy },
+            None => Dialer::Direct,
+        }
+    }
 }
 
 /// Full validation for a config arriving via `SetConfig`: everything
@@ -886,6 +942,7 @@ mod tests {
             network: network.to_string(),
             oracle_url: oracle_url.to_string(),
             p2p_node_addr: Some(p2p.to_string()),
+            p2p_proxy: None,
             start_height: Some(1),
             spend_pubkey: Some(
                 "02e6642fd69bd211f93f7f1f36ca51a26a5290eb2dd1b0d8279a87bb0d480c8443".to_string(),
@@ -926,18 +983,105 @@ mod tests {
     #[test]
     fn p2p_peer_accepts_hostnames_and_default_ports() {
         let r = resolve(resolvable("signet", "http://127.0.0.1:1", "127.0.0.1")).unwrap();
-        assert_eq!(r.p2p_node, Some("127.0.0.1:38333".parse().unwrap()));
+        assert_eq!(
+            r.p2p_node,
+            Some("127.0.0.1:38333".parse::<SocketAddr>().unwrap().into())
+        );
         let r = resolve(resolvable(
             "regtest",
             "http://127.0.0.1:1",
             "localhost:18444",
         ))
         .unwrap();
-        let node = r.p2p_node.unwrap();
-        assert!(node.ip().is_loopback());
-        assert_eq!(node.port(), 18444);
+        let node = r.p2p_node.clone().unwrap();
+        assert!(
+            node.ip().is_some_and(|ip| ip.is_loopback()),
+            "resolved here"
+        );
+        assert_eq!(node.port, 18444);
+        assert_eq!(r.dialer(), Dialer::Direct);
         let err = resolve(resolvable("signet", "http://127.0.0.1:1", "host:notaport")).unwrap_err();
         assert!(err.contains("p2p_node_addr"), "{err}");
+    }
+
+    #[test]
+    fn through_a_proxy_the_node_name_is_not_resolved_here() {
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "node.invalid");
+        cfg.p2p_proxy = Some(" localhost:9050 ".to_string());
+        let r = resolve(cfg).unwrap();
+        assert_eq!(
+            r.p2p_node,
+            Some(PeerAddr {
+                host: PeerHost::Name("node.invalid".to_string()),
+                port: 38333,
+            }),
+            "left for the proxy (resolving .invalid here would fail)"
+        );
+        assert_eq!(
+            r.dialer(),
+            Dialer::Socks5 {
+                proxy: "127.0.0.1:9050".parse().unwrap()
+            }
+        );
+        // An IP stays an IP.
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "152.53.151.148");
+        cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
+        assert_eq!(
+            resolve(cfg).unwrap().p2p_node,
+            Some("152.53.151.148:38333".parse::<SocketAddr>().unwrap().into())
+        );
+        // An empty proxy is no proxy.
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "127.0.0.1");
+        cfg.p2p_proxy = Some("  ".to_string());
+        let r = resolve(cfg).unwrap();
+        assert_eq!((r.p2p_proxy, r.raw.p2p_proxy), (None, None));
+    }
+
+    #[test]
+    fn an_onion_node_needs_the_proxy_and_the_proxy_needs_an_ip() {
+        let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:38333";
+        let err = resolve(resolvable("signet", "http://127.0.0.1:1", onion)).unwrap_err();
+        for expected in ["p2p_node_addr", "only through Tor", "set p2p_proxy"] {
+            assert!(err.contains(expected), "{expected:?} in {err}");
+        }
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", onion);
+        cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
+        assert!(resolve(cfg).is_ok());
+
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "127.0.0.1");
+        cfg.p2p_proxy = Some("tor.example:9050".to_string());
+        let err = resolve(cfg).unwrap_err();
+        assert!(
+            err.contains("p2p_proxy") && err.contains("IP address"),
+            "{err}"
+        );
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "127.0.0.1");
+        cfg.p2p_proxy = Some("127.0.0.1".to_string());
+        assert!(resolve(cfg).unwrap_err().contains("ip:port"));
+    }
+
+    #[test]
+    fn the_proxy_comes_from_flag_env_or_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("friglet.toml", "p2p_proxy = \"127.0.0.1:9150\"\n")?;
+            let file = jail.directory().join("friglet.toml");
+            let from_file = merge_layers(Some(&file), &ScanArgs::default()).unwrap();
+            assert_eq!(from_file.p2p_proxy.as_deref(), Some("127.0.0.1:9150"));
+            jail.set_env("FRIGLET_P2P_PROXY", "127.0.0.1:9050");
+            let from_env = merge_layers(Some(&file), &ScanArgs::default()).unwrap();
+            assert_eq!(from_env.p2p_proxy.as_deref(), Some("127.0.0.1:9050"));
+            let args = ScanArgs {
+                p2p_proxy: Some("[::1]:9050".to_string()),
+                ..ScanArgs::default()
+            };
+            let from_flag = merge_layers(Some(&file), &args).unwrap();
+            assert_eq!(from_flag.p2p_proxy.as_deref(), Some("[::1]:9050"));
+            // An empty variable does not switch the file's proxy off.
+            jail.set_env("FRIGLET_P2P_PROXY", " ");
+            let empty_env = merge_layers(Some(&file), &ScanArgs::default()).unwrap();
+            assert_eq!(empty_env.p2p_proxy.as_deref(), Some("127.0.0.1:9150"));
+            Ok(())
+        });
     }
 
     #[test]

@@ -227,6 +227,13 @@
                 the network's.</p>
             </div>
             <div class="field">
+              <label for="cfg-p2p-proxy">Tor proxy (optional)</label>
+              <input id="cfg-p2p-proxy" type="text" spellcheck="false" placeholder="e.g. 127.0.0.1:9050" />
+              <p class="hint">Tor's SOCKS port. Set, every Bitcoin peer connection goes through
+                Tor and never directly; your node can then be an .onion address. The oracle
+                connection does not use it.</p>
+            </div>
+            <div class="field">
               <label for="cfg-oracle-url">BlindBit oracle URL</label>
               <input id="cfg-oracle-url" type="text" spellcheck="false" placeholder="https://oracle.setor.dev" />
               <p id="oracle-hint" class="hint"></p>

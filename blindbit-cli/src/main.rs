@@ -1,5 +1,5 @@
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use blindbit_lib::net::{Dialer, PeerSource, Seeds};
+use blindbit_lib::net::{Dialer, PeerAddr, PeerHost, PeerSource, Seeds};
 use blindbit_lib::scanner::{self, ScannerConfig};
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode, str::FromStr};
@@ -34,11 +34,19 @@ enum Commands {
         #[arg(long)]
         end_height: u64,
 
-        /// Your Bitcoin node's P2P address (ip:port). Without it, blocks come
-        /// from random peers of the network, found through its DNS seeds
-        /// (they see this computer's IP and which blocks it downloads).
+        /// Your Bitcoin node's P2P address (ip:port; with --p2p-proxy also
+        /// host:port, e.g. an .onion address). Without it, blocks come from
+        /// random peers of the network, found through its DNS seeds (they
+        /// see this computer's IP, or Tor's with --p2p-proxy, and which
+        /// blocks it downloads).
         #[arg(long)]
         p2p_node_addr: Option<String>,
+
+        /// SOCKS5 proxy (Tor) for every P2P connection, ip:port, e.g.
+        /// 127.0.0.1:9050. No P2P connection goes out directly, and nothing
+        /// is looked up locally (the oracle connection is not proxied).
+        #[arg(long)]
+        p2p_proxy: Option<String>,
 
         /// Maximum label number
         #[arg(long, default_value = "0")]
@@ -85,6 +93,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             start_height,
             end_height,
             p2p_node_addr,
+            p2p_proxy,
             max_label_num,
             oracle_url,
             state_file,
@@ -104,25 +113,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let public_spend = PublicKey::from_str(&spend_pubkey)
                 .map_err(|e| format!("Invalid spend_pubkey: {e}. Must be a valid 33-byte hex string representing a secp256k1 public key"))?;
 
+            let dialer = match p2p_proxy.as_deref().map(str::trim) {
+                None | Some("") => Dialer::Direct,
+                Some(proxy) => Dialer::Socks5 {
+                    proxy: parse_proxy(proxy)?,
+                },
+            };
             let own_node = p2p_node_addr
                 .as_deref()
                 .map(str::trim)
                 .filter(|addr| !addr.is_empty())
-                .map(SocketAddr::from_str)
-                .transpose()
-                .map_err(|e| format!("Invalid p2p_node_addr: {e}"))?;
+                .map(|addr| own_node_addr(addr, &dialer))
+                .transpose()?;
             if own_node.is_none() && network == Network::Regtest {
                 return Err(
                     "regtest has no public peers: pass --p2p-node-addr with your regtest node"
                         .into(),
                 );
             }
-            let peers = PeerSource::new(
-                network,
-                Dialer::Direct,
-                own_node.map(Into::into),
-                Seeds::for_network(network),
-            );
+            let peers = PeerSource::new(network, dialer, own_node, Seeds::for_network(network));
             peers.start();
             tracing::info!(p2p = %peers.summary(), "block downloads");
 
@@ -156,4 +165,39 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+/// `ip:port` or `localhost:port`: finding the proxy needs no DNS lookup.
+fn parse_proxy(proxy: &str) -> Result<SocketAddr, String> {
+    if let Some(port) = proxy.strip_prefix("localhost:") {
+        let port = port
+            .parse::<u16>()
+            .map_err(|e| format!("Invalid p2p_proxy `{proxy}`: {e}"))?;
+        return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    SocketAddr::from_str(proxy).map_err(|e| {
+        format!("Invalid p2p_proxy `{proxy}`: {e} (expected ip:port, e.g. 127.0.0.1:9050)")
+    })
+}
+
+/// The own node: `ip:port`, or through a proxy also `host:port` (the proxy
+/// resolves the name).
+fn own_node_addr(addr: &str, dialer: &Dialer) -> Result<PeerAddr, String> {
+    if let Ok(socket) = SocketAddr::from_str(addr) {
+        return Ok(socket.into());
+    }
+    match (dialer.proxy(), addr.rsplit_once(':')) {
+        (Some(_), Some((host, port))) if !host.is_empty() => Ok(PeerAddr {
+            host: PeerHost::Name(host.to_string()),
+            port: port
+                .parse()
+                .map_err(|e| format!("Invalid p2p_node_addr `{addr}`: {e}"))?,
+        }),
+        (Some(_), _) => Err(format!(
+            "Invalid p2p_node_addr `{addr}`: expected host:port"
+        )),
+        (None, _) => Err(format!(
+            "Invalid p2p_node_addr `{addr}`: expected ip:port (host names only with --p2p-proxy)"
+        )),
+    }
 }

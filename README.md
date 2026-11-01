@@ -51,7 +51,8 @@ cargo run --release --package friglet scan \
 | `--spend-pubkey` | Spend public key (33-byte hex, secp256k1) | required |
 | `--start-height` | Wallet birthday block height | required (or `--start-at-tip`) |
 | `--start-at-tip` | New wallet: use the oracle's current tip as the birthday (recorded as `start_height` in the config file on first start) | off |
-| `--p2p-node-addr` | Your Bitcoin node's P2P address: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start. When set, friglet talks only to this node. Empty: random peers of the network (see [Privacy: your node or random peers](#privacy-your-node-or-random-peers)) | empty (random peers); required on regtest |
+| `--p2p-node-addr` | Your Bitcoin node's P2P address: `host:port`, `ip:port`, or a bare host (network default port); hostnames are resolved at every start (by the proxy when `--p2p-proxy` is set, which also reaches `.onion` nodes). When set, friglet talks only to this node. Empty: random peers of the network (see [Privacy: your node or random peers](#privacy-your-node-or-random-peers)) | empty (random peers); required on regtest |
+| `--p2p-proxy` | SOCKS5 proxy for every Bitcoin P2P connection, usually Tor: `ip:port` or `localhost:port` (see [Tor](#tor)). While set, no P2P connection goes out directly, even when the proxy is down | empty (direct) |
 | `--oracle-url` | BlindBit Oracle URL | hosted oracle of `--network` (mainnet `https://oracle.setor.dev`, signet `https://signet.oracle.setor.dev`; none for other networks) |
 | `--network` | Bitcoin network: `bitcoin\|signet\|testnet\|testnet4\|regtest` | `bitcoin` |
 | `--max-label-num` | Maximum number of Silent Payment labels | `0` |
@@ -174,9 +175,49 @@ or from the wallet), block headers, and broadcasts over Bitcoin P2P.
   served the last block first, so that peer sees most of them. A broadcast
   hands the transaction to two random peers straight from this computer's
   IP address, and asks three more for it before it has spread, so all five
-  can tell it comes from here. Use your own node, or (planned) Tor, if that
+  can tell it comes from here. Use your own node, or [Tor](#tor), if that
   matters to you.
 - Regtest has no public peers: it needs `p2p_node_addr`.
+- The addresses friglet learns are kept beside the wallet state
+  (`peers-<network>-new.book`, `peers-<network>-tried.book`; saved every
+  10 minutes and at exit), so a restart asks the seeds only when it knows
+  fewer than 50 peers.
+
+#### Tor
+
+With `p2p_proxy` set to Tor's SOCKS port, every Bitcoin P2P connection
+(block downloads, headers, mempool checks, broadcasts) goes through Tor.
+Peers then see a Tor exit's address instead of this computer's.
+
+- Run Tor: install it from your package manager (`apt install tor`,
+  `brew install tor`) and start it; it listens on `127.0.0.1:9050`. The Tor
+  Browser's Tor listens on `127.0.0.1:9150` while it runs. Then set
+  `p2p_proxy = "127.0.0.1:9050"` (or `--p2p-proxy`, `FRIGLET_P2P_PROXY`, or
+  the tray's *Tor proxy* field, whose Save checks that the proxy answers).
+- Fail-closed: while `p2p_proxy` is set, friglet never connects to a peer
+  directly. If Tor is down, block downloads and broadcasts fail with an
+  error that names `p2p_proxy`, and the scan retries until Tor is back.
+- Nothing is looked up locally: your node's host name (also an `.onion`
+  address, which needs the proxy) goes to Tor unresolved, and instead of
+  DNS seed lookups friglet connects through Tor to three of the network's
+  seed names, asks the node there for addresses and disconnects.
+- Each connection logs in to Tor with random credentials, so Tor gives it a
+  circuit of its own and no single exit sees all of friglet's peers: the two
+  peers a broadcast hands the transaction to and the ones that watch for it
+  each see a different exit.
+- A broadcast to random peers through Tor may take up to 45 seconds before
+  Sparrow gets the answer (25 directly): Tor connections are slower to open.
+- Not proxied: the BlindBit oracle (gRPC over HTTPS to `oracle_url`; the
+  oracle sees this computer's IP, but the requests do not depend on your
+  keys), and the Electrum server, which only listens locally.
+- Your own node on this computer or your local network does not need Tor;
+  Tor cannot reach it either (its exits only connect to public addresses).
+  Leave `p2p_proxy` empty for it, or give the node's onion address.
+- Through Tor a block takes longer (connections get 20 s, a block 60 s),
+  and the first download waits for the seeds' answers through Tor.
+- An older friglet-tray does not know `p2p_proxy` and drops it when it saves
+  settings; the daemon then logs a warning. Update the tray with the
+  daemon.
 
 ---
 
@@ -343,8 +384,11 @@ first-time-setup banner. Then:
    `host:port` or just `host`. Left empty, friglet downloads blocks from
    random peers of the network (see
    [Privacy](#privacy-your-node-or-random-peers)); regtest needs a node.
+   *Tor proxy* (optional): Tor's SOCKS port, e.g. `127.0.0.1:9050` (see
+   [Tor](#tor)).
 
-Save validates the form (including a DNS lookup of the node, if one is set), writes the
+Save validates the form (including a DNS lookup of the node, if one is set
+and no proxy is; with a proxy, a 2 s connection check to it instead), writes the
 config file (atomic TOML at the platform default path, e.g.
 `~/.config/friglet/config.toml` on Linux or
 `~/Library/Application Support/friglet/config.toml` on macOS) and the scan
@@ -577,7 +621,8 @@ cargo run --release --package blindbit-cli scan \
 - `--spend-pubkey`: 33-byte hex string representing the spend public key (required)
 - `--start-height`: Block height to begin scanning from (wallet birthday; required)
 - `--end-height`: Last block height to scan (required)
-- `--p2p-node-addr`: your Bitcoin node's P2P address as `ip:port`; hostnames are not accepted (default: random peers of the network, found through its DNS seeds; required on regtest)
+- `--p2p-node-addr`: your Bitcoin node's P2P address as `ip:port`; hostnames only with `--p2p-proxy` (default: random peers of the network, found through its DNS seeds; required on regtest)
+- `--p2p-proxy`: SOCKS5 proxy (Tor) for every P2P connection, `ip:port` (see [Tor](#tor); default: none)
 - `--oracle-url`: Oracle service URL (default: `https://oracle.setor.dev`)
 - `--state-file`: Path for scanner state, loaded at start and saved at the end; the given range is scanned either way (default: `scanner_state.json` in the working directory)
 - `--network`: Bitcoin network `bitcoin|signet|testnet|testnet4|regtest` (default: `bitcoin`)

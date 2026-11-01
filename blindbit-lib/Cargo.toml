@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 default = []
 serde = ["dep:serde", "dep:serde_json"]
+# `net::testing`: a fake SOCKS5 proxy for tests of code that dials through
+# `net::Dialer` (friglet's tests use it).
+test-util = []
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
