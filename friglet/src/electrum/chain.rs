@@ -136,8 +136,15 @@ impl ChainSource {
                 return Ok(rate);
             }
             // A fresh connection carries a fresh filter: Bitcoin Core sends
-            // it right after the handshake.
-            self.header_peer.lock().expect("header peer lock").take();
+            // it right after the handshake. A request using the shared
+            // connection holds it (blocking, up to its timeouts): wait for
+            // it off the runtime, so a caller's time limit still holds.
+            let slot = self.header_peer.clone();
+            tokio::task::spawn_blocking(move || {
+                drop(slot.lock().expect("header peer lock").take())
+            })
+            .await
+            .map_err(|error| format!("P2P task failed: {error}"))?;
             self.with_header_peer(
                 Arc::new(|peer: &mut Peer| {
                     peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
@@ -1101,5 +1108,40 @@ mod tests {
         });
         runtime.shutdown_background();
         assert_eq!(rate, Ok(1_500));
+    }
+
+    /// Own node: a relay fee request answers within its limit while a
+    /// header request holds the shared connection (it used to wait on its
+    /// lock on the runtime, past any limit, until that request ended).
+    #[tokio::test]
+    async fn a_relay_fee_request_does_not_wait_for_a_busy_header_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let chain = ChainSource::new(
+            own_node("127.0.0.1:1".parse().unwrap()),
+            "http://127.0.0.1:1".into(),
+        );
+        let released = Arc::new(AtomicBool::new(false));
+        let (held, holding) = mpsc::channel();
+        let (release, releasing) = mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let (slot, released) = (chain.header_peer.clone(), released.clone());
+            move || {
+                let busy = slot.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = releasing.recv_timeout(Duration::from_secs(10));
+                released.store(true, Ordering::SeqCst);
+                drop(busy);
+            }
+        });
+        holding.recv().unwrap();
+        let answer = chain.fee_filter_within(Duration::from_millis(200)).await;
+        let in_time = !released.load(Ordering::SeqCst);
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(in_time, "the request waited for the busy connection");
+        let error = answer.unwrap_err();
+        assert!(error.contains("within"), "{error}");
     }
 }
