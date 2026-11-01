@@ -52,6 +52,12 @@ pub const SETTLE_WAIT: Duration = Duration::from_secs(2);
 /// on the wire only through `MAX_SIZE` (32 MB). Anything above is garbage.
 const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
 
+/// Messages a peer may send while it answers one header request before it
+/// is given up on: the answer is one `headers` message, and little else
+/// arrives on a `relay = false` connection meanwhile. Without a bound a peer
+/// could keep sending until the request times out.
+const HEADER_ANSWER_MESSAGES: usize = 100;
+
 #[derive(Debug)]
 pub enum P2pError {
     Io(io::Error),
@@ -85,11 +91,13 @@ impl P2pError {
     /// How a failed connection counts against the peer: unreachable, or,
     /// when the proxy said nothing clear about it (no reply in time, a
     /// general failure: also what Tor without a working circuit does),
-    /// only unhelpful, so it rests but stays in the address book.
+    /// [`PeerEvent::ProxyUnclear`]: unreachable only while the proxy
+    /// recently carried a handshake, otherwise the peer just rests. The
+    /// scanner's block downloads count it the same way.
     pub fn peer_event(&self) -> PeerEvent {
         match self {
             P2pError::Io(error) if blindbit_lib::net::is_proxy_unclear(error) => {
-                PeerEvent::Unhelpful
+                PeerEvent::ProxyUnclear
             }
             _ => PeerEvent::Unreachable,
         }
@@ -130,6 +138,37 @@ fn useless_address() -> Address {
     )
 }
 
+/// The connect and handshake timeout through `dialer`: at least
+/// [`PROXY_CONNECT_TIMEOUT`] through a proxy, where every message crosses a
+/// Tor circuit.
+fn through(dialer: &Dialer, timeout: Duration) -> Duration {
+    if dialer.proxy().is_some() {
+        timeout.max(PROXY_CONNECT_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
+/// Shuts a connection down when dropped, unless disarmed: whatever blocks
+/// on it in another thread ends at once. For blocking work whose async
+/// caller may stop waiting.
+pub struct HangUpOnDrop(pub Option<TcpStream>);
+
+impl HangUpOnDrop {
+    /// Keep the connection open after all.
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for HangUpOnDrop {
+    fn drop(&mut self) {
+        if let Some(socket) = self.0.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 /// One open, handshaken P2P connection.
 pub struct Peer {
     stream: TcpStream,
@@ -166,12 +205,43 @@ impl Peer {
         relay: bool,
         timeout: Duration,
     ) -> Result<Self, P2pError> {
-        let timeout = if dialer.proxy().is_some() {
-            timeout.max(PROXY_CONNECT_TIMEOUT)
-        } else {
-            timeout
-        };
+        let timeout = through(dialer, timeout);
         let stream = dialer.connect(addr, timeout)?;
+        Self::handshake_on(stream, addr, network, relay, timeout)
+    }
+
+    /// [`Self::connect`] for async callers, and cancellable: dropping the
+    /// future abandons the connection at once, also during the handshake
+    /// (which runs on a blocking thread whose socket is shut down then).
+    pub async fn open(
+        dialer: &Dialer,
+        addr: &PeerAddr,
+        network: Network,
+        relay: bool,
+        timeout: Duration,
+    ) -> Result<Self, P2pError> {
+        let timeout = through(dialer, timeout);
+        let stream = dialer.open(addr, timeout).await?;
+        let hang_up = HangUpOnDrop(Some(stream.try_clone()?));
+        let addr = addr.clone();
+        let peer = tokio::task::spawn_blocking(move || {
+            Self::handshake_on(stream, &addr, network, relay, timeout)
+        })
+        .await
+        .map_err(|error| P2pError::Protocol(format!("the handshake task failed: {error}")))??;
+        hang_up.disarm();
+        Ok(peer)
+    }
+
+    /// Complete the version handshake on `stream`, a connection just opened
+    /// to `addr`, within `timeout`.
+    fn handshake_on(
+        stream: TcpStream,
+        addr: &PeerAddr,
+        network: Network,
+        relay: bool,
+        timeout: Duration,
+    ) -> Result<Self, P2pError> {
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
@@ -195,6 +265,12 @@ impl Peer {
 
     pub fn addr(&self) -> &PeerAddr {
         &self.addr
+    }
+
+    /// A handle to shut this connection down from another thread: every
+    /// read and write on it fails at once from then on.
+    pub fn closer(&self) -> io::Result<TcpStream> {
+        self.stream.try_clone()
     }
 
     /// What the peer said about itself in its `version` message.
@@ -366,10 +442,11 @@ impl Peer {
         Ok(())
     }
 
-    /// Is this transaction in the peer's mempool? Asks with `getdata`, which
-    /// Bitcoin Core answers with the transaction or with `notfound`. Only
-    /// meaningful on a `relay = true` connection that has settled.
-    /// `on_other` sees every other message that arrives meanwhile.
+    /// Is this transaction, witness included, in the peer's mempool? Asks
+    /// with `getdata` ([`Self::tx_request`]), which Bitcoin Core answers
+    /// with the transaction or with `notfound`. Only meaningful on a
+    /// `relay = true` connection that has settled. `on_other` sees every
+    /// other message that arrives meanwhile.
     pub fn mempool_has(
         &mut self,
         txid: Txid,
@@ -377,11 +454,14 @@ impl Peer {
         deadline: Instant,
         mut on_other: impl FnMut(&mut Self, NetworkMessage) -> Result<(), P2pError>,
     ) -> Result<bool, P2pError> {
-        self.send_getdata(self.tx_inventory(txid, wtxid))?;
+        self.send_getdata(self.tx_request(txid, wtxid))?;
         loop {
             match self.recv_until(deadline)? {
+                // Asked by txid (no wtxid relay), a peer serves whichever
+                // witness its mempool holds: another witness is another
+                // transaction, which says nothing about this one's.
                 Some(NetworkMessage::Tx(tx)) if tx.compute_txid() == txid => {
-                    return Ok(true);
+                    return Ok(tx.compute_wtxid() == wtxid);
                 }
                 Some(NetworkMessage::NotFound(items))
                     if items
@@ -397,8 +477,10 @@ impl Peer {
     }
 
     /// The header of block `hash`, `None` when the peer does not know the
-    /// block. Only a header whose hash is `hash` is returned. One round trip:
-    /// the `getheaders` is answered before the trailing ping's pong.
+    /// block. Only a header whose hash is `hash` is kept and returned; a peer
+    /// that sends more than [`HEADER_ANSWER_MESSAGES`] messages before its
+    /// pong is given up on. One round trip: the `getheaders` is answered
+    /// before the trailing ping's pong.
     pub fn header_by_hash(
         &mut self,
         hash: BlockHash,
@@ -409,13 +491,26 @@ impl Peer {
             locator_hashes: Vec::new(),
             stop_hash: hash,
         }))?;
-        let mut found = Vec::new();
+        let mut found = None;
+        let mut messages = 0;
         self.sync_with_ping(deadline, "block headers", |message| {
-            if let NetworkMessage::Headers(headers) = message {
-                found.extend(headers.iter().copied());
+            messages += 1;
+            if messages > HEADER_ANSWER_MESSAGES {
+                return Err(P2pError::Protocol(format!(
+                    "more than {HEADER_ANSWER_MESSAGES} messages in answer to one header request"
+                )));
             }
+            if let NetworkMessage::Headers(headers) = message
+                && found.is_none()
+            {
+                found = headers
+                    .iter()
+                    .find(|header| header.block_hash() == hash)
+                    .copied();
+            }
+            Ok(())
         })?;
-        Ok(found.into_iter().find(|header| header.block_hash() == hash))
+        Ok(found)
     }
 
     /// Wait until the peer has processed everything sent so far: it answers
@@ -423,31 +518,46 @@ impl Peer {
     /// a socket with unread input resets it, which can make the peer drop
     /// what it has not read yet; call this before closing after a hand-over.
     pub fn flush(&mut self, deadline: Instant) -> Result<(), P2pError> {
-        self.sync_with_ping(deadline, "a pong", |_| {})
+        self.sync_with_ping(deadline, "a pong", |_| Ok(()))
     }
 
-    /// Send a ping and feed every message to `on_message` until its pong.
+    /// Send a ping and feed every message to `on_message` until its pong; an
+    /// error from `on_message` ends the wait.
     fn sync_with_ping(
         &mut self,
         deadline: Instant,
         what: &'static str,
-        mut on_message: impl FnMut(&NetworkMessage),
+        mut on_message: impl FnMut(&NetworkMessage) -> Result<(), P2pError>,
     ) -> Result<(), P2pError> {
         let nonce = random_u64();
         self.send(NetworkMessage::Ping(nonce))?;
         loop {
             match self.recv_until(deadline)? {
                 Some(NetworkMessage::Pong(n)) if n == nonce => return Ok(()),
-                Some(message) => on_message(&message),
+                Some(message) => on_message(&message)?,
                 None => return Err(P2pError::Timeout(what)),
             }
         }
     }
 
-    /// The inventory item this peer uses for a transaction.
+    /// The inventory item this peer uses to announce a transaction.
     pub fn tx_inventory(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
         if self.wtxid_relay {
             Inventory::WTx(wtxid)
+        } else {
+            Inventory::Transaction(txid)
+        }
+    }
+
+    /// The inventory item that asks this peer for a transaction with its
+    /// witness. By wtxid with BIP 339; without it, `MSG_WITNESS_TX` from a
+    /// peer that offers witnesses (BIP 144): Bitcoin Core answers `MSG_TX`
+    /// without them, and that copy's wtxid is not the transaction's.
+    pub fn tx_request(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
+        if self.wtxid_relay {
+            Inventory::WTx(wtxid)
+        } else if self.info.services.has(ServiceFlags::WITNESS) {
+            Inventory::WitnessTransaction(txid)
         } else {
             Inventory::Transaction(txid)
         }
@@ -464,5 +574,47 @@ pub fn inventory_matches(item: &Inventory, txid: Txid, wtxid: Wtxid) -> bool {
         Inventory::Transaction(id) | Inventory::WitnessTransaction(id) => *id == txid,
         Inventory::WTx(id) => *id == wtxid,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::electrum::fake_peer::{FakePeer, Script, header};
+
+    /// A peer that answers a header request with message after message
+    /// about other blocks, and never with the pong, is given up on after
+    /// [`HEADER_ANSWER_MESSAGES`] of them, not when the request's deadline
+    /// (here five minutes) passes; what it sent is not kept meanwhile.
+    #[test]
+    fn a_peer_flooding_a_header_request_is_given_up_on() {
+        let fake = FakePeer::spawn(
+            Script {
+                flood_headers: 10_000,
+                ..Script::default()
+            },
+            1,
+        );
+        let wanted = header(u32::MAX).block_hash();
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut peer = Peer::connect(
+                &Dialer::Direct,
+                &PeerAddr::from(fake.addr),
+                Network::Regtest,
+                false,
+                Duration::from_secs(10),
+            )
+            .expect("handshake");
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let _ = answered.send(peer.header_by_hash(wanted, deadline));
+        });
+        let answer = answer
+            .recv_timeout(Duration::from_secs(60))
+            .expect("given up on long before the request's deadline");
+        assert!(
+            matches!(&answer, Err(P2pError::Protocol(message)) if message.contains("messages")),
+            "{answer:?}"
+        );
     }
 }

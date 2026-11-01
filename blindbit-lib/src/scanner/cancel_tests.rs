@@ -198,6 +198,93 @@ fn a_stop_ends_the_wait_between_download_attempts() {
     });
 }
 
+/// A listener whose accept queue is full, so the kernel drops every further
+/// connection attempt and a connect to it hangs, as to a node behind a
+/// firewall that drops packets. Keep the returned connections open: they
+/// fill the queue.
+#[cfg(target_os = "linux")]
+fn silent_node() -> (
+    std::net::SocketAddr,
+    std::net::TcpListener,
+    Vec<std::net::TcpStream>,
+) {
+    // Tokio's socket can set a backlog of 1; it needs a runtime only to
+    // create the listener.
+    let listener = run(async {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        socket.listen(1).unwrap().into_std().unwrap()
+    });
+    let addr = listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    while let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        queued.push(stream);
+        assert!(queued.len() < 16, "the accept queue never fills");
+    }
+    (addr, listener, queued)
+}
+
+/// A stop while connecting to an own node that drops connection attempts
+/// ends the connect itself, not only the wait for it: the runtime shuts
+/// down at once instead of waiting out the 5 s connect timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stop_while_connecting_to_a_silent_own_node_abandons_the_connect() {
+    // Silent until the end of the test, after the runtime has shut down.
+    let (addr, _listener, _queued) = silent_node();
+    let started = Instant::now();
+    run(async {
+        let cancel = CancellationToken::new();
+        let fetcher = BlockFetcher::new(own_node(addr))
+            .with_policy(RetryPolicy {
+                attempts: 1,
+                connect_timeout: Duration::from_secs(5),
+                ..RetryPolicy::default()
+            })
+            .with_cancel(cancel.clone());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let stop = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            cancel.cancel();
+        };
+        let (fetched, ()) = tokio::join!(fetcher.fetch(genesis.block_hash(), 100), stop);
+        assert_eq!(
+            fetched.expect_err("stopped").failure,
+            FetchFailure::Cancelled
+        );
+    });
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "the fetch and its runtime took {took:?} to stop"
+    );
+}
+
+/// The connect to such a node times out with the words it always had.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_connect_to_a_silent_own_node_times_out_as_before() {
+    let (addr, _listener, _queued) = silent_node();
+    run(async {
+        let err = BlockFetcher::new(own_node(addr))
+            .with_policy(RetryPolicy {
+                attempts: 1,
+                connect_timeout: Duration::from_millis(300),
+                ..RetryPolicy::default()
+            })
+            .fetch(
+                bitcoin::constants::genesis_block(bitcoin::Network::Regtest).block_hash(),
+                100,
+            )
+            .await
+            .expect_err("never connects");
+        assert_eq!(
+            err.failure,
+            FetchFailure::Connect("connection timed out".to_string())
+        );
+    });
+}
+
 /// `watch_chain_until` stops in its wait for the next poll (10 s after the
 /// oracle could not be reached), returns `Ok`, and leaves the scanner
 /// uncancelled for later scans.

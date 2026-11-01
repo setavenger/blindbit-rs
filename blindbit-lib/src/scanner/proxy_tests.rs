@@ -2,24 +2,64 @@
 //! name goes to the proxy unresolved, and when the proxy fails nothing is
 //! tried directly and the message names the proxy.
 
-use std::net::SocketAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use bitcoin::Network;
+use bitcoin::p2p::ServiceFlags;
 
-use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure};
-use super::p2p_tests::{Conn, Node, fast};
+use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy, connect_failure};
+use super::p2p_tests::{
+    Conn, GATE_LIMIT, Node, assert_version_gives_nothing_away, fast, recording_node,
+};
 use super::test_support::run;
+use crate::net::pool::Where;
 use crate::net::testing::FakeSocks5;
-use crate::net::{Dialer, PeerAddr, PeerHost, PeerSource, Seeds};
+use crate::net::{Dialer, PeerAddr, PeerEvent, PeerHost, PeerSource, Seeds};
 
 fn genesis() -> bitcoin::Block {
     bitcoin::constants::genesis_block(Network::Regtest)
 }
 
+/// A loopback address of its own for a node of this module (the address
+/// book tells peers apart by IP; other modules use other ranges).
+fn ip(last: u8) -> IpAddr {
+    [127, 0, 0, last].into()
+}
+
+/// `fetch`, failing the test after a minute rather than hanging it.
+async fn within_a_minute<T>(fetch: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), fetch)
+        .await
+        .expect("the fetch ended within a minute")
+}
+
+/// Polls `condition` every 5 ms for up to `within`; whether it came true.
+fn comes_true(within: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !condition() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// The node's first connection has sent its `version`.
+fn got_version(node: &Node) -> bool {
+    node.accepted()
+        .first()
+        .is_some_and(|connection| connection.version_after.is_some())
+}
+
 fn fetch(peers: std::sync::Arc<PeerSource>) -> Result<bitcoin::Block, Box<BlockFetchError>> {
-    run(BlockFetcher::new(peers)
-        .with_policy(fast(3))
-        .fetch(genesis().block_hash(), 0))
+    run(within_a_minute(
+        BlockFetcher::new(peers)
+            .with_policy(fast(3))
+            .fetch(genesis().block_hash(), 0),
+    ))
 }
 
 /// An address nothing listens on: a proxy that is not running. Port 1
@@ -53,6 +93,115 @@ fn the_own_node_is_reached_by_name_through_the_proxy() {
     let requests = proxy.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].target, node_invalid(node.addr.port()));
+}
+
+/// An own node on this computer is reached through a proxy that can reach
+/// it (a SOCKS5 proxy other than Tor, such as `ssh -D`): the proxy is used,
+/// never bypassed.
+#[test]
+fn a_local_own_node_is_reached_through_the_proxy() {
+    let node = Node::full(200, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    let block = fetch(PeerSource::own_node(
+        node.addr.into(),
+        proxy.dialer(),
+        Network::Regtest,
+    ))
+    .expect("served through the proxy");
+    assert_eq!(block.block_hash(), genesis().block_hash());
+    let targets: Vec<PeerAddr> = proxy.requests().into_iter().map(|r| r.target).collect();
+    assert_eq!(targets, vec![PeerAddr::from(node.addr)]);
+}
+
+/// When the proxy cannot connect to a local own node, the message says
+/// why that may be: Tor cannot reach this computer or the local network,
+/// nor a carrier-grade NAT address (Tailscale's). A node elsewhere gets the
+/// usual message.
+#[test]
+fn a_local_own_node_the_proxy_cannot_reach_gets_a_word_about_tor() {
+    let proxy = FakeSocks5::start();
+    let hint = "Tor cannot: it connects from the internet";
+    // Nothing listens on port 1; `localhost` is a name the proxy cannot
+    // resolve.
+    for node in [
+        "127.0.0.1:1".parse::<SocketAddr>().unwrap().into(),
+        PeerAddr {
+            host: PeerHost::Name("localhost".to_string()),
+            port: 18444,
+        },
+    ] {
+        let err = fetch(PeerSource::own_node(
+            node.clone(),
+            proxy.dialer(),
+            Network::Regtest,
+        ))
+        .expect_err("the proxy cannot connect");
+        let message = err.to_string();
+        assert!(matches!(err.failure, FetchFailure::Connect(_)), "{message}");
+        for expected in [
+            "Check that bitcoind is running",
+            hint,
+            &format!("through p2p_proxy {}", proxy.addr()),
+            "clear p2p_proxy",
+            ".onion address",
+        ] {
+            assert!(message.contains(expected), "{expected:?} in {message}");
+        }
+    }
+    let refusing = FakeSocks5::start();
+    refusing.refuse_with(0x05);
+    let refused = |node: &str| {
+        let err = fetch(PeerSource::own_node(
+            node.parse::<SocketAddr>().unwrap().into(),
+            refusing.dialer(),
+            Network::Regtest,
+        ))
+        .expect_err("refused");
+        err.to_string()
+    };
+    for tailnet in [
+        "100.64.0.1:18444",
+        "100.101.102.103:18444",
+        "[::ffff:100.127.0.9]:18444",
+    ] {
+        let message = refused(tailnet);
+        assert!(message.contains(hint), "{tailnet}: {message}");
+    }
+    let message = refused("45.1.7.1:18444");
+    assert!(
+        message.contains("Check that bitcoind is running"),
+        "{message}"
+    );
+    assert!(!message.contains(hint), "{message}");
+}
+
+/// Through the proxy the handshake gives nothing away either, to the own
+/// node and to a discovered peer: placeholder addresses, no height, the
+/// shared user agent.
+#[test]
+fn through_the_proxy_the_handshake_gives_nothing_away() {
+    let proxy = FakeSocks5::start();
+    let (own, own_node) = recording_node(ip(1));
+    proxy.route("node.invalid", own);
+    let err = fetch(PeerSource::own_node(
+        node_invalid(own.port()),
+        proxy.dialer(),
+        Network::Regtest,
+    ))
+    .expect_err("notfound");
+    assert_eq!(err.failure, FetchFailure::NotFound);
+    let (discovered, discovered_node) = recording_node(ip(84));
+    fetch(PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![discovered.into()]),
+    ))
+    .expect_err("notfound");
+    for node in [own_node, discovered_node] {
+        let (version, _) = node.join().unwrap();
+        assert_version_gives_nothing_away(&version);
+    }
+    assert_eq!(proxy.requests().len(), 2, "both through the proxy");
 }
 
 /// The proxy is down or refuses: the error names `p2p_proxy`, and the node
@@ -128,7 +277,9 @@ fn discovered_peers_are_reached_through_the_proxy() {
 }
 
 /// Through Tor a dead address costs the whole connect timeout; the
-/// connections race, so a live peer serves the block at once anyway.
+/// connections race, so a live peer serves the block at once anyway, and
+/// the losing connects close with the fetch: the runtime shuts down without
+/// waiting for them.
 #[test]
 fn through_a_proxy_connections_race_past_dead_peers() {
     let node = Node::full(200, vec![Conn::Serve]);
@@ -143,28 +294,215 @@ fn through_a_proxy_connections_race_past_dead_peers() {
     let mut seeds = dead.clone();
     seeds.push(node.addr.into());
     let source = PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
-    // The losing connects stay under way until the proxy timeout; a plain
-    // runtime drop would wait for them.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let started = std::time::Instant::now();
-    let block = runtime.block_on(BlockFetcher::new(source).fetch(genesis().block_hash(), 0));
+    let started = Instant::now();
+    let block = run(within_a_minute(
+        BlockFetcher::new(source).fetch(genesis().block_hash(), 0),
+    ));
     let waited = started.elapsed();
-    runtime.shutdown_background();
     let block = block.expect("the live peer serves it");
     assert_eq!(block.block_hash(), genesis().block_hash());
     assert!(
-        waited < std::time::Duration::from_secs(10),
+        waited < Duration::from_secs(10),
         "waited {waited:?} (a dead peer costs 20 s)"
     );
     assert_eq!(node.connections(), 1);
 }
 
+/// A racer that opens while another connection downloads completes its
+/// handshake at once, so when the download fails it is ready, not a socket
+/// left idle that the peer may have dropped meanwhile. The stalling peer
+/// keeps its download going until the serving peer has the racer's
+/// `version` (or 20 s pass); a racer that waited for its turn to
+/// handshake would get there only after that.
+#[test]
+fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let stalls = Node::spawn_on(
+        ip(81),
+        full,
+        200,
+        &block,
+        vec![Conn::StallMidBlockUntilOpened],
+    );
+    let serves = Node::spawn_on(ip(82), full, 200, &block, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    // The serving peer's connection opens once the stalling peer, asked for
+    // the block first, has stalled.
+    let serves_opens = proxy.hold(serves.addr.into());
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![stalls.addr.into(), serves.addr.into()]),
+    );
+    let fetcher = BlockFetcher::new(source);
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || stalls.stalled().is_some()));
+            serves_opens.open();
+            if comes_true(GATE_LIMIT, || got_version(&serves)) {
+                stalls.open();
+            }
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+    });
+    let got = got.expect("the second peer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    assert!(
+        stalls.stalled().is_some(),
+        "the stalling peer was asked first"
+    );
+    assert_eq!(
+        stalls.opened_in_time(),
+        Some(true),
+        "the racer's handshake waited until the stalled download ended"
+    );
+    assert_eq!(serves.connections(), 1);
+}
+
+/// A racer whose handshake completed while another connection downloaded
+/// keeps the time for the block once its turn comes: its wait does not
+/// count. Here the peer asked first trickles its block until that
+/// connection's time is up (18 s); the other, which opened before it and
+/// waited all along, then serves the block.
+#[test]
+fn a_racer_waiting_for_its_turn_keeps_its_time_for_the_block() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let trickles = Node::spawn_on(ip(86), full, 200, &block, vec![Conn::TrickleMidBlock]);
+    let waits = Node::spawn_on(ip(87), full, 200, &block, vec![Conn::ServeOnceOpened]);
+    let proxy = FakeSocks5::start();
+    // The waiting peer's connection opens first, the trickling peer's once
+    // the waiting one's handshake started…
+    let trickles_opens = proxy.hold(trickles.addr.into());
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![trickles.addr.into(), waits.addr.into()]),
+    );
+    let fetcher = BlockFetcher::new(source).with_policy(RetryPolicy {
+        connect_timeout: Duration::ZERO,
+        block_deadline: Duration::from_secs(3),
+        ..RetryPolicy::discovered()
+    });
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || got_version(&waits)));
+            trickles_opens.open();
+            // …and its handshake completes once the trickling peer, ready
+            // first, was asked for the block.
+            assert!(comes_true(GATE_LIMIT, || trickles.stalled().is_some()));
+            waits.open();
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+    });
+    let got = got.expect("the waiting peer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    assert!(
+        trickles.stalled().is_some(),
+        "the trickling peer was asked first"
+    );
+    assert_eq!(waits.connections(), 1);
+}
+
+/// Racers that finished while another one downloads the block are reported
+/// when the block arrives, before they close: one whose node hung up during
+/// the handshake rests, one whose handshake completed is tried. They
+/// connect once the download has started, and the block is complete only
+/// once both have finished (each racer's last step is seen on its node).
+#[test]
+fn racers_that_finished_are_reported_when_the_block_arrives() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let serves = Node::spawn_on(
+        ip(91),
+        full,
+        200,
+        &block,
+        vec![Conn::PauseMidBlockUntilOpened],
+    );
+    let hangs_up = Node::spawn_on(ip(92), full, 200, &block, vec![Conn::CloseBeforeVersion]);
+    let handshakes = Node::spawn_on(ip(93), full, 200, &block, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    let held = [
+        proxy.hold(hangs_up.addr.into()),
+        proxy.hold(handshakes.addr.into()),
+    ];
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![
+            serves.addr.into(),
+            hangs_up.addr.into(),
+            handshakes.addr.into(),
+        ]),
+    );
+    let fetcher = BlockFetcher::new(source.clone());
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || serves.stalled().is_some()));
+            for gate in &held {
+                gate.open();
+            }
+            // The hang-up follows the `version`; `getaddr` ends the
+            // handshake.
+            assert!(comes_true(GATE_LIMIT, || got_version(&hangs_up)));
+            assert!(comes_true(GATE_LIMIT, || {
+                handshakes.commands().iter().any(|c| c == "getaddr")
+            }));
+            serves.open();
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+    });
+    let got = got.expect("the first racer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    let PeerSource::Discovered(pool) = &*source else {
+        unreachable!()
+    };
+    assert!(
+        pool.is_resting(&hangs_up.addr.into()),
+        "the racer whose node hung up was not reported"
+    );
+    assert_eq!(
+        pool.place(&handshakes.addr.into()),
+        Some(Where::Tried),
+        "the racer whose handshake completed was not reported"
+    );
+}
+
+/// How the proxy's refusals count: no clear answer (a general failure, a
+/// timeout) is reported as such, for the peer source to weigh by whether
+/// the proxy works; a refusal is the peer's; and the proxy having no route
+/// to an IPv6 peer (Tor's exit has none) is not this computer lacking one,
+/// which would stop it using IPv6 peers.
+#[test]
+fn refusals_through_the_proxy_count_for_what_they_say() {
+    let proxy = FakeSocks5::start();
+    let v4: PeerAddr = "203.0.113.79:18444".parse::<SocketAddr>().unwrap().into();
+    let v6: PeerAddr = "[2001:db8::79]:18444".parse::<SocketAddr>().unwrap().into();
+    for (code, peer, event) in [
+        (0x01, &v4, PeerEvent::ProxyUnclear),
+        (0x06, &v4, PeerEvent::ProxyUnclear),
+        (0x05, &v4, PeerEvent::Unreachable),
+        (0x03, &v6, PeerEvent::Unreachable),
+    ] {
+        proxy.refuse_with(code);
+        let err = proxy
+            .dialer()
+            .connect(peer, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            connect_failure(err, peer).peer_event(false),
+            event,
+            "SOCKS5 reply {code} for {peer}"
+        );
+    }
+}
+
 /// A refusal through the proxy counts against the peer (forgotten after
 /// three); a general failure, what Tor without a working circuit answers,
-/// only rests it, so an outage cannot empty the address book.
+/// only rests it while nothing went through the proxy, so an outage cannot
+/// empty the address book.
 #[test]
 fn only_a_clear_refusal_through_the_proxy_counts_against_a_peer() {
     for (code, kept) in [(0x05, 0), (0x01, 1)] {

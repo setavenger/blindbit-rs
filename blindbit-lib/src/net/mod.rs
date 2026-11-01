@@ -26,7 +26,8 @@ pub mod testing;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::message::NetworkMessage;
@@ -78,6 +79,21 @@ impl PeerAddr {
 
     pub(crate) fn is_ipv6(&self) -> bool {
         matches!(self.host, PeerHost::Ip(IpAddr::V6(_)))
+    }
+
+    /// On this computer or a network the internet does not route to: an
+    /// address that is not public ([`pool::is_public`]: loopback, private,
+    /// link-local, carrier-grade NAT such as Tailscale's 100.64.0.0/10, …),
+    /// `localhost`, or a `.local` (mDNS) name. Tor's exits connect from the
+    /// internet and cannot reach such a peer.
+    pub fn is_local(&self) -> bool {
+        match &self.host {
+            PeerHost::Ip(ip) => !pool::is_public(*ip),
+            PeerHost::Name(name) => {
+                let name = name.trim_end_matches('.').to_ascii_lowercase();
+                name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local")
+            }
+        }
     }
 
     /// The peer's network group; see [`NetGroup`].
@@ -192,6 +208,45 @@ pub(crate) fn gossiped_addrs(message: &NetworkMessage) -> Option<Vec<AddrV2Messa
                 .collect(),
         ),
         _ => None,
+    }
+}
+
+/// Did connecting to `peer` fail because this computer has no route to the
+/// peer's network (typically an IPv6 peer on a host without IPv6)? Never
+/// for an error through the proxy: its "network unreachable" is about the
+/// proxy's routes (Tor's exit), not this computer's. Hosts without IPv6
+/// also answer an IPv6 connect with "address not available". "Host
+/// unreachable" is the peer's: a router on the way says it about that one
+/// address.
+pub fn is_no_route(error: &io::Error, peer: &PeerAddr) -> bool {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<Socks5Error>())
+    {
+        return false;
+    }
+    match error.kind() {
+        io::ErrorKind::NetworkUnreachable => true,
+        io::ErrorKind::AddrNotAvailable => peer.is_ipv6(),
+        _ => false,
+    }
+}
+
+/// A second handle on a connection's socket that shuts the connection down
+/// when dropped. A shutdown ends a read or write blocked on the socket in
+/// another thread at once (it then sees the connection closed), so the
+/// owner of this handle bounds the connection however its I/O waits.
+pub(crate) struct ShutdownOnDrop(TcpStream);
+
+impl ShutdownOnDrop {
+    pub(crate) fn new(stream: &TcpStream) -> io::Result<Self> {
+        Ok(Self(stream.try_clone()?))
+    }
+}
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
     }
 }
 

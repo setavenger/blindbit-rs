@@ -23,6 +23,7 @@
 //! outside: the transaction never shows up. The error then says so, and
 //! names the fee shortfall when the fee is known.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
@@ -133,6 +134,10 @@ pub enum Outcome {
     NotAccepted(String),
 }
 
+/// Asked right before a transaction is written to the peer: `false` means
+/// it must not be (the broadcast it belongs to has decided).
+pub(super) type SendGate = Box<dyn FnMut(Txid) -> bool + Send>;
+
 /// What the peer revealed while we waited.
 #[derive(Default)]
 pub(super) struct Signals {
@@ -140,9 +145,55 @@ pub(super) struct Signals {
     pub(super) sent: bool,
     /// The peer asked for another transaction: a parent of ours.
     pub(super) missing_inputs: bool,
+    /// See [`SendGate`]. None (the own node): always written.
+    gate: Option<SendGate>,
+    /// See [`Parents`]. None (the own node): any other transaction the peer
+    /// asks for after the hand-over counts as a parent.
+    parents: Option<Parents>,
+}
+
+/// A transaction's parents: only a request for one of them (by txid; a
+/// parent is never known by wtxid) says the peer lacks its inputs, and the
+/// ones friglet holds (pending broadcasts of its own) are handed over when
+/// asked for, so the peer can take the child. A held parent's own parents
+/// count the same way: a peer that took it asks for them next.
+pub(super) struct Parents {
+    ids: HashSet<Txid>,
+    held: HashMap<Txid, Transaction>,
+}
+
+impl Parents {
+    /// The parents of `tx`, given its `held` pending ancestors.
+    pub(super) fn of(tx: &Transaction, held: &[Transaction]) -> Self {
+        Self {
+            ids: std::iter::once(tx)
+                .chain(held)
+                .flat_map(|tx| tx.input.iter().map(|input| input.previous_output.txid))
+                .collect(),
+            held: held
+                .iter()
+                .map(|tx| (tx.compute_txid(), tx.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl Signals {
+    /// Signals whose transaction is written only while `gate` allows it,
+    /// with `parents` told apart from other requests.
+    pub(super) fn gated(gate: SendGate, parents: Parents) -> Self {
+        Self {
+            gate: Some(gate),
+            parents: Some(parents),
+            ..Self::default()
+        }
+    }
+
+    /// May `txid` be written to the peer now?
+    pub(super) fn may_send(&mut self, txid: Txid) -> bool {
+        self.gate.as_mut().is_none_or(|gate| gate(txid))
+    }
+
     /// React to `message`: hand the transaction over when the peer asks for
     /// it, answer any other request with `notfound`.
     pub(super) fn observe(
@@ -159,9 +210,15 @@ impl Signals {
         let mut unknown = Vec::new();
         for item in items {
             if inventory_matches(&item, txid, wtxid) {
-                peer.send(NetworkMessage::Tx(tx.clone()))?;
-                self.sent = true;
-            } else {
+                // Once the gate is shut the request goes unanswered: the
+                // connection is being closed.
+                if self.may_send(txid) {
+                    peer.send(NetworkMessage::Tx(tx.clone()))?;
+                    self.sent = true;
+                }
+                continue;
+            }
+            let Some(parents) = &self.parents else {
                 if matches!(
                     item,
                     Inventory::Transaction(_)
@@ -172,6 +229,27 @@ impl Signals {
                     self.missing_inputs = true;
                 }
                 unknown.push(item);
+                continue;
+            };
+            let parent = match item {
+                Inventory::Transaction(id) | Inventory::WitnessTransaction(id)
+                    if parents.ids.contains(&id) =>
+                {
+                    Some((id, parents.held.get(&id).cloned()))
+                }
+                _ => None,
+            };
+            match parent {
+                Some((id, Some(held))) => {
+                    if self.may_send(id) {
+                        peer.send(NetworkMessage::Tx(held))?;
+                    }
+                }
+                Some((_, None)) => {
+                    self.missing_inputs |= self.sent;
+                    unknown.push(item);
+                }
+                None => unknown.push(item),
             }
         }
         if !unknown.is_empty() {
@@ -355,11 +433,20 @@ fn disconnected_message() -> String {
         .into()
 }
 
+/// The highest fee filter that is a mempool minimum (0.1 BTC/kvB). Above it
+/// a peer says "send me no transactions" (Bitcoin Core does that during its
+/// initial block download, and a filter outside 0..=u32::MAX reads as
+/// `u64::MAX / 1000`): no fee would be enough, so no fee is short.
+const MAX_FEE_FILTER: u64 = 10_000_000;
+
 /// The fee `candidate` would need to pass a mempool minimum of `fee_filter`
 /// sat/kvB, with what it pays, when it pays less.
 pub(super) fn fee_shortfall(candidate: &Candidate, fee_filter: Option<u64>) -> Option<(u64, u64)> {
     let (fee, filter) = (candidate.fee?, fee_filter?);
-    let required = (filter * candidate.vsize).div_ceil(1000);
+    if filter > MAX_FEE_FILTER {
+        return None;
+    }
+    let required = filter.saturating_mul(candidate.vsize).div_ceil(1000);
     (fee < required).then_some((fee, required))
 }
 
@@ -524,6 +611,34 @@ mod tests {
         assert!(!message.contains("sat/vB"));
     }
 
+    /// A peer saying "send me nothing" (a fee filter out of range, or one in
+    /// its initial block download) sets no fee anyone could pay: no fee
+    /// claim, and no overflow for a transaction over 1 kvB.
+    #[test]
+    fn a_relay_nothing_fee_filter_makes_no_fee_claim() {
+        let mut candidate = Candidate::decode(bitcoin::consensus::encode::serialize(&tx(
+            vec![outpoint(1, 0)],
+            vec![1000; 150],
+        )))
+        .unwrap();
+        assert!(candidate.vsize > 1000, "{}", candidate.vsize);
+        candidate.fee = Some(500);
+        for filter in [u64::MAX / 1000, 2_100_000_000_000_000, MAX_FEE_FILTER + 1] {
+            assert_eq!(fee_shortfall(&candidate, Some(filter)), None, "{filter}");
+            let message = not_accepted_message(&candidate, Some(filter), Duration::from_secs(25));
+            assert!(
+                message.starts_with("the P2P peer did not accept the transaction"),
+                "{message}"
+            );
+        }
+        // The highest real minimum still counts.
+        let required = (MAX_FEE_FILTER * candidate.vsize).div_ceil(1000);
+        assert_eq!(
+            fee_shortfall(&candidate, Some(MAX_FEE_FILTER)),
+            Some((500, required))
+        );
+    }
+
     use crate::electrum::fake_peer::{FakePeer, Script, TxPolicy};
 
     fn candidate(seed: u8) -> Candidate {
@@ -630,6 +745,67 @@ mod tests {
         let (outcome, peer) = run(script, &candidate, Duration::from_secs(15));
         assert_eq!(outcome, Outcome::InMempool);
         assert!(peer.commands().iter().any(|c| c == "tx"));
+    }
+
+    /// A peer without wtxid relay is asked by txid and serves whatever
+    /// witness its mempool holds: the same txid with another witness is not
+    /// the transaction friglet has.
+    #[test]
+    fn a_mempool_copy_with_another_witness_is_not_this_transaction() {
+        let mut ours = tx(vec![outpoint(10, 0)], vec![5_000]);
+        ours.input[0].witness = Witness::from_slice(&[[1u8; 64]]);
+        let mut theirs = ours.clone();
+        theirs.input[0].witness = Witness::from_slice(&[[2u8; 64]]);
+        assert_eq!(ours.compute_txid(), theirs.compute_txid());
+        assert_ne!(ours.compute_wtxid(), theirs.compute_wtxid());
+        let peer = FakePeer::spawn(
+            Script {
+                mempool: vec![bitcoin::consensus::encode::serialize(&theirs)],
+                wtxid_relay: false,
+                ..Script::default()
+            },
+            2,
+        );
+        let ours = Candidate::decode(bitcoin::consensus::encode::serialize(&ours)).unwrap();
+        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &ours);
+        assert!(!present.unwrap(), "another witness counted as ours");
+        // Its own copy is found.
+        let theirs = Candidate::decode(bitcoin::consensus::encode::serialize(&theirs)).unwrap();
+        let present = in_mempool(
+            &Dialer::Direct,
+            &peer.addr.into(),
+            Network::Regtest,
+            &theirs,
+        );
+        assert!(present.unwrap());
+    }
+
+    /// A witness-capable own node without wtxid relay (protocol 70015): a
+    /// copy asked for with `MSG_TX` comes without its witness, so friglet
+    /// asks with `MSG_WITNESS_TX` and finds the transaction it has, witness
+    /// and all, whether it was there already or was just handed over.
+    #[test]
+    fn a_peer_without_wtxid_relay_is_asked_for_the_witness() {
+        let witnessed = |seed: u8| {
+            let mut tx = tx(vec![outpoint(seed, 0)], vec![5_000]);
+            tx.input[0].witness = Witness::from_slice(&[[seed; 64]]);
+            Candidate::decode(bitcoin::consensus::encode::serialize(&tx)).unwrap()
+        };
+        let (held, sent) = (witnessed(11), witnessed(12));
+        assert_ne!(held.txid.to_string(), held.wtxid.to_string());
+        let script = Script {
+            mempool: vec![held.raw.clone()],
+            wtxid_relay: false,
+            ..Script::default()
+        };
+        let peer = FakePeer::spawn(script.clone(), 1);
+        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &held);
+        assert!(present.unwrap(), "its own copy, witness and all");
+
+        let (outcome, peer) = run(script, &sent, Duration::from_secs(10));
+        assert_eq!(outcome, Outcome::InMempool);
+        // Announced by txid all the same: no wtxid relay.
+        assert!(peer.commands().iter().any(|c| c == "inv"));
     }
 
     #[test]

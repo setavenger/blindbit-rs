@@ -58,13 +58,16 @@ async fn main() -> std::io::Result<()> {
         let config = config.clone();
         tokio::spawn(async move {
             while let Ok(Some(req)) = conn.next_request().await {
+                // One lock per request: a second lock in the same match arm
+                // would wait for the first forever.
+                let current = config.lock().unwrap().clone();
                 let resp = match req {
                     Request::GetStatus => Response::Status(StatusInfo {
                         scanning: scanning.load(Ordering::Relaxed),
                         scanned_height: 899_000,
                         tip_height: Some(900_000),
                         scan_progress: 0.42,
-                        network: config.lock().unwrap().network.clone(),
+                        network: current.network.clone(),
                         electrum_clients: 1,
                         oracle_connected: scanning.load(Ordering::Relaxed),
                         last_error: None,
@@ -100,7 +103,7 @@ async fn main() -> std::io::Result<()> {
                         log_file: None,
                         oracle_error: None,
                         oracle_down_since_unix: None,
-                        p2p: Some(match &config.lock().unwrap().p2p_node_addr {
+                        p2p: Some(match &current.p2p_node_addr {
                             Some(node) => format!("your node {node}"),
                             None => "random peers: 37 known, 1 ignored".to_string(),
                         }),
@@ -114,11 +117,12 @@ async fn main() -> std::io::Result<()> {
                         Response::Ok
                     }
                     Request::GetConfig => Response::Config(config.lock().unwrap().clone()),
-                    Request::SetConfig(new_cfg) => match check_config(&new_cfg) {
+                    Request::SetConfig(update) => match check_config(&update.config) {
                         Ok(()) => {
                             let mut cfg = config.lock().unwrap();
+                            let new_cfg = update.apply_to(&cfg);
                             let bind_changed = new_cfg.electrum_addr != cfg.electrum_addr;
-                            *cfg = *new_cfg;
+                            *cfg = new_cfg;
                             eprintln!("fake daemon config updated");
                             if bind_changed {
                                 Response::OkWithNote(
@@ -143,17 +147,18 @@ async fn main() -> std::io::Result<()> {
                         }
                     }
                     Request::ApplySettings {
-                        config: new_cfg,
+                        config: update,
                         scan_key,
                     } => {
                         let key_ok = scan_key.as_deref().is_none_or(valid_scan_key);
-                        match check_config(&new_cfg) {
+                        match check_config(&update.config) {
                             Err(e) => Response::Error(e),
                             Ok(()) if !key_ok => Response::Error(
                                 "invalid scan key: must be a 32-byte hex string".to_string(),
                             ),
                             Ok(()) => {
-                                *config.lock().unwrap() = *new_cfg;
+                                let mut cfg = config.lock().unwrap();
+                                *cfg = update.apply_to(&cfg);
                                 Response::OkWithNote(
                                     "saved; the daemon restarts to apply it (fake daemon: \
                                      applied in memory)"

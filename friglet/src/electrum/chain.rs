@@ -136,8 +136,15 @@ impl ChainSource {
                 return Ok(rate);
             }
             // A fresh connection carries a fresh filter: Bitcoin Core sends
-            // it right after the handshake.
-            self.header_peer.lock().expect("header peer lock").take();
+            // it right after the handshake. A request using the shared
+            // connection holds it (blocking, up to its timeouts): wait for
+            // it off the runtime, so a caller's time limit still holds.
+            let slot = self.header_peer.clone();
+            tokio::task::spawn_blocking(move || {
+                drop(slot.lock().expect("header peer lock").take())
+            })
+            .await
+            .map_err(|error| format!("P2P task failed: {error}"))?;
             self.with_header_peer(
                 Arc::new(|peer: &mut Peer| {
                     peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
@@ -162,6 +169,21 @@ impl ChainSource {
             .ok_or_else(|| "no P2P peer sent a fee filter".to_string())
     }
 
+    /// [`Self::fee_filter`], waiting at most `wait`. Sampling that takes
+    /// longer goes on and counts for the next call; meanwhile what is known
+    /// ([`Self::known_fee_filter`]).
+    pub async fn fee_filter_within(&self, wait: Duration) -> Result<u64, String> {
+        match tokio::time::timeout(wait, self.fee_filter()).await {
+            Ok(rate) => rate,
+            Err(_) => self.known_fee_filter().ok_or_else(|| {
+                format!(
+                    "no P2P peer sent a fee filter within {} s",
+                    wait.as_secs_f32()
+                )
+            }),
+        }
+    }
+
     /// What [`Self::fee_filter`] would report now, without asking a peer.
     pub fn known_fee_filter(&self) -> Option<u64> {
         let filters = self.fee_filters();
@@ -179,8 +201,9 @@ impl ChainSource {
     }
 
     /// Discovered peers: read the fee filters of enough further peers for a
-    /// quorum, on short connections opened at once. Connections still under
-    /// way when the caller stops waiting finish and count for the next call.
+    /// quorum, on short connections opened at once, until the quorum is
+    /// there. Connections still under way then, or when the caller stops
+    /// waiting, finish and count for the next call.
     async fn sample_fee_filters(&self) {
         let _one_at_a_time = self.fee_sampling.lock().await;
         let mut asked = self.fee_filters().fresh_peers();
@@ -214,7 +237,12 @@ impl ChainSource {
                 }
             });
         }
-        while connections.join_next().await.is_some() {}
+        while connections.join_next().await.is_some() {
+            if self.fee_filters().current(FEE_FILTER_QUORUM).is_some() {
+                connections.detach_all();
+                break;
+            }
+        }
     }
 
     /// Remember a fee filter `peer` sent on any connection.
@@ -224,9 +252,10 @@ impl ChainSource {
 
     /// Run `request` on the shared header connection, opening it when
     /// needed. The own node gets a second try on a fresh connection when
-    /// the first fails; with discovered peers each try asks another peer,
-    /// also when the answer is not `wanted` (a header the peer does not
-    /// know), and the last answer is returned if none is.
+    /// the first fails; with discovered peers the peer already connected
+    /// goes first, and each try asks another peer, also when the answer is
+    /// not `wanted` (a header the peer does not know), and the last answer
+    /// is returned if none is.
     async fn with_header_peer<T: Send + 'static>(
         &self,
         request: HeaderRequest<T>,
@@ -237,19 +266,39 @@ impl ChainSource {
         let mut asked = HashSet::new();
         let mut last_error = None;
         let mut last_answer = None;
-        // Through a proxy, open the connection by racing several peers.
-        let mut raced = if !own_node && self.peers.dialer().proxy().is_some() {
-            self.race_header_connection(&mut asked).await?
+        // Through a proxy, open the connection by racing several peers;
+        // the racers are asked in the order they connect, before anyone
+        // else.
+        let mut race = if !own_node && self.peers.dialer().proxy().is_some() {
+            self.race_header_connections(&mut asked).await
         } else {
             None
         };
         for _ in 0..tries {
-            let next = match raced.take() {
-                Some(addr) => Ok(addr),
-                None => self.peers.next(Purpose::Header, &asked).await,
+            let raced = match race.as_mut() {
+                Some(race) => match race.next().await {
+                    Ok(raced) => raced,
+                    // Every other peer would fail the same way.
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                },
+                None => None,
             };
-            let addr = match next {
-                Ok(addr) => addr,
+            let next = match raced {
+                Some((addr, peer)) => Ok((addr, Some(peer))),
+                None => match self.connected_header_peer(&asked).filter(|_| !own_node) {
+                    Some(addr) => Ok((addr, None)),
+                    None => self
+                        .peers
+                        .next(Purpose::Header, &asked)
+                        .await
+                        .map(|addr| (addr, None)),
+                },
+            };
+            let (addr, connected) = match next {
+                Ok(next) => next,
                 Err(no_peers) => {
                     last_error = Some(format!("no P2P peer to ask: {no_peers}"));
                     break;
@@ -265,7 +314,7 @@ impl ChainSource {
             );
             let request = request.clone();
             let answer = tokio::task::spawn_blocking(move || {
-                ask_header_peer(&slot, &peers, &addr, &*request, &fee_filters)
+                ask_header_peer(&slot, &peers, &addr, connected, &*request, &fee_filters)
                     .map(|value| (value, addr.clone()))
                     .map_err(|error| (error, addr))
             })
@@ -273,9 +322,10 @@ impl ChainSource {
             .map_err(|error| format!("P2P task failed: {error}"))?;
             match answer {
                 Ok((value, _)) if own_node || wanted(&value) => return Ok(value),
-                Ok((value, addr)) => {
-                    // It does not know the block: probably behind.
-                    self.peers.report(&addr, PeerEvent::Behind);
+                Ok((value, _)) => {
+                    // It does not know the block: it is behind, or the
+                    // block is newer than its tip. Only this request moves
+                    // on; blocks may still come from it.
                     last_answer = Some(value);
                 }
                 Err((error, _)) => {
@@ -294,17 +344,22 @@ impl ChainSource {
         }
     }
 
+    /// The peer of the shared connection while it is fresh enough to reuse
+    /// and not in `asked`. `None` also while a request is using it.
+    fn connected_header_peer(&self, asked: &HashSet<PeerAddr>) -> Option<PeerAddr> {
+        let slot = self.header_peer.try_lock().ok()?;
+        let (peer, used) = slot.as_ref()?;
+        (used.elapsed() <= P2P_IDLE_REUSE && !asked.contains(peer.addr()))
+            .then(|| peer.addr().clone())
+    }
+
     /// Through a proxy (Tor) an address nobody answers at keeps a connect
     /// waiting the whole 20 s, so trying header peers one after another
     /// can hold a request (and with it a new-block notification or a
     /// broadcast's answer) for a minute. Unless the shared connection is
-    /// still fresh, connect to [`HEADER_PEERS`] peers at once and keep the
-    /// first that answers in it. The peer it went to, if any; the others
-    /// are reported as their connects end. `Err` when the proxy is down.
-    async fn race_header_connection(
-        &self,
-        asked: &mut HashSet<PeerAddr>,
-    ) -> Result<Option<PeerAddr>, String> {
+    /// still fresh, connect to [`HEADER_PEERS`] peers at once (they count
+    /// as asked: the race hands each one over as it connects).
+    async fn race_header_connections(&self, asked: &mut HashSet<PeerAddr>) -> Option<HeaderRace> {
         // Never wait for the lock here (async context): a request holding
         // it is using the shared connection.
         let fresh = match self.header_peer.try_lock() {
@@ -314,7 +369,7 @@ impl ChainSource {
             Err(_) => true,
         };
         if fresh {
-            return Ok(None);
+            return None;
         }
         let mut connecting = tokio::task::JoinSet::new();
         for _ in 0..HEADER_PEERS {
@@ -323,14 +378,15 @@ impl ChainSource {
             };
             asked.insert(addr.clone());
             let peers = self.peers.clone();
-            connecting.spawn_blocking(move || {
-                let connected = Peer::connect(
+            connecting.spawn(async move {
+                let connected = Peer::open(
                     peers.dialer(),
                     &addr,
                     peers.network(),
                     false,
                     P2P_CONNECT_TIMEOUT,
-                );
+                )
+                .await;
                 match &connected {
                     Ok(peer) => peers.report(&addr, PeerEvent::Connected(peer.info())),
                     Err(e) if e.proxy_down() => {}
@@ -339,18 +395,23 @@ impl ChainSource {
                 (addr, connected)
             });
         }
-        // Dropping the set on return leaves the losers running: blocking
-        // connects end on their own, within the connect timeout.
-        while let Some(joined) = connecting.join_next().await {
+        Some(HeaderRace(connecting))
+    }
+}
+
+/// Header connections racing to open ([`ChainSource::race_header_connections`]),
+/// each connect and handshake one cancellable unit ([`Peer::open`]):
+/// dropped with the request, the ones still under way are abandoned, and
+/// the ones up but not used are closed.
+struct HeaderRace(tokio::task::JoinSet<(PeerAddr, Result<Peer, P2pError>)>);
+
+impl HeaderRace {
+    /// The next racer that connected, waiting for it if none has yet;
+    /// `None` once every one failed. `Err` when the proxy is down.
+    async fn next(&mut self) -> Result<Option<(PeerAddr, Peer)>, String> {
+        while let Some(joined) = self.0.join_next().await {
             match joined {
-                Ok((addr, Ok(peer))) => {
-                    let Ok(mut slot) = self.header_peer.try_lock() else {
-                        return Ok(None);
-                    };
-                    *slot = Some((peer, Instant::now()));
-                    return Ok(Some(addr));
-                }
-                // Every other peer would fail the same way.
+                Ok((addr, Ok(peer))) => return Ok(Some((addr, peer))),
                 Ok((_, Err(error))) if error.proxy_down() => return Err(error.to_string()),
                 _ => {}
             }
@@ -359,16 +420,21 @@ impl ChainSource {
     }
 }
 
-/// One header request to `addr` on the shared connection (blocking),
-/// reporting to `peers` how the connection went.
+/// One header request to `addr` on the shared connection (blocking), which
+/// becomes `connected` when given, reporting to `peers` how the connection
+/// went.
 fn ask_header_peer<T>(
     slot: &StdMutex<Option<(Peer, Instant)>>,
     peers: &PeerSource,
     addr: &PeerAddr,
+    connected: Option<Peer>,
     request: &(dyn Fn(&mut Peer) -> Result<T, P2pError> + Send + Sync),
     fee_filters: &StdMutex<FeeFilters>,
 ) -> Result<T, P2pError> {
     let mut slot = slot.lock().expect("header peer lock");
+    if let Some(peer) = connected {
+        *slot = Some((peer, Instant::now()));
+    }
     if slot
         .as_ref()
         .is_some_and(|(peer, used)| used.elapsed() > P2P_IDLE_REUSE || peer.addr() != addr)
@@ -505,7 +571,8 @@ mod tests {
     }
 
     /// Through a proxy a header request races its first connection, so
-    /// addresses Tor gets no answer from (20 s each) do not hold it up.
+    /// addresses Tor gets no answer from (20 s each) do not hold it up, and
+    /// the connects still waiting end with the request.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn through_a_proxy_header_peers_race_past_dead_addresses() {
@@ -527,8 +594,6 @@ mod tests {
             proxy.stall(dead.clone());
             seeds.push(dead);
         }
-        // The stalled connects outlive the request; a plain runtime drop
-        // would wait for them.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -541,9 +606,15 @@ mod tests {
             let header = chain.header(known.block_hash()).await;
             (header, started.elapsed())
         });
-        runtime.shutdown_background();
+        let ended = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(60));
+        let lingered = ended.elapsed();
         assert_eq!(header.unwrap(), known);
         assert!(waited < Duration::from_secs(10), "waited {waited:?}");
+        assert!(
+            lingered < Duration::from_secs(10),
+            "connects went on {lingered:?} after the request"
+        );
     }
 
     /// Through `p2p_proxy` the Electrum server's own connections go through
@@ -588,6 +659,260 @@ mod tests {
             assert!(err.contains("p2p_proxy"), "{err}");
         }
         assert_eq!(peers.known(), 1, "the peer is not blamed for the proxy");
+    }
+
+    /// Right after a connection through the proxy completed its handshake,
+    /// a header connection the proxy has no clear answer for (a general
+    /// failure) counts against the address, as for block downloads: three
+    /// and it is forgotten.
+    #[tokio::test]
+    async fn through_a_working_proxy_an_unclear_header_connect_counts_against_the_peer() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let live = FakePeer::spawn(Script::default(), 1);
+        let live_addr: PeerAddr = live.addr.into();
+        let dead: PeerAddr = std::net::SocketAddr::from(([10, 140, 0, 1], 18444)).into();
+        let proxy = FakeSocks5::start();
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            proxy.dialer(),
+            Seeds::Static(vec![live_addr.clone(), dead.clone()]),
+        );
+        // The first pick loads the seeds.
+        peers.next(Purpose::Header, &HashSet::new()).await.unwrap();
+        assert_eq!(peers.known(), 2);
+        let (slot, filters) = (StdMutex::new(None), StdMutex::new(FeeFilters::default()));
+        let nothing = |_: &mut Peer| Ok(());
+        ask_header_peer(&slot, &peers, &live_addr, None, &nothing, &filters)
+            .expect("the live peer answers through the proxy");
+        proxy.refuse_with(0x01);
+        for _ in 0..3 {
+            ask_header_peer(&slot, &peers, &dead, None, &nothing, &filters)
+                .expect_err("the proxy fails it");
+        }
+        assert_eq!(peers.known(), 1, "the dead address is forgotten");
+    }
+
+    /// A gate on `ip` in front of the peer at `to`: it takes one connection
+    /// and holds it (the peer's handshake waits) until opened. Its address,
+    /// word that the connection arrived, and the opener.
+    fn gate(
+        ip: [u8; 4],
+        to: std::net::SocketAddr,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::net::{TcpListener, TcpStream};
+
+        let gate = TcpListener::bind((std::net::Ipv4Addr::from(ip), 0)).unwrap();
+        let gate_addr = gate.local_addr().unwrap();
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (open, opened) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (client, _) = gate.accept().unwrap();
+            let _ = arrived.send(());
+            let _ = opened.recv();
+            let upstream = TcpStream::connect(to).unwrap();
+            let (mut up_read, mut client_write) =
+                (upstream.try_clone().unwrap(), client.try_clone().unwrap());
+            std::thread::spawn(move || std::io::copy(&mut up_read, &mut client_write));
+            let (mut client_read, mut up_write) = (client, upstream);
+            let _ = std::io::copy(&mut client_read, &mut up_write);
+        });
+        (gate_addr, arrival, open)
+    }
+
+    /// Through a proxy a cold header request races three connections. The
+    /// first one up is to a peer that lacks the header: the slower racers
+    /// are asked next, not passed over unasked. (Only these three peers
+    /// are known.)
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn through_a_proxy_a_slower_racer_is_asked_when_the_first_lacks_the_header() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let known = fake_peer::header(15);
+        let lacks = FakePeer::spawn_on([127, 0, 0, 81].into(), Script::default(), 1);
+        let knows = FakePeer::spawn_on(
+            [127, 0, 0, 82].into(),
+            Script {
+                headers: vec![known],
+                ..Script::default()
+            },
+            1,
+        );
+        // Held until the first racer was asked: it cannot win the race.
+        let (gate_addr, _arrival, open) = gate([127, 0, 0, 83], knows.addr);
+        let proxy = FakeSocks5::start();
+        let dead: PeerAddr = std::net::SocketAddr::from(([10, 135, 0, 1], 18444)).into();
+        proxy.stall(dead.clone());
+        let seeds = vec![lacks.addr.into(), gate_addr.into(), dead];
+        let peers = PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
+        let chain = Arc::new(ChainSource::new(peers, "http://127.0.0.1:1".into()));
+        let request = tokio::spawn({
+            let chain = chain.clone();
+            async move { chain.header(known.block_hash()).await }
+        });
+        let asked = |peer: &FakePeer| {
+            peer.commands()
+                .iter()
+                .filter(|c| *c == "getheaders")
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while asked(&lacks) == 0 && !request.is_finished() {
+            assert!(Instant::now() < deadline, "the first racer was never asked");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        open.send(()).unwrap();
+        let header = tokio::time::timeout(Duration::from_secs(20), request)
+            .await
+            .expect("the request ends")
+            .unwrap();
+        assert_eq!(header.unwrap(), known);
+        assert_eq!((asked(&lacks), asked(&knows)), (1, 1));
+    }
+
+    /// Through a proxy the race's first connection is used also when the
+    /// shared connection is busy as it opens. (It used to be dropped, and
+    /// with it here the only peer that answers.)
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_raced_connection_is_used_while_the_shared_one_is_busy() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let known = fake_peer::header(11);
+        let live = FakePeer::spawn_on(
+            [127, 0, 0, 73].into(),
+            Script {
+                headers: vec![known],
+                ..Script::default()
+            },
+            1,
+        );
+        // In front of it a gate that holds the connection until opened.
+        let (gate_addr, arrival, open) = gate([127, 0, 0, 74], live.addr);
+        let proxy = FakeSocks5::start();
+        let mut seeds: Vec<PeerAddr> = vec![gate_addr.into()];
+        for n in 0..2u8 {
+            let dead: PeerAddr = std::net::SocketAddr::from(([10, 130 + n, 0, 1], 18444)).into();
+            proxy.stall(dead.clone());
+            seeds.push(dead);
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peers = PeerSource::discover(Network::Regtest, proxy.dialer(), Seeds::Static(seeds));
+        let chain = Arc::new(ChainSource::new(peers, "http://127.0.0.1:1".into()));
+        let request = runtime.spawn({
+            let chain = chain.clone();
+            async move { chain.header(known.block_hash()).await }
+        });
+        arrival
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the race connects through the gate");
+        let busy = chain.header_peer.lock().unwrap();
+        open.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live.conns().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The handshake ends while the shared connection is still busy.
+        std::thread::sleep(Duration::from_millis(300));
+        drop(busy);
+        let header = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), request)
+                .await
+                .expect("the request ends")
+                .unwrap()
+        });
+        runtime.shutdown_background();
+        assert_eq!(header.unwrap(), known);
+    }
+
+    /// A peer that does not know a header (it may be behind, or the block
+    /// newer than its tip) is passed over for that request only: blocks
+    /// still come from it first.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_header_a_peer_does_not_know_keeps_it_for_blocks() {
+        let known = fake_peer::header(12);
+        let lacks = FakePeer::spawn_on([127, 0, 0, 75].into(), Script::default(), 1);
+        let knows = FakePeer::spawn_on(
+            [127, 0, 0, 76].into(),
+            Script {
+                headers: vec![known],
+                ..Script::default()
+            },
+            1,
+        );
+        let (lacks_addr, knows_addr): (PeerAddr, PeerAddr) = (lacks.addr.into(), knows.addr.into());
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            Dialer::Direct,
+            Seeds::Static(vec![lacks_addr.clone(), knows_addr]),
+        );
+        peers.next(Purpose::Block, &HashSet::new()).await.unwrap();
+        // The last block came from the peer that lacks the header.
+        peers.report(&lacks_addr, PeerEvent::Served);
+        let chain = ChainSource::new(peers.clone(), "http://127.0.0.1:1".into());
+        assert_eq!(chain.header(known.block_hash()).await.unwrap(), known);
+        let asked = |peer: &FakePeer| {
+            peer.commands()
+                .iter()
+                .filter(|c| *c == "getheaders")
+                .count()
+        };
+        assert_eq!((asked(&lacks), asked(&knows)), (1, 1));
+        assert_eq!(
+            peers.next(Purpose::Block, &HashSet::new()).await.unwrap(),
+            lacks_addr
+        );
+    }
+
+    /// A header request goes to the peer already connected while that
+    /// connection is fresh, not to a new connection to the peer the pool
+    /// would pick.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn header_requests_reuse_the_open_connection() {
+        let headers = [fake_peer::header(13), fake_peer::header(14)];
+        let script = Script {
+            headers: headers.to_vec(),
+            ..Script::default()
+        };
+        let first = FakePeer::spawn_on([127, 0, 0, 77].into(), script.clone(), 1);
+        let other = FakePeer::spawn_on([127, 0, 0, 78].into(), script, 1);
+        let (first_addr, other_addr): (PeerAddr, PeerAddr) = (first.addr.into(), other.addr.into());
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            Dialer::Direct,
+            Seeds::Static(vec![first_addr.clone(), other_addr.clone()]),
+        );
+        peers.next(Purpose::Block, &HashSet::new()).await.unwrap();
+        peers.report(&first_addr, PeerEvent::Served);
+        let chain = ChainSource::new(peers.clone(), "http://127.0.0.1:1".into());
+        assert_eq!(
+            chain.header(headers[0].block_hash()).await.unwrap(),
+            headers[0]
+        );
+        // Blocks now come from the other peer, which the pool picks first.
+        peers.report(&other_addr, PeerEvent::Served);
+        assert_eq!(
+            chain.header(headers[1].block_hash()).await.unwrap(),
+            headers[1]
+        );
+        assert_eq!(first.conns().len(), 1);
+        let getheaders = first
+            .commands()
+            .iter()
+            .filter(|c| *c == "getheaders")
+            .count();
+        assert_eq!(getheaders, 2);
+        assert!(other.conns().is_empty(), "a second connection was opened");
     }
 
     #[tokio::test]
@@ -701,5 +1026,122 @@ mod tests {
         );
         let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
         assert_eq!(chain.fee_filter().await.unwrap(), 2_000);
+    }
+
+    /// A peer that accepts the connection and never answers: its handshake
+    /// waits the whole connect timeout.
+    fn silent_peer(ip: [u8; 4]) -> std::net::TcpListener {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::from(ip), 0)).unwrap()
+    }
+
+    /// The relay fee is there as soon as a quorum of peers sent filters;
+    /// a further peer that does not answer is not waited for (its 5 s
+    /// connect timeout used to hold the answer).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_relay_fee_does_not_wait_past_the_quorum() {
+        let fakes: Vec<FakePeer> = [1_000, 2_000, 3_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, fee_filter)| {
+                FakePeer::spawn_on(
+                    [127, 0, 0, 51 + i as u8].into(),
+                    Script {
+                        fee_filter,
+                        ..Script::default()
+                    },
+                    1,
+                )
+            })
+            .collect();
+        let silent = silent_peer([127, 0, 0, 54]);
+        let mut seeds: Vec<PeerAddr> = fakes.iter().map(|fake| fake.addr.into()).collect();
+        seeds.push(silent.local_addr().unwrap().into());
+        // The silent peer's connect outlives the answer; a plain runtime
+        // drop would wait for it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (rate, waited) = runtime.block_on(async {
+            let peers =
+                PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(seeds));
+            let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+            let started = Instant::now();
+            let rate = chain.fee_filter().await;
+            (rate, started.elapsed())
+        });
+        runtime.shutdown_background();
+        assert_eq!(rate.unwrap(), 2_000);
+        assert!(waited < FEE_SAMPLE_CONNECT_TIMEOUT / 2, "waited {waited:?}");
+        // The silent peer was asked too.
+        silent.set_nonblocking(true).unwrap();
+        let asked = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            silent.accept().is_ok()
+        });
+        assert!(asked, "the silent peer was not asked");
+    }
+
+    /// When sampling takes longer than a relay fee request may wait, the
+    /// request gets the filters known by then, not an error.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_relay_fee_that_cannot_wait_gets_the_known_filters() {
+        let silent: Vec<_> = (61..64).map(|n| silent_peer([127, 0, 0, n])).collect();
+        let seeds = silent
+            .iter()
+            .map(|peer| peer.local_addr().unwrap().into())
+            .collect();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rate = runtime.block_on(async {
+            let peers =
+                PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(seeds));
+            let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+            let broadcast_peer: PeerAddr =
+                std::net::SocketAddr::from(([192, 0, 2, 1], 8333)).into();
+            chain.note_fee_filter(&broadcast_peer, Some(1_500));
+            chain.fee_filter_within(Duration::from_millis(300)).await
+        });
+        runtime.shutdown_background();
+        assert_eq!(rate, Ok(1_500));
+    }
+
+    /// Own node: a relay fee request answers within its limit while a
+    /// header request holds the shared connection (it used to wait on its
+    /// lock on the runtime, past any limit, until that request ended).
+    #[tokio::test]
+    async fn a_relay_fee_request_does_not_wait_for_a_busy_header_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let chain = ChainSource::new(
+            own_node("127.0.0.1:1".parse().unwrap()),
+            "http://127.0.0.1:1".into(),
+        );
+        let released = Arc::new(AtomicBool::new(false));
+        let (held, holding) = mpsc::channel();
+        let (release, releasing) = mpsc::channel::<()>();
+        let holder = std::thread::spawn({
+            let (slot, released) = (chain.header_peer.clone(), released.clone());
+            move || {
+                let busy = slot.lock().unwrap();
+                held.send(()).unwrap();
+                let _ = releasing.recv_timeout(Duration::from_secs(10));
+                released.store(true, Ordering::SeqCst);
+                drop(busy);
+            }
+        });
+        holding.recv().unwrap();
+        let answer = chain.fee_filter_within(Duration::from_millis(200)).await;
+        let in_time = !released.load(Ordering::SeqCst);
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(in_time, "the request waited for the busy connection");
+        let error = answer.unwrap_err();
+        assert!(error.contains("within"), "{error}");
     }
 }

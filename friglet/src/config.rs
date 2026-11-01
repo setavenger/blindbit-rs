@@ -15,10 +15,11 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use blindbit_lib::net::{Dialer, PeerAddr, PeerHost};
+use blindbit_lib::net::{Dialer, PeerAddr, PeerHost, PeerSource, Seeds};
 use clap::Args;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
@@ -397,7 +398,10 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 
 /// The own node's address. Without a proxy a host name is resolved here,
 /// i.e. at every daemon (re)start; through one it is left for the proxy to
-/// resolve (no local DNS), which also reaches a Tor onion service.
+/// resolve (no local DNS), which also reaches a Tor onion service. Through
+/// a proxy the address is the proxy's to reach: Tor cannot reach this
+/// computer or the local network, other SOCKS5 proxies (`ssh -D`) can, so a
+/// local node is accepted and a failed connection says why.
 fn own_node_addr(addr: &str, network: &str, proxy: Option<SocketAddr>) -> Result<PeerAddr, String> {
     let (host, port) = friglet_ipc::network::split_peer_addr(addr, network)?;
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -426,6 +430,18 @@ impl ResolvedConfig {
             Some(proxy) => Dialer::Socks5 { proxy },
             None => Dialer::Direct,
         }
+    }
+
+    /// Where blocks, headers and broadcasts go: the configured own node, or
+    /// peers of the network found through its DNS seeds; through
+    /// [`Self::dialer`] either way.
+    pub fn peer_source(&self) -> Arc<PeerSource> {
+        PeerSource::new(
+            self.network,
+            self.dialer(),
+            self.p2p_node.clone(),
+            Seeds::for_network(self.network),
+        )
     }
 }
 
@@ -1035,6 +1051,93 @@ mod tests {
         cfg.p2p_proxy = Some("  ".to_string());
         let r = resolve(cfg).unwrap();
         assert_eq!((r.p2p_proxy, r.raw.p2p_proxy), (None, None));
+    }
+
+    /// What the daemon connects to: the configured own node (and nothing
+    /// else), through the proxy when one is set; without a node, peers of
+    /// the network.
+    #[test]
+    fn the_daemon_connects_to_the_configured_node() {
+        let r = resolve(resolvable(
+            "signet",
+            "http://127.0.0.1:1",
+            "152.53.151.148:38333",
+        ))
+        .unwrap();
+        let peers = r.peer_source();
+        assert_eq!(
+            peers.own_node_addr(),
+            Some(&"152.53.151.148:38333".parse::<SocketAddr>().unwrap().into())
+        );
+        assert_eq!(peers.dialer(), &Dialer::Direct);
+        assert_eq!(peers.network(), Network::Signet);
+
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "node.invalid");
+        cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
+        let peers = resolve(cfg).unwrap().peer_source();
+        assert_eq!(
+            peers.own_node_addr(),
+            Some(&PeerAddr {
+                host: PeerHost::Name("node.invalid".to_string()),
+                port: 38333,
+            })
+        );
+        assert_eq!(
+            peers.dialer(),
+            &Dialer::Socks5 {
+                proxy: "127.0.0.1:9050".parse().unwrap()
+            }
+        );
+
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "");
+        cfg.p2p_node_addr = None;
+        let peers = resolve(cfg).unwrap().peer_source();
+        assert!(!peers.is_own_node());
+    }
+
+    /// Through a proxy the own node may be on this computer or the local
+    /// network: a SOCKS5 proxy other than Tor (`ssh -D`) can reach it. The
+    /// proxy stays in use and a name stays a name, for the proxy to resolve.
+    #[test]
+    fn a_node_on_the_local_network_is_reached_through_the_proxy() {
+        let by_name = |name: &str| PeerAddr {
+            host: PeerHost::Name(name.to_string()),
+            port: 38333,
+        };
+        let by_ip = |addr: &str| PeerAddr::from(addr.parse::<SocketAddr>().unwrap());
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        for (local, node) in [
+            ("127.0.0.1", by_ip("127.0.0.1:38333")),
+            ("192.168.1.20:8333", by_ip("192.168.1.20:8333")),
+            ("[fe80::1]:38333", by_ip("[fe80::1]:38333")),
+            ("localhost", by_name("localhost")),
+            ("bitcoin.local", by_name("bitcoin.local")),
+        ] {
+            let mut cfg = resolvable("signet", "http://127.0.0.1:1", local);
+            cfg.p2p_proxy = Some(proxy.to_string());
+            let r = resolve(cfg).unwrap_or_else(|e| panic!("{local}: {e}"));
+            assert_eq!(r.p2p_node, Some(node), "{local}");
+            assert_eq!(r.dialer(), Dialer::Socks5 { proxy });
+        }
+
+        // The daemon's connection to a node on this computer, through a
+        // proxy that reaches it.
+        use blindbit_lib::net::testing::FakeSocks5;
+        let node = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = FakeSocks5::start();
+        let node_addr = node.local_addr().unwrap().to_string();
+        let mut cfg = resolvable("regtest", "http://127.0.0.1:1", &node_addr);
+        cfg.p2p_proxy = Some(proxy.addr().to_string());
+        let peers = resolve(cfg).unwrap().peer_source();
+        let own = peers.own_node_addr().expect("the own node").clone();
+        peers
+            .dialer()
+            .connect(&own, std::time::Duration::from_secs(5))
+            .expect("connected through the proxy");
+        let targets: Vec<PeerAddr> = proxy.requests().into_iter().map(|r| r.target).collect();
+        assert_eq!(targets, vec![own]);
+        node.set_nonblocking(true).unwrap();
+        assert!(node.accept().is_ok(), "the proxy connected to the node");
     }
 
     #[test]

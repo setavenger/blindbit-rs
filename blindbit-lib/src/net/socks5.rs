@@ -116,6 +116,18 @@ pub(crate) fn connect(
     target: &PeerAddr,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
+    connect_watched(proxy, target, timeout, |_| Ok(()))
+}
+
+/// [`connect`], handing the socket to `opened` as soon as the proxy accepted
+/// the TCP connection, so another thread can shut it down to end the
+/// exchange early. An error from `opened` ends the connect.
+pub(crate) fn connect_watched(
+    proxy: SocketAddr,
+    target: &PeerAddr,
+    timeout: Duration,
+    opened: impl FnOnce(&TcpStream) -> io::Result<()>,
+) -> io::Result<TcpStream> {
     let deadline = Instant::now() + timeout;
     let mut stream = TcpStream::connect_timeout(&proxy, timeout).map_err(|e| {
         proxy_failed(
@@ -123,6 +135,7 @@ pub(crate) fn connect(
             format!("cannot connect to p2p_proxy {proxy}: {e}"),
         )
     })?;
+    opened(&stream)?;
     let _ = stream.set_nodelay(true);
     let proxy_io = |e: io::Error| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => proxy_failed(
@@ -139,12 +152,9 @@ pub(crate) fn connect(
     };
 
     // Greeting: no authentication, or a username and password.
-    set_deadline(&stream, deadline).map_err(proxy_io)?;
-    stream
-        .write_all(&[VERSION, 2, NO_AUTH, USER_PASS])
-        .map_err(proxy_io)?;
+    write_by(&mut stream, &[VERSION, 2, NO_AUTH, USER_PASS], deadline).map_err(proxy_io)?;
     let mut choice = [0u8; 2];
-    stream.read_exact(&mut choice).map_err(proxy_io)?;
+    read_by(&mut stream, &mut choice, deadline).map_err(proxy_io)?;
     if choice[0] != VERSION {
         return Err(proxy_failed(
             io::ErrorKind::Other,
@@ -154,10 +164,9 @@ pub(crate) fn connect(
     match choice[1] {
         NO_AUTH => {}
         USER_PASS => {
-            set_deadline(&stream, deadline).map_err(proxy_io)?;
-            log_in(&mut stream).map_err(proxy_io)?;
+            log_in(&mut stream, deadline).map_err(proxy_io)?;
             let mut status = [0u8; 2];
-            stream.read_exact(&mut status).map_err(proxy_io)?;
+            read_by(&mut stream, &mut status, deadline).map_err(proxy_io)?;
             if status[1] != 0 {
                 return Err(proxy_failed(
                     io::ErrorKind::PermissionDenied,
@@ -211,13 +220,12 @@ pub(crate) fn connect(
         }
     }
     request.extend(target.port.to_be_bytes());
-    set_deadline(&stream, deadline).map_err(proxy_io)?;
-    stream.write_all(&request).map_err(proxy_io)?;
+    write_by(&mut stream, &request, deadline).map_err(proxy_io)?;
 
     // The reply, once the proxy has connected to the peer (or failed to).
     // Through Tor that takes a circuit and the exit's connection.
     let mut head = [0u8; 4];
-    stream.read_exact(&mut head).map_err(|e| match e.kind() {
+    read_by(&mut stream, &mut head, deadline).map_err(|e| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => unclear(
             io::ErrorKind::TimedOut,
             format!(
@@ -252,7 +260,7 @@ pub(crate) fn connect(
         ATYP_IPV6 => 16,
         ATYP_DOMAIN => {
             let mut len = [0u8; 1];
-            stream.read_exact(&mut len).map_err(proxy_io)?;
+            read_by(&mut stream, &mut len, deadline).map_err(proxy_io)?;
             usize::from(len[0])
         }
         other => {
@@ -263,7 +271,7 @@ pub(crate) fn connect(
         }
     };
     let mut skip = vec![0u8; bound + 2];
-    stream.read_exact(&mut skip).map_err(proxy_io)?;
+    read_by(&mut stream, &mut skip, deadline).map_err(proxy_io)?;
 
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
@@ -272,23 +280,60 @@ pub(crate) fn connect(
 
 /// RFC 1929 login with a random username and password, new for every
 /// connection, so Tor puts the connection on a circuit of its own.
-fn log_in(stream: &mut TcpStream) -> io::Result<()> {
+fn log_in(stream: &mut TcpStream, deadline: Instant) -> io::Result<()> {
     let user = format!("{:016x}", super::random_u64());
     let password = format!("{:016x}", super::random_u64());
     let mut login = vec![USER_PASS_VERSION, user.len() as u8];
     login.extend(user.as_bytes());
     login.push(password.len() as u8);
     login.extend(password.as_bytes());
-    stream.write_all(&login)
+    write_by(stream, &login, deadline)
 }
 
-/// Bound the next reads and writes by `deadline`.
-fn set_deadline(stream: &TcpStream, deadline: Instant) -> io::Result<()> {
-    let left = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_millis(1));
-    stream.set_read_timeout(Some(left))?;
-    stream.set_write_timeout(Some(left))
+/// The time left until `deadline`, or a timeout once it has passed.
+fn left_until(deadline: Instant) -> io::Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::ErrorKind::TimedOut.into());
+    }
+    Ok(left)
+}
+
+/// Fill `buf` by `deadline`, however the proxy splits the bytes: every read
+/// waits only for the time left, so a proxy that drips its answer cannot
+/// stretch the connection past its timeout.
+fn read_by(stream: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        stream.set_read_timeout(Some(left_until(deadline)?))?;
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Write all of `data` by `deadline` (see [`read_by`]).
+fn write_by(stream: &mut TcpStream, data: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        stream.set_write_timeout(Some(left_until(deadline)?))?;
+        match stream.write(&data[written..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => written += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// What a SOCKS5 reply code (RFC 1928, and Tor's onion service codes)
@@ -438,6 +483,51 @@ mod tests {
                 assert!(message.contains(expected), "{expected:?} in {message}");
             }
         }
+    }
+
+    /// A proxy that answers its CONNECT reply one byte every 400 ms, each
+    /// byte well within the 1 s timeout: the connection still ends at its
+    /// deadline, not when the last byte drips in (11 s; the limit below
+    /// leaves room for a busy machine).
+    #[test]
+    fn a_proxy_that_drips_its_reply_cannot_stretch_the_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut client, _)) = listener.accept() else {
+                return;
+            };
+            let _ = client.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut greeting = [0u8; 4];
+            let mut request = [0u8; 10];
+            if client.read_exact(&mut greeting).is_err()
+                || client.write_all(&[VERSION, NO_AUTH]).is_err()
+                || client.read_exact(&mut request).is_err()
+            {
+                return;
+            }
+            // Bound to a 20-byte name: a 27-byte reply.
+            let mut reply = vec![VERSION, 0, 0, ATYP_DOMAIN, 20];
+            reply.extend(b"exit.proxy.invalid.x");
+            reply.extend([0, 1]);
+            for byte in reply {
+                std::thread::sleep(Duration::from_millis(400));
+                if client.write_all(&[byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        let started = Instant::now();
+        let err = connect(
+            proxy,
+            &"192.0.2.7:8333".parse::<SocketAddr>().unwrap().into(),
+            Duration::from_secs(1),
+        )
+        .expect_err("the reply takes 11 s");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(is_proxy_unclear(&err), "{err}");
     }
 
     #[test]

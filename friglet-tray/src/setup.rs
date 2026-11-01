@@ -733,6 +733,25 @@ mod tests {
         assert_eq!(validate_setup(&new_wallet, KEY_HEX), Ok(()));
     }
 
+    /// A node on this computer or the local network with a proxy: a SOCKS5
+    /// proxy other than Tor (`ssh -D`) can reach it.
+    #[test]
+    fn validate_accepts_a_local_node_with_a_proxy() {
+        for p2p in [
+            "192.168.1.20:38333",
+            "localhost",
+            "127.0.0.1",
+            "bitcoin.local",
+        ] {
+            let cfg = DaemonConfig {
+                p2p_node_addr: Some(p2p.to_string()),
+                p2p_proxy: Some("127.0.0.1:9050".to_string()),
+                ..valid_config()
+            };
+            assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()), "{p2p}");
+        }
+    }
+
     #[test]
     fn descriptor_summary_picks_network_and_hides_secret() {
         let s = summarize_descriptor(TEST_DESCRIPTOR, "bitcoin").unwrap();

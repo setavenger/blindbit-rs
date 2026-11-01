@@ -31,7 +31,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin_address_book::io::FileExt;
 use bitcoin_address_book::{Record, Table};
 
-use super::seeds::Seeds;
+use super::seeds::{Seeded, Seeding, Seeds};
 use super::{Dialer, NetGroup, PeerAddr, PeerHost, Purpose, random_u64};
 use crate::scanner::PeerInfo;
 
@@ -39,6 +39,11 @@ use crate::scanner::PeerInfo;
 // buckets; 4 x 16 tried slots, a source reaches 2 of the 4.
 type NewTable = Table<16, 16, 8>;
 type TriedTable = Table<4, 16, 2>;
+const NEW_SLOTS: u64 = 16 * 16;
+const TRIED_SLOTS: u64 = 4 * 16;
+/// A saved table holds at most one record per slot; a file listing more
+/// than this many per slot is refused unread.
+const SAVED_PER_SLOT: u64 = 2;
 
 /// Random draws from the tables before settling for any usable peer.
 const MAX_DRAWS: usize = 64;
@@ -46,7 +51,7 @@ const MAX_DRAWS: usize = 64;
 const WANT_ADDRS_BELOW: usize = 200;
 /// At most this many addresses are taken from one gossip message (Bitcoin
 /// Core's `MAX_ADDR_TO_SEND`).
-const MAX_GOSSIP_PER_MESSAGE: usize = 1_000;
+pub(crate) const MAX_GOSSIP_PER_MESSAGE: usize = 1_000;
 /// A peer that could not be reached rests this long, and is forgotten after
 /// [`MAX_UNREACHABLE`] failures in a row: the seeds and gossip cannot bring
 /// it back for [`FORGET_FOR`].
@@ -58,6 +63,11 @@ const FORGET_FOR: Duration = Duration::from_secs(60 * 60);
 const IPV6_DEAD_FOR: Duration = Duration::from_secs(30 * 60);
 /// A peer that connected but did not help (no block, closed, stalled).
 const UNHELPFUL_REST: Duration = Duration::from_secs(10 * 60);
+/// The proxy counts as working this long after a connection through it
+/// completed a handshake…
+const PROXY_WORKS_FOR: Duration = Duration::from_secs(10 * 60);
+/// …until this many connects through it got no clear answer since.
+const PROXY_UNCLEAR_COUNTED: u8 = 8;
 /// A peer whose chain is below the block asked for: it may catch up soon.
 const BEHIND_REST: Duration = Duration::from_secs(2 * 60);
 /// The DNS seeds are asked again at most this often…
@@ -67,6 +77,10 @@ const RESEED_EVERY_WHILE_EMPTY: Duration = Duration::from_secs(30);
 /// At start, the seeds are asked only while fewer addresses are known
 /// (from the address book on disk).
 const SEED_BELOW: usize = 50;
+/// Through a proxy, how many addresses the seeds' nodes must have added to
+/// the book before seeding returns; the answers of the seeds still being
+/// asked join it as they come.
+const ENOUGH_SEEDED: usize = 20;
 /// A kept address book is saved this often while it changes, and at exit.
 const SAVE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Kyoto's limits for replacing a colliding record that keeps failing.
@@ -81,7 +95,8 @@ pub(crate) fn required_services() -> ServiceFlags {
 /// How a connection to a peer went, reported with [`PeerSource::report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEvent {
-    /// The handshake completed; what the peer said about itself.
+    /// The handshake completed; what the peer said about itself. A full
+    /// node (every block, with witnesses) moves to "tried".
     Connected(PeerInfo),
     /// The peer served the block asked for.
     Served,
@@ -93,6 +108,14 @@ pub enum PeerEvent {
     NoRoute,
     /// Connected, but did not help: no block, closed, went quiet.
     Unhelpful,
+    /// Through the proxy, the connect got no clear answer about the peer:
+    /// no reply in time, or a general failure. Tor answers that for a dead
+    /// address, and for every address while it has no working circuit. So
+    /// it counts as [`Self::Unreachable`] only while the proxy works (a
+    /// connection through it completed a handshake in the last 10 minutes,
+    /// and fewer than 8 connects have failed this way since); otherwise the
+    /// peer only rests, and a Tor outage cannot empty the address book.
+    ProxyUnclear,
     /// Its chain is below the block asked for.
     Behind,
     /// Sent a block that fails its checks, or speaks another network.
@@ -289,11 +312,20 @@ impl PeerSource {
         }
     }
 
-    /// Addresses `from` gossiped (`addr` / `addrv2`). Nothing for an own
-    /// node.
-    pub fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) {
-        if let Self::Discovered(pool) = self {
-            pool.add_gossip(from, addrs);
+    /// Addresses `from` gossiped (`addr` / `addrv2`). Whether they answer
+    /// the peer's `getaddr`: more than one address, or one IP address that
+    /// is not the peer's own (a node announces itself with a message of its
+    /// own address alone, also of its Tor, I2P or CJDNS address). Only an
+    /// answer stops [`Self::wants_addr`] asking the peer again. Nothing for
+    /// an own node.
+    pub fn add_gossip(
+        &self,
+        from: &PeerAddr,
+        addrs: impl IntoIterator<Item = AddrV2Message>,
+    ) -> bool {
+        match self {
+            Self::Discovered(pool) => pool.add_gossip(from, addrs),
+            Self::OwnNode { .. } => false,
         }
     }
 
@@ -343,6 +375,8 @@ pub struct PeerPool {
     inner: Mutex<Inner>,
     /// One seeding at a time; callers that need peers wait for it.
     seeding: tokio::sync::Mutex<()>,
+    /// One save of the kept address book at a time.
+    saving: Mutex<()>,
 }
 
 impl fmt::Debug for PeerPool {
@@ -364,8 +398,9 @@ pub(crate) enum Where {
 
 /// What the pool knows about one address beyond its table record.
 struct Meta {
-    /// The record as added: its source decides its bucket, so table
-    /// operations on it need this one.
+    /// The record as the table holds it: its source decides its bucket, so
+    /// table operations on it need this one; connections stamp it as they
+    /// stamp the table's copy (see [`count`]), and a saved book keeps it.
     record: Record,
     /// The table it is in; `None` once it is ignored.
     table: Option<Where>,
@@ -375,8 +410,6 @@ struct Meta {
     /// Ignored for the rest of the session; kept so gossip cannot add it
     /// back.
     ignored: bool,
-    /// Said it relays no transactions: never handed out for relaying.
-    no_tx_relay: bool,
 }
 
 /// What a caller of [`PeerSource::next_outside`] asks for and rules out.
@@ -409,8 +442,20 @@ struct Inner {
     last_seed: Option<(Instant, usize)>,
     /// Peers that gossiped addresses this session.
     gossiped: HashSet<PeerAddr>,
+    /// Peers that said they relay no transactions: never handed out for
+    /// relaying this session, also after they left the tables (a slot
+    /// collision, failures) and came back. Learnt again after a restart.
+    no_tx_relay: HashSet<PeerAddr>,
     /// The proxy failed the last time the seeds were asked: why.
     seed_error: Option<String>,
+    /// When a connection through the proxy last completed a handshake, and
+    /// how many connects through it got no clear answer since.
+    proxy_worked: Option<(Instant, u8)>,
+    /// Answers of seeds still being asked when a seeding returned, one
+    /// receiver per seeding until its last seed answered (a later seeding
+    /// does not drop them); added to the book on the next
+    /// [`PeerPool::next`].
+    later_seeds: Vec<tokio::sync::mpsc::UnboundedReceiver<Seeding>>,
     /// The tables changed since they were last saved.
     changed: bool,
 }
@@ -437,10 +482,14 @@ impl PeerPool {
                 ipv6_dead_since: None,
                 last_seed: None,
                 gossiped: HashSet::new(),
+                no_tx_relay: HashSet::new(),
                 seed_error: None,
+                proxy_worked: None,
+                later_seeds: Vec::new(),
                 changed: false,
             }),
             seeding: tokio::sync::Mutex::new(()),
+            saving: Mutex::new(()),
         }
     }
 
@@ -450,6 +499,7 @@ impl PeerPool {
     }
 
     async fn next(&self, want: Want<'_>) -> Result<PeerAddr, NoPeers> {
+        self.add_later_seeds();
         let mut seeded = false;
         loop {
             if let Some(addr) = self.lock().pick(want) {
@@ -528,12 +578,57 @@ impl PeerPool {
         let port = default_port(self.network);
         let started = Instant::now();
         let seeding = self.seeds.resolve(port, &self.dialer, self.network).await;
-        let found = seeding.found;
+        let mut found = seeding.found.len();
+        let mut added = {
+            let mut inner = self.lock();
+            inner.seed_error = seeding.proxy_error;
+            self.add_seeded(&mut inner, &seeding.found)
+        };
+        // Through a proxy the seeds' nodes answer one by one. What counts is
+        // what the book took: an answer may hold only addresses it refuses
+        // (not public, a bad port, known already, a taken slot).
+        let mut answers = seeding.later;
+        while added < ENOUGH_SEEDED
+            && let Some(later) = answers.as_mut()
+        {
+            let Some(answer) = later.recv().await else {
+                answers = None;
+                break;
+            };
+            found += answer.found.len();
+            let mut inner = self.lock();
+            if let Some(error) = answer.proxy_error {
+                inner.seed_error = Some(error);
+            }
+            added += self.add_seeded(&mut inner, &answer.found);
+        }
         let mut inner = self.lock();
-        inner.seed_error = seeding.proxy_error;
+        inner.later_seeds.extend(answers);
+        inner.last_seed = Some((Instant::now(), added));
+        let seeds: Vec<&str> = match &self.seeds {
+            Seeds::Dns(names) => names.to_vec(),
+            Seeds::Static(_) => vec!["static"],
+            Seeds::None => Vec::new(),
+        };
+        tracing::info!(
+            seeds = %seeds.join(", "),
+            via = %self.dialer,
+            addresses = found,
+            added,
+            known = inner.known(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer discovery: asked the DNS seeds"
+        );
+        if let Some(error) = &inner.seed_error {
+            tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+        }
+    }
+
+    /// Put the addresses the seeds gave in the book; how many were new.
+    fn add_seeded(&self, inner: &mut Inner, found: &[Seeded]) -> usize {
         let mut added = 0;
         let from_dns = matches!(self.seeds, Seeds::Dns(_));
-        for seeded in &found {
+        for seeded in found {
             let Some(ip) = seeded.addr.ip() else {
                 continue;
             };
@@ -557,23 +652,40 @@ impl PeerPool {
                 added += 1;
             }
         }
-        inner.last_seed = Some((Instant::now(), added));
-        let seeds: Vec<&str> = match &self.seeds {
-            Seeds::Dns(names) => names.to_vec(),
-            Seeds::Static(_) => vec!["static"],
-            Seeds::None => Vec::new(),
-        };
-        tracing::info!(
-            seeds = %seeds.join(", "),
-            via = %self.dialer,
-            addresses = found.len(),
-            added,
-            known = inner.known(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "peer discovery: asked the DNS seeds"
-        );
-        if let Some(error) = &inner.seed_error {
-            tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+        added
+    }
+
+    /// Add what seeds that answered after seeding returned gave, counted
+    /// with what the last seeding added (which decides when the seeds are
+    /// asked again); a proxy failure counts as during seeding.
+    fn add_later_seeds(&self) {
+        use tokio::sync::mpsc::error::TryRecvError;
+        let mut inner = self.lock();
+        let mut answers = Vec::new();
+        inner.later_seeds.retain_mut(|later| {
+            loop {
+                match later.try_recv() {
+                    Ok(answer) => answers.push(answer),
+                    Err(TryRecvError::Empty) => break true,
+                    Err(TryRecvError::Disconnected) => break false,
+                }
+            }
+        });
+        for answer in answers {
+            if let Some(error) = answer.proxy_error {
+                tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+                inner.seed_error = Some(error);
+            }
+            let added = self.add_seeded(&mut inner, &answer.found);
+            if let Some((_, last_added)) = inner.last_seed.as_mut() {
+                *last_added += added;
+            }
+            tracing::debug!(
+                addresses = answer.found.len(),
+                added,
+                known = inner.known(),
+                "peer discovery: a seed answered after seeding returned"
+            );
         }
     }
 
@@ -588,7 +700,12 @@ impl PeerPool {
             inner.preferred = None;
         }
         match event {
-            PeerEvent::Connected(info) => inner.promote(peer, info.services),
+            PeerEvent::Connected(info) => {
+                if self.dialer.proxy().is_some() {
+                    inner.proxy_worked = Some((now, 0));
+                }
+                inner.connected(peer, info.services);
+            }
             PeerEvent::Served => {
                 inner.preferred = Some(peer.clone());
                 if let Some(meta) = inner.meta.get_mut(peer) {
@@ -607,30 +724,59 @@ impl PeerPool {
             }
             PeerEvent::Unreachable | PeerEvent::NoRoute => inner.failed(peer, now),
             PeerEvent::Unhelpful => inner.rest(peer, now + UNHELPFUL_REST),
+            PeerEvent::ProxyUnclear => {
+                let proxy_works = inner
+                    .proxy_worked
+                    .as_mut()
+                    .filter(|(at, unclear)| {
+                        now.duration_since(*at) < PROXY_WORKS_FOR
+                            && *unclear < PROXY_UNCLEAR_COUNTED
+                    })
+                    .map(|(_, unclear)| *unclear += 1)
+                    .is_some();
+                // Tor works: the address does not.
+                if proxy_works {
+                    inner.failed(peer, now);
+                } else {
+                    inner.rest(peer, now + UNHELPFUL_REST);
+                }
+            }
             PeerEvent::Behind => inner.rest(peer, now + BEHIND_REST),
             PeerEvent::Misbehaved => inner.ignore(peer),
             PeerEvent::NoTxRelay => {
-                if let Some(meta) = inner.meta.get_mut(peer) {
-                    meta.no_tx_relay = true;
-                }
+                inner.no_tx_relay.insert(peer.clone());
             }
         }
     }
 
-    fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) {
+    fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) -> bool {
         let Some(from_ip) = from.ip() else {
-            return;
+            return false;
         };
+        let addrs: Vec<AddrV2Message> = addrs.into_iter().take(MAX_GOSSIP_PER_MESSAGE).collect();
+        let own = |message: &AddrV2Message| {
+            let ip = match message.addr {
+                AddrV2::Ipv4(ip) => IpAddr::V4(ip),
+                AddrV2::Ipv6(ip) => IpAddr::V6(ip),
+                // A node on Tor, I2P or CJDNS too announces itself, and
+                // which address is the peer's own cannot be told there.
+                _ => return true,
+            };
+            // An IPv4-mapped address is the IPv4 address it maps.
+            PeerAddr::from(SocketAddr::new(ip, 0)).ip() == Some(from_ip)
+        };
+        let answer = addrs.len() > 1 || addrs.first().is_some_and(|message| !own(message));
         // A peer on the public internet cannot point friglet at this
         // computer or its local network; a local one (a test, a LAN node)
         // may name local peers.
         let local_source = !is_public(from_ip);
         let source = addrv2(from_ip);
         let mut inner = self.lock();
-        inner.gossiped.insert(from.clone());
-        let (mut offered, mut added) = (0, 0);
-        for message in addrs.into_iter().take(MAX_GOSSIP_PER_MESSAGE) {
-            offered += 1;
+        if answer {
+            inner.gossiped.insert(from.clone());
+        }
+        let (offered, mut added) = (addrs.len(), 0);
+        for message in addrs {
             let ip = match message.addr {
                 AddrV2::Ipv4(ip) => IpAddr::V4(ip),
                 AddrV2::Ipv6(ip) => IpAddr::V6(ip),
@@ -654,9 +800,11 @@ impl PeerPool {
             peer = %from,
             offered,
             added,
+            answer,
             known = inner.known(),
             "peer gossiped addresses"
         );
+        answer
     }
 
     /// A gossiped address worth a place in the book: a full node (every
@@ -685,7 +833,11 @@ impl PeerPool {
         let mut loaded = 0;
         // "tried" first: an address in both files stays tried.
         for (path, place) in [(&files.tried, Where::Tried), (&files.new, Where::New)] {
-            match read_book(path) {
+            let slots = match place {
+                Where::New => NEW_SLOTS,
+                Where::Tried => TRIED_SLOTS,
+            };
+            match read_book(path, SAVED_PER_SLOT * slots) {
                 Ok(records) => {
                     for record in records {
                         if inner.add_saved(record, place) {
@@ -713,26 +865,37 @@ impl PeerPool {
     /// Write the tables to the kept address book's files, if there is one
     /// (and, with `only_if_changed`, only when they changed). A failure is
     /// logged; the book stays in memory.
+    ///
+    /// The records are copied under the lock and the files written (and
+    /// synced to disk) without it, so connections are not held up by a
+    /// slow disk; one save at a time, so an older copy never overwrites a
+    /// newer one.
     fn save(&self, only_if_changed: bool) {
         let Some(files) = self.book.get() else {
             return;
         };
-        let mut inner = self.lock();
-        if only_if_changed && !inner.changed {
-            return;
-        }
-        let result = write_book(&files.new, |file| file.write_table(&*inner.new))
-            .and_then(|()| write_book(&files.tried, |file| file.write_table(&*inner.tried)));
-        match result {
-            Ok(()) => {
-                inner.changed = false;
-                tracing::debug!(known = inner.known(), "peer address book saved");
+        let _one_at_a_time = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = {
+            let mut inner = self.lock();
+            if only_if_changed && !inner.changed {
+                return;
             }
-            Err(e) => tracing::warn!(
-                path = %files.new.display(),
-                error = %e,
-                "cannot save the peer address book"
-            ),
+            inner.changed = false;
+            inner.saved_records()
+        };
+        let (new, tried) = saved_tables(&saved);
+        let result = write_book(&files.new, |file| file.write_table(&*new))
+            .and_then(|()| write_book(&files.tried, |file| file.write_table(&*tried)));
+        match result {
+            Ok(()) => tracing::debug!(known = saved.len(), "peer address book saved"),
+            Err(e) => {
+                self.lock().changed = true;
+                tracing::warn!(
+                    path = %files.new.display(),
+                    error = %e,
+                    "cannot save the peer address book"
+                );
+            }
         }
     }
 
@@ -752,6 +915,26 @@ impl PeerPool {
     #[cfg(test)]
     pub(crate) fn place(&self, addr: &PeerAddr) -> Option<Where> {
         self.lock().meta.get(addr).and_then(|meta| meta.table)
+    }
+
+    /// As if a seeding had returned while seeds were still being asked:
+    /// their answers come through `later`.
+    #[cfg(test)]
+    pub(crate) fn queue_later_seeds(&self, later: tokio::sync::mpsc::UnboundedReceiver<Seeding>) {
+        self.lock().later_seeds.push(later);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_error(&self) -> Option<String> {
+        self.lock().seed_error.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn services(&self, addr: &PeerAddr) -> Option<ServiceFlags> {
+        self.lock()
+            .meta
+            .get(addr)
+            .map(|meta| meta.record.service_flags())
     }
 
     #[cfg(test)]
@@ -791,6 +974,14 @@ impl PeerPool {
     }
 
     #[cfg(test)]
+    pub(crate) fn age_proxy_worked(&self, by: Duration) {
+        let mut inner = self.lock();
+        if let Some((at, unclear)) = inner.proxy_worked {
+            inner.proxy_worked = Some((at.checked_sub(by).unwrap_or(at), unclear));
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn age_ipv6_dead(&self, by: Duration) {
         let mut inner = self.lock();
         inner.ipv6_dead_since = inner
@@ -807,7 +998,46 @@ impl PeerPool {
     }
 }
 
+/// The tables `saved` describes, each record as the live table holds it,
+/// with the times connections gave it.
+fn saved_tables(saved: &[(Record, Where)]) -> (Box<NewTable>, Box<TriedTable>) {
+    let (mut new, mut tried) = (Box::<NewTable>::default(), Box::<TriedTable>::default());
+    for (record, table) in saved {
+        match table {
+            Where::New => new.add(record),
+            Where::Tried => tried.add(record),
+        };
+    }
+    (new, tried)
+}
+
+/// Do to `record` what a table's `successful_connection` (`connected`) or
+/// `failed_connection` does to its copy now: stamp the attempt (and the
+/// connection), count or clear the failures. The pool's copy then matches
+/// the table's and keeps those times when saved.
+fn count(record: &mut Record, connected: bool) {
+    // A table of one slot holds only this record, so `select` gives it back.
+    let mut one = Table::<1, 1, 1>::new();
+    one.add(record);
+    if connected {
+        one.successful_connection(record);
+    } else {
+        one.failed_connection(record);
+    }
+    if let Some(counted) = one.select() {
+        *record = counted;
+    }
+}
+
 impl Inner {
+    /// Every record in a table, to save.
+    fn saved_records(&self) -> Vec<(Record, Where)> {
+        self.meta
+            .values()
+            .filter_map(|meta| Some((meta.record.clone(), meta.table?)))
+            .collect()
+    }
+
     fn ipv6_dead(&self) -> bool {
         self.ipv6_dead_since
             .is_some_and(|since| since.elapsed() < IPV6_DEAD_FOR)
@@ -840,7 +1070,7 @@ impl Inner {
         };
         meta.table.is_some()
             && !meta.ignored
-            && !(want.purpose == Purpose::Relay && meta.no_tx_relay)
+            && !(want.purpose == Purpose::Relay && self.no_tx_relay.contains(addr))
             && want.allows(addr)
             && !(self.ipv6_dead() && addr.is_ipv6())
     }
@@ -943,7 +1173,6 @@ impl Inner {
                 resting_until: None,
                 failures: 0,
                 ignored: false,
-                no_tx_relay: false,
             },
         );
         self.changed = true;
@@ -974,26 +1203,32 @@ impl Inner {
                 resting_until: None,
                 failures: 0,
                 ignored: false,
-                // Learnt again from the next handshake.
-                no_tx_relay: false,
             },
         );
         true
     }
 
-    /// A handshake completed: move the peer to "tried" (Kyoto's `tried`),
-    /// sending a colliding tried peer back to "new" when it has room there.
-    fn promote(&mut self, addr: &PeerAddr, services: ServiceFlags) {
+    /// A handshake completed: the peer's run of failures ends and its
+    /// services are what it just said. A full node moves to "tried"
+    /// (Kyoto's `tried`), sending a colliding tried peer back to "new" when
+    /// it has room there. Header and fee connections take any peer, but the
+    /// book is for block downloads, so another peer stays where it is.
+    fn connected(&mut self, addr: &PeerAddr, services: ServiceFlags) {
         let Some(meta) = self.meta.get_mut(addr) else {
             return;
         };
         self.changed = true;
         meta.failures = 0;
         meta.record.update_service_flags(services);
+        count(&mut meta.record, true);
         let (record, table) = (meta.record.clone(), meta.table);
         match table {
             Some(Where::Tried) => {
                 self.tried.successful_connection(&record);
+                return;
+            }
+            Some(Where::New) if !services.has(required_services()) => {
+                self.new.successful_connection(&record);
                 return;
             }
             Some(Where::New) => self.new.remove(&record),
@@ -1024,6 +1259,7 @@ impl Inner {
         };
         meta.failures = meta.failures.saturating_add(1);
         meta.resting_until = Some(now + UNREACHABLE_REST);
+        count(&mut meta.record, false);
         let (record, table, failures) = (meta.record.clone(), meta.table, meta.failures);
         match table {
             Some(Where::New) => self.new.failed_connection(&record),
@@ -1073,7 +1309,6 @@ impl Inner {
                             resting_until: None,
                             failures: 0,
                             ignored: true,
-                            no_tx_relay: false,
                         },
                     );
                 }
@@ -1100,8 +1335,10 @@ const BOOK_MAGIC: [u8; 4] = *b"ADBK";
 
 /// The records of an address book file written with `io::FileExt`. The
 /// crate's `Table` cannot list its records, and the pool needs each one to
-/// index it, so the file is read record by record here.
-fn read_book(path: &Path) -> io::Result<Vec<Record>> {
+/// index it, so the file is read record by record here. A file listing
+/// more than `max` records was not written for a table of this size and is
+/// refused before any is read.
+fn read_book(path: &Path, max: u64) -> io::Result<Vec<Record>> {
     let mut file = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
@@ -1114,6 +1351,12 @@ fn read_book(path: &Path) -> io::Result<Vec<Record>> {
     let mut count = [0u8; 8];
     file.read_exact(&mut count)?;
     let count = u64::from_le_bytes(count);
+    if count > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it lists {count} addresses, more than the {max} it can hold"),
+        ));
+    }
     let mut records = Vec::new();
     for _ in 0..count {
         records.push(Record::deserialize(&mut file)?);
@@ -1126,6 +1369,29 @@ fn read_book(path: &Path) -> io::Result<Vec<Record>> {
         ));
     }
     Ok(records)
+}
+
+/// When each record of a saved table was last tried and last connected to
+/// (Unix seconds), by address.
+#[cfg(test)]
+pub(crate) fn saved_times(path: &Path) -> HashMap<PeerAddr, (Option<u64>, Option<u64>)> {
+    let time = |field: &[u8]| {
+        (field[0] == 1).then(|| u64::from_le_bytes(field[1..9].try_into().expect("8 bytes")))
+    };
+    read_book(path, u64::MAX)
+        .expect("a readable book")
+        .into_iter()
+        .filter_map(|record| {
+            let addr = peer_addr(&record)?;
+            // A serialized record ends with its two times, 9 bytes each.
+            let bytes = record.serialize();
+            let end = bytes.len();
+            Some((
+                addr,
+                (time(&bytes[end - 18..end - 9]), time(&bytes[end - 9..])),
+            ))
+        })
+        .collect()
 }
 
 /// Write `path` through a temporary file, so a crash leaves the old file.

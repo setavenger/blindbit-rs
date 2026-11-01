@@ -35,9 +35,14 @@ fn pool(source: &PeerSource) -> &PeerPool {
 
 /// A discovering regtest source seeded with `addrs`, seeded already.
 fn seeded(addrs: &[&str]) -> Arc<PeerSource> {
+    seeded_via(addrs, Dialer::Direct)
+}
+
+/// [`seeded`], its connections going through `dialer`.
+fn seeded_via(addrs: &[&str], dialer: Dialer) -> Arc<PeerSource> {
     let source = PeerSource::discover(
         Network::Regtest,
-        Dialer::Direct,
+        dialer,
         Seeds::Static(addrs.iter().map(|a| addr(a)).collect()),
     );
     run(source.next(Purpose::Block, &HashSet::new())).ok();
@@ -117,6 +122,33 @@ fn a_handshake_moves_a_peer_to_tried_and_a_bad_block_ignores_it_for_good() {
     assert_eq!(source.known(), 2);
 }
 
+/// A handshake with a peer that does not serve every block with witnesses
+/// (a pruned node, met by a header or fee connection) does not move it to
+/// "tried", but it still ends the peer's run of failures and records the
+/// services it said it has.
+#[test]
+fn only_a_full_node_moves_to_tried() {
+    let source = seeded(&PEERS);
+    let (pruned, full) = (addr(PEERS[0]), addr(PEERS[1]));
+    let limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    source.report(&pruned, PeerEvent::Unreachable);
+    source.report(&pruned, PeerEvent::Unreachable);
+    source.report(
+        &pruned,
+        PeerEvent::Connected(PeerInfo {
+            services: limited,
+            height: 1_000,
+        }),
+    );
+    assert_eq!(pool(&source).place(&pruned), Some(Where::New));
+    assert_eq!(pool(&source).services(&pruned), Some(limited));
+    // Three failures, but not in a row: still known.
+    source.report(&pruned, PeerEvent::Unreachable);
+    assert_eq!(pool(&source).place(&pruned), Some(Where::New));
+    source.report(&full, PeerEvent::Connected(info()));
+    assert_eq!(pool(&source).place(&full), Some(Where::Tried));
+}
+
 #[test]
 fn the_peer_that_served_a_block_is_asked_first_but_not_for_relay() {
     let source = seeded(&PEERS);
@@ -153,6 +185,84 @@ fn failed_peers_rest_and_are_only_handed_out_when_nothing_else_is_left() {
     assert_eq!(pool(&source).place(&a), None);
     assert!(!pool(&source).is_ignored(&a));
     assert_eq!(source.known(), 1);
+}
+
+/// Connections through a proxy (seeding a static list makes none).
+fn proxied() -> Dialer {
+    Dialer::Socks5 {
+        proxy: "127.0.0.1:1".parse().unwrap(),
+    }
+}
+
+#[test]
+fn through_a_working_proxy_an_unclear_connect_counts_against_the_peer() {
+    let source = seeded_via(&PEERS, proxied());
+    let (works, dead) = (addr(PEERS[0]), addr(PEERS[1]));
+    // Nothing went through the proxy yet (Tor may have no circuit): the
+    // peer only rests.
+    for _ in 0..3 {
+        source.report(&dead, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(source.known(), 3);
+    assert!(pool(&source).is_resting(&dead));
+    // A connection through it works: the address is what fails.
+    source.report(&works, PeerEvent::Connected(info()));
+    for _ in 0..3 {
+        source.report(&dead, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&dead), None, "forgotten");
+    assert_eq!(source.known(), 2);
+}
+
+#[test]
+fn once_the_proxy_stopped_working_an_unclear_connect_only_rests_the_peer() {
+    let source = seeded_via(&PEERS, proxied());
+    let (works, many, last) = (addr(PEERS[0]), addr(PEERS[1]), addr(PEERS[2]));
+    // The last connection through the proxy worked 10 minutes ago.
+    source.report(&works, PeerEvent::Connected(info()));
+    pool(&source).age_proxy_worked(Duration::from_secs(10 * 60));
+    for _ in 0..3 {
+        source.report(&last, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&last), Some(Where::New));
+    // It worked just now, but then 8 connects got no clear answer.
+    source.report(&works, PeerEvent::Connected(info()));
+    for _ in 0..8 {
+        source.report(&many, PeerEvent::ProxyUnclear);
+    }
+    for _ in 0..3 {
+        source.report(&last, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&last), Some(Where::New));
+    assert!(pool(&source).is_resting(&last));
+}
+
+/// The errors that mean this computer has no route to a peer's network:
+/// the ones a host without IPv6 gives for an IPv6 peer, never one through
+/// the proxy.
+#[test]
+fn no_route_is_this_computer_lacking_one() {
+    use std::io::{Error, ErrorKind};
+    let (v4, v6) = (addr(PEERS[0]), addr("[2001:db8::5]:18444"));
+    for kind in [ErrorKind::NetworkUnreachable, ErrorKind::AddrNotAvailable] {
+        assert!(super::is_no_route(&Error::from(kind), &v6), "{kind:?}");
+    }
+    assert!(super::is_no_route(
+        &Error::from(ErrorKind::NetworkUnreachable),
+        &v4
+    ));
+    // A host that does not answer is the peer, not the route, over IPv6 as
+    // well (a router's ICMPv6 "address unreachable").
+    for peer in [&v4, &v6] {
+        assert!(
+            !super::is_no_route(&Error::from(ErrorKind::HostUnreachable), peer),
+            "{peer}"
+        );
+    }
+    assert!(!super::is_no_route(
+        &Error::from(ErrorKind::ConnectionRefused),
+        &v6
+    ));
 }
 
 #[test]
@@ -227,6 +337,39 @@ fn seeds_that_gave_nothing_are_asked_again_sooner() {
     assert_ne!(pool.seeded_at(), Some(first), "after 30 s");
 }
 
+/// A seed that answers after seeding returned (through a proxy, once the
+/// others gave enough) is not lost to the next seeding, and what it gave
+/// counts: seeds that gave something are asked again only after 5 min.
+#[test]
+fn a_seed_answering_late_counts_and_outlasts_the_next_seeding() {
+    let source = PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(Vec::new()));
+    let pool = pool(&source);
+    let (answer, later) = tokio::sync::mpsc::unbounded_channel();
+    pool.queue_later_seeds(later);
+    // A seeding that finds nothing while that seed is still being asked.
+    run(source.next(Purpose::Block, &none())).expect_err("nothing yet");
+    answer
+        .send(super::seeds::Seeding {
+            found: vec![super::seeds::Seeded {
+                addr: addr(PEERS[0]),
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                seed: "late",
+                gossiped: false,
+            }],
+            ..Default::default()
+        })
+        .expect("its answer is still awaited");
+    assert_eq!(
+        run(source.next(Purpose::Block, &none())).unwrap(),
+        addr(PEERS[0])
+    );
+    pool.age_last_seed(Duration::from_secs(30));
+    let aged = pool.seeded_at();
+    let asked = HashSet::from([addr(PEERS[0])]);
+    run(source.next(Purpose::Block, &asked)).expect_err("nobody else");
+    assert_eq!(pool.seeded_at(), aged, "not asked again after 30 s");
+}
+
 #[test]
 fn regtest_has_no_seeds() {
     assert!(matches!(Seeds::for_network(Network::Regtest), Seeds::None));
@@ -284,6 +427,57 @@ fn gossip_keeps_full_nodes_and_public_peers_cannot_name_local_ones() {
     // A local peer may name local peers.
     source.add_gossip(&addr("127.0.0.5:18444"), [message([127, 0, 0, 9], full)]);
     assert_eq!(source.known(), 5);
+}
+
+/// A message holding only the peer's own address is the peer announcing
+/// itself, not its answer to `getaddr`: it is asked again. One other
+/// address, or more, is an answer.
+#[test]
+fn a_peer_announcing_itself_has_not_answered_getaddr() {
+    let source = seeded(&PEERS);
+    let peer = addr("93.184.216.1:8333");
+    let message = |ip: [u8; 4]| AddrV2Message {
+        time: 0,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        addr: AddrV2::Ipv4(ip.into()),
+        port: 8333,
+    };
+    assert!(!source.add_gossip(&peer, [message([93, 184, 216, 1])]));
+    assert!(source.wants_addr(&peer));
+    assert!(source.add_gossip(&peer, [message([93, 184, 216, 2])]));
+    assert!(!source.wants_addr(&peer));
+    let other = addr("93.184.217.1:8333");
+    assert!(source.add_gossip(
+        &other,
+        [message([93, 184, 217, 1]), message([93, 184, 217, 3])]
+    ));
+    assert!(!source.wants_addr(&other));
+}
+
+/// A message holding only one Tor, I2P or CJDNS address is a node
+/// announcing itself there (whether it is its own cannot be told), not an
+/// answer to `getaddr`: it is asked again.
+#[test]
+fn a_peer_announcing_its_onion_address_has_not_answered_getaddr() {
+    let source = seeded(&PEERS);
+    let peer = addr("93.184.216.1:8333");
+    let message = |addr: AddrV2| AddrV2Message {
+        time: 0,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        addr,
+        port: 8333,
+    };
+    for announced in [
+        AddrV2::TorV3([7; 32]),
+        AddrV2::I2p([8; 32]),
+        AddrV2::Cjdns("fc00::1".parse().unwrap()),
+    ] {
+        assert!(
+            !source.add_gossip(&peer, [message(announced.clone())]),
+            "{announced:?} taken for an answer"
+        );
+        assert!(source.wants_addr(&peer));
+    }
 }
 
 #[test]
@@ -358,6 +552,32 @@ fn the_address_book_survives_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A saved book keeps when each peer was last tried and connected to:
+/// saving it again later does not make those times the time of the save.
+#[test]
+fn saving_the_address_book_keeps_when_peers_were_tried() {
+    let dir = temp_dir("times");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    let (connected, failed) = (addr(PEERS[0]), addr(PEERS[1]));
+    source.report(&connected, PeerEvent::Connected(info()));
+    source.report(&failed, PeerEvent::Unreachable);
+    let times =
+        |table: &str| super::pool::saved_times(&dir.join(format!("peers-regtest-{table}.book")));
+    source.save_book();
+    let first = (times("tried")[&connected], times("new")[&failed]);
+    assert!(
+        matches!(first, ((Some(_), Some(_)), (Some(_), None))),
+        "tried and connected, tried only: {first:?}"
+    );
+    // A second later another peer fails, and the book is saved again.
+    std::thread::sleep(Duration::from_millis(1_100));
+    source.report(&addr(PEERS[2]), PeerEvent::Unreachable);
+    source.save_book();
+    assert_eq!((times("tried")[&connected], times("new")[&failed]), first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_unreadable_address_book_is_ignored() {
     let dir = temp_dir("corrupt");
@@ -378,6 +598,76 @@ fn an_unreadable_address_book_is_ignored() {
     assert_eq!(restarted.known(), PEERS.len());
     restarted.save_book();
     assert_eq!(kept_in(&dir, &[]).known(), PEERS.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A save on a disk that blocks (here: the file is a pipe nobody reads
+/// yet) does not hold up the peers: the book stays usable meanwhile.
+#[cfg(unix)]
+#[test]
+fn saving_the_address_book_does_not_hold_up_the_peers() {
+    use std::io::Read;
+    let dir = temp_dir("blocking-disk");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    let pipe = dir.join("peers-regtest-new.book.tmp");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success());
+    let saver = {
+        let source = source.clone();
+        std::thread::spawn(move || source.save_book())
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let (known, answer) = std::sync::mpsc::channel();
+    {
+        let source = source.clone();
+        std::thread::spawn(move || {
+            let _ = known.send(source.known());
+        });
+    }
+    let answered = answer.recv_timeout(Duration::from_secs(2));
+    // Let the save go on: read the pipe (syncing a pipe fails, so the save
+    // fails, which is fine here).
+    let mut sink = Vec::new();
+    std::fs::File::open(&pipe)
+        .unwrap()
+        .read_to_end(&mut sink)
+        .unwrap();
+    saver.join().unwrap();
+    assert_eq!(
+        answered,
+        Ok(PEERS.len()),
+        "held up while the book was saved"
+    );
+    assert!(pool(&source).changed(), "the failed save is tried again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A well-formed file listing far more records than its table holds is
+/// refused before they are read, not loaded into memory and time.
+#[test]
+fn an_address_book_listing_more_records_than_it_holds_is_ignored() {
+    let dir = temp_dir("oversized");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    source.save_book();
+    let path = dir.join("peers-regtest-new.book");
+    let saved = std::fs::read(&path).unwrap();
+    let count = u64::from_le_bytes(saved[4..12].try_into().unwrap()) as usize;
+    assert_eq!(count, PEERS.len());
+    // Records of IPv4 addresses are all the same size: repeat the first.
+    let one = &saved[12..12 + (saved.len() - 12) / count];
+    let listed = 2_000u64;
+    let mut oversized = b"ADBK".to_vec();
+    oversized.extend(listed.to_le_bytes());
+    for _ in 0..listed {
+        oversized.extend(one);
+    }
+    std::fs::write(&path, oversized).unwrap();
+    assert_eq!(kept_in(&dir, &[]).known(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -470,4 +760,39 @@ fn a_peer_that_relays_no_transactions_is_never_handed_out_for_relay() {
         run(source.next(Purpose::Block, &asked)).unwrap(),
         blocks_only
     );
+}
+
+/// A peer that relays no transactions stays out of relaying after it left
+/// the tables and gossip brought it back (as after a slot collision).
+#[test]
+fn a_blocks_only_peer_stays_out_of_relay_after_it_left_the_book_and_came_back() {
+    let source = seeded(&PEERS[..2]);
+    let blocks_only = addr(PEERS[0]);
+    source.report(&blocks_only, PeerEvent::Connected(info()));
+    source.report(&blocks_only, PeerEvent::NoTxRelay);
+    // Forgotten after failing three times; an hour later gossip names it.
+    for _ in 0..3 {
+        source.report(&blocks_only, PeerEvent::Unreachable);
+    }
+    assert_eq!(pool(&source).place(&blocks_only), None);
+    pool(&source).age_rest(&blocks_only, Duration::from_secs(60 * 60));
+    let Some(std::net::IpAddr::V4(ip)) = blocks_only.ip() else {
+        panic!("IPv4 test peer");
+    };
+    source.add_gossip(
+        &addr("10.0.0.1:18444"),
+        [AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            addr: AddrV2::Ipv4(ip),
+            port: blocks_only.port,
+        }],
+    );
+    assert_eq!(pool(&source).place(&blocks_only), Some(Where::New));
+    for _ in 0..30 {
+        assert_eq!(
+            run(source.next(Purpose::Relay, &none())).unwrap(),
+            addr(PEERS[1])
+        );
+    }
 }

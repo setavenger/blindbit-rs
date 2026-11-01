@@ -7,6 +7,7 @@
 //! (the proxy, Tor's exit, resolves them to one of their nodes), asks that
 //! node for addresses and hangs up.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -17,7 +18,8 @@ use bitcoin::p2p::address::AddrV2Message;
 use bitcoin_p2p::handshake::ConnectionConfig;
 use bitcoin_p2p::net::{ConnectionExt, TimeoutParams};
 
-use super::{Dialer, PeerAddr, PeerHost, USER_AGENT, is_proxy_down, random_u64};
+use super::pool::MAX_GOSSIP_PER_MESSAGE;
+use super::{Dialer, PeerAddr, PeerHost, ShutdownOnDrop, USER_AGENT, is_proxy_down, random_u64};
 
 /// How long one DNS seed lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,6 +28,10 @@ const PROXIED_SEEDS: usize = 3;
 /// …and how long the handshake and the node's addresses may take once
 /// connected (the connection itself gets the dialer's proxy timeout).
 const PROXIED_SEED_WAIT: Duration = Duration::from_secs(20);
+/// A seed's node answers `getaddr` within this many messages after the
+/// handshake (Bitcoin Core sends a few first: feature messages, a ping, its
+/// own address); reading stops after them.
+const SEED_MESSAGES: usize = 100;
 
 /// Where a discovering [`super::PeerSource`] gets its first addresses.
 #[derive(Debug, Clone)]
@@ -44,6 +50,11 @@ pub(crate) struct Seeding {
     pub(crate) found: Vec<Seeded>,
     /// The proxy failed, so no seed could be asked: why.
     pub(crate) proxy_error: Option<String>,
+    /// Through a proxy, the seeds' answers, one message per seed as it
+    /// answers: its addresses, or the proxy's failure (no `later` of its
+    /// own). Dropping the receiver closes the connections of the seeds
+    /// still being asked.
+    pub(crate) later: Option<tokio::sync::mpsc::UnboundedReceiver<Seeding>>,
 }
 
 /// An address a seed gave.
@@ -80,7 +91,8 @@ impl Seeds {
     /// Through a proxy ([`Dialer::Socks5`]) there is no DNS lookup:
     /// [`PROXIED_SEEDS`] random seeds are each connected to by name through
     /// the proxy (`x9.<seed>`, else the bare name), and the node the proxy
-    /// reaches is asked for addresses (`getaddr`).
+    /// reaches is asked for addresses (`getaddr`). This returns at once;
+    /// the answers come through [`Seeding::later`].
     pub(crate) async fn resolve(&self, port: u16, dialer: &Dialer, network: Network) -> Seeding {
         match self {
             Self::None => Seeding::default(),
@@ -94,10 +106,10 @@ impl Seeds {
                         gossiped: false,
                     })
                     .collect(),
-                proxy_error: None,
+                ..Seeding::default()
             },
             Self::Dns(names) if dialer.proxy().is_some() => {
-                through_proxy(names, dialer, network, port).await
+                through_proxy(names, dialer, network, port)
             }
             Self::Dns(names) => {
                 let mut lookups = tokio::task::JoinSet::new();
@@ -112,7 +124,7 @@ impl Seeds {
                 }
                 Seeding {
                     found,
-                    proxy_error: None,
+                    ..Seeding::default()
                 }
             }
         }
@@ -163,8 +175,10 @@ async fn lookup(host: String, port: u16) -> Vec<IpAddr> {
     }
 }
 
-/// Ask [`PROXIED_SEEDS`] random seeds' nodes, through the proxy, at once.
-async fn through_proxy(
+/// Ask [`PROXIED_SEEDS`] random seeds' nodes, through the proxy, at once;
+/// each answer comes through [`Seeding::later`] as it arrives. The caller
+/// decides how many it waits for: only it knows which addresses it can use.
+fn through_proxy(
     names: &'static [&'static str],
     dialer: &Dialer,
     network: Network,
@@ -175,83 +189,132 @@ async fn through_proxy(
     while !names.is_empty() && picked.len() < PROXIED_SEEDS {
         picked.push(names.swap_remove((random_u64() % names.len() as u64) as usize));
     }
+    // Dropping the set closes the connections of every seed still asked.
     let mut asks = tokio::task::JoinSet::new();
     for seed in picked {
         let dialer = dialer.clone();
-        asks.spawn_blocking(move || (seed, ask_seed_node(&dialer, seed, port, network)));
+        asks.spawn(async move {
+            let answer = ask_seed_node(&dialer, seed, port, network, PROXIED_SEED_WAIT).await;
+            (seed, answer)
+        });
     }
-    let mut seeding = Seeding::default();
-    while let Some(answer) = asks.join_next().await {
-        let Ok((seed, answer)) = answer else {
-            continue;
-        };
-        match answer {
-            Ok(mut addrs) => {
-                tracing::debug!(
-                    seed,
-                    addresses = addrs.len(),
-                    "a seed's node answered through the proxy"
-                );
-                // Most recently seen first: they take the book's slots
-                // before older ones collide with them. Many addresses a node
-                // knows are days old and gone, and through Tor each dead one
-                // costs the whole connect timeout.
-                addrs.sort_by_key(|message| std::cmp::Reverse(message.time));
-                seeding
-                    .found
-                    .extend(addrs.into_iter().filter_map(|message| {
-                        let ip = match message.addr {
-                            bitcoin::p2p::address::AddrV2::Ipv4(ip) => IpAddr::V4(ip),
-                            bitcoin::p2p::address::AddrV2::Ipv6(ip) => IpAddr::V6(ip),
-                            // Onion peers are not dialled yet.
-                            _ => return None,
-                        };
-                        Some(Seeded {
-                            addr: SocketAddr::new(ip, message.port).into(),
-                            services: message.services,
-                            seed,
-                            gossiped: true,
-                        })
-                    }));
-            }
-            Err(e) if is_proxy_down(&e) => seeding.proxy_error = Some(e.to_string()),
-            Err(e) => {
-                tracing::debug!(seed, error = %e, "a seed could not be asked through the proxy")
+    let (later, answers) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let joined = tokio::select! {
+                joined = asks.join_next() => joined,
+                // Nobody waits for the rest any more.
+                () = later.closed() => return,
+            };
+            let Some(joined) = joined else {
+                return;
+            };
+            let Ok((seed, answer)) = joined else {
+                continue;
+            };
+            let mut one = Seeding::default();
+            take_answer(&mut one, seed, answer);
+            if later.send(one).is_err() {
+                return;
             }
         }
+    });
+    Seeding {
+        later: Some(answers),
+        ..Seeding::default()
     }
-    seeding
+}
+
+/// Take `seed`'s answer into `seeding`: its node's addresses, or why the
+/// proxy failed; any other failure is only logged.
+fn take_answer(seeding: &mut Seeding, seed: &'static str, answer: io::Result<Vec<AddrV2Message>>) {
+    match answer {
+        Ok(addrs) => seeding.found.extend(seeded_by(seed, addrs)),
+        Err(e) if is_proxy_down(&e) => seeding.proxy_error = Some(e.to_string()),
+        Err(e) => {
+            tracing::debug!(seed, error = %e, "a seed could not be asked through the proxy")
+        }
+    }
+}
+
+/// The addresses `seed`'s node gave, as seeded addresses.
+fn seeded_by(seed: &'static str, mut addrs: Vec<AddrV2Message>) -> Vec<Seeded> {
+    tracing::debug!(
+        seed,
+        addresses = addrs.len(),
+        "a seed's node answered through the proxy"
+    );
+    // Most recently seen first: they take the book's slots before older ones
+    // collide with them. Many addresses a node knows are days old and gone,
+    // and through Tor each dead one costs the whole connect timeout.
+    addrs.sort_by_key(|message| std::cmp::Reverse(message.time));
+    addrs
+        .into_iter()
+        .filter_map(|message| {
+            let ip = match message.addr {
+                bitcoin::p2p::address::AddrV2::Ipv4(ip) => IpAddr::V4(ip),
+                bitcoin::p2p::address::AddrV2::Ipv6(ip) => IpAddr::V6(ip),
+                // Onion peers are not dialled yet.
+                _ => return None,
+            };
+            Some(Seeded {
+                addr: SocketAddr::new(ip, message.port).into(),
+                services: message.services,
+                seed,
+                gossiped: true,
+            })
+        })
+        .collect()
 }
 
 /// Connect through the proxy to `seed`'s name (`x9.` first), ask the node
-/// for addresses and hang up. Blocking.
-fn ask_seed_node(
+/// for addresses, waiting at most `wait` once connected, and hang up.
+/// Dropping the future closes the connection.
+pub(super) async fn ask_seed_node(
     dialer: &Dialer,
     seed: &'static str,
     port: u16,
     network: Network,
+    wait: Duration,
 ) -> io::Result<Vec<AddrV2Message>> {
     let by_name = |host: String| PeerAddr {
         host: PeerHost::Name(host),
         port,
     };
     let started = Instant::now();
-    let stream = match dialer.connect(&by_name(format!("x9.{seed}")), PROXIED_SEED_WAIT) {
+    let stream = match dialer.open(&by_name(format!("x9.{seed}")), wait).await {
         Ok(stream) => stream,
         Err(e) if is_proxy_down(&e) => return Err(e),
         // Not every seed serves the `x9.` filter; a quick failure (the exit
         // could not resolve it) leaves time for the bare name.
-        Err(e) if started.elapsed() < PROXIED_SEED_WAIT / 2 => {
+        Err(e) if started.elapsed() < wait / 2 => {
             tracing::debug!(seed, error = %e, "x9 seed name failed through the proxy; trying the bare name");
-            dialer.connect(&by_name(seed.to_string()), PROXIED_SEED_WAIT)?
+            dialer.open(&by_name(seed.to_string()), wait).await?
         }
         Err(e) => return Err(e),
     };
-    addresses_from(stream, network, Instant::now() + PROXIED_SEED_WAIT)
+    let deadline = Instant::now() + wait;
+    // This future owns the deadline: the blocking reads cannot see it while
+    // a message trickles in, so the connection is shut down when it passes.
+    let shutdown = ShutdownOnDrop::new(&stream)?;
+    let mut asking = tokio::task::spawn_blocking(move || addresses_from(stream, network, deadline));
+    let asked = match tokio::time::timeout_at(deadline.into(), &mut asking).await {
+        Ok(asked) => asked,
+        Err(_) => {
+            drop(shutdown);
+            asking.await
+        }
+    };
+    asked.map_err(|e| io::Error::other(format!("the seed task failed: {e}")))?
 }
 
 /// Handshake on `stream`, ask for addresses and wait for them until
-/// `deadline`, then close.
+/// `deadline` (or [`SEED_MESSAGES`] messages), then close. Each read may
+/// take all the time left, so a pause in the middle of a message does not
+/// cut it; a read that fails or times out ends the wait. What is kept:
+/// the first address the node sent on its own, and its answer, each address
+/// once and at most [`MAX_GOSSIP_PER_MESSAGE`] in all, however much it
+/// sends.
 fn addresses_from(
     stream: TcpStream,
     network: Network,
@@ -268,21 +331,26 @@ fn addresses_from(
             .request_addr()
             .handshake(stream, TimeoutParams::default())
             .map_err(|e| io::Error::other(format!("handshake failed: {e}")))?;
-        socket.set_read_timeout(Some(Duration::from_millis(500)))?;
-        let mut got = Vec::new();
-        while !left().is_zero() {
+        // Bitcoin Core answers `getaddr` with one big message; a single
+        // address is a node announcing itself (kept in case it is all).
+        let mut announced = None;
+        for _ in 0..SEED_MESSAGES {
+            let left = left();
+            if left.is_zero() {
+                break;
+            }
+            socket.set_read_timeout(Some(left))?;
             match reader.read_message() {
                 Ok(Some(bitcoin::p2p::message::NetworkMessage::Ping(nonce))) => {
                     let _ = writer.send_message(bitcoin::p2p::message::NetworkMessage::Pong(nonce));
                 }
                 Ok(Some(message)) => {
-                    // Bitcoin Core answers `getaddr` with one big message;
-                    // a single address is a node announcing itself.
                     if let Some(addrs) = super::gossiped_addrs(&message) {
-                        let answer = addrs.len() > 1;
-                        got.extend(addrs);
-                        if answer {
-                            return Ok(got);
+                        if addrs.len() > 1 {
+                            return Ok(kept(announced, addrs));
+                        }
+                        if announced.is_none() {
+                            announced = addrs.into_iter().next();
                         }
                     }
                 }
@@ -291,20 +359,37 @@ fn addresses_from(
                     if matches!(
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) if announced.is_some() => break,
                 Err(e) => return Err(io::Error::other(e.to_string())),
             }
         }
-        if got.is_empty() {
-            return Err(io::Error::new(
+        match announced {
+            Some(announced) => Ok(vec![announced]),
+            None => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the seed's node sent no addresses",
-            ));
+            )),
         }
-        Ok(got)
     })();
     let _ = socket.shutdown(std::net::Shutdown::Both);
     result
+}
+
+/// A seed node's answer as kept: the address it `announced` on its own
+/// first, then the answer, each address once, at most
+/// [`MAX_GOSSIP_PER_MESSAGE`] (what a peer may send in one message).
+fn kept(announced: Option<AddrV2Message>, answer: Vec<AddrV2Message>) -> Vec<AddrV2Message> {
+    let mut seen = HashSet::new();
+    announced
+        .into_iter()
+        .chain(answer)
+        .filter(|message| seen.insert((message.addr.clone(), message.port)))
+        .take(MAX_GOSSIP_PER_MESSAGE)
+        .collect()
 }
 
 /// Every DNS name this process looked up as a seed, for tests that check a

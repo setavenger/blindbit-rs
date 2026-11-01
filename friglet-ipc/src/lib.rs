@@ -53,7 +53,8 @@ pub struct DaemonConfig {
     /// `ip:port` or `localhost:port` (no other host names, so finding the
     /// proxy needs no DNS). When set, friglet never connects to a peer
     /// directly, also not when the proxy is down. The oracle is not
-    /// proxied.
+    /// proxied. Always serialized, also when unset (`null`): a settings
+    /// request without it keeps the daemon's proxy ([`ConfigUpdate`]).
     pub p2p_proxy: Option<String>,
     /// Wallet birthday block height. Required to start scanning unless
     /// `start_at_tip` is set.
@@ -110,6 +111,66 @@ impl Default for DaemonConfig {
     }
 }
 
+/// The configuration of a [`Request::SetConfig`] or
+/// [`Request::ApplySettings`]: a whole [`DaemonConfig`] on the wire, plus
+/// whether the message named `p2p_proxy` at all. A tray from before the
+/// setting omits it, and saving its settings must not turn Tor off: an
+/// omitted `p2p_proxy` keeps the daemon's, only an explicit `null` clears
+/// it. Built from a `DaemonConfig` it names the proxy, as every current
+/// client does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigUpdate {
+    pub config: DaemonConfig,
+    /// The message carried `p2p_proxy` (a value or `null`).
+    pub names_p2p_proxy: bool,
+}
+
+impl ConfigUpdate {
+    /// The configuration to apply in place of `current`: this one, with
+    /// `current`'s proxy when the message did not name one.
+    pub fn apply_to(&self, current: &DaemonConfig) -> DaemonConfig {
+        let mut config = self.config.clone();
+        if !self.names_p2p_proxy {
+            config.p2p_proxy = current.p2p_proxy.clone();
+        }
+        config
+    }
+}
+
+impl From<DaemonConfig> for ConfigUpdate {
+    fn from(config: DaemonConfig) -> Self {
+        Self {
+            config,
+            names_p2p_proxy: true,
+        }
+    }
+}
+
+impl Serialize for ConfigUpdate {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.names_p2p_proxy {
+            return self.config.serialize(serializer);
+        }
+        let mut value = serde_json::to_value(&self.config).map_err(serde::ser::Error::custom)?;
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("p2p_proxy");
+        }
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigUpdate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let names_p2p_proxy = value.get("p2p_proxy").is_some();
+        let config = DaemonConfig::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            config,
+            names_p2p_proxy,
+        })
+    }
+}
+
 /// Requests a client can send to the daemon.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Request {
@@ -125,7 +186,7 @@ pub enum Request {
     /// itself in-process so every setting takes full effect (Electrum
     /// clients are disconnected and reconnect to the new wallet view). The
     /// answer ([`Response::OkWithNote`]) is sent before the restart.
-    SetConfig(Box<DaemonConfig>),
+    SetConfig(Box<ConfigUpdate>),
     /// Replace the scan secret: a hex-encoded 32-byte secp256k1 secret key.
     /// The daemon validates it, writes it to its key file (0600 on Unix) and
     /// restarts like [`Request::SetConfig`]. The secret is deliberately not
@@ -135,7 +196,7 @@ pub enum Request {
     /// [`Request::SetConfig`] and [`Request::SetScanKey`] in one step (one
     /// validation, one restart) — used when switching wallets.
     ApplySettings {
-        config: Box<DaemonConfig>,
+        config: Box<ConfigUpdate>,
         scan_key: Option<String>,
     },
     /// Gracefully shut down the whole daemon process.
@@ -562,12 +623,47 @@ mod tests {
 
     #[test]
     fn request_roundtrip() {
-        let req = Request::SetConfig(Box::new(DaemonConfig {
-            start_height: Some(1000),
-            ..DaemonConfig::default()
-        }));
+        let req = Request::SetConfig(Box::new(
+            DaemonConfig {
+                start_height: Some(1000),
+                ..DaemonConfig::default()
+            }
+            .into(),
+        ));
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+    }
+
+    /// A tray from before `p2p_proxy` omits it: that keeps the daemon's
+    /// proxy. A current client always sends it, `null` to clear it.
+    #[test]
+    fn an_omitted_proxy_keeps_the_current_one_and_null_clears_it() {
+        let current = DaemonConfig {
+            p2p_proxy: Some("127.0.0.1:9050".to_string()),
+            ..DaemonConfig::default()
+        };
+        let update_in = |json: &str| match serde_json::from_str(json).unwrap() {
+            Request::ApplySettings { config, .. } => *config,
+            other => panic!("{other:?}"),
+        };
+        let request = Request::ApplySettings {
+            config: Box::new(DaemonConfig::default().into()),
+            scan_key: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains(r#""p2p_proxy":null"#), "{json}");
+        assert_eq!(update_in(&json).apply_to(&current).p2p_proxy, None);
+
+        let older = json.replace(r#""p2p_proxy":null,"#, "");
+        assert_ne!(older, json);
+        let omitted = update_in(&older);
+        assert!(!omitted.names_p2p_proxy);
+        assert_eq!(omitted.apply_to(&current).p2p_proxy, current.p2p_proxy);
+        // Sent on, it still omits the proxy.
+        let resent = serde_json::to_string(&omitted).unwrap();
+        assert!(!resent.contains("p2p_proxy"), "{resent}");
+        let again: ConfigUpdate = serde_json::from_str(&resent).unwrap();
+        assert_eq!(again, omitted);
     }
 
     #[test]

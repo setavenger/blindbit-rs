@@ -5,10 +5,40 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{Dialer, PeerAddr, PeerHost};
+
+/// A gate a test opens to let something go on: closed until
+/// [`Self::open`], then open for good. Orders events across threads
+/// without guessing how long each takes.
+#[derive(Debug, Default)]
+pub struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::default()
+    }
+
+    pub fn open(&self) {
+        *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.opened.notify_all();
+    }
+
+    /// Wait until the gate is open, at most `limit`; whether it is.
+    pub fn wait(&self, limit: Duration) -> bool {
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (open, _) = self
+            .opened
+            .wait_timeout_while(open, limit, |open| !*open)
+            .unwrap_or_else(|e| e.into_inner());
+        *open
+    }
+}
 
 /// One connection a [`FakeSocks5`] was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +59,17 @@ struct State {
     refuse_with: Option<u8>,
     /// Targets whose CONNECT is never answered.
     stalled: HashSet<PeerAddr>,
+    /// Targets the proxy connects to only after a wait.
+    delayed: HashMap<PeerAddr, Duration>,
+    /// Targets whose CONNECT is answered only once their gate opens.
+    held: HashMap<PeerAddr, Arc<Gate>>,
+    /// Every new connection is answered as by a web server.
+    down: bool,
     requests: Vec<Socks5Request>,
 }
+
+/// How long a held CONNECT waits for its gate at most.
+const HOLD_LIMIT: Duration = Duration::from_secs(30);
 
 /// A SOCKS5 proxy on 127.0.0.1 that records what it is asked, "resolves"
 /// host names only through [`Self::route`] (an unrouted name is
@@ -92,6 +131,26 @@ impl FakeSocks5 {
         self.lock().stalled.insert(target);
     }
 
+    /// Connect to `target` only `by` after its CONNECT arrives, as Tor
+    /// takes a while to build a circuit.
+    pub fn delay(&self, target: PeerAddr, by: Duration) {
+        self.lock().delayed.insert(target, by);
+    }
+
+    /// Go on with a CONNECT to `target` only once the gate returned opens
+    /// (or 30 s pass), so a test decides when that connection opens.
+    pub fn hold(&self, target: PeerAddr) -> Arc<Gate> {
+        let gate = Gate::new();
+        self.lock().held.insert(target, gate.clone());
+        gate
+    }
+
+    /// From now on answer every new connection like a web server: the proxy
+    /// is down for friglet (not SOCKS5).
+    pub fn go_down(&self) {
+        self.lock().down = true;
+    }
+
     /// Every connection asked for, in order.
     pub fn requests(&self) -> Vec<Socks5Request> {
         self.lock().requests.clone()
@@ -119,6 +178,12 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
     }
     let mut methods = vec![0u8; usize::from(head[1])];
     client.read_exact(&mut methods)?;
+    if state.lock().unwrap_or_else(|e| e.into_inner()).down {
+        client.write_all(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")?;
+        let mut sink = [0u8; 64];
+        while client.read(&mut sink)? > 0 {}
+        return Ok(());
+    }
     let credentials = if methods.contains(&2) {
         client.write_all(&[5, 2])?;
         let mut version_len = [0u8; 2];
@@ -169,7 +234,7 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
         host,
         port: u16::from_be_bytes(port),
     };
-    let (refuse_with, destination) = {
+    let (refuse_with, destination, delay, held) = {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.requests.push(Socks5Request {
             methods,
@@ -183,10 +248,18 @@ fn serve(mut client: TcpStream, state: &Mutex<State>) -> io::Result<()> {
         (
             state.refuse_with,
             destination.filter(|_| !state.stalled.contains(&target)),
+            state.delayed.get(&target).copied(),
+            state.held.get(&target).cloned(),
         )
     };
+    if let Some(gate) = held {
+        gate.wait(HOLD_LIMIT);
+    }
     if let Some(code) = refuse_with {
         return reply(&mut client, code);
+    }
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
     }
     if destination.is_none() && matches!(target.host, PeerHost::Ip(_)) {
         // Stalled: say nothing until the client gives up.

@@ -26,6 +26,7 @@ use super::p2p::{
 use super::scanning::BlockStreamSource;
 use super::stream_safety_tests::{TestStream, payment_block};
 use super::test_support::{own_node, run, scanner};
+use crate::net::testing::Gate;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
@@ -39,6 +40,19 @@ pub(super) enum Conn {
     /// Start sending the block and go silent halfway through it, keeping
     /// the connection open until the client hangs up (or 10 s pass).
     StallMidBlock,
+    /// [`Conn::StallMidBlock`] until the node's gate opens
+    /// ([`Node::open`], or [`GATE_LIMIT`] passes), then close.
+    StallMidBlockUntilOpened,
+    /// [`Conn::StallMidBlock`] until the node's gate opens
+    /// ([`Node::open`], or [`GATE_LIMIT`] passes), then send the rest.
+    PauseMidBlockUntilOpened,
+    /// Start sending the block, then send one more byte of it every
+    /// 250 ms (the rest of the default block takes 38 s), until the client
+    /// hangs up (or a minute passes).
+    TrickleMidBlock,
+    /// [`Conn::Serve`], but answer the client's `version` only once the
+    /// node's gate opens ([`Node::open`], or [`GATE_LIMIT`] passes).
+    ServeOnceOpened,
     /// Serve the block as Bitcoin Core does: with its witnesses for
     /// `MSG_WITNESS_BLOCK`, without them for `MSG_BLOCK`.
     Serve,
@@ -56,6 +70,23 @@ pub(super) enum Conn {
     Http,
     /// Close without answering the version message.
     CloseBeforeVersion,
+    /// [`Conn::Serve`], then answer `getaddr` with [`GOSSIP`] in a message
+    /// that pauses for 400 ms halfway through.
+    ServeThenSplitAddr,
+    /// [`Conn::Serve`], then start a message and send one byte of it every
+    /// 100 ms (for at most 15 s), never completing it.
+    ServeThenTrickle,
+    /// Announce its own address right after the handshake, as Bitcoin Core
+    /// does, then [`Conn::Serve`], then answer `getaddr` with [`GOSSIP`].
+    AnnounceThenServeThenAddr,
+    /// Serve a block whose header differs (another nonce): another block.
+    ServeAnotherBlock,
+    /// Serve the block with a coinbase output changed: its transactions no
+    /// longer match the header's merkle root.
+    ServeBadMerkle,
+    /// Serve the block with a byte of a witness changed: the transactions
+    /// still match the merkle root, but not the witness commitment.
+    ServeBadWitness,
 }
 
 /// What a [`Conn::ServeWithAddr`] node gossips: two loopback peers (that
@@ -65,23 +96,78 @@ pub(super) const GOSSIP: [&str; 2] = ["127.0.0.61:18444", "127.0.0.62:18444"];
 pub(super) struct Node {
     pub(super) addr: SocketAddr,
     connections: Arc<AtomicUsize>,
-    /// When a [`Conn::StallMidBlock`] connection went silent.
-    stalled: Arc<Mutex<Option<Instant>>>,
+    moments: Arc<Moments>,
     /// Every command received after the handshake, on every connection.
     commands: Arc<Mutex<Vec<String>>>,
+    /// Per connection: when it was accepted, and how long the client then
+    /// took to send its `version` (none if it never did).
+    connected: Arc<Mutex<Vec<Accepted>>>,
 }
 
-/// The block a node serves, with and without its witnesses.
+/// How long a gated [`Conn`] waits for [`Node::open`] at most.
+pub(super) const GATE_LIMIT: Duration = Duration::from_secs(20);
+
+/// When things happened on a [`Node`]'s connections.
+#[derive(Default)]
+struct Moments {
+    /// A [`Conn::StallMidBlock`] (or `…UntilOpened`, or
+    /// [`Conn::PauseMidBlockUntilOpened`]) connection went silent, or a
+    /// [`Conn::TrickleMidBlock`] one started trickling.
+    stalled: Mutex<Option<Instant>>,
+    /// A [`Conn::ServeThenTrickle`] connection started trickling.
+    trickling: Mutex<Option<Instant>>,
+    /// The client hung up on a [`Conn::ServeThenTrickle`] connection.
+    hung_up: Mutex<Option<Instant>>,
+    /// What gated connections wait for.
+    gate: Gate,
+    /// Whether the gate opened while a [`Conn::StallMidBlockUntilOpened`]
+    /// connection waited for it.
+    opened_in_time: Mutex<Option<bool>>,
+}
+
+/// One connection a [`Node`] accepted.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Accepted {
+    pub(super) at: Instant,
+    pub(super) version_after: Option<Duration>,
+}
+
+/// The block a node serves, with and without its witnesses, and tampered
+/// with in the ways [`Conn`] names.
 struct Served {
     full: Block,
     stripped: Block,
+    another: Block,
+    bad_merkle: Block,
+    bad_witness: Block,
 }
 
 impl Served {
     fn new(block: &Block) -> Self {
+        let mut another = block.clone();
+        another.header.nonce = another.header.nonce.wrapping_add(1);
+        let mut bad_merkle = block.clone();
+        if let Some(out) = bad_merkle.txdata[0].output.first_mut() {
+            out.value += bitcoin::Amount::from_sat(1);
+        }
+        let mut bad_witness = block.clone();
+        if let Some(input) = bad_witness
+            .txdata
+            .iter_mut()
+            .skip(1)
+            .flat_map(|tx| tx.input.iter_mut())
+            .find(|input| !input.witness.is_empty())
+        {
+            let mut elements = input.witness.to_vec();
+            elements[0][0] ^= 1;
+            input.witness = bitcoin::Witness::from_slice(&elements);
+        }
         Self {
             full: block.clone(),
             stripped: stripped(block),
+            another,
+            bad_merkle,
+            bad_witness,
         }
     }
 }
@@ -144,20 +230,34 @@ impl Node {
         let addr = listener.local_addr().unwrap();
         let connections = Arc::new(AtomicUsize::new(0));
         let counter = connections.clone();
-        let stalled = Arc::new(Mutex::new(None));
-        let stalled_at = stalled.clone();
+        let moments = Arc::new(Moments::default());
+        let moments_at = moments.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let received = commands.clone();
+        let connected = Arc::new(Mutex::new(Vec::new()));
+        let accepted = connected.clone();
         std::thread::spawn(move || {
             for conn in script {
                 let Ok((stream, _)) = listener.accept() else {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
+                let index = {
+                    let mut accepted = accepted.lock().unwrap();
+                    accepted.push(Accepted {
+                        at: Instant::now(),
+                        version_after: None,
+                    });
+                    accepted.len() - 1
+                };
                 // Each connection on a thread of its own, so a client that
                 // keeps one open never holds up the next.
-                let (served, stalled_at, received) =
-                    (served.clone(), stalled_at.clone(), received.clone());
+                let (served, moments_at, received, accepted) = (
+                    served.clone(),
+                    moments_at.clone(),
+                    received.clone(),
+                    accepted.clone(),
+                );
                 std::thread::spawn(move || {
                     let _ = serve(
                         stream,
@@ -165,8 +265,12 @@ impl Node {
                         services,
                         height,
                         &served,
-                        &stalled_at,
+                        &moments_at,
                         &received,
+                        &|| {
+                            let mut accepted = accepted.lock().unwrap();
+                            accepted[index].version_after = Some(accepted[index].at.elapsed());
+                        },
                     );
                 });
             }
@@ -174,9 +278,36 @@ impl Node {
         Node {
             addr,
             connections,
-            stalled,
+            moments,
             commands,
+            connected,
         }
+    }
+
+    /// When the client hung up on a [`Conn::ServeThenTrickle`] connection.
+    pub(super) fn hung_up(&self) -> Option<Instant> {
+        *self.moments.hung_up.lock().unwrap()
+    }
+
+    /// When a [`Conn::ServeThenTrickle`] connection started trickling.
+    pub(super) fn trickling(&self) -> Option<Instant> {
+        *self.moments.trickling.lock().unwrap()
+    }
+
+    /// Let the gated connections go on.
+    pub(super) fn open(&self) {
+        self.moments.gate.open();
+    }
+
+    /// Whether the gate opened while a [`Conn::StallMidBlockUntilOpened`]
+    /// connection waited for it (`None`: none waited yet).
+    pub(super) fn opened_in_time(&self) -> Option<bool> {
+        *self.moments.opened_in_time.lock().unwrap()
+    }
+
+    /// The connections accepted so far, in order.
+    pub(super) fn accepted(&self) -> Vec<Accepted> {
+        self.connected.lock().unwrap().clone()
     }
 
     /// Commands received after the handshake, across connections.
@@ -190,7 +321,7 @@ impl Node {
 
     /// When the node went silent in the middle of the block, if it did.
     pub(super) fn stalled(&self) -> Option<Instant> {
-        *self.stalled.lock().unwrap()
+        *self.moments.stalled.lock().unwrap()
     }
 }
 
@@ -242,14 +373,16 @@ fn block() -> Block {
     bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     stream: TcpStream,
     conn: Conn,
     services: ServiceFlags,
     height: i32,
     served: &Served,
-    stalled: &Mutex<Option<Instant>>,
+    moments: &Arc<Moments>,
     commands: &Mutex<Vec<String>>,
+    got_version: &dyn Fn(),
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = match conn {
@@ -264,6 +397,7 @@ fn serve(
     let NetworkMessage::Version(_) = wire.recv()? else {
         return Ok(());
     };
+    got_version();
     if let Conn::CloseBeforeVersion = conn {
         return Ok(());
     }
@@ -271,6 +405,12 @@ fn serve(
         wire.stream
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
         return wire.drain();
+    }
+    if conn == Conn::ServeOnceOpened {
+        moments.gate.wait(GATE_LIMIT);
+        // Its request may come long after the handshake, as a node's would.
+        wire.stream
+            .set_read_timeout(Some(Duration::from_secs(60)))?;
     }
     wire.send(version_message(services, height))?;
     if let Conn::Magic(_) = conn {
@@ -280,6 +420,18 @@ fn serve(
     wire.send(NetworkMessage::Verack)?;
     while !matches!(wire.recv()?, NetworkMessage::Verack) {}
     wire.send(NetworkMessage::Ping(1))?;
+    if conn == Conn::AnnounceThenServeThenAddr {
+        let own = wire.stream.local_addr()?;
+        let IpAddr::V4(ip) = own.ip() else {
+            unreachable!("IPv4 test node")
+        };
+        wire.send(NetworkMessage::AddrV2(vec![AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            addr: AddrV2::Ipv4(ip),
+            port: own.port(),
+        }]))?;
+    }
     let items = loop {
         let message = wire.recv()?;
         commands.lock().unwrap().push(message.command().to_string());
@@ -293,12 +445,36 @@ fn serve(
     };
     let witness = matches!(items.first(), Some(Inventory::WitnessBlock(_)));
     match conn {
-        Conn::Serve | Conn::ServeWithAddr if witness => {
+        Conn::Serve | Conn::ServeWithAddr | Conn::ServeOnceOpened if witness => {
             wire.send(NetworkMessage::Block(served.full.clone()))?
         }
-        Conn::Serve | Conn::ServeWithAddr | Conn::ServeStripped => {
+        Conn::Serve | Conn::ServeWithAddr | Conn::ServeOnceOpened | Conn::ServeStripped => {
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
+        Conn::ServeThenSplitAddr => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::AddrV2(gossip()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            wire.stream.flush()?;
+            std::thread::sleep(Duration::from_millis(400));
+            wire.stream.write_all(rest)?;
+        }
+        Conn::ServeThenTrickle => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            trickle(&mut wire.stream, magic, moments)?;
+        }
+        Conn::AnnounceThenServeThenAddr => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            std::thread::sleep(Duration::from_millis(100));
+            wire.send(NetworkMessage::AddrV2(gossip()))?;
+        }
+        Conn::ServeAnotherBlock => wire.send(NetworkMessage::Block(served.another.clone()))?,
+        Conn::ServeBadMerkle => wire.send(NetworkMessage::Block(served.bad_merkle.clone()))?,
+        Conn::ServeBadWitness => wire.send(NetworkMessage::Block(served.bad_witness.clone()))?,
         Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
         Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
@@ -316,7 +492,51 @@ fn serve(
             ));
             wire.stream.write_all(&bytes[..bytes.len() / 2])?;
             wire.stream.flush()?;
-            *stalled.lock().unwrap() = Some(Instant::now());
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+        }
+        Conn::StallMidBlockUntilOpened => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            wire.stream.write_all(&bytes[..bytes.len() / 2])?;
+            wire.stream.flush()?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            let opened = moments.gate.wait(GATE_LIMIT);
+            *moments.opened_in_time.lock().unwrap() = Some(opened);
+            return wire.stream.shutdown(Shutdown::Both);
+        }
+        Conn::PauseMidBlockUntilOpened => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            wire.stream.flush()?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            moments.gate.wait(GATE_LIMIT);
+            wire.stream.write_all(rest)?;
+        }
+        Conn::TrickleMidBlock => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            let started = Instant::now();
+            for byte in rest {
+                if started.elapsed() > Duration::from_secs(60) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                // The client hung up.
+                if wire.stream.write_all(&[*byte]).is_err() {
+                    return Ok(());
+                }
+            }
         }
         Conn::Ignore => loop {
             if let NetworkMessage::Ping(nonce) = wire.recv()? {
@@ -326,6 +546,44 @@ fn serve(
         _ => {}
     }
     wire.drain()
+}
+
+/// Start a large `addrv2` message and send one byte of it every 100 ms,
+/// for at most a minute; note when the client hangs up.
+fn trickle(stream: &mut TcpStream, magic: Magic, moments: &Arc<Moments>) -> std::io::Result<()> {
+    let watch = stream.try_clone()?;
+    let watcher_moments = moments.clone();
+    std::thread::spawn(move || {
+        let mut watch = watch;
+        let mut sink = [0u8; 1024];
+        loop {
+            match watch.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        *watcher_moments.hung_up.lock().unwrap() = Some(Instant::now());
+    });
+    let many: Vec<AddrV2Message> = (0..200u8).flat_map(|_| gossip()).collect();
+    let bytes = encode::serialize(&RawNetworkMessage::new(magic, NetworkMessage::AddrV2(many)));
+    let started = Instant::now();
+    stream.write_all(&bytes[..30])?;
+    *moments.trickling.lock().unwrap() = Some(Instant::now());
+    for byte in &bytes[30..] {
+        if started.elapsed() > Duration::from_secs(60) || moments.hung_up.lock().unwrap().is_some()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&[*byte])?;
+    }
+    Ok(())
 }
 
 /// [`GOSSIP`] as an `addrv2` message.
@@ -637,12 +895,16 @@ fn a_service_that_is_not_bitcoin_p2p_is_named() {
     );
 }
 
-/// What a node learns about friglet in the handshake stays what it was with
-/// the previous P2P library: user agent, protocol version, no services, no
-/// transaction relay, and a 1 sat/vB fee filter after `verack`.
-#[test]
-fn the_handshake_shows_the_node_the_same_client_as_before() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// A full node at height 1 on `ip` that takes one connection, notes the
+/// client's `version` and the messages after the handshake, and answers
+/// the block request with `notfound`. The thread returns what it noted.
+pub(super) fn recording_node(
+    ip: IpAddr,
+) -> (
+    SocketAddr,
+    std::thread::JoinHandle<(VersionMessage, Vec<NetworkMessage>)>,
+) {
+    let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let node = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
@@ -676,6 +938,28 @@ fn the_handshake_shows_the_node_the_same_client_as_before() {
         let _ = wire.drain();
         (version, after)
     });
+    (addr, node)
+}
+
+/// What a `version` message must not give away: friglet's address, the
+/// peer's address as friglet sees it, a chain height, services, relaying.
+pub(super) fn assert_version_gives_nothing_away(version: &VersionMessage) {
+    let placeholder = Address::new(&"127.0.0.1:1".parse().unwrap(), ServiceFlags::NONE);
+    assert_eq!(version.user_agent, "/SwiftSync:0.1.0/");
+    assert_eq!(version.sender, placeholder, "friglet's address");
+    assert_eq!(version.receiver, placeholder, "the peer's address");
+    assert_eq!(version.start_height, 0);
+    assert_eq!(version.services, ServiceFlags::NONE);
+    assert!(!version.relay);
+}
+
+/// What a node learns about friglet in the handshake stays what it was with
+/// the previous P2P library: user agent, protocol version, no services, no
+/// transaction relay, placeholder addresses, and a 1 sat/vB fee filter
+/// after `verack`.
+#[test]
+fn the_handshake_shows_the_node_the_same_client_as_before() {
+    let (addr, node) = recording_node([127, 0, 0, 1].into());
     let err = run(BlockFetcher::new(own_node(addr))
         .with_policy(fast(1))
         .fetch(block().block_hash(), 1))
@@ -683,11 +967,8 @@ fn the_handshake_shows_the_node_the_same_client_as_before() {
     assert_eq!(err.failure, FetchFailure::NotFound);
 
     let (version, after) = node.join().unwrap();
-    assert_eq!(version.user_agent, "/SwiftSync:0.1.0/");
     assert_eq!(version.version, 70016);
-    assert_eq!(version.services, ServiceFlags::NONE);
-    assert_eq!(version.start_height, 0);
-    assert!(!version.relay);
+    assert_version_gives_nothing_away(&version);
     for expected in [
         NetworkMessage::WtxidRelay,
         NetworkMessage::Verack,

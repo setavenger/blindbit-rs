@@ -155,6 +155,10 @@ dbus-run-session -- bash -c '
 - `FRIGLET_TRAY_SHOW_ON_START` is the supported way to force the status
   window visible without clicking the tray menu (main window starts with
   `visible: false` in `tauri.conf.json`).
+- Without imagemagick and fluxbox: the window still maps at 0,0 on bare
+  Xvfb; `xdotool windowsize "$WID" 420 1000` makes it tall enough for the
+  Settings tab's node and proxy fields, and `ffmpeg -f x11grab -video_size
+  1280x800 -i :99 -frames:v 1 shot.png` takes the screenshot.
 - A D-Bus session is required (`dbus-run-session`); without one, GTK/portal
   init is flaky. The tray and `gtk-sni-tray-standalone` must share that bus.
 - Tray icon: bare Xvfb has no StatusNotifierWatcher. With
@@ -284,17 +288,51 @@ dbus-run-session -- bash -c '
   requires `NETWORK|WITNESS`, skips peers below the block height, ignores a
   peer that sends a bad/stripped block for the session, prefers the peer
   that served the last block, and asks for addresses while < 200 are known.
-  Headers try up to 3 peers; `blockchain.relayfee` is the median of fresh
-  feefilters from >= 3 (up to 5) peers, sampled at Electrum start, the lowest
-  until then. Broadcast (SNB-856, `friglet/src/electrum/net_broadcast.rs`):
-  3 observers (relay=true, settled, their version relays txs) first, then 2
-  senders (relay=false, inv → getdata → tx → ping/pong, then listen), all in
-  distinct netgroups (`PeerAddr::netgroup`: /16, /32); success only when an
-  observer serves the tx, rejection only when every sender gave the same
-  signal; rechecks ask 2 peers outside `PendingTx.sent_to` and hand a lost tx
-  to one of them. Own node: `relay::broadcast`/`recheck`, unchanged. DNS seed
-  answers must be public IPs; gossip may name local IPs only when it comes
-  from a local peer, and only the network's port or ports >= 1024.
+  Headers try up to 3 peers, the peer of the open header connection first
+  while it is fresh; a peer that lacks a header is skipped for that request
+  only (not rested, still the block peer). Of a header answer only the
+  matching header is kept, and a peer sending more than 100 messages before
+  its pong is given up on (`p2p.rs` `HEADER_ANSWER_MESSAGES`). `blockchain.relayfee` is the
+  median of fresh feefilters (from any connection: headers, broadcasts,
+  rechecks) of >= 3 (up to 5) peers, the lowest below that; sampling (at
+  Electrum start, and when fewer are fresh) stops once the quorum is in, and
+  a request waits at most 2 s, then answers from what is known
+  (`ChainSource::fee_filter_within`). Broadcast (SNB-856,
+  `friglet/src/electrum/net_broadcast.rs`): 3 observers (relay=true,
+  settled, their version relays txs) first, then 2 senders (relay=false,
+  inv → getdata → tx → ping/pong, then listen), all in distinct netgroups
+  (`PeerAddr::netgroup`: /16, /32); when no observer has it a quiet spell
+  after the latest hand-over (`Timing::rotate_after`: 10 s, 12 s proxied),
+  one further sender gets it, at most 4 peers (`MAX_HAND_OVERS`). Success
+  only when an observer serves the tx with its wtxid (`mempool_has`, also
+  for the own node; recent outcomes are keyed by wtxid); a peer ever handed
+  the tx never confirms it (`History::handed_to`: not an observer or
+  sender, its netgroup passed over while others are left). Each recipient
+  is written to the pending file before any bytes go to it (a broadcast's
+  sender for the tx and every held ancestor in one write); when that write
+  fails it gets nothing (a broadcast ends with a "local storage error", a
+  recheck logs one), and a copy from
+  a peer listed there never counts, also when a recheck handed it over
+  during the broadcast. Missing inputs are reported only when the budget
+  ends with no observer having the tx and at least 2 senders (`REFUSALS`),
+  and every sender, asked for an actual parent (an input's txid); any
+  pending ancestor friglet holds is handed over instead
+  (`PendingStore::held_ancestors`). Every sender dropping the connection
+  still ends the broadcast at once. A rejection or a dropped connection (no
+  proof of invalidity) is never cached as final; ending a broadcast also
+  ends its connections still opening. Rechecks run every 10 min (`PENDING_RECHECK`) while a
+  tx is pending (≤ 14 days): 2 peers it was never handed to (in any
+  attempt) are asked about all pending txids on one connection each (so
+  they can link them; README privacy note), and a lost tx goes to one of
+  them (written down once its connection is up, before the tx goes out; a
+  peer that could not be reached is not kept). `<state>.pending.json` (0600; written to a temp file that is synced,
+  renamed, then the directory synced on Unix) is `{"pending": {…}, "handed_to":
+  {…}}`: every tx's recipients whatever the verdict, kept 14 days
+  (`EXPIRY_SECS`) once it is no longer pending; the older bare map still
+  loads, older builds ignore the new file. Own node:
+  `relay::broadcast`/`recheck`, unchanged. DNS seed answers must be public
+  IPs; gossip may name local IPs only when it comes from a local peer, and
+  only the network's port or ports >= 1024.
 - Tests: `blindbit-lib/src/net/pool_tests.rs` (pure),
   `scanner/discovery_tests.rs` (fake nodes on 127.0.0.x; not on macOS),
   broadcast scenarios in `friglet/src/electrum/net_broadcast.rs` and
@@ -306,8 +344,10 @@ dbus-run-session -- bash -c '
 - Address book on disk (daemon only): `PeerSource::keep_book_in(<state file
   dir>)` loads `peers-<network>-{new,tried}.book` (`bitcoin-address-book`
   `io::FileExt` format, read back record by record because `Table` cannot
-  list them); saved every 10 min when changed and at exit; unreadable file
-  → warning, ignored. `start()` seeds only while < 50 addresses are known.
+  list them); saved every 10 min when changed and at exit (records copied
+  under the pool lock, files written outside it); unreadable file, or one
+  listing more than 2× its table's slots (`SAVED_PER_SLOT`) → warning,
+  ignored. `start()` seeds only while < 50 addresses are known.
 
 ## Tor / SOCKS5 (`p2p_proxy`, SNB-857)
 
@@ -325,44 +365,71 @@ dbus-run-session -- bash -c '
   `FetchFailure::Proxy`: the round ends at once, no peer is blamed, and the
   message names `p2p_proxy`; Electrum header requests do the same. No
   CONNECT reply in time, or reply 0x01/0x06 (`is_proxy_unclear`, what Tor
-  without a working circuit gives) only rests the peer (`Unhelpful`), so a
-  Tor outage cannot empty the saved address book. An empty
-  `FRIGLET_P2P_PROXY` does not override the file's `p2p_proxy`.
+  gives for a dead address and, without a working circuit, for every one)
+  is `PeerEvent::ProxyUnclear`, from the scanner and friglet's Electrum
+  connections alike: unreachable while the proxy recently carried a
+  handshake (within 10 min, < 8 unclear connects since), otherwise it only
+  rests the peer, so dead addresses are evicted but a Tor outage cannot
+  empty the saved address book. Reply 0x03 is never this computer lacking
+  a route (`net::is_no_route`, also for broadcasts), so it does not turn
+  off IPv6. An empty `FRIGLET_P2P_PROXY` does not override the file's
+  `p2p_proxy`.
 - No local DNS through the proxy: `ResolvedConfig.p2p_node` is a `PeerAddr`
   whose host name stays a name (resolved locally only without a proxy; an
-  `.onion` node without a proxy is a config error); `Seeds::resolve` with a
-  proxy connects to `x9.<seed>` (then the bare name) of 3 random seeds
-  through it, handshakes with `getaddr` and keeps the `addr`/`addrv2` answer
-  (≤ 20 s). The tray's Save does a 2 s TCP check of the proxy instead of a
+  `.onion` node without a proxy is a config error; an own node on the local
+  network is allowed with one, a SOCKS5 proxy other than Tor can reach it,
+  and a failed connect to it through the proxy adds a Tor hint to the
+  error: `PeerAddr::is_local`, any IP that is not public (`pool::is_public`,
+  so also 100.64.0.0/10, Tailscale), `localhost`, `.local`);
+  `Seeds::resolve` with a proxy connects to `x9.<seed>` (then the bare
+  name) of 3 random seeds through it, handshakes with `getaddr` and keeps
+  the `addr`/`addrv2` answer (≤ 20 s, ≤ 100 messages; of single-address
+  messages only the first; ≤ 1,000 addresses, each once); seeding returns
+  once the book took 20 of their addresses (`ENOUGH_SEEDED` in `pool.rs`;
+  refused ones, e.g. not public or a taken slot, do not count; later
+  answers still join the book) or all answered. The tray's Save does a 2 s TCP check of the proxy instead of a
   DNS lookup of the node.
 - Through a proxy: connect ≥ 20 s (`PROXY_CONNECT_TIMEOUT`, enforced in the
   dialer), block deadline ≥ 60 s (`RetryPolicy::through_proxy`). Tor keeps
   trying a dead address for the whole connect timeout, so a discovered-peer
-  fetch races `PROXY_RACE` (3) connects at once and uses the first to open
-  (the losers finish on blocking threads within the timeout), and a seed
+  fetch races `PROXY_RACE` (3) connects at once and uses the first
+  handshaken one (each racer connects and handshakes as one cancellable
+  unit, `prepare`; the others close when the block arrives, those already
+  finished reported first (`report_finished`: connected, or why not); a handshaken
+  racer's wait for its turn does not count against its time), and a seed
   node's addresses enter the book most recently seen first (half of a
   signet node's `getaddr` answer is > 5 days old).
 - Broadcast through a proxy (`net_broadcast.rs` `Timing::PROXIED`): 6
   observer connects at the start (3 directly), then every 6 s more
   observers while < 3 are ready and, once senders start, more senders
   while < 2 handed over ("hedging"; `Job::claim_hand_over` caps hand-overs
-  at 2); observer window 15 s, limit 30 s, pong wait 15 s (5 s); budget
-  `PROXIED_BROADCAST_BUDGET` 45 s (`electrum/mod.rs`; Sparrow's requests
-  end at ~3, 12, 29, 64, 99 s, so the answer lands in the fourth). Each
-  sender/observer is its own SOCKS login (own circuit). Proxy down →
-  `Event::ProxyDown`, no peer blamed, error names `p2p_proxy`.
-  `ask_mempools` races 2 extra connects and header requests race their
-  first connection (`ChainSource::race_header_connection`) through a proxy:
-  a tip header behind three dead addresses otherwise held a broadcast's
+  at 2, one more per rotation); observer window 15 s, limit 30 s, pong
+  wait 15 s (5 s); budget `PROXIED_BROADCAST_BUDGET` 45 s
+  (`electrum/mod.rs`; Sparrow's requests end at ~3, 12, 29, 64, 99 s, so
+  the answer lands in the fourth). Each sender/observer is its own SOCKS
+  login (own circuit; separate circuits may still share an exit relay, Tor
+  does not promise otherwise). Proxy down → `Event::ProxyDown`, no peer
+  blamed, error names `p2p_proxy`.
+  `ask_mempools` races 2 extra connects through a proxy, and so do header
+  requests unless the shared header connection is fresh
+  (`ChainSource::race_header_connections`): 3 peers connect at once and
+  the `HeaderRace` hands them over in the order they connect; when the
+  first lacks the header or fails, the slower racers are asked in turn
+  before any other peer, and the ones not used close with the request. A
+  tip header behind three dead addresses otherwise held a broadcast's
   answer for 40 s. Senders keep listening after the pong (bounded by the
   budget).
-- An older tray drops `p2p_proxy` on Save (unknown field); the daemon logs a
-  warning when an apply clears it.
+- An older tray drops `p2p_proxy` on Save (unknown field): a
+  `SetConfig`/`ApplySettings` without the field keeps the daemon's proxy
+  (`friglet_ipc::ConfigUpdate`); only an explicit `null`, which the current
+  tray sends for an empty field, clears it, and the daemon logs a warning
+  then.
 - Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
   down / not SOCKS5), `net/proxy_tests.rs` (seeding by name, no local
-  lookup), `scanner/proxy_tests.rs` (own node `node.invalid` through the
+  lookup, the 1,000-address cap), `scanner/proxy_tests.rs` (own node `node.invalid` through the
   proxy, proxy down/refusing → no direct connection), `electrum/chain.rs`
-  (headers through the proxy); `scanner/proxy_tests.rs` also races past
+  (headers through the proxy, an unclear connect counted against the
+  peer); `scanner/proxy_tests.rs` also races past
   stalled peers. `net::testing::FakeSocks5` (feature
   `test-util`, on in friglet's dev-dependencies) routes names to local
   listeners and records methods, credentials and targets. Closed-proxy tests
