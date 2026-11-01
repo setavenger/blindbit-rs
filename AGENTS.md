@@ -155,6 +155,10 @@ dbus-run-session -- bash -c '
 - `FRIGLET_TRAY_SHOW_ON_START` is the supported way to force the status
   window visible without clicking the tray menu (main window starts with
   `visible: false` in `tauri.conf.json`).
+- Without imagemagick and fluxbox: the window still maps at 0,0 on bare
+  Xvfb; `xdotool windowsize "$WID" 420 1000` makes it tall enough for the
+  Settings tab's node and proxy fields, and `ffmpeg -f x11grab -video_size
+  1280x800 -i :99 -frames:v 1 shot.png` takes the screenshot.
 - A D-Bus session is required (`dbus-run-session`); without one, GTK/portal
   init is flaky. The tray and `gtk-sni-tray-standalone` must share that bus.
 - Tray icon: bare Xvfb has no StatusNotifierWatcher. With

@@ -58,13 +58,16 @@ async fn main() -> std::io::Result<()> {
         let config = config.clone();
         tokio::spawn(async move {
             while let Ok(Some(req)) = conn.next_request().await {
+                // One lock per request: a second lock in the same match arm
+                // would wait for the first forever.
+                let current = config.lock().unwrap().clone();
                 let resp = match req {
                     Request::GetStatus => Response::Status(StatusInfo {
                         scanning: scanning.load(Ordering::Relaxed),
                         scanned_height: 899_000,
                         tip_height: Some(900_000),
                         scan_progress: 0.42,
-                        network: config.lock().unwrap().network.clone(),
+                        network: current.network.clone(),
                         electrum_clients: 1,
                         oracle_connected: scanning.load(Ordering::Relaxed),
                         last_error: None,
@@ -100,7 +103,7 @@ async fn main() -> std::io::Result<()> {
                         log_file: None,
                         oracle_error: None,
                         oracle_down_since_unix: None,
-                        p2p: Some(match &config.lock().unwrap().p2p_node_addr {
+                        p2p: Some(match &current.p2p_node_addr {
                             Some(node) => format!("your node {node}"),
                             None => "random peers: 37 known, 1 ignored".to_string(),
                         }),
