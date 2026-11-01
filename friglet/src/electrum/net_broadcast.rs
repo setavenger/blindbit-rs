@@ -884,10 +884,14 @@ fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2p
         // The proxy failed, not the peer.
         Err(error) if error.proxy_down() => Err(error),
         Err(error) => {
-            let no_route = matches!(
-                &error,
-                P2pError::Io(io) if io.kind() == std::io::ErrorKind::NetworkUnreachable
-            );
+            // Only a direct connect says this computer has no route there;
+            // through a proxy "network unreachable" (SOCKS reply 0x03) is
+            // about the proxy's network.
+            let no_route = peers.dialer().proxy().is_none()
+                && matches!(
+                    &error,
+                    P2pError::Io(io) if io.kind() == std::io::ErrorKind::NetworkUnreachable
+                );
             let event = if no_route {
                 PeerEvent::NoRoute
             } else {
@@ -2167,6 +2171,36 @@ mod tests {
                 .count();
             assert_eq!(fake.conns().len(), through_proxy, "{}", fake.addr);
         }
+    }
+
+    /// Through a proxy, "network unreachable" (SOCKS reply 0x03) is about
+    /// the proxy's network, not this computer's: IPv6 peers are not skipped
+    /// as if this computer had no IPv6 route.
+    #[tokio::test]
+    async fn through_a_proxy_network_unreachable_is_no_local_missing_route() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let proxy = FakeSocks5::start();
+        proxy.refuse_with(0x03);
+        let v6: Vec<SocketAddr> = [0xdb8, 0xdb9]
+            .into_iter()
+            .map(|block| SocketAddr::from(([0x2001, block, 0, 0, 0, 0, 0, 1], 18444)))
+            .collect();
+        let peers = pool_via(&v6, proxy.dialer()).await;
+        let error = broadcast(
+            peers.clone(),
+            candidate(25),
+            Duration::from_secs(10),
+            History::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.starts_with("no Bitcoin peers reachable to confirm the broadcast"),
+            "{error}"
+        );
+        assert!(!error.contains("IPv6"), "{error}");
+        assert!(proxy.requests().len() >= 2, "both were tried");
     }
 
     /// The proxy is down: the error names it, no peer is blamed and none is
