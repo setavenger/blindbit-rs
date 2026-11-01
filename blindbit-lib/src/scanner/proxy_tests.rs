@@ -14,6 +14,7 @@ use super::p2p_tests::{
     Conn, GATE_LIMIT, Node, assert_version_gives_nothing_away, fast, recording_node,
 };
 use super::test_support::run;
+use crate::net::pool::Where;
 use crate::net::testing::FakeSocks5;
 use crate::net::{Dialer, PeerAddr, PeerEvent, PeerHost, PeerSource, Seeds};
 
@@ -402,6 +403,71 @@ fn a_racer_waiting_for_its_turn_keeps_its_time_for_the_block() {
         "the trickling peer was asked first"
     );
     assert_eq!(waits.connections(), 1);
+}
+
+/// Racers that finished while another one downloads the block are reported
+/// when the block arrives, before they close: one whose node hung up during
+/// the handshake rests, one whose handshake completed is tried. They
+/// connect once the download has started, and the block is complete only
+/// once both have finished (each racer's last step is seen on its node).
+#[test]
+fn racers_that_finished_are_reported_when_the_block_arrives() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let serves = Node::spawn_on(
+        ip(91),
+        full,
+        200,
+        &block,
+        vec![Conn::PauseMidBlockUntilOpened],
+    );
+    let hangs_up = Node::spawn_on(ip(92), full, 200, &block, vec![Conn::CloseBeforeVersion]);
+    let handshakes = Node::spawn_on(ip(93), full, 200, &block, vec![Conn::Serve]);
+    let proxy = FakeSocks5::start();
+    let held = [
+        proxy.hold(hangs_up.addr.into()),
+        proxy.hold(handshakes.addr.into()),
+    ];
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![
+            serves.addr.into(),
+            hangs_up.addr.into(),
+            handshakes.addr.into(),
+        ]),
+    );
+    let fetcher = BlockFetcher::new(source.clone());
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || serves.stalled().is_some()));
+            for gate in &held {
+                gate.open();
+            }
+            // The hang-up follows the `version`; `getaddr` ends the
+            // handshake.
+            assert!(comes_true(GATE_LIMIT, || got_version(&hangs_up)));
+            assert!(comes_true(GATE_LIMIT, || {
+                handshakes.commands().iter().any(|c| c == "getaddr")
+            }));
+            serves.open();
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+    });
+    let got = got.expect("the first racer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    let PeerSource::Discovered(pool) = &*source else {
+        unreachable!()
+    };
+    assert!(
+        pool.is_resting(&hangs_up.addr.into()),
+        "the racer whose node hung up was not reported"
+    );
+    assert_eq!(
+        pool.place(&handshakes.addr.into()),
+        Some(Where::Tried),
+        "the racer whose handshake completed was not reported"
+    );
 }
 
 /// How the proxy's refusals count: no clear answer (a general failure, a

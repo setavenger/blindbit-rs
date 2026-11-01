@@ -43,6 +43,9 @@ pub(super) enum Conn {
     /// [`Conn::StallMidBlock`] until the node's gate opens
     /// ([`Node::open`], or [`GATE_LIMIT`] passes), then close.
     StallMidBlockUntilOpened,
+    /// [`Conn::StallMidBlock`] until the node's gate opens
+    /// ([`Node::open`], or [`GATE_LIMIT`] passes), then send the rest.
+    PauseMidBlockUntilOpened,
     /// Start sending the block, then send one more byte of it every
     /// 250 ms (the rest of the default block takes 38 s), until the client
     /// hangs up (or a minute passes).
@@ -107,8 +110,9 @@ pub(super) const GATE_LIMIT: Duration = Duration::from_secs(20);
 /// When things happened on a [`Node`]'s connections.
 #[derive(Default)]
 struct Moments {
-    /// A [`Conn::StallMidBlock`] (or `…UntilOpened`) connection went
-    /// silent, or a [`Conn::TrickleMidBlock`] one started trickling.
+    /// A [`Conn::StallMidBlock`] (or `…UntilOpened`, or
+    /// [`Conn::PauseMidBlockUntilOpened`]) connection went silent, or a
+    /// [`Conn::TrickleMidBlock`] one started trickling.
     stalled: Mutex<Option<Instant>>,
     /// A [`Conn::ServeThenTrickle`] connection started trickling.
     trickling: Mutex<Option<Instant>>,
@@ -501,6 +505,18 @@ fn serve(
             let opened = moments.gate.wait(GATE_LIMIT);
             *moments.opened_in_time.lock().unwrap() = Some(opened);
             return wire.stream.shutdown(Shutdown::Both);
+        }
+        Conn::PauseMidBlockUntilOpened => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            wire.stream.flush()?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            moments.gate.wait(GATE_LIMIT);
+            wire.stream.write_all(rest)?;
         }
         Conn::TrickleMidBlock => {
             let bytes = encode::serialize(&RawNetworkMessage::new(

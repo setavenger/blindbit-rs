@@ -1063,6 +1063,7 @@ impl BlockFetcher {
             match result {
                 Ok(block) => {
                     self.peers.report(&peer, PeerEvent::Served);
+                    report_finished(&self.peers, &mut connecting);
                     tracing::info!(
                         %peer,
                         height,
@@ -1314,6 +1315,35 @@ struct Ready {
     handshake_took: Duration,
 }
 
+/// How a connection to a discovered peer went ([`prepare`]): ready, or why
+/// not, with what the peer said about itself when its handshake completed.
+type Prepared = (PeerAddr, Result<Ready, (AttemptFailure, Option<PeerInfo>)>);
+
+/// Report how the racers that have finished went (a connect or handshake
+/// that failed, a handshake completed) before they are dropped unused, so
+/// the peer source learns of them; the ones still under way are not
+/// waited for.
+fn report_finished(peers: &PeerSource, connecting: &mut tokio::task::JoinSet<Prepared>) {
+    while let Some(joined) = connecting.try_join_next() {
+        let Ok((peer, prepared)) = joined else {
+            continue;
+        };
+        let (failure, info) = match prepared {
+            Ok(ready) => (None, Some(ready.connection.info)),
+            Err((failure, info)) => (Some(failure), info),
+        };
+        if let Some(info) = info {
+            peers.report(&peer, PeerEvent::Connected(info));
+        }
+        match failure {
+            // Not the peer's doing.
+            None
+            | Some(AttemptFailure::Regular(FetchFailure::Cancelled | FetchFailure::Proxy(_))) => {}
+            Some(failure) => peers.report(&peer, failure.peer_event(info.is_some())),
+        }
+    }
+}
+
 /// Open a connection to the discovered `peer` and complete its handshake on
 /// a blocking thread as soon as it opens, within the connection's overall
 /// deadline; a peer whose chain ends below `min_height` is refused before it
@@ -1325,7 +1355,7 @@ async fn prepare(
     policy: RetryPolicy,
     read_timeout: Duration,
     min_height: u64,
-) -> (PeerAddr, Result<Ready, (AttemptFailure, Option<PeerInfo>)>) {
+) -> Prepared {
     let result = async {
         let stream = peers
             .dialer()

@@ -394,7 +394,8 @@ dbus-run-session -- bash -c '
   trying a dead address for the whole connect timeout, so a discovered-peer
   fetch races `PROXY_RACE` (3) connects at once and uses the first
   handshaken one (each racer connects and handshakes as one cancellable
-  unit, `prepare`; the others close when the block arrives; a handshaken
+  unit, `prepare`; the others close when the block arrives, those already
+  finished reported first (`report_finished`: connected, or why not); a handshaken
   racer's wait for its turn does not count against its time), and a seed
   node's addresses enter the book most recently seen first (half of a
   signet node's `getaddr` answer is > 5 days old).
