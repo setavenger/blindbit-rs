@@ -305,12 +305,17 @@ dbus-run-session -- bash -c '
   only when an observer serves the tx with its wtxid (`mempool_has`, also
   for the own node; recent outcomes are keyed by wtxid); a peer ever handed
   the tx never confirms it (`History::handed_to`: not an observer or
-  sender, its netgroup passed over while others are left). Rejection only
-  when at least 2 senders (`REFUSALS`), and every sender, gave the same
-  signal; only a getdata for an actual parent (an input's txid) is that
-  signal, and a parent friglet holds as pending is handed over instead. A
-  rejection or a dropped connection (no proof of invalidity) is never
-  cached as final. Rechecks run every 10 min (`PENDING_RECHECK`) while a
+  sender, its netgroup passed over while others are left). Each recipient
+  is written to the pending file before any bytes go to it, and a copy from
+  a peer listed there never counts, also when a recheck handed it over
+  during the broadcast. Missing inputs are reported only when the budget
+  ends with no observer having the tx and at least 2 senders (`REFUSALS`),
+  and every sender, asked for an actual parent (an input's txid); any
+  pending ancestor friglet holds is handed over instead
+  (`PendingStore::held_ancestors`). Every sender dropping the connection
+  still ends the broadcast at once. A rejection or a dropped connection (no
+  proof of invalidity) is never cached as final; ending a broadcast also
+  ends its connections still opening. Rechecks run every 10 min (`PENDING_RECHECK`) while a
   tx is pending (≤ 14 days): 2 peers it was never handed to (in any
   attempt) are asked about all pending txids on one connection each (so
   they can link them; README privacy note), and a lost tx goes to one of

@@ -147,8 +147,9 @@ What to expect from it:
   seconds (45 through [Tor](#tor)). The P2P protocol does not say why a
   peer refuses a transaction. friglet reports what it can tell: a fee below
   the mempool minimum, or missing or spent inputs (with random peers, only
-  when at least two peers it was handed to, and every one, ask for one of
-  its parents; a resend checks again). A peer that drops the connection
+  when no other peer has it by the end and at least two peers it was handed
+  to, and every one, asked for one of its parents; unconfirmed parents
+  friglet is broadcasting itself are handed over; a resend checks again). A peer that drops the connection
   after receiving the transaction does not prove it invalid, so that is not
   reported as a rejection. Broadcasts that have not confirmed are kept in
   `<state file>.pending.json` (`0600`: it also names the peers they went
