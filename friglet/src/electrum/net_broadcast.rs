@@ -18,11 +18,13 @@
 //!
 //! Success is an observer serving the transaction: to friglet's `getdata`
 //! every [`POLL_INTERVAL`], or right after the observer announced it with
-//! `inv`. Nothing a sender says counts as success. A rejection needs every
-//! sender that got the transaction to give the same answer: all asked for a
-//! parent (missing or spent inputs), or all dropped the connection before
-//! the pong (what Bitcoin Core does with a consensus-invalid transaction).
-//! Anything else runs until the budget ends, as "not confirmed".
+//! `inv`. Nothing a sender says counts as success. A rejection needs at
+//! least two senders, and every sender that got the transaction, to give
+//! the same answer: all asked for one of its parents (missing or spent
+//! inputs; a parent friglet broadcast itself and still holds is handed over
+//! instead), or all dropped the connection before the pong (what Bitcoin
+//! Core does with a consensus-invalid transaction). Anything else runs
+//! until the budget ends, as "not confirmed".
 //!
 //! Pending broadcasts are rechecked the same way: peers they were not handed
 //! to are asked, and a lost one is handed to one of those
@@ -39,18 +41,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
-use bitcoin::{Txid, Wtxid};
+use bitcoin::{Transaction, Txid, Wtxid};
 use blindbit_lib::net::{NetGroup, NoPeers, PeerAddr, PeerEvent, PeerSource, Purpose};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches, random_u64};
-use super::relay::{self, Candidate, Signals};
+use super::relay::{self, Candidate, Parents, Signals};
 
 /// Peers that watch for the transaction.
 const OBSERVERS: usize = 3;
 /// Peers the transaction is handed to.
 const SENDERS: usize = 2;
+/// A rejection needs at least this many senders giving the same answer
+/// (and every sender that got it): one peer's word is worth little, and a
+/// parent one peer lacks may just not have reached it yet.
+const REFUSALS: usize = 2;
 /// Raised to the dialer's `PROXY_CONNECT_TIMEOUT` (20 s) through a proxy.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often an observer is asked for the transaction.
@@ -72,6 +78,9 @@ pub struct History {
     /// an observer (nor a sender), and peers in its network group are
     /// passed over while the pool has others.
     pub handed_to: HashSet<PeerAddr>,
+    /// Its unconfirmed parents that friglet broadcast itself and still
+    /// holds: a sender's peer that asks for one gets it.
+    pub parents: Vec<Transaction>,
 }
 
 /// How a broadcast ended, unless no peer could be asked.
@@ -80,6 +89,8 @@ pub struct Report {
     pub verdict: Verdict,
     /// The peers the transaction was handed to.
     pub sent_to: Vec<PeerAddr>,
+    /// Parents ([`History::parents`]) handed to a peer that asked for one.
+    pub parents_sent_to: Vec<(Txid, PeerAddr)>,
     /// Fee filters (sat/kvB) the observers sent.
     pub fee_filters: Vec<(PeerAddr, u64)>,
 }
@@ -88,8 +99,9 @@ pub struct Report {
 pub enum Verdict {
     /// `by`, a peer the transaction was not handed to, served it.
     InMempool { by: PeerAddr },
-    /// Every sender asked for a parent: its inputs are missing or spent.
-    /// The message is for the user.
+    /// Every sender (at least two) asked for a parent friglet does not hold:
+    /// its inputs are missing or spent, or those peers lack an unconfirmed
+    /// parent, so this is not final. The message is for the user.
     Rejected(String),
     /// Every sender dropped the connection before answering the ping after
     /// the transaction, which Bitcoin Core does with a consensus-invalid
@@ -203,6 +215,8 @@ enum Signal {
 struct Job {
     peers: Arc<PeerSource>,
     candidate: Arc<Candidate>,
+    /// [`History::parents`].
+    parents: Arc<Vec<Transaction>>,
     stop: CancellationToken,
     deadline: Instant,
     events: mpsc::UnboundedSender<Event>,
@@ -231,12 +245,14 @@ impl Job {
     fn new(
         peers: Arc<PeerSource>,
         candidate: Arc<Candidate>,
+        parents: Vec<Transaction>,
         deadline: Instant,
         events: mpsc::UnboundedSender<Event>,
     ) -> Self {
         Self {
             peers,
             candidate,
+            parents: Arc::new(parents),
             stop: CancellationToken::new(),
             deadline,
             events,
@@ -308,11 +324,12 @@ impl Job {
         true
     }
 
-    /// Signals for a sender to `addr`: the transaction is written only
-    /// through [`Job::may_send`].
+    /// Signals for a sender to `addr`: the transaction (or a held parent)
+    /// is written only through [`Job::may_send`].
     fn signals_for(&self, addr: &PeerAddr) -> Signals {
+        let parents = Parents::of(&self.candidate.tx, &self.parents);
         let (job, addr) = (self.clone(), addr.clone());
-        Signals::gated(Box::new(move |txid| job.may_send(&addr, txid)))
+        Signals::gated(Box::new(move |txid| job.may_send(&addr, txid)), parents)
     }
 
     /// End the broadcast: nothing more is handed over, and every connection
@@ -385,12 +402,12 @@ struct Round {
 }
 
 impl Round {
-    fn new(timing: Timing, history: History) -> Self {
+    fn new(timing: Timing, earlier: HashSet<PeerAddr>) -> Self {
         Self {
             timing,
             started: Instant::now(),
-            earlier_groups: history.handed_to.iter().map(PeerAddr::netgroup).collect(),
-            earlier: history.handed_to,
+            earlier_groups: earlier.iter().map(PeerAddr::netgroup).collect(),
+            earlier,
             peers: HashMap::new(),
             sent_to: Vec::new(),
             handed_over_at: None,
@@ -579,11 +596,13 @@ impl Round {
         if Instant::now() >= deadline {
             return Some(Ok(self.unconfirmed()));
         }
-        // Every sender that got it refused it the same way, and no other
-        // sender may still get it: none is connecting, or all the hand-over
-        // slots are taken (hedged senders still connecting hand nothing
-        // over then).
-        if self.senders_connecting() == 0 || self.sent_to.len() >= SENDERS {
+        // Every sender that got it, and at least [`REFUSALS`] of them,
+        // refused it the same way, and no other sender may still get it:
+        // none is connecting, or all the hand-over slots are taken (hedged
+        // senders still connecting hand nothing over then).
+        if self.sent_to.len() >= REFUSALS
+            && (self.senders_connecting() == 0 || self.sent_to.len() >= SENDERS)
+        {
             let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
             let first = signals.next().flatten().copied()?;
             if signals.all(|signal| signal == Some(&first)) {
@@ -649,10 +668,10 @@ pub async fn broadcast(
     let deadline = Instant::now() + budget;
     let timing = Timing::for_peers(&peers);
     let (events, mut received) = mpsc::unbounded_channel();
-    let job = Job::new(peers, candidate, deadline, events);
+    let job = Job::new(peers, candidate, history.parents, deadline, events);
     // Every connection of this broadcast ends when it returns.
     let _close = CloseOnDrop(job.clone());
-    let mut round = Round::new(timing, history);
+    let mut round = Round::new(timing, history.handed_to);
     for _ in 0..timing.observers_at_start {
         if !round.launch(&job, true).await {
             break;
@@ -679,12 +698,11 @@ pub async fn broadcast(
             // From here on nothing is handed over, and every peer that may
             // hold the transaction is in the ledger, including one whose
             // report is still on its way.
-            let sent_to: Vec<PeerAddr> = job
+            let (handed, parents_sent_to): (Vec<_>, Vec<_>) = job
                 .close()
                 .into_iter()
-                .filter(|(txid, _)| *txid == job.candidate.txid)
-                .map(|(_, addr)| addr)
-                .collect();
+                .partition(|(txid, _)| *txid == job.candidate.txid);
+            let sent_to: Vec<PeerAddr> = handed.into_iter().map(|(_, addr)| addr).collect();
             let verdict = match end {
                 Ok(verdict) => verdict,
                 Err(_) if !sent_to.is_empty() => round.unconfirmed(),
@@ -693,6 +711,7 @@ pub async fn broadcast(
             return Ok(Report {
                 verdict,
                 sent_to,
+                parents_sent_to,
                 fee_filters: round.fee_filters,
             });
         }
@@ -978,18 +997,17 @@ fn send(job: Job, addr: PeerAddr) {
     job.tell(Event::Gone { addr });
 }
 
+/// The message for every one of `senders` (at least [`REFUSALS`]) giving
+/// `signal`.
 fn rejected_message(signal: Signal, senders: usize) -> String {
-    let peers = if senders == 1 {
-        "the peer friglet sent it to"
-    } else {
-        "every peer friglet sent it to"
-    };
+    let peers = format!("all {senders} peers friglet sent it to");
     match signal {
         // Sparrow keys its "inputs missing or spent" dialog on the prefix.
         Signal::MissingInputs => format!(
             "bad-txns-inputs-missingorspent: {peers} asked for a parent of this transaction, so \
-             the outputs it spends are unknown to the network: they are already spent, or their \
-             transaction is unknown."
+             they do not have the outputs it spends: those are already spent, or the \
+             transaction that creates them has not reached these peers. Sending it again checks \
+             whether it has spread since."
         ),
         Signal::Dropped => format!(
             "{peers} disconnected right after receiving the transaction. Bitcoin Core does that \
@@ -1388,6 +1406,7 @@ mod tests {
         let peers = pool(&all).await;
         let history = History {
             handed_to: earlier.iter().map(|fake| fake.addr.into()).collect(),
+            ..History::default()
         };
         let result = broadcast(peers, candidate, Duration::from_secs(10), history).await;
         if let Ok(Report {
@@ -1455,9 +1474,87 @@ mod tests {
         };
         // Sparrow keys its "inputs missing or spent" dialog on this prefix.
         assert!(
-            message.starts_with("bad-txns-inputs-missingorspent: every peer"),
+            message.starts_with("bad-txns-inputs-missingorspent: all 2 peers"),
             "{message}"
         );
+    }
+
+    /// Only a request for one of its parents says a peer lacks its inputs:
+    /// peers asking for some other transaction reject nothing.
+    #[tokio::test]
+    async fn a_request_for_another_transaction_is_not_a_rejection() {
+        let net = FakeNet::new();
+        let asking = Script {
+            policy: TxPolicy::RequestOther,
+            ..Script::default()
+        };
+        let fakes = net_of(&net, 205, vec![asking; 5]);
+        let report = run(&fakes, &candidate(19), Duration::from_secs(4)).await;
+        assert!(
+            matches!(report.verdict, Verdict::Unconfirmed { .. }),
+            "{report:?}"
+        );
+        assert_eq!(report.sent_to.len(), SENDERS);
+    }
+
+    /// One sender asking for a parent decides nothing, also when no other
+    /// sender can be found: that peer may just lack an unconfirmed parent.
+    #[tokio::test]
+    async fn one_sender_asking_for_a_parent_is_no_rejection_on_its_own() {
+        let net = FakeNet::new();
+        let orphan = Script {
+            policy: TxPolicy::Orphan,
+            ..Script::default()
+        };
+        // Three observers and one sender: nobody is left for a second.
+        let fakes = net_of(&net, 211, vec![orphan; 4]);
+        let report = run(&fakes, &candidate(20), Duration::from_secs(4)).await;
+        assert!(
+            matches!(report.verdict, Verdict::Unconfirmed { .. }),
+            "{report:?}"
+        );
+        assert_eq!(report.sent_to.len(), 1);
+    }
+
+    /// A child of a transaction friglet broadcast itself (still pending):
+    /// a sender's peer that lacks the parent asks for it and gets it, then
+    /// takes the child.
+    #[tokio::test]
+    async fn a_peer_asking_for_a_parent_friglet_holds_gets_it() {
+        let parent = candidate(21);
+        let mut tx = parent.tx.clone();
+        tx.input[0].previous_output = bitcoin::OutPoint {
+            txid: parent.txid,
+            vout: 0,
+        };
+        tx.output[0].value = Amount::from_sat(4_000);
+        let child =
+            Arc::new(Candidate::decode(bitcoin::consensus::encode::serialize(&tx)).unwrap());
+        let net = FakeNet::new();
+        let orphan = Script {
+            policy: TxPolicy::Orphan,
+            ..Script::default()
+        };
+        let fakes = net_of(&net, 216, vec![orphan; 5]);
+        let peers = pool(&addrs(&fakes)).await;
+        let history = History {
+            parents: vec![parent.tx.clone()],
+            ..History::default()
+        };
+        let report = broadcast(peers, child.clone(), Duration::from_secs(20), history)
+            .await
+            .unwrap();
+        let Verdict::InMempool { by } = &report.verdict else {
+            panic!("expected success, got {report:?}");
+        };
+        assert!(!report.sent_to.contains(by));
+        assert!(net.has(parent.txid) && net.has(child.txid));
+        // The parent went to a sender that asked for it, and is listed.
+        assert!(!report.parents_sent_to.is_empty(), "{report:?}");
+        for (txid, peer) in &report.parents_sent_to {
+            assert_eq!(*txid, parent.txid);
+            assert!(report.sent_to.contains(peer));
+        }
     }
 
     #[tokio::test]
@@ -1529,7 +1626,8 @@ mod tests {
         let peers = pool(&[fake.addr]).await;
         let (events, received) = mpsc::unbounded_channel();
         let deadline = Instant::now() + Duration::from_secs(30);
-        (Job::new(peers, candidate(seed), deadline, events), received)
+        let job = Job::new(peers, candidate(seed), Vec::new(), deadline, events);
+        (job, received)
     }
 
     /// Wait (up to 10 s) until `done` holds.

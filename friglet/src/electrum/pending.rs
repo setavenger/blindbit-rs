@@ -196,6 +196,19 @@ impl PendingStore {
         }
     }
 
+    /// The pending transactions `tx` spends from: unconfirmed parents a
+    /// peer may lack, which friglet can hand over.
+    pub fn held_parents(&self, tx: &Transaction) -> Vec<Transaction> {
+        let ids: HashSet<String> = tx
+            .input
+            .iter()
+            .map(|input| input.previous_output.txid.to_string())
+            .collect();
+        ids.iter()
+            .filter_map(|id| decode(&self.txs.get(id)?.raw_hex))
+            .collect()
+    }
+
     /// Every discovered peer `txid` was handed to, pending or not.
     pub fn handed_to(&self, txid: &str) -> HashSet<PeerAddr> {
         let mut peers = self

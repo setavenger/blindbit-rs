@@ -23,6 +23,7 @@
 //! outside: the transaction never shows up. The error then says so, and
 //! names the fee shortfall when the fee is known.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
@@ -146,13 +147,43 @@ pub(super) struct Signals {
     pub(super) missing_inputs: bool,
     /// See [`SendGate`]. None (the own node): always written.
     gate: Option<SendGate>,
+    /// See [`Parents`]. None (the own node): any other transaction the peer
+    /// asks for after the hand-over counts as a parent.
+    parents: Option<Parents>,
+}
+
+/// A transaction's parents: only a request for one of them (by txid; a
+/// parent is never known by wtxid) says the peer lacks its inputs, and the
+/// ones friglet holds (pending broadcasts of its own) are handed over when
+/// asked for, so the peer can take the child.
+pub(super) struct Parents {
+    ids: HashSet<Txid>,
+    held: HashMap<Txid, Transaction>,
+}
+
+impl Parents {
+    pub(super) fn of(tx: &Transaction, held: &[Transaction]) -> Self {
+        Self {
+            ids: tx
+                .input
+                .iter()
+                .map(|input| input.previous_output.txid)
+                .collect(),
+            held: held
+                .iter()
+                .map(|tx| (tx.compute_txid(), tx.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl Signals {
-    /// Signals whose transaction is written only while `gate` allows it.
-    pub(super) fn gated(gate: SendGate) -> Self {
+    /// Signals whose transaction is written only while `gate` allows it,
+    /// with `parents` told apart from other requests.
+    pub(super) fn gated(gate: SendGate, parents: Parents) -> Self {
         Self {
             gate: Some(gate),
+            parents: Some(parents),
             ..Self::default()
         }
     }
@@ -184,7 +215,9 @@ impl Signals {
                     peer.send(NetworkMessage::Tx(tx.clone()))?;
                     self.sent = true;
                 }
-            } else {
+                continue;
+            }
+            let Some(parents) = &self.parents else {
                 if matches!(
                     item,
                     Inventory::Transaction(_)
@@ -195,6 +228,27 @@ impl Signals {
                     self.missing_inputs = true;
                 }
                 unknown.push(item);
+                continue;
+            };
+            let parent = match item {
+                Inventory::Transaction(id) | Inventory::WitnessTransaction(id)
+                    if parents.ids.contains(&id) =>
+                {
+                    Some((id, parents.held.get(&id).cloned()))
+                }
+                _ => None,
+            };
+            match parent {
+                Some((id, Some(held))) => {
+                    if self.may_send(id) {
+                        peer.send(NetworkMessage::Tx(held))?;
+                    }
+                }
+                Some((_, None)) => {
+                    self.missing_inputs |= self.sent;
+                    unknown.push(item);
+                }
+                None => unknown.push(item),
             }
         }
         if !unknown.is_empty() {

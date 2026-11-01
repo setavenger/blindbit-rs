@@ -911,9 +911,14 @@ async fn broadcast_to_network(
         BROADCAST_BUDGET
     };
     // Peers that got it from an earlier attempt (before a restart too)
-    // never confirm it.
-    let history = net_broadcast::History {
-        handed_to: state.pending.lock().await.handed_to(&txid),
+    // never confirm it; a peer that asks for a parent friglet broadcast
+    // itself gets that parent.
+    let history = {
+        let store = state.pending.lock().await;
+        net_broadcast::History {
+            handed_to: store.handed_to(&txid),
+            parents: store.held_parents(&candidate.tx),
+        }
     };
     let report = net_broadcast::broadcast(peers, candidate.clone(), budget, history)
         .await
@@ -929,6 +934,9 @@ async fn broadcast_to_network(
     {
         let mut store = state.pending.lock().await;
         store.note_handed_to(&txid, &sent_to);
+        for (parent, peer) in &report.parents_sent_to {
+            store.note_handed_to(&parent.to_string(), std::slice::from_ref(peer));
+        }
         store.save();
     }
     let senders = sent_to
@@ -950,9 +958,13 @@ async fn broadcast_to_network(
             accept_pending(state, candidate, &sent_to).await;
             RecentBroadcast::Final(Ok(txid))
         }
+        // The inputs may be spent, or those peers may only lack an
+        // unconfirmed parent: a resend looks again.
         Verdict::Rejected(message) => {
             tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast rejected");
-            RecentBroadcast::Final(Err((1, message)))
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+            }
         }
         // Probably invalid, but peers can also just go away: a resend
         // looks again.
@@ -2314,6 +2326,71 @@ mod tests {
                     .contains(&fakes[0].addr.into())
             );
             drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// Every sender asking for a parent is answered with Sparrow's
+        /// "inputs missing or spent" wording, but not for good: those peers
+        /// may only lack an unconfirmed parent, so a resend looks again.
+        #[tokio::test]
+        async fn a_parent_request_is_no_final_rejection() {
+            let dir = temp_dir("net-parent-request");
+            let (index, received) = wallet();
+            let net = FakeNet::new();
+            let orphan = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Orphan,
+                ..Script::default()
+            };
+            let fakes = fake_net(&net, 225, vec![orphan; 5]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&spend(
+                &received, 1_000, 0,
+            )));
+            let send = "blockchain.transaction.broadcast";
+            for attempt in ["first", "resend"] {
+                let before = connections(&fakes);
+                let response = call(&state, send, vec![json!(raw.clone())]).await;
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.starts_with("bad-txns-inputs-missingorspent"),
+                    "{attempt}: {response}"
+                );
+                assert!(connections(&fakes) > before, "{attempt}: no peer asked");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A child of a broadcast that is still pending: a peer that lacks
+        /// the parent gets it from friglet, and is kept out of the parent's
+        /// rechecks from then on.
+        #[tokio::test]
+        async fn a_child_of_a_pending_broadcast_goes_out_with_its_parent() {
+            let dir = temp_dir("net-child");
+            let (index, received) = wallet();
+            let parent = spend(&received, 1_000, 0);
+            let parent_txid = parent.compute_txid().to_string();
+            let child = spend(&parent, 1_000, 0);
+            let child_txid = child.compute_txid().to_string();
+            let net = FakeNet::new();
+            let orphan = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Orphan,
+                ..Script::default()
+            };
+            let fakes = fake_net(&net, 190, vec![orphan; 5]);
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&parent));
+                store.insert(parent_txid.clone(), raw_hex, &[]);
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&child));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert_eq!(response["result"], json!(child_txid), "{response}");
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            let got_parent = reloaded.handed_to(&parent_txid);
+            assert!(!got_parent.is_empty());
+            assert!(got_parent.is_subset(&reloaded.handed_to(&child_txid)));
             std::fs::remove_dir_all(dir).unwrap();
         }
 

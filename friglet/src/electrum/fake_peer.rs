@@ -30,8 +30,12 @@ pub enum TxPolicy {
     Ignore,
     /// Consensus-invalid: the connection is closed.
     Disconnect,
-    /// Inputs missing: asks for the parent transaction.
+    /// Inputs missing unless its parent is in the mempool: asks for the
+    /// parent, and takes both once the parent comes.
     Orphan,
+    /// Silently dropped, and another transaction (not a parent) is asked
+    /// for.
+    RequestOther,
 }
 
 /// One connection the peer served.
@@ -326,6 +330,8 @@ fn serve(
     // Transactions this connection knows: announced either way.
     let mut known: HashSet<Vec<u8>> = HashSet::new();
     let mut echoed: Option<(Vec<u8>, Instant)> = None;
+    // The parent asked for, and the transaction waiting for it.
+    let mut orphan: Option<(bitcoin::Txid, Vec<u8>)> = None;
     loop {
         if script.announce && script.relay && their_relay {
             let fresh: Vec<Vec<u8>> = shared
@@ -406,6 +412,16 @@ fn serve(
             NetworkMessage::Tx(tx) => {
                 let raw = encode::serialize(&tx);
                 known.insert(raw.clone());
+                // The parent this connection asked for: taken, and the
+                // transaction that waited for it too.
+                if let Some((parent, child)) = &orphan
+                    && tx.compute_txid() == *parent
+                {
+                    accept(shared, raw);
+                    accept(shared, child.clone());
+                    orphan = None;
+                    continue;
+                }
                 let policy = shared
                     .first_policies
                     .lock()
@@ -413,18 +429,30 @@ fn serve(
                     .pop_front()
                     .unwrap_or(script.policy);
                 match policy {
-                    TxPolicy::Accept => {
-                        let mut mempool = shared.mempool.lock().unwrap();
-                        if !mempool.contains(&raw) {
-                            mempool.push(raw.clone());
-                        }
-                    }
+                    TxPolicy::Accept => accept(shared, raw.clone()),
                     TxPolicy::Ignore => {}
                     TxPolicy::Disconnect => return Ok(()),
                     TxPolicy::Orphan => {
                         let parent = tx.input[0].previous_output.txid;
+                        let has_parent = shared
+                            .mempool
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|raw| ids(raw).0 == parent);
+                        if has_parent {
+                            accept(shared, raw.clone());
+                        } else {
+                            wire.send(NetworkMessage::GetData(vec![
+                                Inventory::WitnessTransaction(parent),
+                            ]))?;
+                            orphan = Some((parent, raw.clone()));
+                        }
+                    }
+                    TxPolicy::RequestOther => {
+                        let other = bitcoin::hashes::Hash::from_byte_array([0xee; 32]);
                         wire.send(NetworkMessage::GetData(vec![
-                            Inventory::WitnessTransaction(parent),
+                            Inventory::WitnessTransaction(other),
                         ]))?;
                     }
                 }
@@ -435,6 +463,14 @@ fn serve(
             }
             _ => {}
         }
+    }
+}
+
+/// Put `raw` into the shared mempool.
+fn accept(shared: &Shared, raw: Vec<u8>) {
+    let mut mempool = shared.mempool.lock().unwrap();
+    if !mempool.contains(&raw) {
+        mempool.push(raw);
     }
 }
 
