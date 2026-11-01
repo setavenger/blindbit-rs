@@ -628,6 +628,38 @@ mod tests {
         assert_eq!(peers.known(), 1, "the peer is not blamed for the proxy");
     }
 
+    /// Right after a connection through the proxy completed its handshake,
+    /// a header connection the proxy has no clear answer for (a general
+    /// failure) counts against the address, as for block downloads: three
+    /// and it is forgotten.
+    #[tokio::test]
+    async fn through_a_working_proxy_an_unclear_header_connect_counts_against_the_peer() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let live = FakePeer::spawn(Script::default(), 1);
+        let live_addr: PeerAddr = live.addr.into();
+        let dead: PeerAddr = std::net::SocketAddr::from(([10, 140, 0, 1], 18444)).into();
+        let proxy = FakeSocks5::start();
+        let peers = PeerSource::discover(
+            Network::Regtest,
+            proxy.dialer(),
+            Seeds::Static(vec![live_addr.clone(), dead.clone()]),
+        );
+        // The first pick loads the seeds.
+        peers.next(Purpose::Header, &HashSet::new()).await.unwrap();
+        assert_eq!(peers.known(), 2);
+        let (slot, filters) = (StdMutex::new(None), StdMutex::new(FeeFilters::default()));
+        let nothing = |_: &mut Peer| Ok(());
+        ask_header_peer(&slot, &peers, &live_addr, None, &nothing, &filters)
+            .expect("the live peer answers through the proxy");
+        proxy.refuse_with(0x01);
+        for _ in 0..3 {
+            ask_header_peer(&slot, &peers, &dead, None, &nothing, &filters)
+                .expect_err("the proxy fails it");
+        }
+        assert_eq!(peers.known(), 1, "the dead address is forgotten");
+    }
+
     /// Through a proxy the race's first connection is used also when the
     /// shared connection is busy as it opens. (It used to be dropped, and
     /// with it here the only peer that answers.)

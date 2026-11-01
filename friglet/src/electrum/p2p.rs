@@ -85,11 +85,13 @@ impl P2pError {
     /// How a failed connection counts against the peer: unreachable, or,
     /// when the proxy said nothing clear about it (no reply in time, a
     /// general failure: also what Tor without a working circuit does),
-    /// only unhelpful, so it rests but stays in the address book.
+    /// [`PeerEvent::ProxyUnclear`]: unreachable only while the proxy
+    /// recently carried a handshake, otherwise the peer just rests. The
+    /// scanner's block downloads count it the same way.
     pub fn peer_event(&self) -> PeerEvent {
         match self {
             P2pError::Io(error) if blindbit_lib::net::is_proxy_unclear(error) => {
-                PeerEvent::Unhelpful
+                PeerEvent::ProxyUnclear
             }
             _ => PeerEvent::Unreachable,
         }
