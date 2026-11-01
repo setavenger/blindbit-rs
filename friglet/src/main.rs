@@ -13,7 +13,6 @@ use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use blindbit_lib::net::{PeerSource, Seeds};
 use blindbit_lib::scanner;
 
 use config::ScanArgs;
@@ -248,12 +247,7 @@ async fn run(
     // the address book saved beside the wallet state knows enough). Shared
     // by the scanner and the Electrum server. With p2p_proxy, every one of
     // these connections goes through the proxy, never directly.
-    let peers = PeerSource::new(
-        cfg.network,
-        cfg.dialer(),
-        cfg.p2p_node.clone(),
-        Seeds::for_network(cfg.network),
-    );
+    let peers = cfg.peer_source();
     if let Some(dir) = cfg.state_file.parent() {
         peers.keep_book_in(if dir.as_os_str().is_empty() {
             std::path::Path::new(".")

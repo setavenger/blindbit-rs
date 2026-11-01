@@ -15,10 +15,11 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use blindbit_lib::net::{Dialer, PeerAddr, PeerHost};
+use blindbit_lib::net::{Dialer, PeerAddr, PeerHost, PeerSource, Seeds};
 use clap::Args;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
@@ -436,6 +437,18 @@ impl ResolvedConfig {
             Some(proxy) => Dialer::Socks5 { proxy },
             None => Dialer::Direct,
         }
+    }
+
+    /// Where blocks, headers and broadcasts go: the configured own node, or
+    /// peers of the network found through its DNS seeds; through
+    /// [`Self::dialer`] either way.
+    pub fn peer_source(&self) -> Arc<PeerSource> {
+        PeerSource::new(
+            self.network,
+            self.dialer(),
+            self.p2p_node.clone(),
+            Seeds::for_network(self.network),
+        )
     }
 }
 
@@ -1045,6 +1058,48 @@ mod tests {
         cfg.p2p_proxy = Some("  ".to_string());
         let r = resolve(cfg).unwrap();
         assert_eq!((r.p2p_proxy, r.raw.p2p_proxy), (None, None));
+    }
+
+    /// What the daemon connects to: the configured own node (and nothing
+    /// else), through the proxy when one is set; without a node, peers of
+    /// the network.
+    #[test]
+    fn the_daemon_connects_to_the_configured_node() {
+        let r = resolve(resolvable(
+            "signet",
+            "http://127.0.0.1:1",
+            "152.53.151.148:38333",
+        ))
+        .unwrap();
+        let peers = r.peer_source();
+        assert_eq!(
+            peers.own_node_addr(),
+            Some(&"152.53.151.148:38333".parse::<SocketAddr>().unwrap().into())
+        );
+        assert_eq!(peers.dialer(), &Dialer::Direct);
+        assert_eq!(peers.network(), Network::Signet);
+
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "node.invalid");
+        cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
+        let peers = resolve(cfg).unwrap().peer_source();
+        assert_eq!(
+            peers.own_node_addr(),
+            Some(&PeerAddr {
+                host: PeerHost::Name("node.invalid".to_string()),
+                port: 38333,
+            })
+        );
+        assert_eq!(
+            peers.dialer(),
+            &Dialer::Socks5 {
+                proxy: "127.0.0.1:9050".parse().unwrap()
+            }
+        );
+
+        let mut cfg = resolvable("signet", "http://127.0.0.1:1", "");
+        cfg.p2p_node_addr = None;
+        let peers = resolve(cfg).unwrap().peer_source();
+        assert!(!peers.is_own_node());
     }
 
     #[test]
