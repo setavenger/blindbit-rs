@@ -349,12 +349,15 @@ fn a_seed_answering_late_counts_and_outlasts_the_next_seeding() {
     // A seeding that finds nothing while that seed is still being asked.
     run(source.next(Purpose::Block, &none())).expect_err("nothing yet");
     answer
-        .send(vec![super::seeds::Seeded {
-            addr: addr(PEERS[0]),
-            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            seed: "late",
-            gossiped: false,
-        }])
+        .send(super::seeds::Seeding {
+            found: vec![super::seeds::Seeded {
+                addr: addr(PEERS[0]),
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                seed: "late",
+                gossiped: false,
+            }],
+            ..Default::default()
+        })
         .expect("its answer is still awaited");
     assert_eq!(
         run(source.next(Purpose::Block, &none())).unwrap(),

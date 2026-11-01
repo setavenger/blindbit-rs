@@ -31,7 +31,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin_address_book::io::FileExt;
 use bitcoin_address_book::{Record, Table};
 
-use super::seeds::{Seeded, Seeds};
+use super::seeds::{Seeded, Seeding, Seeds};
 use super::{Dialer, NetGroup, PeerAddr, PeerHost, Purpose, random_u64};
 use crate::scanner::PeerInfo;
 
@@ -450,7 +450,7 @@ struct Inner {
     /// receiver per seeding until its last seed answered (a later seeding
     /// does not drop them); added to the book on the next
     /// [`PeerPool::next`].
-    later_seeds: Vec<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
+    later_seeds: Vec<tokio::sync::mpsc::UnboundedReceiver<Seeding>>,
     /// The tables changed since they were last saved.
     changed: bool,
 }
@@ -631,7 +631,7 @@ impl PeerPool {
 
     /// Add what seeds that answered after seeding returned gave, counted
     /// with what the last seeding added (which decides when the seeds are
-    /// asked again).
+    /// asked again); a proxy failure counts as during seeding.
     fn add_later_seeds(&self) {
         use tokio::sync::mpsc::error::TryRecvError;
         let mut inner = self.lock();
@@ -639,19 +639,23 @@ impl PeerPool {
         inner.later_seeds.retain_mut(|later| {
             loop {
                 match later.try_recv() {
-                    Ok(found) => answers.push(found),
+                    Ok(answer) => answers.push(answer),
                     Err(TryRecvError::Empty) => break true,
                     Err(TryRecvError::Disconnected) => break false,
                 }
             }
         });
-        for found in answers {
-            let added = self.add_seeded(&mut inner, &found);
+        for answer in answers {
+            if let Some(error) = answer.proxy_error {
+                tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+                inner.seed_error = Some(error);
+            }
+            let added = self.add_seeded(&mut inner, &answer.found);
             if let Some((_, last_added)) = inner.last_seed.as_mut() {
                 *last_added += added;
             }
             tracing::debug!(
-                addresses = found.len(),
+                addresses = answer.found.len(),
                 added,
                 known = inner.known(),
                 "peer discovery: a seed answered after seeding returned"
@@ -888,11 +892,13 @@ impl PeerPool {
     /// As if a seeding had returned while seeds were still being asked:
     /// their answers come through `later`.
     #[cfg(test)]
-    pub(crate) fn queue_later_seeds(
-        &self,
-        later: tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>,
-    ) {
+    pub(crate) fn queue_later_seeds(&self, later: tokio::sync::mpsc::UnboundedReceiver<Seeding>) {
         self.lock().later_seeds.push(later);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_error(&self) -> Option<String> {
+        self.lock().seed_error.clone()
     }
 
     #[cfg(test)]

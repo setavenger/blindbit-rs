@@ -356,6 +356,45 @@ fn proxied_seeding_does_not_wait_for_the_slowest_seed() {
     });
 }
 
+/// A seed still being asked when seeding returned, whose connection then
+/// finds the proxy down, is handled as during seeding: the proxy's failure
+/// is noted (and logged as a warning), not taken for the seed's.
+#[test]
+fn the_proxy_failing_for_a_seed_that_answers_late_is_noted() {
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.quick-seed.invalid",
+        seed_node(Answer::Now, gossip_of(1, 25)).0,
+    );
+    // Unrouted: once let through, its filter name fails at once and its
+    // bare name is asked on a new connection to the proxy.
+    let held = proxy.hold(name("x9.late-seed.invalid"));
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Dns(&["quick-seed.invalid", "late-seed.invalid"]),
+    );
+    let PeerSource::Discovered(pool) = &*source else {
+        unreachable!()
+    };
+    run(async {
+        source
+            .next(Purpose::Block, &HashSet::new())
+            .await
+            .expect("seeded");
+        assert_eq!(pool.seed_error(), None);
+        proxy.go_down();
+        held.open();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while pool.seed_error().is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = source.next(Purpose::Block, &HashSet::new()).await;
+        }
+    });
+    let error = pool.seed_error().expect("the proxy's failure is noted");
+    assert!(error.contains("p2p_proxy"), "{error}");
+}
+
 #[test]
 fn a_seed_without_the_filter_name_is_asked_by_its_bare_name() {
     let proxy = FakeSocks5::start();

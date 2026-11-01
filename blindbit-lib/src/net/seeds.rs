@@ -56,8 +56,9 @@ pub(crate) struct Seeding {
     pub(crate) proxy_error: Option<String>,
     /// The answers of seeds still being asked when the others had given
     /// enough addresses ([`ENOUGH_SEEDED`]), one message per seed as it
-    /// answers.
-    pub(crate) later: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
+    /// answers: its addresses, or the proxy's failure (no `later` of its
+    /// own).
+    pub(crate) later: Option<tokio::sync::mpsc::UnboundedReceiver<Seeding>>,
 }
 
 /// An address a seed gave.
@@ -205,29 +206,18 @@ async fn through_proxy(
         let Ok((seed, answer)) = answer else {
             continue;
         };
-        match answer {
-            Ok(addrs) => seeding.found.extend(seeded_by(seed, addrs)),
-            Err(e) if is_proxy_down(&e) => seeding.proxy_error = Some(e.to_string()),
-            Err(e) => {
-                tracing::debug!(seed, error = %e, "a seed could not be asked through the proxy")
-            }
-        }
+        take_answer(&mut seeding, seed, answer);
         if seeding.found.len() >= ENOUGH_SEEDED && !asks.is_empty() {
             let (later, answers) = tokio::sync::mpsc::unbounded_channel();
             tokio::spawn(async move {
                 while let Some(answer) = asks.join_next().await {
-                    match answer {
-                        Ok((seed, Ok(addrs))) => {
-                            if later.send(seeded_by(seed, addrs)).is_err() {
-                                return;
-                            }
-                        }
-                        Ok((seed, Err(e))) => tracing::debug!(
-                            seed,
-                            error = %e,
-                            "a seed could not be asked through the proxy"
-                        ),
-                        Err(_) => {}
+                    let Ok((seed, answer)) = answer else {
+                        continue;
+                    };
+                    let mut one = Seeding::default();
+                    take_answer(&mut one, seed, answer);
+                    if later.send(one).is_err() {
+                        return;
                     }
                 }
             });
@@ -236,6 +226,18 @@ async fn through_proxy(
         }
     }
     seeding
+}
+
+/// Take `seed`'s answer into `seeding`: its node's addresses, or why the
+/// proxy failed; any other failure is only logged.
+fn take_answer(seeding: &mut Seeding, seed: &'static str, answer: io::Result<Vec<AddrV2Message>>) {
+    match answer {
+        Ok(addrs) => seeding.found.extend(seeded_by(seed, addrs)),
+        Err(e) if is_proxy_down(&e) => seeding.proxy_error = Some(e.to_string()),
+        Err(e) => {
+            tracing::debug!(seed, error = %e, "a seed could not be asked through the proxy")
+        }
+    }
 }
 
 /// The addresses `seed`'s node gave, as seeded addresses.
