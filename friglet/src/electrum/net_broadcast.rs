@@ -12,7 +12,9 @@
 //! - **Senders** ([`SENDERS`]): opened once observers are ready, with relay
 //!   off and nothing else asked for, like Bitcoin Core 31's private
 //!   broadcast: `inv`, the peer's `getdata`, `tx`, then `ping`/`pong` so the
-//!   peer has processed it. Then they only listen.
+//!   peer has processed it. Then they only listen. When no observer has it
+//!   a while after the latest hand-over, one more sender gets it, at most
+//!   [`MAX_HAND_OVERS`] in all ([`Timing::rotate_after`]).
 //! - Every peer of a broadcast is in a different network group (/16, /32),
 //!   so observers and senders are unlikely to share an operator.
 //!
@@ -53,6 +55,12 @@ use super::relay::{self, Candidate, Parents, Signals};
 const OBSERVERS: usize = 3;
 /// Peers the transaction is handed to.
 const SENDERS: usize = 2;
+/// Peers the transaction is handed to at most, rotations included
+/// ([`Timing::rotate_after`]): two more than [`SENDERS`]. Every one is one
+/// more stranger that sees this computer's address (or a Tor exit) hand
+/// the transaction over, so a further sender only replaces ones that kept
+/// it to themselves, and only twice.
+const MAX_HAND_OVERS: usize = 4;
 /// A rejection needs at least this many senders giving the same answer
 /// (and every sender that got it): one peer's word is worth little, and a
 /// parent one peer lacks may just not have reached it yet.
@@ -141,9 +149,19 @@ struct Timing {
     /// How long a sender waits for the pong that follows the transaction:
     /// a sender that gets none says nothing about the transaction.
     flush_wait: Duration,
+    /// When no observer has had the transaction this long after the latest
+    /// hand-over, the peers that got it most likely keep it to themselves
+    /// (they dropped it, or went away): one more sender gets it, up to
+    /// [`MAX_HAND_OVERS`].
+    rotate_after: Duration,
 }
 
 impl Timing {
+    /// Rotation after 10 s: a peer that takes the transaction passes it on
+    /// within seconds, and an observer announces it to friglet (an inbound
+    /// connection for it) every 5 s on average, so two such rounds with
+    /// none seeing it means it is not spreading. With the hand-over about
+    /// 3 s into the 25 s budget, a further sender still has about 10 s.
     const DIRECT: Self = Self {
         observers_at_start: OBSERVERS,
         observer_tries: 9,
@@ -152,6 +170,7 @@ impl Timing {
         observer_limit: Duration::from_secs(12),
         hedge_every: None,
         flush_wait: FLUSH_WAIT,
+        rotate_after: Duration::from_secs(10),
     };
 
     /// Through Tor: six observers at the start and more every 6 s while
@@ -159,7 +178,9 @@ impl Timing {
     /// 2 s settle wait); senders likewise. The window covers a slower
     /// circuit; the limit, two rounds of hedging after the first dead
     /// addresses time out (20 s). The pong crosses a circuit (on signet one
-    /// took over 5 s).
+    /// took over 5 s). Rotation after 12 s: the observers' announcements
+    /// cross circuits too, and the 45 s budget leaves room for one more
+    /// circuit after a hand-over 20 s in.
     const PROXIED: Self = Self {
         observers_at_start: 2 * OBSERVERS,
         observer_tries: 18,
@@ -168,6 +189,7 @@ impl Timing {
         observer_limit: Duration::from_secs(30),
         hedge_every: Some(Duration::from_secs(6)),
         flush_wait: Duration::from_secs(15),
+        rotate_after: Duration::from_secs(12),
     };
 
     fn for_peers(peers: &PeerSource) -> Self {
@@ -217,6 +239,7 @@ struct Job {
     candidate: Arc<Candidate>,
     /// [`History::parents`].
     parents: Arc<Vec<Transaction>>,
+    timing: Timing,
     stop: CancellationToken,
     deadline: Instant,
     events: mpsc::UnboundedSender<Event>,
@@ -233,9 +256,11 @@ struct Ledger {
     closed: bool,
     /// (transaction, peer), in the order they were let through.
     handed: Vec<(Txid, PeerAddr)>,
-    /// Hand-over slots taken ([`Job::claim_hand_over`]): with hedged
-    /// senders, no more than [`SENDERS`] hand the transaction over.
+    /// Hand-over slots taken ([`Job::claim_hand_over`]) and allowed: with
+    /// hedged senders, no more than `slots` hand the transaction over;
+    /// [`SENDERS`], raised by each rotation.
     slots_taken: usize,
+    slots: usize,
     /// Open connections, shut down when the broadcast ends.
     sockets: Vec<(u64, TcpStream)>,
     next_socket: u64,
@@ -246,6 +271,7 @@ impl Job {
         peers: Arc<PeerSource>,
         candidate: Arc<Candidate>,
         parents: Vec<Transaction>,
+        timing: Timing,
         deadline: Instant,
         events: mpsc::UnboundedSender<Event>,
     ) -> Self {
@@ -253,10 +279,14 @@ impl Job {
             peers,
             candidate,
             parents: Arc::new(parents),
+            timing,
             stop: CancellationToken::new(),
             deadline,
             events,
-            ledger: Arc::default(),
+            ledger: Arc::new(Mutex::new(Ledger {
+                slots: SENDERS,
+                ..Ledger::default()
+            })),
         }
     }
 
@@ -274,15 +304,20 @@ impl Job {
         self.ledger.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Take one of the [`SENDERS`] hand-over slots; `false` when they are
-    /// all taken or the broadcast has ended.
+    /// Take one of the hand-over slots; `false` when they are all taken or
+    /// the broadcast has ended.
     fn claim_hand_over(&self) -> bool {
         let mut ledger = self.ledger();
-        if ledger.closed || ledger.slots_taken >= SENDERS {
+        if ledger.closed || ledger.slots_taken >= ledger.slots {
             return false;
         }
         ledger.slots_taken += 1;
         true
+    }
+
+    /// One more hand-over slot, for a rotation.
+    fn add_hand_over_slot(&self) {
+        self.ledger().slots += 1;
     }
 
     /// Give a slot back: the sender did not hand the transaction over.
@@ -387,8 +422,11 @@ struct Round {
     peers: HashMap<PeerAddr, State>,
     /// Peers in the order they were handed the transaction.
     sent_to: Vec<PeerAddr>,
-    /// When the first of them got it.
+    /// When the first of them got it, and the latest.
     handed_over_at: Option<Instant>,
+    last_handed_over_at: Option<Instant>,
+    /// Hand-over slots: [`SENDERS`], one more per rotation.
+    slots: usize,
     refused: HashMap<PeerAddr, Signal>,
     fee_filters: Vec<(PeerAddr, u64)>,
     observer_tries: usize,
@@ -411,6 +449,8 @@ impl Round {
             peers: HashMap::new(),
             sent_to: Vec::new(),
             handed_over_at: None,
+            last_handed_over_at: None,
+            slots: SENDERS,
             refused: HashMap::new(),
             fee_filters: Vec::new(),
             observer_tries: 0,
@@ -515,6 +555,7 @@ impl Round {
                 tracing::debug!(peer = %addr, "broadcast: handed the transaction over");
                 self.sent_to.push(addr.clone());
                 self.handed_over_at.get_or_insert_with(Instant::now);
+                self.last_handed_over_at = Some(Instant::now());
                 self.peers
                     .insert(addr, State::Sending { handed_over: true });
             }
@@ -537,7 +578,7 @@ impl Round {
                 }
                 Some(State::Sending { handed_over }) => {
                     self.peers.insert(addr, State::SenderGone { handed_over });
-                    if !handed_over && self.sent_to.len() + self.senders_connecting() < SENDERS {
+                    if !handed_over && self.sent_to.len() + self.senders_connecting() < self.slots {
                         self.launch(job, false).await;
                     }
                 }
@@ -549,13 +590,13 @@ impl Round {
     /// Through a proxy: start more connections alongside the ones not up
     /// yet, which are probably to dead addresses. Observers until enough
     /// are ready; then senders until enough have handed it over (a hedged
-    /// sender hands nothing over once [`SENDERS`] slots are taken).
+    /// sender hands nothing over once every slot is taken).
     async fn hedge(&mut self, job: &Job) {
         if self.seen_by.is_some() {
             return;
         }
         let (observer, missing) = if self.senders_started {
-            (false, SENDERS.saturating_sub(self.sent_to.len()))
+            (false, self.slots.saturating_sub(self.sent_to.len()))
         } else {
             (true, OBSERVERS.saturating_sub(self.observers_ready()))
         };
@@ -564,6 +605,35 @@ impl Round {
                 break;
             }
         }
+    }
+
+    /// When the next sender may get the transaction if still nobody has
+    /// seen it ([`Timing::rotate_after`]); `None` while a sender is still
+    /// on its way, before the first hand-over, or after the last allowed.
+    fn rotation_due(&self) -> Option<Instant> {
+        let last = self.last_handed_over_at?;
+        let rotate = self.senders_started
+            && self.seen_by.is_none()
+            && self.proxy_down.is_none()
+            && self.senders_connecting() == 0
+            && self.sent_to.len() < MAX_HAND_OVERS
+            && self.sender_tries < self.timing.sender_tries;
+        rotate.then(|| last + self.timing.rotate_after)
+    }
+
+    /// Hand the transaction to one more sender (a free slot, or a new one
+    /// up to [`MAX_HAND_OVERS`]), its earlier ones and their groups still
+    /// passed over.
+    async fn rotate(&mut self, job: &Job) {
+        tracing::debug!(
+            handed_over = self.sent_to.len(),
+            "broadcast: no observer has it; handing it to one more peer"
+        );
+        if self.sent_to.len() >= self.slots {
+            self.slots += 1;
+            job.add_hand_over_slot();
+        }
+        self.launch(job, false).await;
     }
 
     fn should_start_senders(&self) -> bool {
@@ -601,7 +671,7 @@ impl Round {
         // none is connecting, or all the hand-over slots are taken (hedged
         // senders still connecting hand nothing over then).
         if self.sent_to.len() >= REFUSALS
-            && (self.senders_connecting() == 0 || self.sent_to.len() >= SENDERS)
+            && (self.senders_connecting() == 0 || self.sent_to.len() >= self.slots)
         {
             let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
             let first = signals.next().flatten().copied()?;
@@ -665,10 +735,21 @@ pub async fn broadcast(
     budget: Duration,
     history: History,
 ) -> Result<Report, String> {
-    let deadline = Instant::now() + budget;
     let timing = Timing::for_peers(&peers);
+    broadcast_paced(peers, candidate, budget, history, timing).await
+}
+
+/// [`broadcast`] at the pace of `timing`.
+async fn broadcast_paced(
+    peers: Arc<PeerSource>,
+    candidate: Arc<Candidate>,
+    budget: Duration,
+    history: History,
+    timing: Timing,
+) -> Result<Report, String> {
+    let deadline = Instant::now() + budget;
     let (events, mut received) = mpsc::unbounded_channel();
-    let job = Job::new(peers, candidate, history.parents, deadline, events);
+    let job = Job::new(peers, candidate, history.parents, timing, deadline, events);
     // Every connection of this broadcast ends when it returns.
     let _close = CloseOnDrop(job.clone());
     let mut round = Round::new(timing, history.handed_to);
@@ -693,6 +774,11 @@ pub async fn broadcast(
         {
             round.hedge(&job).await;
             next_hedge = Some(Instant::now() + every);
+        }
+        if round.end(deadline).is_none()
+            && round.rotation_due().is_some_and(|at| Instant::now() >= at)
+        {
+            round.rotate(&job).await;
         }
         if let Some(end) = round.end(deadline) {
             // From here on nothing is handed over, and every peer that may
@@ -722,6 +808,9 @@ pub async fn broadcast(
                 .min(round.started + timing.observer_limit);
         }
         if let Some(at) = next_hedge {
+            wake = wake.min(at);
+        }
+        if let Some(at) = round.rotation_due() {
             wake = wake.min(at);
         }
         tokio::select! {
@@ -940,8 +1029,7 @@ fn send(job: Job, addr: PeerAddr) {
             &mut peer,
             &candidate,
             &mut signals,
-            job.deadline
-                .min(Instant::now() + Timing::for_peers(&job.peers).flush_wait),
+            job.deadline.min(Instant::now() + job.timing.flush_wait),
         )?;
         flushed = true;
         // A parent request comes seconds later (Bitcoin Core delays
@@ -1376,6 +1464,79 @@ mod tests {
         );
     }
 
+    /// [`Timing::DIRECT`] with a further sender after `rotate_after`.
+    fn rotating_after(rotate_after: Duration) -> Timing {
+        Timing {
+            rotate_after,
+            ..Timing::DIRECT
+        }
+    }
+
+    /// The first two peers it is handed to keep it to themselves; after a
+    /// quiet spell with no observer seeing it, one more sender gets it,
+    /// takes it, and an observer has it next.
+    #[tokio::test]
+    async fn a_further_sender_gets_it_after_a_quiet_spell() {
+        let net = FakeNet::with_first_policies(vec![TxPolicy::Ignore, TxPolicy::Ignore]);
+        let fakes = net_of(&net, 221, vec![Script::default(); 6]);
+        let candidate = candidate(22);
+        let peers = pool(&addrs(&fakes)).await;
+        let rotate_after = Duration::from_secs(2);
+        let started = Instant::now();
+        let report = broadcast_paced(
+            peers,
+            candidate.clone(),
+            Duration::from_secs(15),
+            History::default(),
+            rotating_after(rotate_after),
+        )
+        .await
+        .unwrap();
+        let Verdict::InMempool { by } = &report.verdict else {
+            panic!("expected success, got {report:?}");
+        };
+        assert!(
+            started.elapsed() >= rotate_after,
+            "not before the quiet spell"
+        );
+        assert_eq!(report.sent_to.len(), SENDERS + 1, "{report:?}");
+        assert!(!report.sent_to.contains(by));
+        assert_eq!(
+            fakes.iter().filter(|fake| got_tx(fake)).count(),
+            SENDERS + 1
+        );
+    }
+
+    /// Nobody ever takes it: further senders stop at [`MAX_HAND_OVERS`].
+    #[tokio::test]
+    async fn further_senders_stop_at_the_cap() {
+        let net = FakeNet::new();
+        let silent = Script {
+            policy: TxPolicy::Ignore,
+            ..Script::default()
+        };
+        let fakes = net_of(&net, 230, vec![silent; 9]);
+        let peers = pool(&addrs(&fakes)).await;
+        let report = broadcast_paced(
+            peers,
+            candidate(23),
+            Duration::from_secs(6),
+            History::default(),
+            rotating_after(Duration::from_millis(500)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(report.verdict, Verdict::Unconfirmed { .. }),
+            "{report:?}"
+        );
+        assert_eq!(report.sent_to.len(), MAX_HAND_OVERS, "{report:?}");
+        assert_eq!(
+            fakes.iter().filter(|fake| got_tx(fake)).count(),
+            MAX_HAND_OVERS
+        );
+    }
+
     /// A peer an earlier attempt handed the transaction to may hold it only
     /// because friglet gave it to it: it never confirms it. Two of four
     /// peers got it before and keep it to themselves, the other two never
@@ -1626,7 +1787,14 @@ mod tests {
         let peers = pool(&[fake.addr]).await;
         let (events, received) = mpsc::unbounded_channel();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let job = Job::new(peers, candidate(seed), Vec::new(), deadline, events);
+        let job = Job::new(
+            peers,
+            candidate(seed),
+            Vec::new(),
+            Timing::DIRECT,
+            deadline,
+            events,
+        );
         (job, received)
     }
 
