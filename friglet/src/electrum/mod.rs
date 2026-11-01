@@ -748,12 +748,9 @@ type BroadcastResult = Result<String, (i32, String)>;
 enum RecentBroadcast {
     /// Accepted, or refused for a reason that does not go away.
     Final(BroadcastResult),
-    /// Not seen in a mempool when the wait ended; `sent_to` are the
-    /// discovered peers it was handed to.
-    Inconclusive {
-        error: (i32, String),
-        sent_to: Vec<PeerAddr>,
-    },
+    /// Not seen in a mempool when the wait ended. The discovered peers it
+    /// was handed to are in the pending store ([`PendingStore::handed_to`]).
+    Inconclusive { error: (i32, String) },
 }
 
 /// Relay a transaction and answer with its txid only once it is in a
@@ -780,13 +777,13 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
         Some(RecentBroadcast::Final(result)) => return result,
         // It may have been accepted after the wait ended: one quick look
         // before repeating the answer.
-        Some(RecentBroadcast::Inconclusive { error, sent_to }) => {
+        Some(RecentBroadcast::Inconclusive { error }) => {
             let candidate = Arc::new(candidate);
-            if !in_mempool_now(state, &candidate, &sent_to).await {
+            if !in_mempool_now(state, &candidate).await {
                 return Err(error);
             }
             tracing::info!(%txid, "broadcast reached a mempool after the wait ended");
-            accept_pending(state, &candidate, &sent_to).await;
+            accept_pending(state, &candidate, &[]).await;
             remember_broadcast(state, &wtxid, RecentBroadcast::Final(Ok(txid.clone()))).await;
             return Ok(txid);
         }
@@ -816,12 +813,8 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
 }
 
 /// Is `candidate` in a mempool now? The own node's, or that of one
-/// discovered peer outside `sent_to`.
-async fn in_mempool_now(
-    state: &ElectrumServerState,
-    candidate: &Arc<Candidate>,
-    sent_to: &[PeerAddr],
-) -> bool {
+/// discovered peer it was never handed to.
+async fn in_mempool_now(state: &ElectrumServerState, candidate: &Arc<Candidate>) -> bool {
     let peers = state.chain.peers().clone();
     if peers.is_own_node() {
         let task_candidate = candidate.clone();
@@ -831,9 +824,13 @@ async fn in_mempool_now(
         .await;
         return matches!(answer, Ok((true, _)));
     }
-    let exclude = sent_to.iter().cloned().collect();
+    let exclude = state
+        .pending
+        .lock()
+        .await
+        .handed_to(&candidate.txid.to_string());
     let candidates = Arc::new(vec![Candidate::clone(candidate)]);
-    match net_broadcast::ask_mempools(&peers, candidates, &exclude, true, 1).await {
+    match ask_others(&peers, candidates, &exclude, 1).await {
         Ok(asked) => {
             for (peer, rate) in &asked.fee_filters {
                 state.chain.note_fee_filter(peer, Some(*rate));
@@ -894,7 +891,6 @@ async fn broadcast_to_own_node(
             tracing::warn!(%txid, peer = %addr, reason = %message, "broadcast not accepted");
             RecentBroadcast::Inconclusive {
                 error: (1, message),
-                sent_to: Vec::new(),
             }
         }
     })
@@ -914,7 +910,12 @@ async fn broadcast_to_network(
     } else {
         BROADCAST_BUDGET
     };
-    let report = net_broadcast::broadcast(peers, candidate.clone(), budget)
+    // Peers that got it from an earlier attempt (before a restart too)
+    // never confirm it.
+    let history = net_broadcast::History {
+        handed_to: state.pending.lock().await.handed_to(&txid),
+    };
+    let report = net_broadcast::broadcast(peers, candidate.clone(), budget, history)
         .await
         .map_err(|error| {
             tracing::warn!(%txid, %error, "broadcast failed");
@@ -924,6 +925,12 @@ async fn broadcast_to_network(
         state.chain.note_fee_filter(peer, Some(*rate));
     }
     let sent_to = report.sent_to;
+    // Whatever the verdict: the next attempt and every recheck know.
+    {
+        let mut store = state.pending.lock().await;
+        store.note_handed_to(&txid, &sent_to);
+        store.save();
+    }
     let senders = sent_to
         .iter()
         .map(ToString::to_string)
@@ -953,7 +960,6 @@ async fn broadcast_to_network(
             tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast dropped by every peer it was handed to");
             RecentBroadcast::Inconclusive {
                 error: (1, message),
-                sent_to,
             }
         }
         Verdict::Unconfirmed { waited } => {
@@ -966,7 +972,6 @@ async fn broadcast_to_network(
             tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast not confirmed");
             RecentBroadcast::Inconclusive {
                 error: (1, message),
-                sent_to,
             }
         }
     })
@@ -1043,7 +1048,7 @@ async fn accept_pending(state: &ElectrumServerState, candidate: &Candidate, sent
         let mut store = state.pending.lock().await;
         let replaced = store.conflicting(&txid, &pending::spent_outpoints(&candidate.tx));
         for other in &replaced {
-            store.remove(other);
+            store.retire(other);
         }
         store.insert(txid.clone(), raw_hex, sent_to);
         store.save();
@@ -1211,23 +1216,7 @@ async fn recheck_on_network(
             .map(|(candidate, _)| candidate)
             .collect(),
     );
-    // Many pending transactions can rule out every group the pool knows:
-    // then only the peers themselves are passed over.
-    let mut asked = Err(String::new());
-    for avoid_groups in [true, false] {
-        asked = net_broadcast::ask_mempools(
-            &peers,
-            candidates.clone(),
-            &sent_to,
-            avoid_groups,
-            RECHECK_PEERS,
-        )
-        .await;
-        if asked.is_ok() {
-            break;
-        }
-    }
-    let asked = match asked {
+    let asked = match ask_others(&peers, candidates.clone(), &sent_to, RECHECK_PEERS).await {
         Ok(asked) => asked,
         Err(error) => {
             tracing::warn!(%error, "could not recheck pending broadcasts");
@@ -1293,6 +1282,28 @@ async fn recheck_on_network(
     )
 }
 
+/// Ask up to `count` discovered peers outside `exclude` (the peers the
+/// candidates were handed to), and outside their network groups while the
+/// pool has others: many pending transactions can rule out every group it
+/// knows, and then only the peers themselves are passed over.
+async fn ask_others(
+    peers: &Arc<PeerSource>,
+    candidates: Arc<Vec<Candidate>>,
+    exclude: &HashSet<PeerAddr>,
+    count: usize,
+) -> Result<net_broadcast::Asked, String> {
+    let mut asked = Err(String::new());
+    for avoid_groups in [true, false] {
+        asked =
+            net_broadcast::ask_mempools(peers, candidates.clone(), exclude, avoid_groups, count)
+                .await;
+        if asked.is_ok() {
+            break;
+        }
+    }
+    asked
+}
+
 /// Record a recheck: seen ones are fresh again, ones out of every mempool
 /// for longer than Bitcoin Core keeps anything are dropped. Returns whether
 /// the index changed.
@@ -1319,7 +1330,8 @@ async fn settle_rechecked(state: &ElectrumServerState, checked: Vec<Rechecked>) 
     if !expired.is_empty() {
         let mut index = state.index.lock().await;
         for txid in &expired {
-            store.remove(txid);
+            // A resend may come: the peers it went to still never confirm it.
+            store.retire(txid);
             index_changed |= pending::unindex_unconfirmed(&mut index, txid);
             tracing::warn!(
                 %txid,
@@ -1968,7 +1980,6 @@ mod tests {
             &tx.compute_wtxid().to_string(),
             RecentBroadcast::Inconclusive {
                 error: (1, "not accepted".into()),
-                sent_to: Vec::new(),
             },
         )
         .await;
@@ -2279,15 +2290,7 @@ mod tests {
                 ],
             );
             let state = state_with(index, discovered(&fakes).await, &dir);
-            remember_broadcast(
-                &state,
-                &tx.compute_wtxid().to_string(),
-                RecentBroadcast::Inconclusive {
-                    error: (1, "not confirmed".into()),
-                    sent_to: vec![fakes[0].addr.into()],
-                },
-            )
-            .await;
+            inconclusive(&state, &tx, &[fakes[0].addr.into()]).await;
             let response = call(
                 &state,
                 "blockchain.transaction.broadcast",
@@ -2297,6 +2300,146 @@ mod tests {
             assert_eq!(response["result"], json!(txid));
             assert!(fakes[0].conns().is_empty(), "the sender was not asked");
             assert_eq!(fakes[1].conns().len(), 1);
+            // Accepted: the earlier recipient stays out of rechecks.
+            let store = state.pending.lock().await;
+            assert!(
+                store
+                    .entries()
+                    .next()
+                    .unwrap()
+                    .1
+                    .sent_to()
+                    .contains(&fakes[0].addr.into())
+            );
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// An inconclusive attempt that handed `tx` to `sent_to`, as the
+        /// broadcast records it.
+        async fn inconclusive(state: &ElectrumServerState, tx: &Transaction, sent_to: &[PeerAddr]) {
+            let txid = tx.compute_txid().to_string();
+            let mut store = state.pending.lock().await;
+            store.note_handed_to(&txid, sent_to);
+            store.save();
+            drop(store);
+            remember_broadcast(
+                state,
+                &tx.compute_wtxid().to_string(),
+                RecentBroadcast::Inconclusive {
+                    error: (1, "not confirmed".into()),
+                },
+            )
+            .await;
+        }
+
+        /// With every other network group ruled out, a resend still looks
+        /// at a peer it was not handed to, in a group that one shares.
+        #[tokio::test]
+        async fn a_resend_falls_back_to_a_peer_in_a_recipients_group() {
+            let dir = temp_dir("net-resend-groups");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let net = FakeNet::new();
+            let sender = net.peer([127, 165, 0, 1].into(), Script::default());
+            let neighbour = net.peer(
+                [127, 165, 0, 2].into(),
+                Script {
+                    mempool: vec![raw.clone()],
+                    ..Script::default()
+                },
+            );
+            let fakes = [sender, neighbour];
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            inconclusive(&state, &tx, &[fakes[0].addr.into()]).await;
+            let response = call(
+                &state,
+                "blockchain.transaction.broadcast",
+                vec![json!(hex::encode(raw))],
+            )
+            .await;
+            assert_eq!(response["result"], json!(txid), "{response}");
+            assert!(fakes[0].conns().is_empty(), "the sender was not asked");
+            assert_eq!(fakes[1].conns().len(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// The peers an attempt that ended inconclusive handed the
+        /// transaction to are on disk, for the next attempt after a restart.
+        #[tokio::test]
+        async fn an_inconclusive_attempt_s_recipients_survive_a_restart() {
+            let dir = temp_dir("net-inconclusive-kept");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let net = FakeNet::new();
+            // Every peer handed it drops the connection: inconclusive.
+            let dropping = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Disconnect,
+                ..Script::default()
+            };
+            let fakes = fake_net(&net, 170, vec![dropping; 5]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert!(response["result"].is_null(), "{response}");
+            assert!(state.pending.lock().await.is_empty(), "not accepted");
+            let got_it: HashSet<PeerAddr> = fakes
+                .iter()
+                .filter(|fake| fake.commands().iter().any(|c| c == "tx"))
+                .map(|fake| fake.addr.into())
+                .collect();
+            assert_eq!(got_it.len(), 2);
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            assert_eq!(reloaded.handed_to(&txid), got_it);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// After a restart, a peer an earlier attempt handed the transaction
+        /// to never confirms it. Two of four peers got it before and keep it
+        /// to themselves; three observers out of four peers would include
+        /// one of them.
+        #[tokio::test]
+        async fn after_a_restart_an_earlier_recipient_never_confirms_it() {
+            let dir = temp_dir("net-earlier-recipient");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let holding = Script {
+                mempool: vec![raw.clone()],
+                ..Script::default()
+            };
+            let earlier = [
+                FakeNet::new().peer([127, 175, 0, 1].into(), holding.clone()),
+                FakeNet::new().peer([127, 176, 0, 1].into(), holding),
+            ];
+            let net = FakeNet::new();
+            let silent = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Ignore,
+                ..Script::default()
+            };
+            let others = fake_net(&net, 177, vec![silent; 2]);
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                let handed: Vec<PeerAddr> = earlier.iter().map(|f| f.addr.into()).collect();
+                store.note_handed_to(&txid, &handed);
+                store.save();
+            }
+            let all: Vec<FakePeer> = earlier.into_iter().chain(others).collect();
+            let state = state_with(index, discovered(&all).await, &dir);
+            let response = call(
+                &state,
+                "blockchain.transaction.broadcast",
+                vec![json!(hex::encode(raw))],
+            )
+            .await;
+            assert!(response["result"].is_null(), "{response}");
+            for fake in &all[..2] {
+                assert!(fake.conns().is_empty(), "{} was contacted", fake.addr);
+            }
             std::fs::remove_dir_all(dir).unwrap();
         }
 

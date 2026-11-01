@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::{Txid, Wtxid};
-use blindbit_lib::net::{NetGroup, PeerAddr, PeerEvent, PeerSource, Purpose};
+use blindbit_lib::net::{NetGroup, NoPeers, PeerAddr, PeerEvent, PeerSource, Purpose};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +63,16 @@ const ANNOUNCE_WAIT: Duration = Duration::from_secs(5);
 const FLUSH_WAIT: Duration = Duration::from_secs(5);
 /// How often blocking loops look at the stop token.
 const STOP_CHECK: Duration = Duration::from_millis(250);
+
+/// What friglet knows from before about a transaction it broadcasts.
+#[derive(Debug, Default)]
+pub struct History {
+    /// Every discovered peer an earlier attempt or recheck handed it to:
+    /// it may hold it only because friglet gave it to it, so it is never
+    /// an observer (nor a sender), and peers in its network group are
+    /// passed over while the pool has others.
+    pub handed_to: HashSet<PeerAddr>,
+}
 
 /// How a broadcast ended, unless no peer could be asked.
 #[derive(Debug)]
@@ -354,6 +364,9 @@ enum State {
 struct Round {
     timing: Timing,
     started: Instant,
+    /// [`History::handed_to`] and its network groups.
+    earlier: HashSet<PeerAddr>,
+    earlier_groups: HashSet<NetGroup>,
     peers: HashMap<PeerAddr, State>,
     /// Peers in the order they were handed the transaction.
     sent_to: Vec<PeerAddr>,
@@ -372,10 +385,12 @@ struct Round {
 }
 
 impl Round {
-    fn new(timing: Timing) -> Self {
+    fn new(timing: Timing, history: History) -> Self {
         Self {
             timing,
             started: Instant::now(),
+            earlier_groups: history.handed_to.iter().map(PeerAddr::netgroup).collect(),
+            earlier: history.handed_to,
             peers: HashMap::new(),
             sent_to: Vec::new(),
             handed_over_at: None,
@@ -437,20 +452,22 @@ impl Round {
             return false;
         }
         *tries += 1;
-        let exclude: HashSet<PeerAddr> = self.peers.keys().cloned().collect();
-        let picked = tokio::time::timeout_at(
-            job.deadline.into(),
-            job.peers
-                .next_outside(Purpose::Relay, &exclude, &self.groups()),
-        )
-        .await;
+        let exclude: HashSet<PeerAddr> = self.peers.keys().chain(&self.earlier).cloned().collect();
+        // Outside the earlier recipients' groups too while the pool has
+        // peers there; never one of those peers.
+        let groups = self.groups();
+        let all_groups: HashSet<NetGroup> = groups.union(&self.earlier_groups).cloned().collect();
+        let mut picked = pick(job, &exclude, &all_groups).await;
+        if matches!(picked, Some(Err(_))) && all_groups.len() > groups.len() {
+            picked = pick(job, &exclude, &groups).await;
+        }
         let addr = match picked {
-            Ok(Ok(addr)) => addr,
-            Ok(Err(no_peers)) => {
+            Some(Ok(addr)) => addr,
+            Some(Err(no_peers)) => {
                 self.no_peers = Some(no_peers.to_string());
                 return false;
             }
-            Err(_) => return false,
+            None => return false,
         };
         let (task_job, task_addr) = (job.clone(), addr.clone());
         if observer {
@@ -604,13 +621,30 @@ impl Round {
     }
 }
 
+/// The pool's next relay peer outside `exclude` and `groups`; `None` when
+/// the broadcast's deadline passes first.
+async fn pick(
+    job: &Job,
+    exclude: &HashSet<PeerAddr>,
+    groups: &HashSet<NetGroup>,
+) -> Option<Result<PeerAddr, NoPeers>> {
+    tokio::time::timeout_at(
+        job.deadline.into(),
+        job.peers.next_outside(Purpose::Relay, exclude, groups),
+    )
+    .await
+    .ok()
+}
+
 /// Broadcast `candidate` to peers of the network and wait up to `budget`
-/// for a peer it was not handed to to serve it. `Err` (a message for the
-/// user) when no peer could be asked: nothing was sent then.
+/// for a peer it was not handed to (in this or an earlier attempt,
+/// `history`) to serve it. `Err` (a message for the user) when no peer
+/// could be asked: nothing was sent then.
 pub async fn broadcast(
     peers: Arc<PeerSource>,
     candidate: Arc<Candidate>,
     budget: Duration,
+    history: History,
 ) -> Result<Report, String> {
     let deadline = Instant::now() + budget;
     let timing = Timing::for_peers(&peers);
@@ -618,7 +652,7 @@ pub async fn broadcast(
     let job = Job::new(peers, candidate, deadline, events);
     // Every connection of this broadcast ends when it returns.
     let _close = CloseOnDrop(job.clone());
-    let mut round = Round::new(timing);
+    let mut round = Round::new(timing, history);
     for _ in 0..timing.observers_at_start {
         if !round.launch(&job, true).await {
             break;
@@ -1225,7 +1259,9 @@ mod tests {
 
     async fn run(fakes: &[FakePeer], candidate: &Arc<Candidate>, budget: Duration) -> Report {
         let peers = pool(&addrs(fakes)).await;
-        broadcast(peers, candidate.clone(), budget).await.unwrap()
+        broadcast(peers, candidate.clone(), budget, History::default())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1322,6 +1358,50 @@ mod tests {
         );
     }
 
+    /// A peer an earlier attempt handed the transaction to may hold it only
+    /// because friglet gave it to it: it never confirms it. Two of four
+    /// peers got it before and keep it to themselves, the other two never
+    /// get it; three observers out of four peers would include one of the
+    /// two.
+    #[tokio::test]
+    async fn a_peer_an_earlier_attempt_handed_it_to_never_confirms_it() {
+        let candidate = candidate(18);
+        let holding = Script {
+            mempool: vec![candidate.raw.clone()],
+            ..Script::default()
+        };
+        // Each on a net of its own: they pass it to nobody.
+        let earlier = [
+            FakeNet::new().peer(ip(200, 0), holding.clone()),
+            FakeNet::new().peer(ip(200, 1), holding),
+        ];
+        let net = FakeNet::new();
+        let silent = Script {
+            policy: TxPolicy::Ignore,
+            ..Script::default()
+        };
+        let others = [
+            net.peer(ip(200, 2), silent.clone()),
+            net.peer(ip(200, 3), silent),
+        ];
+        let all: Vec<SocketAddr> = earlier.iter().chain(&others).map(|f| f.addr).collect();
+        let peers = pool(&all).await;
+        let history = History {
+            handed_to: earlier.iter().map(|fake| fake.addr.into()).collect(),
+        };
+        let result = broadcast(peers, candidate, Duration::from_secs(10), history).await;
+        if let Ok(Report {
+            verdict: Verdict::InMempool { by },
+            ..
+        }) = &result
+        {
+            panic!("confirmed by {by}, which got it from friglet before");
+        }
+        for fake in &earlier {
+            assert!(fake.conns().is_empty(), "{} was contacted", fake.addr);
+        }
+    }
+
     #[tokio::test]
     async fn no_reachable_observer_is_an_error_and_nothing_is_sent() {
         // Closed ports, and a blocks-only peer.
@@ -1341,9 +1421,14 @@ mod tests {
         );
         all.push(blocks_only.addr);
         let peers = pool(&all).await;
-        let error = broadcast(peers, candidate(4), Duration::from_secs(20))
-            .await
-            .unwrap_err();
+        let error = broadcast(
+            peers,
+            candidate(4),
+            Duration::from_secs(20),
+            History::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.starts_with("no Bitcoin peers reachable to confirm the broadcast"),
             "{error}"
@@ -1419,9 +1504,14 @@ mod tests {
         let blocks_only = &fakes[4];
         let peers = pool(&addrs(&fakes)).await;
         for seed in [8, 9] {
-            let report = broadcast(peers.clone(), candidate(seed), Duration::from_secs(20))
-                .await
-                .unwrap();
+            let report = broadcast(
+                peers.clone(),
+                candidate(seed),
+                Duration::from_secs(20),
+                History::default(),
+            )
+            .await
+            .unwrap();
             assert!(
                 matches!(report.verdict, Verdict::InMempool { .. }),
                 "{report:?}"
@@ -1662,9 +1752,14 @@ mod tests {
         let fakes = net_of(&net, 150, vec![silent; 8]);
         let proxy = FakeSocks5::start();
         let peers = pool_via(&addrs(&fakes), proxy.dialer()).await;
-        let report = broadcast(peers, candidate(15), Duration::from_secs(6))
-            .await
-            .unwrap();
+        let report = broadcast(
+            peers,
+            candidate(15),
+            Duration::from_secs(6),
+            History::default(),
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(report.verdict, Verdict::Unconfirmed { .. }),
             "{report:?}"
@@ -1704,9 +1799,14 @@ mod tests {
             proxy: "127.0.0.1:1".parse().unwrap(),
         };
         let peers = pool_via(&addrs(&fakes), down).await;
-        let error = broadcast(peers.clone(), candidate(16), Duration::from_secs(20))
-            .await
-            .unwrap_err();
+        let error = broadcast(
+            peers.clone(),
+            candidate(16),
+            Duration::from_secs(20),
+            History::default(),
+        )
+        .await
+        .unwrap_err();
         for expected in [
             "no Bitcoin peers reachable to confirm the broadcast",
             "p2p_proxy 127.0.0.1:1",
@@ -1757,9 +1857,14 @@ mod tests {
         let (report, waited) = runtime.block_on(async {
             let peers = pool_via(&all, proxy.dialer()).await;
             let started = Instant::now();
-            let report = broadcast(peers, candidate(17), Duration::from_secs(45))
-                .await
-                .unwrap();
+            let report = broadcast(
+                peers,
+                candidate(17),
+                Duration::from_secs(45),
+                History::default(),
+            )
+            .await
+            .unwrap();
             (report, started.elapsed())
         });
         runtime.shutdown_background();
