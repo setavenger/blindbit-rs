@@ -1147,12 +1147,11 @@ async fn recheck_pending(state: &ElectrumServerState) {
     }
 }
 
-/// What a recheck found for one pending transaction.
+/// What a recheck found for one pending transaction. A discovered peer it
+/// was handed to again is already in its `sent_to`.
 struct Rechecked {
     txid: String,
     in_mempool: bool,
-    /// The discovered peer it was handed to again.
-    handed_to: Option<PeerAddr>,
 }
 
 /// Ask the own node about each pending transaction, re-announcing what its
@@ -1182,7 +1181,6 @@ async fn recheck_on_own_node(
                     .map(|(candidate, in_mempool)| Rechecked {
                         txid: candidate.txid.to_string(),
                         in_mempool,
-                        handed_to: None,
                     })
                     .collect(),
             )
@@ -1235,10 +1233,19 @@ async fn recheck_on_network(
     let lost: Vec<usize> = (0..candidates.len())
         .filter(|&i| !asked.present[i])
         .collect();
-    let mut handed_to = None;
     if !lost.is_empty() {
         // The first asked peer that takes them.
         for target in &asked.peers {
+            // Recorded (and saved) before anything is sent: a hand-over
+            // that fails halfway may still have left the peer holding some.
+            {
+                let mut store = state.pending.lock().await;
+                for &i in &lost {
+                    let txid = candidates[i].txid.to_string();
+                    store.note_handed_to(&txid, std::slice::from_ref(target));
+                }
+                store.save();
+            }
             let (task_peers, task_candidates, task_target, task_lost) = (
                 peers.clone(),
                 candidates.clone(),
@@ -1259,7 +1266,6 @@ async fn recheck_on_network(
                         requested = requested.iter().filter(|r| **r).count(),
                         "pending broadcasts were in no asked mempool; handed them to one of those peers"
                     );
-                    handed_to = Some(target.clone());
                     break;
                 }
                 Ok(Err(error)) => {
@@ -1276,7 +1282,6 @@ async fn recheck_on_network(
             .map(|(candidate, in_mempool)| Rechecked {
                 txid: candidate.txid.to_string(),
                 in_mempool,
-                handed_to: if in_mempool { None } else { handed_to.clone() },
             })
             .collect(),
     )
@@ -1321,9 +1326,6 @@ async fn settle_rechecked(state: &ElectrumServerState, checked: Vec<Rechecked>) 
             expired.push(rechecked.txid);
         } else {
             entry.reannounced += 1;
-            if let Some(peer) = &rechecked.handed_to {
-                entry.note_sent_to(peer);
-            }
         }
     }
     let mut index_changed = false;
@@ -2476,6 +2478,47 @@ mod tests {
             let (_, pending) = store.entries().next().unwrap();
             assert_eq!(pending.reannounced, 0, "it had it");
             drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A recheck's hand-over that fails after the transaction went out
+        /// (the peer drops the connection before the pong) still counts:
+        /// the peer may hold it, so it never confirms it later.
+        #[tokio::test]
+        async fn a_failed_recheck_hand_over_still_counts_as_handed_over() {
+            let dir = temp_dir("net-recheck-failed");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let net = FakeNet::new();
+            let dropping = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Disconnect,
+                ..Script::default()
+            };
+            let fakes = fake_net(
+                &net,
+                180,
+                vec![Script::default(), dropping.clone(), dropping],
+            );
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), raw_hex, &[fakes[0].addr.into()]);
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            recheck_pending(&state).await;
+            for fake in &fakes[1..] {
+                assert!(
+                    fake.commands().iter().any(|c| c == "tx"),
+                    "{} got it",
+                    fake.addr
+                );
+            }
+            let expected: HashSet<PeerAddr> = fakes.iter().map(|f| f.addr.into()).collect();
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            assert_eq!(reloaded.handed_to(&txid), expected);
             std::fs::remove_dir_all(dir).unwrap();
         }
 

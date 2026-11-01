@@ -46,15 +46,13 @@ pub struct PendingTx {
     /// Re-announcements after it went missing from the peer's mempool.
     #[serde(default)]
     pub reannounced: u32,
-    /// Discovered peers it was handed to, oldest first (at most
-    /// [`MAX_SENT_TO`]): a recheck asks other peers, whose word is not
-    /// their own echo. Empty with an own node.
+    /// Discovered peers it was handed to, oldest first: a recheck asks other
+    /// peers, whose word is not their own echo. None is forgotten while the
+    /// entry lives (at most one more per recheck, every 10 minutes for up to
+    /// 14 days). Empty with an own node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sent_to: Vec<String>,
 }
-
-/// Peers remembered per pending transaction in [`PendingTx::sent_to`].
-pub const MAX_SENT_TO: usize = 16;
 
 impl PendingTx {
     /// The peers it was handed to (addresses that do not parse are skipped).
@@ -62,14 +60,12 @@ impl PendingTx {
         parse_peers(&self.sent_to).collect()
     }
 
-    /// Remember that it was handed to `peer`, forgetting the oldest beyond
-    /// [`MAX_SENT_TO`].
+    /// Remember that it was handed to `peer`.
     pub fn note_sent_to(&mut self, peer: &PeerAddr) {
         let peer = peer.to_string();
-        self.sent_to.retain(|known| *known != peer);
-        self.sent_to.push(peer);
-        let excess = self.sent_to.len().saturating_sub(MAX_SENT_TO);
-        self.sent_to.drain(..excess);
+        if !self.sent_to.contains(&peer) {
+            self.sent_to.push(peer);
+        }
     }
 }
 
@@ -552,8 +548,10 @@ mod tests {
         assert_eq!(confirmed_height(&index, "tx"), Some(321));
     }
 
+    /// However many rechecks hand it over again, no peer that got it is
+    /// forgotten: a forgotten one would count as unrelated.
     #[test]
-    fn sent_to_keeps_the_latest_sixteen_peers() {
+    fn sent_to_forgets_no_peer() {
         let mut pending = PendingTx {
             raw_hex: String::new(),
             accepted_at: 0,
@@ -561,14 +559,13 @@ mod tests {
             reannounced: 0,
             sent_to: Vec::new(),
         };
-        let peer = |n: u8| -> PeerAddr { SocketAddr::from(([203, 0, 113, n], 38333)).into() };
-        for n in 0..20 {
+        for n in 0..200 {
             pending.note_sent_to(&peer(n));
         }
         pending.note_sent_to(&peer(19));
-        assert_eq!(pending.sent_to.len(), MAX_SENT_TO);
-        assert!(!pending.sent_to().contains(&peer(3)));
-        assert!(pending.sent_to().contains(&peer(4)));
-        assert_eq!(pending.sent_to.last().unwrap(), "203.0.113.19:38333");
+        assert_eq!(pending.sent_to.len(), 200);
+        assert!(pending.sent_to().contains(&peer(0)));
+        assert_eq!(pending.sent_to.first().unwrap(), "203.0.113.0:38333");
+        assert_eq!(pending.sent_to.last().unwrap(), "203.0.113.199:38333");
     }
 }
