@@ -22,12 +22,15 @@
 //! every [`POLL_INTERVAL`], or right after the observer announced it with
 //! `inv`. Nothing a sender says counts as success. A rejection needs at
 //! least two senders, and every sender that got the transaction, to give
-//! the same answer: all asked for one of its parents (missing or spent
-//! inputs; a parent friglet broadcast itself and still holds is handed over
-//! instead), or all dropped the connection before the pong (older Bitcoin
-//! Core versions do that with a consensus-invalid transaction, newer ones
-//! do not, and a peer can also just go away: reported, never proof).
-//! Anything else runs until the budget ends, as "not confirmed".
+//! the same answer: all dropped the connection before the pong (older
+//! Bitcoin Core versions do that with a consensus-invalid transaction,
+//! newer ones do not, and a peer can also just go away: reported, never
+//! proof), which ends the broadcast; or all asked for one of its parents
+//! (missing or spent inputs; a parent friglet broadcast itself and still
+//! holds is handed over instead), which is reported only if the budget
+//! ends with no observer having it: those peers may only lack an
+//! unconfirmed parent, so observing and further senders go on. Anything
+//! else runs until the budget ends, as "not confirmed".
 //!
 //! Pending broadcasts are rechecked the same way: peers they were not handed
 //! to are asked, and a lost one is handed to one of those
@@ -119,9 +122,10 @@ pub struct Report {
 pub enum Verdict {
     /// `by`, a peer the transaction was not handed to, served it.
     InMempool { by: PeerAddr },
-    /// Every sender (at least two) asked for a parent friglet does not hold:
-    /// its inputs are missing or spent, or those peers lack an unconfirmed
-    /// parent, so this is not final. The message is for the user.
+    /// Every sender (at least two) asked for a parent friglet does not hold,
+    /// and no observer had it when the wait ended: its inputs are missing or
+    /// spent, or those peers lack an unconfirmed parent, so this is not
+    /// final. The message is for the user.
     Rejected(String),
     /// Every sender (at least two) dropped the connection before answering
     /// the ping after the transaction. Older Bitcoin Core versions do that
@@ -724,40 +728,57 @@ impl Round {
             return gave_up.then(|| Err(self.unreachable("to take the transaction")));
         }
         if Instant::now() >= deadline {
-            return Some(Ok(self.unconfirmed()));
+            return Some(Ok(self.final_verdict()));
         }
-        if let Some(refused) = self.refused_by_all() {
-            return Some(Ok(refused));
+        if let Some(dropped) = self.dropped_by_all() {
+            return Some(Ok(dropped));
         }
         // Every observer went away and none can replace them (they are
         // replaced as they go while the pool has peers): nothing can
         // confirm it any more, so waiting on says nothing.
         if !observers_left {
-            return Some(Ok(self.unconfirmed()));
+            return Some(Ok(self.final_verdict()));
         }
         None
     }
 
-    /// Every sender that got it, and at least [`REFUSALS`] of them, refused
-    /// it the same way, and no other sender may still get it: none is
-    /// connecting, or all the hand-over slots are taken (hedged senders
-    /// still connecting hand nothing over then).
-    fn refused_by_all(&self) -> Option<Verdict> {
-        if self.sent_to.len() < REFUSALS
-            || (self.senders_connecting() > 0 && self.sent_to.len() < self.slots)
-        {
+    /// The signal every sender that got it, and at least [`REFUSALS`] of
+    /// them, gave.
+    fn refused_by_all(&self) -> Option<Signal> {
+        if self.sent_to.len() < REFUSALS {
             return None;
         }
         let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
         let first = signals.next().flatten().copied()?;
-        if !signals.all(|signal| signal == Some(&first)) {
+        signals
+            .all(|signal| signal == Some(&first))
+            .then_some(first)
+    }
+
+    /// Every sender that got it dropped the connection ([`Self::refused_by_all`]),
+    /// and no other sender may still get it: none is connecting, or all the
+    /// hand-over slots are taken (hedged senders still connecting hand
+    /// nothing over then). That ends the broadcast at once.
+    fn dropped_by_all(&self) -> Option<Verdict> {
+        if self.senders_connecting() > 0 && self.sent_to.len() < self.slots {
             return None;
         }
-        let message = rejected_message(first, self.sent_to.len());
-        Some(match first {
-            Signal::MissingInputs => Verdict::Rejected(message),
-            Signal::Dropped => Verdict::Dropped(message),
-        })
+        (self.refused_by_all()? == Signal::Dropped)
+            .then(|| Verdict::Dropped(rejected_message(Signal::Dropped, self.sent_to.len())))
+    }
+
+    /// The verdict when the wait is over and no observer had it. Senders
+    /// asking for a parent end nothing early: they may only lack an
+    /// unconfirmed parent while the transaction spreads from elsewhere, or
+    /// a further sender may take it. Only now, when every sender that got
+    /// it did, is it reported as missing inputs.
+    fn final_verdict(&self) -> Verdict {
+        match self.refused_by_all() {
+            Some(Signal::MissingInputs) => {
+                Verdict::Rejected(rejected_message(Signal::MissingInputs, self.sent_to.len()))
+            }
+            _ => self.unconfirmed(),
+        }
     }
 
     /// No observer had it: since the first hand-over (or the start). With
@@ -1802,6 +1823,8 @@ mod tests {
         );
     }
 
+    /// Every sender asking for a parent is a rejection once the wait is
+    /// over with no observer having it, not before.
     #[tokio::test]
     async fn every_sender_asking_for_a_parent_is_a_rejection() {
         let net = FakeNet::new();
@@ -1810,7 +1833,10 @@ mod tests {
             ..Script::default()
         };
         let fakes = net_of(&net, 55, vec![orphan; 5]);
-        let report = run(&fakes, &candidate(5), Duration::from_secs(20)).await;
+        let budget = Duration::from_secs(4);
+        let started = Instant::now();
+        let report = run(&fakes, &candidate(5), budget).await;
+        assert!(started.elapsed() >= budget, "ended before the budget");
         let Verdict::Rejected(message) = &report.verdict else {
             panic!("expected a rejection, got {report:?}");
         };
@@ -1819,6 +1845,32 @@ mod tests {
             message.starts_with("bad-txns-inputs-missingorspent: all 2 peers"),
             "{message}"
         );
+    }
+
+    /// The first two peers handed the transaction lack a parent friglet
+    /// does not hold and ask for it: that ends nothing. After the quiet
+    /// spell a further sender takes it, and an observer has it next. (One
+    /// peer more than needed: should the second sender be slow, the
+    /// rotation's sender may be the second one to lack the parent.)
+    #[tokio::test]
+    async fn two_senders_asking_for_a_parent_do_not_end_it_early() {
+        let net = FakeNet::with_first_policies(vec![TxPolicy::Orphan, TxPolicy::Orphan]);
+        let fakes = net_of(&net, 61, vec![Script::default(); 7]);
+        let peers = pool(&addrs(&fakes)).await;
+        let report = broadcast_paced(
+            peers,
+            candidate(26),
+            Duration::from_secs(20),
+            History::default(),
+            rotating_after(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+        let Verdict::InMempool { by } = &report.verdict else {
+            panic!("expected success, got {report:?}");
+        };
+        assert!(!report.sent_to.contains(by));
+        assert!(report.sent_to.len() > SENDERS, "{report:?}");
     }
 
     /// Only a request for one of its parents says a peer lacks its inputs:
