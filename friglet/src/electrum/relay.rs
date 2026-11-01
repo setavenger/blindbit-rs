@@ -669,6 +669,34 @@ mod tests {
         assert!(peer.commands().iter().any(|c| c == "tx"));
     }
 
+    /// A peer without wtxid relay is asked by txid and serves whatever
+    /// witness its mempool holds: the same txid with another witness is not
+    /// the transaction friglet has.
+    #[test]
+    fn a_mempool_copy_with_another_witness_is_not_this_transaction() {
+        let mut ours = tx(vec![outpoint(10, 0)], vec![5_000]);
+        ours.input[0].witness = Witness::from_slice(&[[1u8; 64]]);
+        let mut theirs = ours.clone();
+        theirs.input[0].witness = Witness::from_slice(&[[2u8; 64]]);
+        assert_eq!(ours.compute_txid(), theirs.compute_txid());
+        assert_ne!(ours.compute_wtxid(), theirs.compute_wtxid());
+        let peer = FakePeer::spawn(
+            Script {
+                mempool: vec![bitcoin::consensus::encode::serialize(&theirs)],
+                wtxid_relay: false,
+                ..Script::default()
+            },
+            2,
+        );
+        let ours = Candidate::decode(bitcoin::consensus::encode::serialize(&ours)).unwrap();
+        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &ours);
+        assert!(!present.unwrap(), "another witness counted as ours");
+        // Its own copy is found.
+        let theirs = Candidate::decode(bitcoin::consensus::encode::serialize(&theirs)).unwrap();
+        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &theirs);
+        assert!(present.unwrap());
+    }
+
     #[test]
     fn an_unreachable_peer_is_an_error_not_a_rejection() {
         let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

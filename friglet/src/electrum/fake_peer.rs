@@ -69,6 +69,9 @@ pub struct Script {
     /// it over, serve it when asked, then drop that connection a second
     /// later: a sender pretending its mempool took it.
     pub echo_inv: bool,
+    /// Offer BIP 339 `wtxidrelay`; without it transactions are announced
+    /// and requested by txid.
+    pub wtxid_relay: bool,
 }
 
 impl Default for Script {
@@ -82,6 +85,7 @@ impl Default for Script {
             relay: true,
             announce: true,
             echo_inv: false,
+            wtxid_relay: true,
         }
     }
 }
@@ -292,13 +296,15 @@ fn serve(
         start_height: 0,
         relay: script.relay,
     }))?;
-    wire.send(NetworkMessage::WtxidRelay)?;
+    if script.wtxid_relay {
+        wire.send(NetworkMessage::WtxidRelay)?;
+    }
     wire.send(NetworkMessage::Verack)?;
     let mut wtxid_relay = false;
     loop {
         match wire.recv_blocking()? {
             NetworkMessage::Verack => break,
-            NetworkMessage::WtxidRelay => wtxid_relay = true,
+            NetworkMessage::WtxidRelay => wtxid_relay = script.wtxid_relay,
             _ => {}
         }
     }

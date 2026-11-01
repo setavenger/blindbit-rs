@@ -366,10 +366,11 @@ impl Peer {
         Ok(())
     }
 
-    /// Is this transaction in the peer's mempool? Asks with `getdata`, which
-    /// Bitcoin Core answers with the transaction or with `notfound`. Only
-    /// meaningful on a `relay = true` connection that has settled.
-    /// `on_other` sees every other message that arrives meanwhile.
+    /// Is this transaction, witness included, in the peer's mempool? Asks
+    /// with `getdata`, which Bitcoin Core answers with the transaction or
+    /// with `notfound`. Only meaningful on a `relay = true` connection that
+    /// has settled. `on_other` sees every other message that arrives
+    /// meanwhile.
     pub fn mempool_has(
         &mut self,
         txid: Txid,
@@ -380,8 +381,11 @@ impl Peer {
         self.send_getdata(self.tx_inventory(txid, wtxid))?;
         loop {
             match self.recv_until(deadline)? {
+                // Asked by txid (no wtxid relay), a peer serves whichever
+                // witness its mempool holds: another witness is another
+                // transaction, which says nothing about this one's.
                 Some(NetworkMessage::Tx(tx)) if tx.compute_txid() == txid => {
-                    return Ok(true);
+                    return Ok(tx.compute_wtxid() == wtxid);
                 }
                 Some(NetworkMessage::NotFound(items))
                     if items

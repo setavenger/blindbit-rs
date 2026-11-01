@@ -200,7 +200,9 @@ struct ElectrumServerState {
     pending: Mutex<PendingStore>,
     /// One broadcast at a time; a client's resend waits for the first.
     broadcast_lock: Mutex<()>,
-    /// txid → when and how recent broadcasts ended.
+    /// wtxid → when and how recent broadcasts ended. By wtxid: the same
+    /// txid with another witness is another transaction (it may be invalid
+    /// where the first one was valid).
     recent_broadcasts: Mutex<HashMap<String, (Instant, RecentBroadcast)>>,
 }
 
@@ -763,6 +765,7 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     let candidate = Candidate::decode(raw).map_err(|message| (1, message))?;
     relay::check_transaction(&candidate.tx).map_err(|message| (1, message))?;
     let txid = candidate.txid.to_string();
+    let wtxid = candidate.wtxid.to_string();
 
     // One broadcast at a time. Sparrow resends a request that took longer
     // than its read timeout; the resend waits here and gets the first
@@ -771,7 +774,7 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
     let cached = {
         let mut recent = state.recent_broadcasts.lock().await;
         recent.retain(|_, (at, _)| at.elapsed() < BROADCAST_OUTCOME_TTL);
-        recent.get(&txid).map(|(_, outcome)| outcome.clone())
+        recent.get(&wtxid).map(|(_, outcome)| outcome.clone())
     };
     let mut candidate = match cached {
         Some(RecentBroadcast::Final(result)) => return result,
@@ -784,7 +787,7 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
             }
             tracing::info!(%txid, "broadcast reached a mempool after the wait ended");
             accept_pending(state, &candidate, &sent_to).await;
-            remember_broadcast(state, &txid, RecentBroadcast::Final(Ok(txid.clone()))).await;
+            remember_broadcast(state, &wtxid, RecentBroadcast::Final(Ok(txid.clone()))).await;
             return Ok(txid);
         }
         None => candidate,
@@ -808,7 +811,7 @@ async fn broadcast_transaction(state: &ElectrumServerState, raw_hex: &str) -> Br
         RecentBroadcast::Final(result) => result.clone(),
         RecentBroadcast::Inconclusive { error, .. } => Err(error.clone()),
     };
-    remember_broadcast(state, &txid, remembered).await;
+    remember_broadcast(state, &wtxid, remembered).await;
     result
 }
 
@@ -1002,12 +1005,12 @@ async fn with_own_node<T: Send + 'static>(
     })
 }
 
-async fn remember_broadcast(state: &ElectrumServerState, txid: &str, outcome: RecentBroadcast) {
+async fn remember_broadcast(state: &ElectrumServerState, wtxid: &str, outcome: RecentBroadcast) {
     state
         .recent_broadcasts
         .lock()
         .await
-        .insert(txid.to_string(), (Instant::now(), outcome));
+        .insert(wtxid.to_string(), (Instant::now(), outcome));
 }
 
 /// The fee of `tx` when the index has every transaction it spends from.
@@ -1904,6 +1907,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The same txid with another witness (for example one that does not
+    /// verify) is another transaction: not answered with the first one's
+    /// outcome.
+    #[tokio::test]
+    async fn a_resend_with_another_witness_is_not_answered_from_the_first_outcome() {
+        let dir = temp_dir("broadcast-witness");
+        let (index, received) = wallet();
+        // The node takes the first transaction and drops the connection
+        // after the second, as for a consensus-invalid one.
+        let net = crate::electrum::fake_peer::FakeNet::with_first_policies(vec![
+            crate::electrum::fake_peer::TxPolicy::Accept,
+            crate::electrum::fake_peer::TxPolicy::Disconnect,
+        ]);
+        let node = net.peer([127, 0, 0, 1].into(), Script::default());
+        let state = state(index, Some(node.addr), &dir);
+        let send = "blockchain.transaction.broadcast";
+        let mut valid = spend(&received, 1_000, 0);
+        valid.input[0].witness = Witness::from_slice(&[[1u8; 64]]);
+        let mut forged = valid.clone();
+        forged.input[0].witness = Witness::from_slice(&[[2u8; 64]]);
+        assert_eq!(valid.compute_txid(), forged.compute_txid());
+
+        let raw = hex::encode(bitcoin::consensus::encode::serialize(&valid));
+        let response = call(&state, send, vec![json!(raw)]).await;
+        assert_eq!(response["result"], json!(valid.compute_txid().to_string()));
+
+        let raw = hex::encode(bitcoin::consensus::encode::serialize(&forged));
+        let response = call(&state, send, vec![json!(raw)]).await;
+        assert!(response["result"].is_null(), "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("disconnected right after receiving"),
+            "{response}"
+        );
+        assert_eq!(node.conns().len(), 2, "the second one was sent");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_resend_after_an_inconclusive_wait_looks_again() {
         let dir = temp_dir("broadcast-late");
@@ -1922,7 +1965,7 @@ mod tests {
         let state = state(index, Some(peer.addr), &dir);
         remember_broadcast(
             &state,
-            &txid,
+            &tx.compute_wtxid().to_string(),
             RecentBroadcast::Inconclusive {
                 error: (1, "not accepted".into()),
                 sent_to: Vec::new(),
@@ -2238,7 +2281,7 @@ mod tests {
             let state = state_with(index, discovered(&fakes).await, &dir);
             remember_broadcast(
                 &state,
-                &txid,
+                &tx.compute_wtxid().to_string(),
                 RecentBroadcast::Inconclusive {
                     error: (1, "not confirmed".into()),
                     sent_to: vec![fakes[0].addr.into()],
