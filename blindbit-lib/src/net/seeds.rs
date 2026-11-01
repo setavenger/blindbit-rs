@@ -25,13 +25,9 @@ use super::{Dialer, PeerAddr, PeerHost, ShutdownOnDrop, USER_AGENT, is_proxy_dow
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Through a proxy: how many seeds are asked at once…
 const PROXIED_SEEDS: usize = 3;
-/// …how long the handshake and the node's addresses may take once
-/// connected (the connection itself gets the dialer's proxy timeout)…
+/// …and how long the handshake and the node's addresses may take once
+/// connected (the connection itself gets the dialer's proxy timeout).
 const PROXIED_SEED_WAIT: Duration = Duration::from_secs(20);
-/// …and how many addresses are enough to start with: once the seeds' nodes
-/// have given this many, seeding returns, and the answers of the seeds
-/// still being asked join the book as they come.
-const ENOUGH_SEEDED: usize = 20;
 /// A seed's node answers `getaddr` within this many messages after the
 /// handshake (Bitcoin Core sends a few first: feature messages, a ping, its
 /// own address); reading stops after them.
@@ -54,10 +50,10 @@ pub(crate) struct Seeding {
     pub(crate) found: Vec<Seeded>,
     /// The proxy failed, so no seed could be asked: why.
     pub(crate) proxy_error: Option<String>,
-    /// The answers of seeds still being asked when the others had given
-    /// enough addresses ([`ENOUGH_SEEDED`]), one message per seed as it
+    /// Through a proxy, the seeds' answers, one message per seed as it
     /// answers: its addresses, or the proxy's failure (no `later` of its
-    /// own).
+    /// own). Dropping the receiver closes the connections of the seeds
+    /// still being asked.
     pub(crate) later: Option<tokio::sync::mpsc::UnboundedReceiver<Seeding>>,
 }
 
@@ -95,7 +91,8 @@ impl Seeds {
     /// Through a proxy ([`Dialer::Socks5`]) there is no DNS lookup:
     /// [`PROXIED_SEEDS`] random seeds are each connected to by name through
     /// the proxy (`x9.<seed>`, else the bare name), and the node the proxy
-    /// reaches is asked for addresses (`getaddr`).
+    /// reaches is asked for addresses (`getaddr`). This returns at once;
+    /// the answers come through [`Seeding::later`].
     pub(crate) async fn resolve(&self, port: u16, dialer: &Dialer, network: Network) -> Seeding {
         match self {
             Self::None => Seeding::default(),
@@ -112,7 +109,7 @@ impl Seeds {
                 ..Seeding::default()
             },
             Self::Dns(names) if dialer.proxy().is_some() => {
-                through_proxy(names, dialer, network, port).await
+                through_proxy(names, dialer, network, port)
             }
             Self::Dns(names) => {
                 let mut lookups = tokio::task::JoinSet::new();
@@ -178,10 +175,10 @@ async fn lookup(host: String, port: u16) -> Vec<IpAddr> {
     }
 }
 
-/// Ask [`PROXIED_SEEDS`] random seeds' nodes, through the proxy, at once.
-/// Returns once they have given [`ENOUGH_SEEDED`] addresses (the others
-/// answer into [`Seeding::later`]) or all have answered.
-async fn through_proxy(
+/// Ask [`PROXIED_SEEDS`] random seeds' nodes, through the proxy, at once;
+/// each answer comes through [`Seeding::later`] as it arrives. The caller
+/// decides how many it waits for: only it knows which addresses it can use.
+fn through_proxy(
     names: &'static [&'static str],
     dialer: &Dialer,
     network: Network,
@@ -201,31 +198,31 @@ async fn through_proxy(
             (seed, answer)
         });
     }
-    let mut seeding = Seeding::default();
-    while let Some(answer) = asks.join_next().await {
-        let Ok((seed, answer)) = answer else {
-            continue;
-        };
-        take_answer(&mut seeding, seed, answer);
-        if seeding.found.len() >= ENOUGH_SEEDED && !asks.is_empty() {
-            let (later, answers) = tokio::sync::mpsc::unbounded_channel();
-            tokio::spawn(async move {
-                while let Some(answer) = asks.join_next().await {
-                    let Ok((seed, answer)) = answer else {
-                        continue;
-                    };
-                    let mut one = Seeding::default();
-                    take_answer(&mut one, seed, answer);
-                    if later.send(one).is_err() {
-                        return;
-                    }
-                }
-            });
-            seeding.later = Some(answers);
-            break;
+    let (later, answers) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let joined = tokio::select! {
+                joined = asks.join_next() => joined,
+                // Nobody waits for the rest any more.
+                () = later.closed() => return,
+            };
+            let Some(joined) = joined else {
+                return;
+            };
+            let Ok((seed, answer)) = joined else {
+                continue;
+            };
+            let mut one = Seeding::default();
+            take_answer(&mut one, seed, answer);
+            if later.send(one).is_err() {
+                return;
+            }
         }
+    });
+    Seeding {
+        later: Some(answers),
+        ..Seeding::default()
     }
-    seeding
 }
 
 /// Take `seed`'s answer into `seeding`: its node's addresses, or why the

@@ -46,6 +46,8 @@ fn gossip_of(first: u8, count: u8) -> Vec<AddrV2Message> {
 #[derive(Clone)]
 enum Answer {
     Now,
+    /// At once, then opens the gate when friglet hangs up.
+    NowThenOpen(Arc<Gate>),
     /// Once the gate opens (or 30 s pass).
     Once(Arc<Gate>),
     /// In a message that pauses for 700 ms halfway through.
@@ -124,6 +126,12 @@ fn serve(
                 let answer_bytes = bytes(NetworkMessage::AddrV2(addrs.clone()));
                 match answer {
                     Answer::Now => stream.write_all(&answer_bytes)?,
+                    Answer::NowThenOpen(gate) => {
+                        stream.write_all(&answer_bytes)?;
+                        while recv(&mut stream, &mut buf).is_ok() {}
+                        gate.open();
+                        return Ok(());
+                    }
                     Answer::Once(gate) => {
                         gate.wait(Duration::from_secs(30));
                         stream.write_all(&answer_bytes)?;
@@ -395,6 +403,48 @@ fn proxied_seeding_does_not_wait_for_the_slowest_seed() {
         }
         assert!(source.known() > first, "the slow seed's addresses joined");
     });
+}
+
+/// Seeding through the proxy counts the addresses the book took, not the
+/// ones the seeds' nodes sent: a first answer of more than enough
+/// addresses that are all refused (not public) does not end it while
+/// another seed is still being asked. That seed answers only once the
+/// first one's connection has ended.
+#[test]
+fn proxied_seeding_waits_while_the_answers_hold_no_usable_address() {
+    let refused: Vec<AddrV2Message> = (1..=25u8)
+        .map(|i| AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(10, i, 0, 1)),
+            port: 18444,
+        })
+        .collect();
+    let first_answered = Gate::new();
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.local-seed.invalid",
+        seed_node(Answer::NowThenOpen(first_answered.clone()), refused).0,
+    );
+    proxy.route(
+        "x9.public-seed.invalid",
+        seed_node(Answer::Once(first_answered), gossip()).0,
+    );
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Dns(&["local-seed.invalid", "public-seed.invalid"]),
+    );
+    let peer = run(source.next(Purpose::Block, &HashSet::new())).expect("seeded");
+    assert!(
+        peer.ip()
+            .is_some_and(|ip| ip.to_string().starts_with("45."))
+    );
+    assert_eq!(
+        source.known(),
+        gossip().len(),
+        "the public seed's addresses"
+    );
 }
 
 /// A seed still being asked when seeding returned, whose connection then

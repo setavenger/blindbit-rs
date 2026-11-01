@@ -77,6 +77,10 @@ const RESEED_EVERY_WHILE_EMPTY: Duration = Duration::from_secs(30);
 /// At start, the seeds are asked only while fewer addresses are known
 /// (from the address book on disk).
 const SEED_BELOW: usize = 50;
+/// Through a proxy, how many addresses the seeds' nodes must have added to
+/// the book before seeding returns; the answers of the seeds still being
+/// asked join it as they come.
+const ENOUGH_SEEDED: usize = 20;
 /// A kept address book is saved this often while it changes, and at exit.
 const SAVE_EVERY: Duration = Duration::from_secs(10 * 60);
 /// Kyoto's limits for replacing a colliding record that keeps failing.
@@ -573,11 +577,32 @@ impl PeerPool {
         let port = default_port(self.network);
         let started = Instant::now();
         let seeding = self.seeds.resolve(port, &self.dialer, self.network).await;
-        let found = seeding.found;
+        let mut found = seeding.found.len();
+        let mut added = {
+            let mut inner = self.lock();
+            inner.seed_error = seeding.proxy_error;
+            self.add_seeded(&mut inner, &seeding.found)
+        };
+        // Through a proxy the seeds' nodes answer one by one. What counts is
+        // what the book took: an answer may hold only addresses it refuses
+        // (not public, a bad port, known already, a taken slot).
+        let mut answers = seeding.later;
+        while added < ENOUGH_SEEDED
+            && let Some(later) = answers.as_mut()
+        {
+            let Some(answer) = later.recv().await else {
+                answers = None;
+                break;
+            };
+            found += answer.found.len();
+            let mut inner = self.lock();
+            if let Some(error) = answer.proxy_error {
+                inner.seed_error = Some(error);
+            }
+            added += self.add_seeded(&mut inner, &answer.found);
+        }
         let mut inner = self.lock();
-        inner.seed_error = seeding.proxy_error;
-        inner.later_seeds.extend(seeding.later);
-        let added = self.add_seeded(&mut inner, &found);
+        inner.later_seeds.extend(answers);
         inner.last_seed = Some((Instant::now(), added));
         let seeds: Vec<&str> = match &self.seeds {
             Seeds::Dns(names) => names.to_vec(),
@@ -587,7 +612,7 @@ impl PeerPool {
         tracing::info!(
             seeds = %seeds.join(", "),
             via = %self.dialer,
-            addresses = found.len(),
+            addresses = found,
             added,
             known = inner.known(),
             elapsed_ms = started.elapsed().as_millis() as u64,
