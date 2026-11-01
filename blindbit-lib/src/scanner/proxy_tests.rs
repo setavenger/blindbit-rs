@@ -10,7 +10,9 @@ use bitcoin::Network;
 use bitcoin::p2p::ServiceFlags;
 
 use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy, connect_failure};
-use super::p2p_tests::{Conn, Node, assert_version_gives_nothing_away, fast, recording_node};
+use super::p2p_tests::{
+    Conn, GATE_LIMIT, Node, assert_version_gives_nothing_away, fast, recording_node,
+};
 use super::test_support::run;
 use crate::net::testing::FakeSocks5;
 use crate::net::{Dialer, PeerAddr, PeerEvent, PeerHost, PeerSource, Seeds};
@@ -30,6 +32,25 @@ async fn within_a_minute<T>(fetch: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(60), fetch)
         .await
         .expect("the fetch ended within a minute")
+}
+
+/// Polls `condition` every 5 ms for up to `within`; whether it came true.
+fn comes_true(within: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !condition() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// The node's first connection has sent its `version`.
+fn got_version(node: &Node) -> bool {
+    node.accepted()
+        .first()
+        .is_some_and(|connection| connection.version_after.is_some())
 }
 
 fn fetch(peers: std::sync::Arc<PeerSource>) -> Result<bitcoin::Block, Box<BlockFetchError>> {
@@ -311,6 +332,51 @@ fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
         version_after < Duration::from_millis(300),
         "the handshake started {version_after:?} after the connection opened"
     );
+}
+
+/// A racer whose handshake completed while another connection downloaded
+/// keeps the time for the block once its turn comes: its wait does not
+/// count. Here the peer asked first trickles its block until that
+/// connection's time is up (18 s); the other, which opened before it and
+/// waited all along, then serves the block.
+#[test]
+fn a_racer_waiting_for_its_turn_keeps_its_time_for_the_block() {
+    let block = genesis();
+    let full = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+    let trickles = Node::spawn_on(ip(86), full, 200, &block, vec![Conn::TrickleMidBlock]);
+    let waits = Node::spawn_on(ip(87), full, 200, &block, vec![Conn::ServeOnceOpened]);
+    let proxy = FakeSocks5::start();
+    // The waiting peer's connection opens first, the trickling peer's once
+    // the waiting one's handshake started…
+    let trickles_opens = proxy.hold(trickles.addr.into());
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![trickles.addr.into(), waits.addr.into()]),
+    );
+    let fetcher = BlockFetcher::new(source).with_policy(RetryPolicy {
+        connect_timeout: Duration::ZERO,
+        block_deadline: Duration::from_secs(3),
+        ..RetryPolicy::discovered()
+    });
+    let got = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(comes_true(GATE_LIMIT, || got_version(&waits)));
+            trickles_opens.open();
+            // …and its handshake completes once the trickling peer, ready
+            // first, was asked for the block.
+            assert!(comes_true(GATE_LIMIT, || trickles.stalled().is_some()));
+            waits.open();
+        });
+        run(within_a_minute(fetcher.fetch(block.block_hash(), 0)))
+    });
+    let got = got.expect("the waiting peer serves it");
+    assert_eq!(got.block_hash(), block.block_hash());
+    assert!(
+        trickles.stalled().is_some(),
+        "the trickling peer was asked first"
+    );
+    assert_eq!(waits.connections(), 1);
 }
 
 /// How the proxy's refusals count: no clear answer (a general failure, a

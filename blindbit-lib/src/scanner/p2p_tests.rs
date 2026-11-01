@@ -26,6 +26,7 @@ use super::p2p::{
 use super::scanning::BlockStreamSource;
 use super::stream_safety_tests::{TestStream, payment_block};
 use super::test_support::{own_node, run, scanner};
+use crate::net::testing::Gate;
 use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse};
 
 /// What the node does on one connection.
@@ -39,6 +40,13 @@ pub(super) enum Conn {
     /// Start sending the block and go silent halfway through it, keeping
     /// the connection open until the client hangs up (or 10 s pass).
     StallMidBlock,
+    /// Start sending the block, then send one more byte of it every
+    /// 250 ms (the rest of the default block takes 38 s), until the client
+    /// hangs up (or a minute passes).
+    TrickleMidBlock,
+    /// [`Conn::Serve`], but answer the client's `version` only once the
+    /// node's gate opens ([`Node::open`], or [`GATE_LIMIT`] passes).
+    ServeOnceOpened,
     /// Serve the block as Bitcoin Core does: with its witnesses for
     /// `MSG_WITNESS_BLOCK`, without them for `MSG_BLOCK`.
     Serve,
@@ -90,13 +98,19 @@ pub(super) struct Node {
     connected: Arc<Mutex<Vec<Accepted>>>,
 }
 
+/// How long a gated [`Conn`] waits for [`Node::open`] at most.
+pub(super) const GATE_LIMIT: Duration = Duration::from_secs(20);
+
 /// When things happened on a [`Node`]'s connections.
 #[derive(Default)]
 struct Moments {
-    /// A [`Conn::StallMidBlock`] connection went silent.
+    /// A [`Conn::StallMidBlock`] connection went silent, or a
+    /// [`Conn::TrickleMidBlock`] one started trickling.
     stalled: Mutex<Option<Instant>>,
     /// The client hung up on a [`Conn::ServeThenTrickle`] connection.
     hung_up: Mutex<Option<Instant>>,
+    /// What gated connections wait for.
+    gate: Gate,
 }
 
 /// One connection a [`Node`] accepted.
@@ -263,6 +277,11 @@ impl Node {
         *self.moments.hung_up.lock().unwrap()
     }
 
+    /// Let the gated connections go on.
+    pub(super) fn open(&self) {
+        self.moments.gate.open();
+    }
+
     /// The connections accepted so far, in order.
     pub(super) fn accepted(&self) -> Vec<Accepted> {
         self.connected.lock().unwrap().clone()
@@ -364,6 +383,12 @@ fn serve(
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
         return wire.drain();
     }
+    if conn == Conn::ServeOnceOpened {
+        moments.gate.wait(GATE_LIMIT);
+        // Its request may come long after the handshake, as a node's would.
+        wire.stream
+            .set_read_timeout(Some(Duration::from_secs(60)))?;
+    }
     wire.send(version_message(services, height))?;
     if let Conn::Magic(_) = conn {
         return wire.drain();
@@ -397,10 +422,10 @@ fn serve(
     };
     let witness = matches!(items.first(), Some(Inventory::WitnessBlock(_)));
     match conn {
-        Conn::Serve | Conn::ServeWithAddr if witness => {
+        Conn::Serve | Conn::ServeWithAddr | Conn::ServeOnceOpened if witness => {
             wire.send(NetworkMessage::Block(served.full.clone()))?
         }
-        Conn::Serve | Conn::ServeWithAddr | Conn::ServeStripped => {
+        Conn::Serve | Conn::ServeWithAddr | Conn::ServeOnceOpened | Conn::ServeStripped => {
             wire.send(NetworkMessage::Block(served.stripped.clone()))?
         }
         Conn::ServeThenSplitAddr => {
@@ -445,6 +470,26 @@ fn serve(
             wire.stream.write_all(&bytes[..bytes.len() / 2])?;
             wire.stream.flush()?;
             *moments.stalled.lock().unwrap() = Some(Instant::now());
+        }
+        Conn::TrickleMidBlock => {
+            let bytes = encode::serialize(&RawNetworkMessage::new(
+                magic,
+                NetworkMessage::Block(served.full.clone()),
+            ));
+            let (first, rest) = bytes.split_at(bytes.len() / 2);
+            wire.stream.write_all(first)?;
+            *moments.stalled.lock().unwrap() = Some(Instant::now());
+            let started = Instant::now();
+            for byte in rest {
+                if started.elapsed() > Duration::from_secs(60) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                // The client hung up.
+                if wire.stream.write_all(&[*byte]).is_err() {
+                    return Ok(());
+                }
+            }
         }
         Conn::Ignore => loop {
             if let NetworkMessage::Ping(nonce) = wire.recv()? {

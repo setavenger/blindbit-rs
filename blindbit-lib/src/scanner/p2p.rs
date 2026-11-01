@@ -155,8 +155,9 @@ impl RetryPolicy {
         }
     }
 
-    /// The deadline for a whole connection to a discovered peer, from when
-    /// it opened, so one that trickles bytes (each read within the timeout,
+    /// The time a connection to a discovered peer gets from when it opened,
+    /// for its handshake and the block (not counting a raced one's wait for
+    /// its turn), so one that trickles bytes (each read within the timeout,
     /// the message never complete) cannot hold the download.
     fn connection_cap(&self) -> Duration {
         self.connect_timeout + self.block_deadline + DISCOVERED_SLACK
@@ -1214,16 +1215,18 @@ impl BlockFetcher {
 
     /// The block request on `ready`, a handshaken connection to a discovered
     /// peer: on a thread of its own, as the own node's download, within what
-    /// is left of the connection's overall deadline. On cancellation (or
-    /// when this future is dropped) the connection is shut down.
+    /// the handshake left of the connection's time, from now on (a raced
+    /// connection may have waited for its turn). On cancellation (or when
+    /// this future is dropped) the connection is shut down.
     async fn fetch_on(&self, ready: Ready, block_hash: BlockHash) -> Result<Block, AttemptFailure> {
         let Ready {
             mut connection,
             shutdown,
             discovery,
+            handshake_took,
             ..
         } = ready;
-        let (opened, lingers) = (connection.opened, discovery.request_addr);
+        let lingers = discovery.request_addr;
         let cap = self.policy.connection_cap();
         let (answer, answered) = tokio::sync::oneshot::channel();
         // Dropped when the thread is done with the connection.
@@ -1249,7 +1252,7 @@ impl BlockFetcher {
         let result = tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(FetchFailure::Cancelled.into()),
-            () = sleep_at_most(cap.saturating_sub(opened.elapsed())) => Err(too_slow(cap)),
+            () = sleep_at_most(cap.saturating_sub(handshake_took)) => Err(too_slow(cap)),
             answered = answered => answered.unwrap_or_else(|_| {
                 Err(FetchFailure::Broken("the download ended without an answer".to_string()).into())
             }),
@@ -1293,6 +1296,8 @@ struct Ready {
     discovery: Discovery,
     /// friglet's address on the connection (none through a proxy).
     local_ip: Option<IpAddr>,
+    /// From when the connection opened until its handshake completed.
+    handshake_took: Duration,
 }
 
 /// Open a connection to the discovered `peer` and complete its handshake on
@@ -1361,6 +1366,7 @@ async fn prepare(
             shutdown,
             discovery,
             local_ip,
+            handshake_took: opened.elapsed(),
         })
     }
     .await;
