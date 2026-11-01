@@ -436,6 +436,76 @@ fn an_unreadable_address_book_is_ignored() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A save on a disk that blocks (here: the file is a pipe nobody reads
+/// yet) does not hold up the peers: the book stays usable meanwhile.
+#[cfg(unix)]
+#[test]
+fn saving_the_address_book_does_not_hold_up_the_peers() {
+    use std::io::Read;
+    let dir = temp_dir("blocking-disk");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    let pipe = dir.join("peers-regtest-new.book.tmp");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success());
+    let saver = {
+        let source = source.clone();
+        std::thread::spawn(move || source.save_book())
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let (known, answer) = std::sync::mpsc::channel();
+    {
+        let source = source.clone();
+        std::thread::spawn(move || {
+            let _ = known.send(source.known());
+        });
+    }
+    let answered = answer.recv_timeout(Duration::from_secs(2));
+    // Let the save go on: read the pipe (syncing a pipe fails, so the save
+    // fails, which is fine here).
+    let mut sink = Vec::new();
+    std::fs::File::open(&pipe)
+        .unwrap()
+        .read_to_end(&mut sink)
+        .unwrap();
+    saver.join().unwrap();
+    assert_eq!(
+        answered,
+        Ok(PEERS.len()),
+        "held up while the book was saved"
+    );
+    assert!(pool(&source).changed(), "the failed save is tried again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A well-formed file listing far more records than its table holds is
+/// refused before they are read, not loaded into memory and time.
+#[test]
+fn an_address_book_listing_more_records_than_it_holds_is_ignored() {
+    let dir = temp_dir("oversized");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    source.save_book();
+    let path = dir.join("peers-regtest-new.book");
+    let saved = std::fs::read(&path).unwrap();
+    let count = u64::from_le_bytes(saved[4..12].try_into().unwrap()) as usize;
+    assert_eq!(count, PEERS.len());
+    // Records of IPv4 addresses are all the same size: repeat the first.
+    let one = &saved[12..12 + (saved.len() - 12) / count];
+    let listed = 2_000u64;
+    let mut oversized = b"ADBK".to_vec();
+    oversized.extend(listed.to_le_bytes());
+    for _ in 0..listed {
+        oversized.extend(one);
+    }
+    std::fs::write(&path, oversized).unwrap();
+    assert_eq!(kept_in(&dir, &[]).known(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_saved_book_that_knows_enough_peers_is_not_seeded_at_start() {
     let dir = temp_dir("enough");

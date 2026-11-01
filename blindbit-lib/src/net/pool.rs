@@ -39,6 +39,11 @@ use crate::scanner::PeerInfo;
 // buckets; 4 x 16 tried slots, a source reaches 2 of the 4.
 type NewTable = Table<16, 16, 8>;
 type TriedTable = Table<4, 16, 2>;
+const NEW_SLOTS: u64 = 16 * 16;
+const TRIED_SLOTS: u64 = 4 * 16;
+/// A saved table holds at most one record per slot; a file listing more
+/// than this many per slot is refused unread.
+const SAVED_PER_SLOT: u64 = 2;
 
 /// Random draws from the tables before settling for any usable peer.
 const MAX_DRAWS: usize = 64;
@@ -356,6 +361,8 @@ pub struct PeerPool {
     inner: Mutex<Inner>,
     /// One seeding at a time; callers that need peers wait for it.
     seeding: tokio::sync::Mutex<()>,
+    /// One save of the kept address book at a time.
+    saving: Mutex<()>,
 }
 
 impl fmt::Debug for PeerPool {
@@ -385,6 +392,10 @@ struct Meta {
     resting_until: Option<Instant>,
     /// Failed connections in a row.
     failures: u8,
+    /// A handshake completed this session. With `failures`, what the table
+    /// did to its copy of `record` since it was added, which a saved copy
+    /// of the table repeats.
+    connected: bool,
     /// Ignored for the rest of the session; kept so gossip cannot add it
     /// back.
     ignored: bool,
@@ -462,6 +473,7 @@ impl PeerPool {
                 changed: false,
             }),
             seeding: tokio::sync::Mutex::new(()),
+            saving: Mutex::new(()),
         }
     }
 
@@ -764,7 +776,11 @@ impl PeerPool {
         let mut loaded = 0;
         // "tried" first: an address in both files stays tried.
         for (path, place) in [(&files.tried, Where::Tried), (&files.new, Where::New)] {
-            match read_book(path) {
+            let slots = match place {
+                Where::New => NEW_SLOTS,
+                Where::Tried => TRIED_SLOTS,
+            };
+            match read_book(path, SAVED_PER_SLOT * slots) {
                 Ok(records) => {
                     for record in records {
                         if inner.add_saved(record, place) {
@@ -792,26 +808,37 @@ impl PeerPool {
     /// Write the tables to the kept address book's files, if there is one
     /// (and, with `only_if_changed`, only when they changed). A failure is
     /// logged; the book stays in memory.
+    ///
+    /// The records are copied under the lock and the files written (and
+    /// synced to disk) without it, so connections are not held up by a
+    /// slow disk; one save at a time, so an older copy never overwrites a
+    /// newer one.
     fn save(&self, only_if_changed: bool) {
         let Some(files) = self.book.get() else {
             return;
         };
-        let mut inner = self.lock();
-        if only_if_changed && !inner.changed {
-            return;
-        }
-        let result = write_book(&files.new, |file| file.write_table(&*inner.new))
-            .and_then(|()| write_book(&files.tried, |file| file.write_table(&*inner.tried)));
-        match result {
-            Ok(()) => {
-                inner.changed = false;
-                tracing::debug!(known = inner.known(), "peer address book saved");
+        let _one_at_a_time = self.saving.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = {
+            let mut inner = self.lock();
+            if only_if_changed && !inner.changed {
+                return;
             }
-            Err(e) => tracing::warn!(
-                path = %files.new.display(),
-                error = %e,
-                "cannot save the peer address book"
-            ),
+            inner.changed = false;
+            inner.saved_records()
+        };
+        let (new, tried) = saved_tables(&saved);
+        let result = write_book(&files.new, |file| file.write_table(&*new))
+            .and_then(|()| write_book(&files.tried, |file| file.write_table(&*tried)));
+        match result {
+            Ok(()) => tracing::debug!(known = saved.len(), "peer address book saved"),
+            Err(e) => {
+                self.lock().changed = true;
+                tracing::warn!(
+                    path = %files.new.display(),
+                    error = %e,
+                    "cannot save the peer address book"
+                );
+            }
         }
     }
 
@@ -894,7 +921,62 @@ impl PeerPool {
     }
 }
 
+/// A record in a table, with what the table did to its copy since it was
+/// added.
+struct SavedRecord {
+    record: Record,
+    table: Where,
+    connected: bool,
+    failures: u8,
+}
+
+/// The tables `saved` describes: each record as added, then the successful
+/// and failed connections the live table counted for it, so the copy
+/// matches the live table record for record.
+fn saved_tables(saved: &[SavedRecord]) -> (Box<NewTable>, Box<TriedTable>) {
+    let (mut new, mut tried) = (Box::<NewTable>::default(), Box::<TriedTable>::default());
+    for saved in saved {
+        let record = &saved.record;
+        match saved.table {
+            Where::New => {
+                new.add(record);
+                if saved.connected {
+                    new.successful_connection(record);
+                }
+                for _ in 0..saved.failures {
+                    new.failed_connection(record);
+                }
+            }
+            Where::Tried => {
+                tried.add(record);
+                if saved.connected {
+                    tried.successful_connection(record);
+                }
+                for _ in 0..saved.failures {
+                    tried.failed_connection(record);
+                }
+            }
+        }
+    }
+    (new, tried)
+}
+
 impl Inner {
+    /// Every record in a table, to save.
+    fn saved_records(&self) -> Vec<SavedRecord> {
+        self.meta
+            .values()
+            .filter_map(|meta| {
+                Some(SavedRecord {
+                    record: meta.record.clone(),
+                    table: meta.table?,
+                    connected: meta.connected,
+                    failures: meta.failures,
+                })
+            })
+            .collect()
+    }
+
     fn ipv6_dead(&self) -> bool {
         self.ipv6_dead_since
             .is_some_and(|since| since.elapsed() < IPV6_DEAD_FOR)
@@ -1029,6 +1111,7 @@ impl Inner {
                 table: Some(Where::New),
                 resting_until: None,
                 failures: 0,
+                connected: false,
                 ignored: false,
                 no_tx_relay: false,
             },
@@ -1060,6 +1143,7 @@ impl Inner {
                 table: Some(place),
                 resting_until: None,
                 failures: 0,
+                connected: false,
                 ignored: false,
                 // Learnt again from the next handshake.
                 no_tx_relay: false,
@@ -1076,6 +1160,7 @@ impl Inner {
         };
         self.changed = true;
         meta.failures = 0;
+        meta.connected = true;
         meta.record.update_service_flags(services);
         let (record, table) = (meta.record.clone(), meta.table);
         match table {
@@ -1159,6 +1244,7 @@ impl Inner {
                             table: None,
                             resting_until: None,
                             failures: 0,
+                            connected: false,
                             ignored: true,
                             no_tx_relay: false,
                         },
@@ -1187,8 +1273,10 @@ const BOOK_MAGIC: [u8; 4] = *b"ADBK";
 
 /// The records of an address book file written with `io::FileExt`. The
 /// crate's `Table` cannot list its records, and the pool needs each one to
-/// index it, so the file is read record by record here.
-fn read_book(path: &Path) -> io::Result<Vec<Record>> {
+/// index it, so the file is read record by record here. A file listing
+/// more than `max` records was not written for a table of this size and is
+/// refused before any is read.
+fn read_book(path: &Path, max: u64) -> io::Result<Vec<Record>> {
     let mut file = BufReader::new(File::open(path)?);
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
@@ -1201,6 +1289,12 @@ fn read_book(path: &Path) -> io::Result<Vec<Record>> {
     let mut count = [0u8; 8];
     file.read_exact(&mut count)?;
     let count = u64::from_le_bytes(count);
+    if count > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("it lists {count} addresses, more than the {max} it can hold"),
+        ));
+    }
     let mut records = Vec::new();
     for _ in 0..count {
         records.push(Record::deserialize(&mut file)?);
