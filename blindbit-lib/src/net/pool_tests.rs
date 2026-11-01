@@ -124,18 +124,26 @@ fn a_handshake_moves_a_peer_to_tried_and_a_bad_block_ignores_it_for_good() {
 
 /// A handshake with a peer that does not serve every block with witnesses
 /// (a pruned node, met by a header or fee connection) does not move it to
-/// "tried".
+/// "tried", but it still ends the peer's run of failures and records the
+/// services it said it has.
 #[test]
 fn only_a_full_node_moves_to_tried() {
     let source = seeded(&PEERS);
     let (pruned, full) = (addr(PEERS[0]), addr(PEERS[1]));
+    let limited = ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS;
+    source.report(&pruned, PeerEvent::Unreachable);
+    source.report(&pruned, PeerEvent::Unreachable);
     source.report(
         &pruned,
         PeerEvent::Connected(PeerInfo {
-            services: ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            services: limited,
             height: 1_000,
         }),
     );
+    assert_eq!(pool(&source).place(&pruned), Some(Where::New));
+    assert_eq!(pool(&source).services(&pruned), Some(limited));
+    // Three failures, but not in a row: still known.
+    source.report(&pruned, PeerEvent::Unreachable);
     assert_eq!(pool(&source).place(&pruned), Some(Where::New));
     source.report(&full, PeerEvent::Connected(info()));
     assert_eq!(pool(&source).place(&full), Some(Where::Tried));

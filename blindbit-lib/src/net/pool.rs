@@ -673,11 +673,7 @@ impl PeerPool {
                 if self.dialer.proxy().is_some() {
                     inner.proxy_worked = Some((now, 0));
                 }
-                // Header and fee connections take any peer, but the book is
-                // for block downloads: only a full node earns "tried".
-                if info.services.has(required_services()) {
-                    inner.promote(peer, info.services);
-                }
+                inner.connected(peer, info.services);
             }
             PeerEvent::Served => {
                 inner.preferred = Some(peer.clone());
@@ -886,6 +882,14 @@ impl PeerPool {
     #[cfg(test)]
     pub(crate) fn place(&self, addr: &PeerAddr) -> Option<Where> {
         self.lock().meta.get(addr).and_then(|meta| meta.table)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn services(&self, addr: &PeerAddr) -> Option<ServiceFlags> {
+        self.lock()
+            .meta
+            .get(addr)
+            .map(|meta| meta.record.service_flags())
     }
 
     #[cfg(test)]
@@ -1177,9 +1181,12 @@ impl Inner {
         true
     }
 
-    /// A handshake completed: move the peer to "tried" (Kyoto's `tried`),
-    /// sending a colliding tried peer back to "new" when it has room there.
-    fn promote(&mut self, addr: &PeerAddr, services: ServiceFlags) {
+    /// A handshake completed: the peer's run of failures ends and its
+    /// services are what it just said. A full node moves to "tried"
+    /// (Kyoto's `tried`), sending a colliding tried peer back to "new" when
+    /// it has room there. Header and fee connections take any peer, but the
+    /// book is for block downloads, so another peer stays where it is.
+    fn connected(&mut self, addr: &PeerAddr, services: ServiceFlags) {
         let Some(meta) = self.meta.get_mut(addr) else {
             return;
         };
@@ -1191,6 +1198,10 @@ impl Inner {
         match table {
             Some(Where::Tried) => {
                 self.tried.successful_connection(&record);
+                return;
+            }
+            Some(Where::New) if !services.has(required_services()) => {
+                self.new.successful_connection(&record);
                 return;
             }
             Some(Where::New) => self.new.remove(&record),
