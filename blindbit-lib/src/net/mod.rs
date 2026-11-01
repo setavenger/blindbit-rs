@@ -81,29 +81,17 @@ impl PeerAddr {
         matches!(self.host, PeerHost::Ip(IpAddr::V6(_)))
     }
 
-    /// On this computer or the local network: a loopback, private or
-    /// link-local address, `localhost`, or a `.local` (mDNS) name. Tor's
-    /// exits connect from the internet and cannot reach such a peer.
+    /// On this computer or a network the internet does not route to: an
+    /// address that is not public ([`pool::is_public`]: loopback, private,
+    /// link-local, carrier-grade NAT such as Tailscale's 100.64.0.0/10, …),
+    /// `localhost`, or a `.local` (mDNS) name. Tor's exits connect from the
+    /// internet and cannot reach such a peer.
     pub fn is_local(&self) -> bool {
-        let ip = match &self.host {
-            PeerHost::Ip(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map_or(IpAddr::V6(*v6), IpAddr::V4),
-            PeerHost::Ip(ip) => *ip,
+        match &self.host {
+            PeerHost::Ip(ip) => !pool::is_public(*ip),
             PeerHost::Name(name) => {
                 let name = name.trim_end_matches('.').to_ascii_lowercase();
-                return name == "localhost"
-                    || name.ends_with(".localhost")
-                    || name.ends_with(".local");
-            }
-        };
-        match ip {
-            IpAddr::V4(ip) => {
-                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-            }
-            IpAddr::V6(ip) => {
-                ip.is_loopback()
-                    || ip.is_unique_local()
-                    || ip.is_unicast_link_local()
-                    || ip.is_unspecified()
+                name == "localhost" || name.ends_with(".localhost") || name.ends_with(".local")
             }
         }
     }

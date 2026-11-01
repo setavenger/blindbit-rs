@@ -379,8 +379,8 @@ dbus-run-session -- bash -c '
   `.onion` node without a proxy is a config error; an own node on the local
   network is allowed with one, a SOCKS5 proxy other than Tor can reach it,
   and a failed connect to it through the proxy adds a Tor hint to the
-  error: `PeerAddr::is_local`, loopback/private/link-local IP, `localhost`,
-  `.local`);
+  error: `PeerAddr::is_local`, any IP that is not public (`pool::is_public`,
+  so also 100.64.0.0/10, Tailscale), `localhost`, `.local`);
   `Seeds::resolve` with a proxy connects to `x9.<seed>` (then the bare
   name) of 3 random seeds through it, handshakes with `getaddr` and keeps
   the `addr`/`addrv2` answer (≤ 20 s, ≤ 100 messages; of single-address

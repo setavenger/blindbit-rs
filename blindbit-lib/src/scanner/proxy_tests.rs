@@ -113,8 +113,9 @@ fn a_local_own_node_is_reached_through_the_proxy() {
 }
 
 /// When the proxy cannot connect to a local own node, the message says
-/// why that may be: Tor cannot reach this computer or the local network.
-/// A node elsewhere gets the usual message.
+/// why that may be: Tor cannot reach this computer or the local network,
+/// nor a carrier-grade NAT address (Tailscale's). A node elsewhere gets the
+/// usual message.
 #[test]
 fn a_local_own_node_the_proxy_cannot_reach_gets_a_word_about_tor() {
     let proxy = FakeSocks5::start();
@@ -148,13 +149,24 @@ fn a_local_own_node_the_proxy_cannot_reach_gets_a_word_about_tor() {
     }
     let refusing = FakeSocks5::start();
     refusing.refuse_with(0x05);
-    let err = fetch(PeerSource::own_node(
-        "192.0.2.1:18444".parse::<SocketAddr>().unwrap().into(),
-        refusing.dialer(),
-        Network::Regtest,
-    ))
-    .expect_err("refused");
-    let message = err.to_string();
+    let refused = |node: &str| {
+        let err = fetch(PeerSource::own_node(
+            node.parse::<SocketAddr>().unwrap().into(),
+            refusing.dialer(),
+            Network::Regtest,
+        ))
+        .expect_err("refused");
+        err.to_string()
+    };
+    for tailnet in [
+        "100.64.0.1:18444",
+        "100.101.102.103:18444",
+        "[::ffff:100.127.0.9]:18444",
+    ] {
+        let message = refused(tailnet);
+        assert!(message.contains(hint), "{tailnet}: {message}");
+    }
+    let message = refused("45.1.7.1:18444");
     assert!(
         message.contains("Check that bitcoind is running"),
         "{message}"
