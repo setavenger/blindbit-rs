@@ -777,6 +777,9 @@ pub struct BlockFetcher {
     peers: Arc<PeerSource>,
     policy: RetryPolicy,
     cancel: CancellationToken,
+    /// How long a connection may stay open after the block to collect the
+    /// peer's addresses ([`linger`]).
+    linger: Duration,
 }
 
 /// What an attempt on a discovered peer does beyond the own-node attempt.
@@ -793,11 +796,20 @@ impl BlockFetcher {
             policy: RetryPolicy::for_source(&peers),
             peers,
             cancel: CancellationToken::new(),
+            linger: GOSSIP_WAIT + LINGER_SLACK,
         }
     }
 
     pub fn with_policy(mut self, policy: RetryPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Keep a connection open after the block at most `linger` (instead of
+    /// the wait for addresses), so a test decides what closes it.
+    #[cfg(test)]
+    pub(crate) fn with_linger(mut self, linger: Duration) -> Self {
+        self.linger = linger;
         self
     }
 
@@ -1260,7 +1272,7 @@ impl BlockFetcher {
         // The thread keeps the connection a moment to collect the peer's
         // addresses.
         if result.is_ok() && lingers {
-            linger(shutdown, finished, self.cancel.clone());
+            linger(shutdown, finished, self.cancel.clone(), self.linger);
         }
         result
     }
@@ -1268,19 +1280,21 @@ impl BlockFetcher {
 
 /// Own the deadline of a connection the download thread keeps after the
 /// block to collect the peer's addresses: shut it down once the thread is
-/// done with it, the wait is over or the fetch is cancelled. The thread's
-/// reads cannot see the deadline while a message arrives, so a peer that
-/// trickles one would otherwise hold the thread and its socket.
+/// done with it, `wait` is over (the wait for addresses, [`GOSSIP_WAIT`],
+/// and some slack) or the fetch is cancelled. The thread's reads cannot see
+/// the deadline while a message arrives, so a peer that trickles one would
+/// otherwise hold the thread and its socket.
 fn linger(
     shutdown: ShutdownOnDrop,
     finished: tokio::sync::oneshot::Receiver<()>,
     cancel: CancellationToken,
+    wait: Duration,
 ) {
     tokio::spawn(async move {
         tokio::select! {
             _ = finished => {}
             () = cancel.cancelled() => {}
-            () = tokio::time::sleep(GOSSIP_WAIT + LINGER_SLACK) => {}
+            () = tokio::time::sleep(wait) => {}
         }
         drop(shutdown);
     });

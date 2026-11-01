@@ -420,7 +420,7 @@ dbus-run-session -- bash -c '
   then.
 - Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
   down / not SOCKS5), `net/proxy_tests.rs` (seeding by name, no local
-  lookup), `scanner/proxy_tests.rs` (own node `node.invalid` through the
+  lookup, the 1,000-address cap), `scanner/proxy_tests.rs` (own node `node.invalid` through the
   proxy, proxy down/refusing → no direct connection), `electrum/chain.rs`
   (headers through the proxy, an unclear connect counted against the
   peer); `scanner/proxy_tests.rs` also races past

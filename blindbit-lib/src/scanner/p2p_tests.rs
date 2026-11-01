@@ -533,7 +533,7 @@ fn serve(
 }
 
 /// Start a large `addrv2` message and send one byte of it every 100 ms,
-/// for at most 15 s; note when the client hangs up.
+/// for at most a minute; note when the client hangs up.
 fn trickle(stream: &mut TcpStream, magic: Magic, moments: &Arc<Moments>) -> std::io::Result<()> {
     let watch = stream.try_clone()?;
     let watcher_moments = moments.clone();
@@ -560,7 +560,7 @@ fn trickle(stream: &mut TcpStream, magic: Magic, moments: &Arc<Moments>) -> std:
     stream.write_all(&bytes[..30])?;
     *moments.trickling.lock().unwrap() = Some(Instant::now());
     for byte in &bytes[30..] {
-        if started.elapsed() > Duration::from_secs(15) || moments.hung_up.lock().unwrap().is_some()
+        if started.elapsed() > Duration::from_secs(60) || moments.hung_up.lock().unwrap().is_some()
         {
             break;
         }

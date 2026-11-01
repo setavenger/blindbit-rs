@@ -410,7 +410,9 @@ fn a_peer_that_trickles_after_the_block_is_hung_up_on_in_time() {
 }
 
 /// A stop while such a peer trickles closes the connection at once, not
-/// when the wait for addresses ends (3 s after the block).
+/// when the wait for addresses ends. That wait is ten minutes here (3 s
+/// normally) and the trickle lasts up to a minute, so nothing but the stop
+/// closes the connection first, however late the stop comes.
 #[test]
 fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
     run(async {
@@ -421,6 +423,7 @@ fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
         BlockFetcher::new(source)
             .with_policy(quick())
             .with_cancel(cancel.clone())
+            .with_linger(Duration::from_secs(600))
             .fetch(block.block_hash(), 100)
             .await
             .expect("served");
@@ -439,9 +442,11 @@ fn a_stop_while_a_peer_trickles_after_the_block_closes_the_connection() {
             hung_up >= stopped,
             "the connection closed before the stop, so the stop was not what closed it"
         );
+        // At once, with room for a loaded machine: the trickle would have
+        // kept it open for most of a minute.
         let after = hung_up - stopped;
         assert!(
-            after < Duration::from_secs(2),
+            after < Duration::from_secs(10),
             "hung up {after:?} after the stop"
         );
     });

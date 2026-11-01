@@ -2642,20 +2642,44 @@ mod tests {
 
     /// Connections still opening when a broadcast ends end with it: through
     /// Tor a dead address keeps a connect waiting 20 s, and so does a peer
-    /// that takes the connection and never answers the handshake.
+    /// that takes the connection and never answers the handshake. The live
+    /// peers' connections are held back until both of those are under way
+    /// (the proxy has the dead address's request, the silent peer the
+    /// `version`), so the broadcast cannot end before they are.
     #[test]
     fn connections_still_opening_end_with_the_broadcast() {
         use blindbit_lib::net::testing::FakeSocks5;
+        use std::io::Read;
 
         let net = FakeNet::new();
         let fakes = net_of(&net, 120, vec![Script::default(); 3]);
         let proxy = FakeSocks5::start();
+        let held: Vec<_> = fakes
+            .iter()
+            .map(|fake| proxy.hold(fake.addr.into()))
+            .collect();
         let mut all = addrs(&fakes);
         let dead = SocketAddr::from(([10, 150, 0, 1], 18444));
         proxy.stall(dead.into());
         all.push(dead);
         let silent = std::net::TcpListener::bind((ip(120, 5), 0)).unwrap();
         all.push(silent.local_addr().unwrap());
+        // The silent peer takes the connection, reads the `version`, never
+        // answers, and notes when the connection closes.
+        let (version_arrived, got_version) = std::sync::mpsc::channel();
+        let (closing, closed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = silent.accept() else {
+                return;
+            };
+            let mut header = [0u8; 24];
+            if stream.read_exact(&mut header).is_ok() {
+                let _ = version_arrived.send(());
+            }
+            let mut sink = [0u8; 1024];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            let _ = closing.send(Instant::now());
+        });
         // Through a proxy six observers start at once: all five peers.
         // With none left for a sender, the broadcast ends as soon as the
         // three live ones are ready.
@@ -2663,41 +2687,79 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = runtime.block_on(async {
-            let peers = pool_via(&all, proxy.dialer()).await;
-            broadcast(
-                peers,
-                candidate(27),
-                Duration::from_secs(45),
-                History::default(),
-            )
-            .await
+        let (under_way, result, silent_closed) = std::thread::scope(|scope| {
+            let (proxy, held) = (&proxy, &held);
+            let opener = scope.spawn(move || {
+                let limit = Instant::now() + Duration::from_secs(15);
+                let dead_asked = loop {
+                    let dead = PeerAddr::from(dead);
+                    if proxy.requests().iter().any(|r| r.target == dead) {
+                        break true;
+                    }
+                    if Instant::now() > limit {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                let silent_asked = got_version.recv_timeout(Duration::from_secs(15)).is_ok();
+                for gate in held {
+                    gate.open();
+                }
+                (dead_asked, silent_asked)
+            });
+            let result = runtime.block_on(async {
+                let peers = pool_via(&all, proxy.dialer()).await;
+                broadcast(
+                    peers,
+                    candidate(27),
+                    Duration::from_secs(45),
+                    History::default(),
+                )
+                .await
+            });
+            // The runtime still runs: only the broadcast's end can close
+            // the silent peer's connection now (its handshake waits 20 s).
+            let silent_closed = closed.recv_timeout(AT_ONCE).is_ok();
+            (opener.join().unwrap(), result, silent_closed)
         });
-        let ended = Instant::now();
+        let shutting_down = Instant::now();
         runtime.shutdown_timeout(Duration::from_secs(60));
-        let lingered = ended.elapsed();
+        let lingered = shutting_down.elapsed();
+        assert_eq!(under_way, (true, true), "(dead address, silent peer)");
         let error = result.unwrap_err();
         assert!(
             error.starts_with("no Bitcoin peers reachable to take the transaction"),
             "{error}"
         );
         assert!(
-            lingered < Duration::from_secs(10),
+            silent_closed,
+            "the silent peer's connection stayed open after the broadcast"
+        );
+        assert!(
+            lingered < AT_ONCE,
             "connections went on {lingered:?} after the broadcast"
         );
     }
 
     /// Through Tor a dead address keeps a connection waiting the whole
     /// 20 s: more observers and senders are started alongside, so the
-    /// broadcast succeeds long before, and still hands the transaction to
-    /// no more than two peers. (The connects still waiting end with it.)
+    /// broadcast succeeds before any such connect gives up, and still hands
+    /// the transaction to no more than two peers. The live peers' connects
+    /// are held until a hedge has started, so one is needed whichever peers
+    /// are picked first, and the budget ends before a dead connect would
+    /// give up (20 s), so nothing but hedging finds the live peers in time.
+    /// The hedges come every second here (6 s in `Timing::PROXIED`).
     #[tokio::test]
     async fn through_a_proxy_dead_addresses_are_hedged_around() {
         use blindbit_lib::net::testing::FakeSocks5;
 
         let net = FakeNet::new();
-        let fakes = net_of(&net, 190, vec![Script::default(); 7]);
-        let proxy = FakeSocks5::start();
+        let fakes = net_of(&net, 190, vec![Script::default(); 10]);
+        let proxy = Arc::new(FakeSocks5::start());
+        let held: Vec<_> = fakes
+            .iter()
+            .map(|fake| proxy.hold(fake.addr.into()))
+            .collect();
         let mut all = addrs(&fakes);
         for n in 0..7u8 {
             // Addresses Tor never gets an answer from.
@@ -2706,23 +2768,43 @@ mod tests {
             all.push(dead);
         }
         let peers = pool_via(&all, proxy.dialer()).await;
-        let started = Instant::now();
-        let report = broadcast(
+        let timing = Timing {
+            hedge_every: Some(Duration::from_secs(1)),
+            ..Timing::PROXIED
+        };
+        // More connections than those opened at the start: a hedge.
+        let opener = std::thread::spawn({
+            let proxy = proxy.clone();
+            move || {
+                let limit = Instant::now() + Duration::from_secs(30);
+                let hedged = loop {
+                    if proxy.requests().len() > timing.observers_at_start {
+                        break true;
+                    }
+                    if Instant::now() > limit {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                for gate in &held {
+                    gate.open();
+                }
+                hedged
+            }
+        });
+        let report = broadcast_paced(
             peers,
             candidate(17),
-            Duration::from_secs(45),
+            Duration::from_secs(19),
             History::default(),
+            timing,
         )
         .await
         .unwrap();
-        let waited = started.elapsed();
+        assert!(opener.join().unwrap(), "no hedge started");
         assert!(
             matches!(report.verdict, Verdict::InMempool { .. }),
             "{report:?}"
-        );
-        assert!(
-            waited < Duration::from_secs(19),
-            "waited {waited:?}: a dead address costs 20 s"
         );
         assert!((1..=SENDERS).contains(&report.sent_to.len()), "{report:?}");
         let handed = fakes.iter().filter(|fake| got_tx(fake)).count();

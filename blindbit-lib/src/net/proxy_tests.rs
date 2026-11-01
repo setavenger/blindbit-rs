@@ -314,6 +314,38 @@ fn a_seed_node_sending_single_addresses_gets_one_of_them_kept() {
     );
 }
 
+/// A seed's node answering with more addresses than a peer may send in one
+/// message (1,000) gets the first 1,000 kept.
+#[test]
+fn of_an_oversized_seed_answer_the_first_thousand_addresses_are_kept() {
+    let answer: Vec<AddrV2Message> = (0..1_500u16)
+        .map(|i| {
+            let [high, low] = i.to_be_bytes();
+            AddrV2Message {
+                time: 0,
+                services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                addr: AddrV2::Ipv4(Ipv4Addr::new(46, high, low, 1)),
+                port: 18444,
+            }
+        })
+        .collect();
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.oversized-seed.invalid",
+        seed_node(Answer::Now, answer.clone()).0,
+    );
+    let kept = run(super::seeds::ask_seed_node(
+        &proxy.dialer(),
+        "oversized-seed.invalid",
+        18444,
+        Network::Regtest,
+        Duration::from_secs(20),
+    ))
+    .expect("the answer");
+    assert_eq!(kept.len(), 1_000);
+    assert!(kept == answer[..1_000], "not the answer's first 1,000");
+}
+
 /// Seeding through the proxy returns once one seed's node has given enough
 /// addresses; a slower seed's answer joins the book later, and one that
 /// never answers holds up nothing. The slower seed answers only once
