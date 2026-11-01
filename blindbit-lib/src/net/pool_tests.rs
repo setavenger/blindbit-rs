@@ -236,22 +236,21 @@ fn once_the_proxy_stopped_working_an_unclear_connect_only_rests_the_peer() {
 fn no_route_is_this_computer_lacking_one() {
     use std::io::{Error, ErrorKind};
     let (v4, v6) = (addr(PEERS[0]), addr("[2001:db8::5]:18444"));
-    for kind in [
-        ErrorKind::NetworkUnreachable,
-        ErrorKind::HostUnreachable,
-        ErrorKind::AddrNotAvailable,
-    ] {
+    for kind in [ErrorKind::NetworkUnreachable, ErrorKind::AddrNotAvailable] {
         assert!(super::is_no_route(&Error::from(kind), &v6), "{kind:?}");
     }
     assert!(super::is_no_route(
         &Error::from(ErrorKind::NetworkUnreachable),
         &v4
     ));
-    // An IPv4 host that does not answer is the peer, not the route.
-    assert!(!super::is_no_route(
-        &Error::from(ErrorKind::HostUnreachable),
-        &v4
-    ));
+    // A host that does not answer is the peer, not the route, over IPv6 as
+    // well (a router's ICMPv6 "address unreachable").
+    for peer in [&v4, &v6] {
+        assert!(
+            !super::is_no_route(&Error::from(ErrorKind::HostUnreachable), peer),
+            "{peer}"
+        );
+    }
     assert!(!super::is_no_route(
         &Error::from(ErrorKind::ConnectionRefused),
         &v6

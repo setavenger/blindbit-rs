@@ -227,8 +227,9 @@ pub(crate) fn gossiped_addrs(message: &NetworkMessage) -> Option<Vec<AddrV2Messa
 /// peer's network (typically an IPv6 peer on a host without IPv6)? Never
 /// for an error through the proxy: its "network unreachable" is about the
 /// proxy's routes (Tor's exit), not this computer's. Hosts without IPv6
-/// also answer an IPv6 connect with "host unreachable" or "address not
-/// available".
+/// also answer an IPv6 connect with "address not available". "Host
+/// unreachable" is the peer's: a router on the way says it about that one
+/// address.
 pub fn is_no_route(error: &io::Error, peer: &PeerAddr) -> bool {
     if error
         .get_ref()
@@ -238,7 +239,7 @@ pub fn is_no_route(error: &io::Error, peer: &PeerAddr) -> bool {
     }
     match error.kind() {
         io::ErrorKind::NetworkUnreachable => true,
-        io::ErrorKind::HostUnreachable | io::ErrorKind::AddrNotAvailable => peer.is_ipv6(),
+        io::ErrorKind::AddrNotAvailable => peer.is_ipv6(),
         _ => false,
     }
 }
