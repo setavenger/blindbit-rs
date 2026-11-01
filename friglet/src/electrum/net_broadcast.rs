@@ -24,9 +24,10 @@
 //! least two senders, and every sender that got the transaction, to give
 //! the same answer: all asked for one of its parents (missing or spent
 //! inputs; a parent friglet broadcast itself and still holds is handed over
-//! instead), or all dropped the connection before the pong (what Bitcoin
-//! Core does with a consensus-invalid transaction). Anything else runs
-//! until the budget ends, as "not confirmed".
+//! instead), or all dropped the connection before the pong (older Bitcoin
+//! Core versions do that with a consensus-invalid transaction, newer ones
+//! do not, and a peer can also just go away: reported, never proof).
+//! Anything else runs until the budget ends, as "not confirmed".
 //!
 //! Pending broadcasts are rechecked the same way: peers they were not handed
 //! to are asked, and a lost one is handed to one of those
@@ -34,8 +35,9 @@
 //!
 //! Every connection goes through the pool's [`Dialer`](blindbit_lib::net::Dialer):
 //! [`connect`] is the only place one is opened. Through a proxy (Tor,
-//! `p2p_proxy`) each one gets a circuit of its own, so no exit relay sees
-//! both an observer and a sender, and the waits are longer ([`Timing`]).
+//! `p2p_proxy`) each one logs in with credentials of its own, so Tor gives
+//! it a circuit of its own (two circuits may still share an exit relay),
+//! and the waits are longer ([`Timing`]).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Shutdown, TcpStream};
@@ -111,9 +113,10 @@ pub enum Verdict {
     /// its inputs are missing or spent, or those peers lack an unconfirmed
     /// parent, so this is not final. The message is for the user.
     Rejected(String),
-    /// Every sender dropped the connection before answering the ping after
-    /// the transaction, which Bitcoin Core does with a consensus-invalid
-    /// transaction. A peer can also just go away, so this is not final.
+    /// Every sender (at least two) dropped the connection before answering
+    /// the ping after the transaction. Older Bitcoin Core versions do that
+    /// with a consensus-invalid transaction, newer ones do not, and a peer
+    /// can also just go away: not proof, and not final.
     Dropped(String),
     /// No observer had it `waited` after the first hand-over (observers that
     /// went away are replaced while the pool has peers).
@@ -1131,9 +1134,11 @@ fn rejected_message(signal: Signal, senders: usize) -> String {
              whether it has spread since."
         ),
         Signal::Dropped => format!(
-            "{peers} disconnected right after receiving the transaction. Bitcoin Core does that \
-             when a transaction is consensus-invalid, for example when a signature does not \
-             verify."
+            "{peers} disconnected right after receiving the transaction. Older Bitcoin Core \
+             versions do that with a consensus-invalid transaction (for example a signature \
+             that does not verify), newer ones do not, and a peer can also just go away: this \
+             does not prove the transaction invalid. Sending it again checks whether it has \
+             spread since."
         ),
     }
 }
@@ -1837,6 +1842,13 @@ mod tests {
             message.contains("disconnected right after receiving"),
             "{message}"
         );
+        // Bitcoin Core 30+ no longer disconnects for an invalid transaction:
+        // the message claims no invalidity.
+        assert!(
+            message.contains("does not prove the transaction invalid"),
+            "{message}"
+        );
+        assert!(!message.contains("Bitcoin Core does that"), "{message}");
     }
 
     #[tokio::test]
@@ -2105,8 +2117,8 @@ mod tests {
     }
 
     /// Through a proxy (Tor) every connection logs in with its own
-    /// credentials, so each gets a circuit of its own: no exit relay sees
-    /// both senders, or a sender and an observer. Nothing goes around it.
+    /// credentials, so Tor gives each a circuit of its own (whether two
+    /// share an exit relay is up to Tor). Nothing goes around it.
     #[tokio::test]
     async fn through_a_proxy_every_connection_is_on_its_own_circuit() {
         use blindbit_lib::net::testing::FakeSocks5;
