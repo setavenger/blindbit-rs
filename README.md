@@ -380,7 +380,7 @@ first-time-setup banner. Then:
    (nothing to rescan; the daemon records the tip as `start_height` on
    first start). **From block height** scans from the height you enter
    (pre-filled when the descriptor carries Sparrow's `?bh=` birth height).
-3. *Your Bitcoin node* (optional): your own node of that network,
+3. *Your Bitcoin node* (optional, recommended): your own node of that network,
    `host:port` or just `host`. Left empty, friglet downloads blocks from
    random peers of the network (see
    [Privacy](#privacy-your-node-or-random-peers)); regtest needs a node.
