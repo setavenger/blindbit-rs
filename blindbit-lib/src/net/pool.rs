@@ -313,10 +313,11 @@ impl PeerSource {
     }
 
     /// Addresses `from` gossiped (`addr` / `addrv2`). Whether they answer
-    /// the peer's `getaddr`: more than one address, or one that is not the
-    /// peer's own (a node announces itself with a message of its own
-    /// address alone). Only an answer stops [`Self::wants_addr`] asking the
-    /// peer again. Nothing for an own node.
+    /// the peer's `getaddr`: more than one address, or one IP address that
+    /// is not the peer's own (a node announces itself with a message of its
+    /// own address alone, also of its Tor, I2P or CJDNS address). Only an
+    /// answer stops [`Self::wants_addr`] asking the peer again. Nothing for
+    /// an own node.
     pub fn add_gossip(
         &self,
         from: &PeerAddr,
@@ -757,7 +758,9 @@ impl PeerPool {
             let ip = match message.addr {
                 AddrV2::Ipv4(ip) => IpAddr::V4(ip),
                 AddrV2::Ipv6(ip) => IpAddr::V6(ip),
-                _ => return false,
+                // A node on Tor, I2P or CJDNS too announces itself, and
+                // which address is the peer's own cannot be told there.
+                _ => return true,
             };
             // An IPv4-mapped address is the IPv4 address it maps.
             PeerAddr::from(SocketAddr::new(ip, 0)).ip() == Some(from_ip)

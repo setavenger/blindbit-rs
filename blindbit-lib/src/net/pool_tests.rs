@@ -454,6 +454,32 @@ fn a_peer_announcing_itself_has_not_answered_getaddr() {
     assert!(!source.wants_addr(&other));
 }
 
+/// A message holding only one Tor, I2P or CJDNS address is a node
+/// announcing itself there (whether it is its own cannot be told), not an
+/// answer to `getaddr`: it is asked again.
+#[test]
+fn a_peer_announcing_its_onion_address_has_not_answered_getaddr() {
+    let source = seeded(&PEERS);
+    let peer = addr("93.184.216.1:8333");
+    let message = |addr: AddrV2| AddrV2Message {
+        time: 0,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        addr,
+        port: 8333,
+    };
+    for announced in [
+        AddrV2::TorV3([7; 32]),
+        AddrV2::I2p([8; 32]),
+        AddrV2::Cjdns("fc00::1".parse().unwrap()),
+    ] {
+        assert!(
+            !source.add_gossip(&peer, [message(announced.clone())]),
+            "{announced:?} taken for an answer"
+        );
+        assert!(source.wants_addr(&peer));
+    }
+}
+
 #[test]
 fn an_own_node_is_the_only_peer_and_learns_nothing() {
     let node = addr("192.0.2.1:8333");
