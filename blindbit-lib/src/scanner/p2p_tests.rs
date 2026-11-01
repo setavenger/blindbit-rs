@@ -65,6 +65,14 @@ pub(super) enum Conn {
     /// Announce its own address right after the handshake, as Bitcoin Core
     /// does, then [`Conn::Serve`], then answer `getaddr` with [`GOSSIP`].
     AnnounceThenServeThenAddr,
+    /// Serve a block whose header differs (another nonce): another block.
+    ServeAnotherBlock,
+    /// Serve the block with a coinbase output changed: its transactions no
+    /// longer match the header's merkle root.
+    ServeBadMerkle,
+    /// Serve the block with a byte of a witness changed: the transactions
+    /// still match the merkle root, but not the witness commitment.
+    ServeBadWitness,
 }
 
 /// What a [`Conn::ServeWithAddr`] node gossips: two loopback peers (that
@@ -98,17 +106,42 @@ pub(super) struct Accepted {
     pub(super) version_after: Option<Duration>,
 }
 
-/// The block a node serves, with and without its witnesses.
+/// The block a node serves, with and without its witnesses, and tampered
+/// with in the ways [`Conn`] names.
 struct Served {
     full: Block,
     stripped: Block,
+    another: Block,
+    bad_merkle: Block,
+    bad_witness: Block,
 }
 
 impl Served {
     fn new(block: &Block) -> Self {
+        let mut another = block.clone();
+        another.header.nonce = another.header.nonce.wrapping_add(1);
+        let mut bad_merkle = block.clone();
+        if let Some(out) = bad_merkle.txdata[0].output.first_mut() {
+            out.value += bitcoin::Amount::from_sat(1);
+        }
+        let mut bad_witness = block.clone();
+        if let Some(input) = bad_witness
+            .txdata
+            .iter_mut()
+            .skip(1)
+            .flat_map(|tx| tx.input.iter_mut())
+            .find(|input| !input.witness.is_empty())
+        {
+            let mut elements = input.witness.to_vec();
+            elements[0][0] ^= 1;
+            input.witness = bitcoin::Witness::from_slice(&elements);
+        }
         Self {
             full: block.clone(),
             stripped: stripped(block),
+            another,
+            bad_merkle,
+            bad_witness,
         }
     }
 }
@@ -391,6 +424,9 @@ fn serve(
             std::thread::sleep(Duration::from_millis(100));
             wire.send(NetworkMessage::AddrV2(gossip()))?;
         }
+        Conn::ServeAnotherBlock => wire.send(NetworkMessage::Block(served.another.clone()))?,
+        Conn::ServeBadMerkle => wire.send(NetworkMessage::Block(served.bad_merkle.clone()))?,
+        Conn::ServeBadWitness => wire.send(NetworkMessage::Block(served.bad_witness.clone()))?,
         Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
         Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,
         Conn::CloseMidBlock => {
@@ -766,12 +802,16 @@ fn a_service_that_is_not_bitcoin_p2p_is_named() {
     );
 }
 
-/// What a node learns about friglet in the handshake stays what it was with
-/// the previous P2P library: user agent, protocol version, no services, no
-/// transaction relay, and a 1 sat/vB fee filter after `verack`.
-#[test]
-fn the_handshake_shows_the_node_the_same_client_as_before() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+/// A full node at height 1 on `ip` that takes one connection, notes the
+/// client's `version` and the messages after the handshake, and answers
+/// the block request with `notfound`. The thread returns what it noted.
+pub(super) fn recording_node(
+    ip: IpAddr,
+) -> (
+    SocketAddr,
+    std::thread::JoinHandle<(VersionMessage, Vec<NetworkMessage>)>,
+) {
+    let listener = TcpListener::bind(SocketAddr::new(ip, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let node = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
@@ -805,6 +845,28 @@ fn the_handshake_shows_the_node_the_same_client_as_before() {
         let _ = wire.drain();
         (version, after)
     });
+    (addr, node)
+}
+
+/// What a `version` message must not give away: friglet's address, the
+/// peer's address as friglet sees it, a chain height, services, relaying.
+pub(super) fn assert_version_gives_nothing_away(version: &VersionMessage) {
+    let placeholder = Address::new(&"127.0.0.1:1".parse().unwrap(), ServiceFlags::NONE);
+    assert_eq!(version.user_agent, "/SwiftSync:0.1.0/");
+    assert_eq!(version.sender, placeholder, "friglet's address");
+    assert_eq!(version.receiver, placeholder, "the peer's address");
+    assert_eq!(version.start_height, 0);
+    assert_eq!(version.services, ServiceFlags::NONE);
+    assert!(!version.relay);
+}
+
+/// What a node learns about friglet in the handshake stays what it was with
+/// the previous P2P library: user agent, protocol version, no services, no
+/// transaction relay, placeholder addresses, and a 1 sat/vB fee filter
+/// after `verack`.
+#[test]
+fn the_handshake_shows_the_node_the_same_client_as_before() {
+    let (addr, node) = recording_node([127, 0, 0, 1].into());
     let err = run(BlockFetcher::new(own_node(addr))
         .with_policy(fast(1))
         .fetch(block().block_hash(), 1))
@@ -812,11 +874,8 @@ fn the_handshake_shows_the_node_the_same_client_as_before() {
     assert_eq!(err.failure, FetchFailure::NotFound);
 
     let (version, after) = node.join().unwrap();
-    assert_eq!(version.user_agent, "/SwiftSync:0.1.0/");
     assert_eq!(version.version, 70016);
-    assert_eq!(version.services, ServiceFlags::NONE);
-    assert_eq!(version.start_height, 0);
-    assert!(!version.relay);
+    assert_version_gives_nothing_away(&version);
     for expected in [
         NetworkMessage::WtxidRelay,
         NetworkMessage::Verack,

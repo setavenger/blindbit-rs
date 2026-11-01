@@ -10,7 +10,7 @@ use bitcoin::Network;
 use bitcoin::p2p::ServiceFlags;
 
 use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy, connect_failure};
-use super::p2p_tests::{Conn, Node, fast};
+use super::p2p_tests::{Conn, Node, assert_version_gives_nothing_away, fast, recording_node};
 use super::test_support::run;
 use crate::net::testing::FakeSocks5;
 use crate::net::{Dialer, PeerAddr, PeerEvent, PeerHost, PeerSource, Seeds};
@@ -71,6 +71,35 @@ fn the_own_node_is_reached_by_name_through_the_proxy() {
     let requests = proxy.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].target, node_invalid(node.addr.port()));
+}
+
+/// Through the proxy the handshake gives nothing away either, to the own
+/// node and to a discovered peer: placeholder addresses, no height, the
+/// shared user agent.
+#[test]
+fn through_the_proxy_the_handshake_gives_nothing_away() {
+    let proxy = FakeSocks5::start();
+    let (own, own_node) = recording_node(ip(1));
+    proxy.route("node.invalid", own);
+    let err = fetch(PeerSource::own_node(
+        node_invalid(own.port()),
+        proxy.dialer(),
+        Network::Regtest,
+    ))
+    .expect_err("notfound");
+    assert_eq!(err.failure, FetchFailure::NotFound);
+    let (discovered, discovered_node) = recording_node(ip(84));
+    fetch(PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Static(vec![discovered.into()]),
+    ))
+    .expect_err("notfound");
+    for node in [own_node, discovered_node] {
+        let (version, _) = node.join().unwrap();
+        assert_version_gives_nothing_away(&version);
+    }
+    assert_eq!(proxy.requests().len(), 2, "both through the proxy");
 }
 
 /// The proxy is down or refuses: the error names `p2p_proxy`, and the node

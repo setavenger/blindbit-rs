@@ -5,6 +5,7 @@
 //! Not on macOS, where only 127.0.0.1 is configured on the loopback
 //! interface.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use super::p2p_tests::{Conn, GOSSIP, Node, OneBlock};
 use super::stream_safety_tests::{owned_outputs, payment_block, served_block, unserve};
 use super::test_support::{run, scanner};
 use crate::net::pool::{PeerPool, Where};
-use crate::net::{Dialer, PeerAddr, PeerSource, Seeds};
+use crate::net::{Dialer, PeerAddr, PeerEvent, PeerSource, Purpose, Seeds};
 
 /// A distinct loopback address per node, across all tests of this module
 /// (they run in parallel and must not share a listener IP).
@@ -68,14 +69,53 @@ fn genesis() -> Block {
     bitcoin::constants::genesis_block(Network::Regtest)
 }
 
+/// `fetch`, failing the test after a minute rather than hanging it (a
+/// fetch that keeps asking the same peer never ends by itself).
+async fn within_a_minute<T>(fetch: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(60), fetch)
+        .await
+        .expect("the fetch ended within a minute")
+}
+
 fn fetch(
     source: &Arc<PeerSource>,
     hash: BlockHash,
     height: u64,
 ) -> Result<Block, Box<super::BlockFetchError>> {
-    run(BlockFetcher::new(source.clone())
-        .with_policy(quick())
-        .fetch(hash, height))
+    run(within_a_minute(
+        BlockFetcher::new(source.clone())
+            .with_policy(quick())
+            .fetch(hash, height),
+    ))
+}
+
+/// Put `nodes` in the source's book and line them up: the pool hands out a
+/// peer that is not resting first, then resting ones by when their rest
+/// ends, so resting the second node 2 min (behind) and the third 10 min
+/// (unhelpful) makes a fetch ask the nodes in the order given.
+async fn in_order(source: &PeerSource, nodes: [&Node; 3]) {
+    source
+        .next(Purpose::Block, &HashSet::new())
+        .await
+        .expect("seeded");
+    assert_eq!(source.known(), 3, "a slot collision: move the addresses");
+    source.report(&nodes[1].addr.into(), PeerEvent::Behind);
+    source.report(&nodes[2].addr.into(), PeerEvent::Unhelpful);
+}
+
+/// Each node was asked once, in the order given.
+fn asked_once_in_order(nodes: [(&str, &Node); 3]) {
+    let mut last = None;
+    for (name, node) in nodes {
+        let [connection] = node.accepted()[..] else {
+            panic!("{name} asked {} times", node.connections());
+        };
+        assert!(
+            last.is_none_or(|last| last < connection.at),
+            "{name} asked out of order"
+        );
+        last = Some(connection.at);
+    }
 }
 
 #[test]
@@ -85,37 +125,78 @@ fn a_stalling_and_a_stripping_peer_are_passed_over_for_one_that_serves() {
     let strip = node(12, &block, vec![Conn::ServeStripped; 2]);
     let serve = node(13, &block, vec![Conn::Serve; 3]);
     let source = discovering(&[&stall, &strip, &serve]);
+    run(in_order(&source, [&stall, &strip, &serve]));
 
-    let got = fetch(&source, block.block_hash(), 100).expect("one peer serves it");
+    let got = fetch(&source, block.block_hash(), 100).expect("the third peer serves it");
     assert_eq!(got.block_hash(), block.block_hash());
-    for (name, node) in [("stall", &stall), ("strip", &strip), ("serve", &serve)] {
-        assert!(
-            node.connections() <= 1,
-            "{name} asked {} times",
-            node.connections()
-        );
-    }
-    assert_eq!(serve.connections(), 1);
+    asked_once_in_order([("stall", &stall), ("strip", &strip), ("serve", &serve)]);
+    assert!(
+        stall.stalled().is_some(),
+        "the first peer stalled mid-block"
+    );
+    let strip_addr: PeerAddr = strip.addr.into();
+    assert!(
+        pool(&source).is_ignored(&strip_addr),
+        "a stripped block gets the peer ignored"
+    );
     let serve_addr: PeerAddr = serve.addr.into();
     assert_eq!(pool(&source).preferred(), Some(serve_addr.clone()));
     assert_eq!(pool(&source).place(&serve_addr), Some(Where::Tried));
-    let strip_addr: PeerAddr = strip.addr.into();
-    if strip.connections() == 1 {
-        assert!(
-            pool(&source).is_ignored(&strip_addr),
-            "a stripped block gets the peer ignored"
-        );
-    }
 
     // The next block: the serving peer first; the stripper never again.
-    let strip_before = strip.connections();
     fetch(&source, block.block_hash(), 100).expect("served again");
     assert_eq!(
         serve.connections(),
         2,
         "the peer that served is asked first"
     );
-    assert_eq!(strip.connections(), strip_before);
+    assert_eq!(strip.connections(), 1);
+}
+
+/// A peer that sends a block failing `check` (its words: `says`) is refused
+/// and ignored for the rest of the session.
+fn a_block_failing_its_check_gets_the_peer_ignored(last: u8, conn: Conn, says: &str) {
+    let block = witness_block(0xd0 ^ last);
+    let bad = node(last, &block, vec![conn; 2]);
+    let source = discovering(&[&bad]);
+    let err = fetch(&source, block.block_hash(), 100).expect_err("refused");
+    assert!(
+        matches!(&err.failure, FetchFailure::BadBlock(why) if why.contains(says)),
+        "{:?}",
+        err.failure
+    );
+    assert!(pool(&source).is_ignored(&bad.addr.into()));
+    assert!(
+        err.to_string()
+            .contains("1 sent a bad block and is ignored now"),
+        "{err}"
+    );
+    let err = fetch(&source, block.block_hash(), 100).expect_err("nobody left");
+    assert!(
+        matches!(err.failure, FetchFailure::NoPeers(_)),
+        "{:?}",
+        err.failure
+    );
+    assert_eq!(bad.connections(), 1, "an ignored peer is never asked again");
+}
+
+#[test]
+fn a_peer_sending_another_block_than_the_oracle_named_is_ignored() {
+    a_block_failing_its_check_gets_the_peer_ignored(15, Conn::ServeAnotherBlock, "it is block ");
+}
+
+#[test]
+fn a_peer_sending_transactions_that_miss_the_merkle_root_is_ignored() {
+    a_block_failing_its_check_gets_the_peer_ignored(16, Conn::ServeBadMerkle, "merkle root");
+}
+
+#[test]
+fn a_peer_sending_witnesses_that_miss_the_commitment_is_ignored() {
+    a_block_failing_its_check_gets_the_peer_ignored(
+        17,
+        Conn::ServeBadWitness,
+        "witness commitment",
+    );
 }
 
 #[test]
@@ -176,15 +257,15 @@ fn a_scan_finds_a_payment_in_a_block_from_the_third_peer() {
         let missing = node(22, &block, vec![Conn::NotFound; 2]);
         let serve = node(23, &block, vec![Conn::Serve; 2]);
         scanner.peers = discovering(&[&close, &missing, &serve]);
+        in_order(&scanner.peers, [&close, &missing, &serve]).await;
         scanner.p2p_retry = Some(quick());
         scanner.update_last_scanned_block_height(7300);
 
-        assert!(!scanner.watch_step(7301, OneBlock(payment.message)).await);
+        assert!(!within_a_minute(scanner.watch_step(7301, OneBlock(payment.message))).await);
         assert_eq!(scanner.get_last_scanned_block_height(), 7301);
         assert_eq!(owned_outputs(&scanner), 1);
         assert_eq!(scanner.scan_health().await.stall, None);
-        assert_eq!(serve.connections(), 1);
-        assert!(close.connections() <= 1 && missing.connections() <= 1);
+        asked_once_in_order([("close", &close), ("missing", &missing), ("serve", &serve)]);
     });
 }
 
