@@ -559,6 +559,7 @@ function fillForm(cfg) {
   // network unless a custom URL is set.
   if (isHostedOracle(cfg.oracle_url)) $("cfg-oracle-url").value = hostedOracle(cfg.network) ?? cfg.oracle_url;
   $("cfg-p2p-addr").value = cfg.p2p_node_addr ?? "";
+  $("cfg-p2p-proxy").value = cfg.p2p_proxy ?? "";
   if (cfg.start_height != null) setBirthday("height", cfg.start_height);
   else {
     $("cfg-start-height").value = "";
@@ -588,6 +589,7 @@ function formConfig() {
     network: $("cfg-network").value,
     oracle_url: text("cfg-oracle-url"),
     p2p_node_addr: optional("cfg-p2p-addr"),
+    p2p_proxy: optional("cfg-p2p-proxy"),
     start_height: atTip || text("cfg-start-height") === "" ? null : Number(text("cfg-start-height")),
     start_at_tip: atTip,
     spend_pubkey: optional("cfg-spend-pubkey"),

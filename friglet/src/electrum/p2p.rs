@@ -75,6 +75,14 @@ impl std::fmt::Display for P2pError {
 
 impl std::error::Error for P2pError {}
 
+impl P2pError {
+    /// The proxy every connection goes through (`p2p_proxy`) failed, not
+    /// the peer: nothing to hold against the peer.
+    pub fn proxy_down(&self) -> bool {
+        matches!(self, P2pError::Io(error) if blindbit_lib::net::is_proxy_down(error))
+    }
+}
+
 impl From<io::Error> for P2pError {
     fn from(error: io::Error) -> Self {
         match error.kind() {
