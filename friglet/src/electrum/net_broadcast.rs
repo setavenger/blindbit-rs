@@ -485,6 +485,8 @@ struct Round {
     /// When the first of them got it, and the latest.
     handed_over_at: Option<Instant>,
     last_handed_over_at: Option<Instant>,
+    /// When the latest rotation started a further sender.
+    last_rotation: Option<Instant>,
     /// Hand-over slots: [`SENDERS`], one more per rotation.
     slots: usize,
     refused: HashMap<PeerAddr, Signal>,
@@ -510,6 +512,7 @@ impl Round {
             sent_to: Vec::new(),
             handed_over_at: None,
             last_handed_over_at: None,
+            last_rotation: None,
             slots: SENDERS,
             refused: HashMap::new(),
             fee_filters: Vec::new(),
@@ -668,17 +671,20 @@ impl Round {
     }
 
     /// When the next sender may get the transaction if still nobody has
-    /// seen it ([`Timing::rotate_after`]); `None` while a sender is still
-    /// on its way, before the first hand-over, or after the last allowed.
+    /// seen it: [`Timing::rotate_after`] after the latest hand-over, and
+    /// after the latest rotation (its sender may still be on its way).
+    /// Senders still connecting otherwise hold nothing up: through a proxy
+    /// a hedged one to a dead address takes 20 s. `None` before the first
+    /// hand-over, or after the last allowed.
     fn rotation_due(&self) -> Option<Instant> {
         let last = self.last_handed_over_at?;
         let rotate = self.senders_started
             && self.seen_by.is_none()
             && self.proxy_down.is_none()
-            && self.senders_connecting() == 0
             && self.sent_to.len() < MAX_HAND_OVERS
             && self.sender_tries < self.timing.sender_tries;
-        rotate.then(|| last + self.timing.rotate_after)
+        let quiet_since = self.last_rotation.map_or(last, |at| at.max(last));
+        rotate.then(|| quiet_since + self.timing.rotate_after)
     }
 
     /// Hand the transaction to one more sender (a free slot, or a new one
@@ -689,6 +695,7 @@ impl Round {
             handed_over = self.sent_to.len(),
             "broadcast: no observer has it; handing it to one more peer"
         );
+        self.last_rotation = Some(Instant::now());
         if self.sent_to.len() >= self.slots {
             self.slots += 1;
             job.add_hand_over_slot();
@@ -1664,6 +1671,33 @@ mod tests {
 
     fn fake_addr(n: u8) -> PeerAddr {
         SocketAddr::from(([127, 250, 0, n], 1)).into()
+    }
+
+    /// Through a proxy a hedged sender to a dead address is "connecting"
+    /// for the whole 20 s connect timeout: the rotation after a quiet spell
+    /// does not wait for it. The next rotation comes a quiet spell after
+    /// that one, not at once.
+    #[test]
+    fn a_sender_still_connecting_does_not_hold_the_rotation() {
+        let timing = Timing::PROXIED;
+        let mut round = Round::new(timing, HashSet::new());
+        round.senders_started = true;
+        round.sent_to = vec![fake_addr(2), fake_addr(3)];
+        for addr in &round.sent_to {
+            round
+                .peers
+                .insert(addr.clone(), State::Sending { handed_over: true });
+        }
+        round
+            .peers
+            .insert(fake_addr(4), State::Sending { handed_over: false });
+        round.last_handed_over_at = Instant::now().checked_sub(timing.rotate_after);
+        let due = round.rotation_due().expect("a rotation");
+        assert!(due <= Instant::now(), "not due yet");
+
+        let rotated = Instant::now();
+        round.last_rotation = Some(rotated);
+        assert_eq!(round.rotation_due(), Some(rotated + timing.rotate_after));
     }
 
     /// [`Timing::DIRECT`] with a further sender after `rotate_after`.
