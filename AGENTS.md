@@ -291,16 +291,24 @@ dbus-run-session -- bash -c '
   Headers try up to 3 peers, the peer of the open header connection first
   while it is fresh; a peer that lacks a header is skipped for that request
   only (not rested, still the block peer). `blockchain.relayfee` is the
-  median of fresh feefilters from >= 3 (up to 5) peers, sampled at Electrum
-  start, the lowest until then. Broadcast (SNB-856, `friglet/src/electrum/net_broadcast.rs`):
-  3 observers (relay=true, settled, their version relays txs) first, then 2
-  senders (relay=false, inv → getdata → tx → ping/pong, then listen), all in
-  distinct netgroups (`PeerAddr::netgroup`: /16, /32); success only when an
-  observer serves the tx, rejection only when every sender gave the same
-  signal; rechecks ask 2 peers outside `PendingTx.sent_to` and hand a lost tx
-  to one of them. Own node: `relay::broadcast`/`recheck`, unchanged. DNS seed
-  answers must be public IPs; gossip may name local IPs only when it comes
-  from a local peer, and only the network's port or ports >= 1024.
+  median of fresh feefilters (from any connection: headers, broadcasts,
+  rechecks) of >= 3 (up to 5) peers, the lowest below that; sampling (at
+  Electrum start, and when fewer are fresh) stops once the quorum is in, and
+  a request waits at most 2 s, then answers from what is known
+  (`ChainSource::fee_filter_within`). Broadcast (SNB-856,
+  `friglet/src/electrum/net_broadcast.rs`): 3 observers (relay=true,
+  settled, their version relays txs) first, then 2 senders (relay=false,
+  inv → getdata → tx → ping/pong, then listen), all in distinct netgroups
+  (`PeerAddr::netgroup`: /16, /32); success only when an observer serves
+  the tx, rejection only when every sender gave the same signal; a dropped
+  connection is no proof of invalidity and no rejection. Rechecks run every
+  10 min (`PENDING_RECHECK`) while a tx is pending (≤ 14 days): 2 peers it
+  was never handed to (in any attempt) are asked about all pending txids on
+  one connection each (so they can link them; README privacy note), and a
+  lost tx goes to one of them. Own node: `relay::broadcast`/`recheck`,
+  unchanged. DNS seed answers must be public IPs; gossip may name local IPs
+  only when it comes from a local peer, and only the network's port or
+  ports >= 1024.
 - Tests: `blindbit-lib/src/net/pool_tests.rs` (pure),
   `scanner/discovery_tests.rs` (fake nodes on 127.0.0.x; not on macOS),
   broadcast scenarios in `friglet/src/electrum/net_broadcast.rs` and
@@ -355,8 +363,9 @@ dbus-run-session -- bash -c '
   at 2); observer window 15 s, limit 30 s, pong wait 15 s (5 s); budget
   `PROXIED_BROADCAST_BUDGET` 45 s (`electrum/mod.rs`; Sparrow's requests
   end at ~3, 12, 29, 64, 99 s, so the answer lands in the fourth). Each
-  sender/observer is its own SOCKS login (own circuit). Proxy down →
-  `Event::ProxyDown`, no peer blamed, error names `p2p_proxy`.
+  sender/observer is its own SOCKS login (own circuit; separate circuits
+  may still share an exit relay, Tor does not promise otherwise). Proxy
+  down → `Event::ProxyDown`, no peer blamed, error names `p2p_proxy`.
   `ask_mempools` races 2 extra connects and header requests race their
   first connection (`ChainSource::race_header_connection`) through a proxy:
   a tip header behind three dead addresses otherwise held a broadcast's
