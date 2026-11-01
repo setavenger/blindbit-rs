@@ -162,6 +162,21 @@ impl ChainSource {
             .ok_or_else(|| "no P2P peer sent a fee filter".to_string())
     }
 
+    /// [`Self::fee_filter`], waiting at most `wait`. Sampling that takes
+    /// longer goes on and counts for the next call; meanwhile what is known
+    /// ([`Self::known_fee_filter`]).
+    pub async fn fee_filter_within(&self, wait: Duration) -> Result<u64, String> {
+        match tokio::time::timeout(wait, self.fee_filter()).await {
+            Ok(rate) => rate,
+            Err(_) => self.known_fee_filter().ok_or_else(|| {
+                format!(
+                    "no P2P peer sent a fee filter within {} s",
+                    wait.as_secs_f32()
+                )
+            }),
+        }
+    }
+
     /// What [`Self::fee_filter`] would report now, without asking a peer.
     pub fn known_fee_filter(&self) -> Option<u64> {
         let filters = self.fee_filters();
@@ -179,8 +194,9 @@ impl ChainSource {
     }
 
     /// Discovered peers: read the fee filters of enough further peers for a
-    /// quorum, on short connections opened at once. Connections still under
-    /// way when the caller stops waiting finish and count for the next call.
+    /// quorum, on short connections opened at once, until the quorum is
+    /// there. Connections still under way then, or when the caller stops
+    /// waiting, finish and count for the next call.
     async fn sample_fee_filters(&self) {
         let _one_at_a_time = self.fee_sampling.lock().await;
         let mut asked = self.fee_filters().fresh_peers();
@@ -214,7 +230,12 @@ impl ChainSource {
                 }
             });
         }
-        while connections.join_next().await.is_some() {}
+        while connections.join_next().await.is_some() {
+            if self.fee_filters().current(FEE_FILTER_QUORUM).is_some() {
+                connections.detach_all();
+                break;
+            }
+        }
     }
 
     /// Remember a fee filter `peer` sent on any connection.
@@ -701,5 +722,87 @@ mod tests {
         );
         let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
         assert_eq!(chain.fee_filter().await.unwrap(), 2_000);
+    }
+
+    /// A peer that accepts the connection and never answers: its handshake
+    /// waits the whole connect timeout.
+    fn silent_peer(ip: [u8; 4]) -> std::net::TcpListener {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::from(ip), 0)).unwrap()
+    }
+
+    /// The relay fee is there as soon as a quorum of peers sent filters;
+    /// a further peer that does not answer is not waited for (its 5 s
+    /// connect timeout used to hold the answer).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_relay_fee_does_not_wait_past_the_quorum() {
+        let fakes: Vec<FakePeer> = [1_000, 2_000, 3_000]
+            .into_iter()
+            .enumerate()
+            .map(|(i, fee_filter)| {
+                FakePeer::spawn_on(
+                    [127, 0, 0, 51 + i as u8].into(),
+                    Script {
+                        fee_filter,
+                        ..Script::default()
+                    },
+                    1,
+                )
+            })
+            .collect();
+        let silent = silent_peer([127, 0, 0, 54]);
+        let mut seeds: Vec<PeerAddr> = fakes.iter().map(|fake| fake.addr.into()).collect();
+        seeds.push(silent.local_addr().unwrap().into());
+        // The silent peer's connect outlives the answer; a plain runtime
+        // drop would wait for it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (rate, waited) = runtime.block_on(async {
+            let peers =
+                PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(seeds));
+            let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+            let started = Instant::now();
+            let rate = chain.fee_filter().await;
+            (rate, started.elapsed())
+        });
+        runtime.shutdown_background();
+        assert_eq!(rate.unwrap(), 2_000);
+        assert!(waited < FEE_SAMPLE_CONNECT_TIMEOUT / 2, "waited {waited:?}");
+        // The silent peer was asked too.
+        silent.set_nonblocking(true).unwrap();
+        let asked = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(20));
+            silent.accept().is_ok()
+        });
+        assert!(asked, "the silent peer was not asked");
+    }
+
+    /// When sampling takes longer than a relay fee request may wait, the
+    /// request gets the filters known by then, not an error.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_relay_fee_that_cannot_wait_gets_the_known_filters() {
+        let silent: Vec<_> = (61..64).map(|n| silent_peer([127, 0, 0, n])).collect();
+        let seeds = silent
+            .iter()
+            .map(|peer| peer.local_addr().unwrap().into())
+            .collect();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rate = runtime.block_on(async {
+            let peers =
+                PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(seeds));
+            let chain = ChainSource::new(peers, "http://127.0.0.1:1".into());
+            let broadcast_peer: PeerAddr =
+                std::net::SocketAddr::from(([192, 0, 2, 1], 8333)).into();
+            chain.note_fee_filter(&broadcast_peer, Some(1_500));
+            chain.fee_filter_within(Duration::from_millis(300)).await
+        });
+        runtime.shutdown_background();
+        assert_eq!(rate, Ok(1_500));
     }
 }

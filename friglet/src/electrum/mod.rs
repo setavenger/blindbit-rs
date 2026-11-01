@@ -1332,29 +1332,24 @@ async fn settle_rechecked(state: &ElectrumServerState, checked: Vec<Rechecked>) 
 /// `blockchain.relayfee`: the lowest fee rate the P2P peer's mempool accepts
 /// right now, in BTC/kvB. Sparrow asks once per connection and drops the
 /// connection on an error, so an unreadable peer falls back to Bitcoin
-/// Core's long-standing 1 sat/vB default.
+/// Core's long-standing 1 sat/vB default. After 2 s it answers from the
+/// fee filters known by then.
 async fn relay_fee(state: &ElectrumServerState) -> f64 {
-    match timeout(Duration::from_secs(2), state.chain.fee_filter()).await {
+    match state.chain.fee_filter_within(Duration::from_secs(2)).await {
         // Above 0.1 BTC/kvB is a peer telling us not to send transactions
         // at all (Bitcoin Core does that during initial block download).
-        Ok(Ok(sat_per_kvb)) if sat_per_kvb > 0 && sat_per_kvb <= 10_000_000 => {
+        Ok(sat_per_kvb) if sat_per_kvb > 0 && sat_per_kvb <= 10_000_000 => {
             sat_per_kvb as f64 / 100_000_000.0
         }
-        Ok(Ok(sat_per_kvb)) => {
+        Ok(sat_per_kvb) => {
             tracing::warn!(
                 sat_per_kvb,
                 "P2P peer's fee filter is unusable as a relay fee; reporting the default"
             );
             DEFAULT_RELAY_FEE_BTC_PER_KVB
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             tracing::warn!(%error, "could not read the P2P peer's fee filter; reporting the default relay fee");
-            DEFAULT_RELAY_FEE_BTC_PER_KVB
-        }
-        Err(_) => {
-            tracing::warn!(
-                "timed out reading the P2P peer's fee filter; reporting the default relay fee"
-            );
             DEFAULT_RELAY_FEE_BTC_PER_KVB
         }
     }
