@@ -96,8 +96,9 @@ pub struct History {
     /// an observer (nor a sender), and peers in its network group are
     /// passed over while the pool has others.
     pub handed_to: HashSet<PeerAddr>,
-    /// Its unconfirmed parents that friglet broadcast itself and still
-    /// holds: a sender's peer that asks for one gets it.
+    /// Its unconfirmed ancestors (parents, their parents, …) that friglet
+    /// broadcast itself and still holds: a sender's peer that asks for one
+    /// gets it.
     pub parents: Vec<Transaction>,
     /// The pending store: every peer the transaction (or a parent) is
     /// handed to goes in, and to disk, before the bytes are written to it,
@@ -1961,6 +1962,7 @@ mod tests {
         let net = FakeNet::new();
         let orphan = Script {
             policy: TxPolicy::Orphan,
+            confirmed: vec![parent.tx.input[0].previous_output.txid],
             ..Script::default()
         };
         let fakes = net_of(&net, 216, vec![orphan; 5]);

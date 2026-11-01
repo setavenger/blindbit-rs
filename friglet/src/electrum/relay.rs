@@ -155,19 +155,20 @@ pub(super) struct Signals {
 /// A transaction's parents: only a request for one of them (by txid; a
 /// parent is never known by wtxid) says the peer lacks its inputs, and the
 /// ones friglet holds (pending broadcasts of its own) are handed over when
-/// asked for, so the peer can take the child.
+/// asked for, so the peer can take the child. A held parent's own parents
+/// count the same way: a peer that took it asks for them next.
 pub(super) struct Parents {
     ids: HashSet<Txid>,
     held: HashMap<Txid, Transaction>,
 }
 
 impl Parents {
+    /// The parents of `tx`, given its `held` pending ancestors.
     pub(super) fn of(tx: &Transaction, held: &[Transaction]) -> Self {
         Self {
-            ids: tx
-                .input
-                .iter()
-                .map(|input| input.previous_output.txid)
+            ids: std::iter::once(tx)
+                .chain(held)
+                .flat_map(|tx| tx.input.iter().map(|input| input.previous_output.txid))
                 .collect(),
             held: held
                 .iter()

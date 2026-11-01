@@ -31,8 +31,10 @@ pub enum TxPolicy {
     Ignore,
     /// Consensus-invalid: the connection is closed.
     Disconnect,
-    /// Inputs missing unless its parent is in the mempool: asks for the
-    /// parent, and takes both once the parent comes.
+    /// Inputs missing unless its parent is in the mempool (or confirmed,
+    /// [`Script::confirmed`]): asks for the parent, then for that parent's
+    /// parent if it lacks it too, and so on, and takes them all once the
+    /// last one comes.
     Orphan,
     /// Silently dropped, and another transaction (not a parent) is asked
     /// for.
@@ -60,6 +62,9 @@ pub struct Script {
     pub request_announced: bool,
     /// Transactions already in the mempool (raw bytes).
     pub mempool: Vec<Vec<u8>>,
+    /// Transactions in a block: a transaction spending one has its input
+    /// ([`TxPolicy::Orphan`]).
+    pub confirmed: Vec<bitcoin::Txid>,
     /// Block headers the peer knows.
     pub headers: Vec<Header>,
     /// Advertised fee filter, sat/kvB.
@@ -91,6 +96,7 @@ impl Default for Script {
             policy: TxPolicy::Accept,
             request_announced: true,
             mempool: Vec::new(),
+            confirmed: Vec::new(),
             headers: Vec::new(),
             fee_filter: 1000,
             relay: true,
@@ -335,8 +341,9 @@ fn serve(
     // Transactions this connection knows: announced either way.
     let mut known: HashSet<Vec<u8>> = HashSet::new();
     let mut echoed: Option<(Vec<u8>, Instant)> = None;
-    // The parent asked for, and the transaction waiting for it.
-    let mut orphan: Option<(bitcoin::Txid, Vec<u8>)> = None;
+    // The parents asked for, each with the transaction waiting for it: the
+    // child first, then a parent that lacked its own parent, and so on.
+    let mut orphans: Vec<(bitcoin::Txid, Vec<u8>)> = Vec::new();
     let connected = Instant::now();
     loop {
         if their_relay
@@ -434,14 +441,27 @@ fn serve(
             NetworkMessage::Tx(tx) => {
                 let raw = encode::serialize(&tx);
                 known.insert(raw.clone());
-                // The parent this connection asked for: taken, and the
-                // transaction that waited for it too.
-                if let Some((parent, child)) = &orphan
-                    && tx.compute_txid() == *parent
+                // The parent this connection asked for last: when it has
+                // its own parent it is taken, and every transaction that
+                // waited for it too; otherwise that parent is asked for.
+                if orphans
+                    .last()
+                    .is_some_and(|(parent, _)| tx.compute_txid() == *parent)
                 {
-                    accept(shared, raw);
-                    accept(shared, child.clone());
-                    orphan = None;
+                    match missing_parent(&tx, shared, script) {
+                        Some(grandparent) => {
+                            wire.send(NetworkMessage::GetData(vec![
+                                Inventory::WitnessTransaction(grandparent),
+                            ]))?;
+                            orphans.push((grandparent, raw));
+                        }
+                        None => {
+                            accept(shared, raw);
+                            while let Some((_, child)) = orphans.pop() {
+                                accept(shared, child);
+                            }
+                        }
+                    }
                     continue;
                 }
                 let policy = shared
@@ -454,23 +474,15 @@ fn serve(
                     TxPolicy::Accept => accept(shared, raw.clone()),
                     TxPolicy::Ignore => {}
                     TxPolicy::Disconnect => return Ok(()),
-                    TxPolicy::Orphan => {
-                        let parent = tx.input[0].previous_output.txid;
-                        let has_parent = shared
-                            .mempool
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .any(|raw| ids(raw).0 == parent);
-                        if has_parent {
-                            accept(shared, raw.clone());
-                        } else {
+                    TxPolicy::Orphan => match missing_parent(&tx, shared, script) {
+                        None => accept(shared, raw.clone()),
+                        Some(parent) => {
                             wire.send(NetworkMessage::GetData(vec![
                                 Inventory::WitnessTransaction(parent),
                             ]))?;
-                            orphan = Some((parent, raw.clone()));
+                            orphans.push((parent, raw.clone()));
                         }
-                    }
+                    },
                     TxPolicy::RequestOther => {
                         let other = bitcoin::hashes::Hash::from_byte_array([0xee; 32]);
                         wire.send(NetworkMessage::GetData(vec![
@@ -486,6 +498,19 @@ fn serve(
             _ => {}
         }
     }
+}
+
+/// The parent `tx` spends from (its first input's) when it is neither in
+/// the mempool nor confirmed.
+fn missing_parent(tx: &Transaction, shared: &Shared, script: &Script) -> Option<bitcoin::Txid> {
+    let parent = tx.input[0].previous_output.txid;
+    let in_mempool = shared
+        .mempool
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|raw| ids(raw).0 == parent);
+    (!in_mempool && !script.confirmed.contains(&parent)).then_some(parent)
 }
 
 /// Put `raw` into the shared mempool.

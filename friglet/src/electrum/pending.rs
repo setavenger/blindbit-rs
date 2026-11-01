@@ -206,17 +206,34 @@ impl PendingStore {
         }
     }
 
-    /// The pending transactions `tx` spends from: unconfirmed parents a
-    /// peer may lack, which friglet can hand over.
-    pub fn held_parents(&self, tx: &Transaction) -> Vec<Transaction> {
-        let ids: HashSet<String> = tx
+    /// The pending transactions `tx` descends from: its pending parents,
+    /// theirs, and so on. Unconfirmed ancestors a peer may lack, which
+    /// friglet can hand over (a peer that gets a parent may ask for its
+    /// parent next).
+    pub fn held_ancestors(&self, tx: &Transaction) -> Vec<Transaction> {
+        let mut ancestors = Vec::new();
+        let mut seen = HashSet::new();
+        let mut next: Vec<String> = tx
             .input
             .iter()
             .map(|input| input.previous_output.txid.to_string())
             .collect();
-        ids.iter()
-            .filter_map(|id| decode(&self.txs.get(id)?.raw_hex))
-            .collect()
+        while let Some(id) = next.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some(parent) = self.txs.get(&id).and_then(|p| decode(&p.raw_hex)) else {
+                continue;
+            };
+            next.extend(
+                parent
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.txid.to_string()),
+            );
+            ancestors.push(parent);
+        }
+        ancestors
     }
 
     /// Every discovered peer `txid` was handed to, pending or not.
@@ -528,6 +545,55 @@ mod tests {
         let store = PendingStore::load(path.clone());
         assert!(store.handed_to("old").is_empty());
         assert_eq!(store.handed_to("new"), HashSet::from([peer(2)]));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The pending ancestors of a transaction: parents, theirs and so on,
+    /// each once; a confirmed (or unknown) one ends the line.
+    #[test]
+    fn held_ancestors_go_back_through_every_pending_generation() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::transaction::Version;
+        use bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        let spend = |prev: Vec<bitcoin::Txid>| Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: prev
+                .into_iter()
+                .map(|txid| TxIn {
+                    previous_output: OutPoint { txid, vout: 0 },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let confirmed = bitcoin::hashes::Hash::from_byte_array([7; 32]);
+        let grandparent = spend(vec![confirmed]);
+        let (left, right) = (
+            spend(vec![grandparent.compute_txid()]),
+            spend(vec![grandparent.compute_txid(), confirmed]),
+        );
+        let child = spend(vec![left.compute_txid(), right.compute_txid()]);
+        let path = temp_path("ancestors");
+        let mut store = PendingStore::load(path.clone());
+        for tx in [&grandparent, &left, &right] {
+            let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(tx));
+            store.insert(tx.compute_txid().to_string(), raw_hex, &[]);
+        }
+        let held: HashSet<bitcoin::Txid> = store
+            .held_ancestors(&child)
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect();
+        let expected = [&grandparent, &left, &right].map(Transaction::compute_txid);
+        assert_eq!(held, HashSet::from(expected));
+        assert_eq!(store.held_ancestors(&child).len(), 3, "each once");
+        assert!(store.held_ancestors(&grandparent).is_empty());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

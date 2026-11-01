@@ -913,14 +913,15 @@ async fn broadcast_to_network(
     };
     // Peers that got it from an earlier attempt (before a restart too)
     // never confirm it; a peer that asks for a parent friglet broadcast
-    // itself gets that parent. Whatever the verdict, and also when this
-    // attempt is dropped halfway, every peer it is handed to is in the
-    // store before it gets it: the next attempt and every recheck know.
+    // itself gets that parent (and that parent's, and so on). Whatever the
+    // verdict, and also when this attempt is dropped halfway, every peer it
+    // is handed to is in the store before it gets it: the next attempt and
+    // every recheck know.
     let history = {
         let store = state.pending.lock().await;
         net_broadcast::History {
             handed_to: store.handed_to(&txid),
-            parents: store.held_parents(&candidate.tx),
+            parents: store.held_ancestors(&candidate.tx),
             store: Some(state.pending.clone()),
         }
     };
@@ -2469,6 +2470,7 @@ mod tests {
             let net = FakeNet::new();
             let orphan = Script {
                 policy: crate::electrum::fake_peer::TxPolicy::Orphan,
+                confirmed: vec![received.compute_txid()],
                 ..Script::default()
             };
             let fakes = fake_net(&net, 190, vec![orphan; 5]);
@@ -2486,6 +2488,47 @@ mod tests {
             let got_parent = reloaded.handed_to(&parent_txid);
             assert!(!got_parent.is_empty());
             assert!(got_parent.is_subset(&reloaded.handed_to(&child_txid)));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A grandchild of a pending broadcast, its parent pending too: a
+        /// peer that lacks both asks for the parent, gets it, asks for the
+        /// grandparent and gets that too, then takes all three. Both stay
+        /// out of their rechecks from then on.
+        #[tokio::test]
+        async fn a_pending_grandparent_goes_out_too() {
+            let dir = temp_dir("net-grandchild");
+            let (index, received) = wallet();
+            let grandparent = spend(&received, 1_000, 0);
+            let parent = spend(&grandparent, 1_000, 0);
+            let child = spend(&parent, 1_000, 0);
+            let child_txid = child.compute_txid().to_string();
+            let net = FakeNet::new();
+            let orphan = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Orphan,
+                confirmed: vec![received.compute_txid()],
+                ..Script::default()
+            };
+            let fakes = fake_net(&net, 200, vec![orphan; 5]);
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                for tx in [&grandparent, &parent] {
+                    let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(tx));
+                    store.insert(tx.compute_txid().to_string(), raw_hex, &[]);
+                }
+                store.save();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&child));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert_eq!(response["result"], json!(child_txid), "{response}");
+            assert!(net.has(grandparent.compute_txid()) && net.has(parent.compute_txid()));
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            for tx in [&grandparent, &parent] {
+                let got_it = reloaded.handed_to(&tx.compute_txid().to_string());
+                assert!(!got_it.is_empty(), "{}", tx.compute_txid());
+                assert!(got_it.is_subset(&reloaded.handed_to(&child_txid)));
+            }
             std::fs::remove_dir_all(dir).unwrap();
         }
 
