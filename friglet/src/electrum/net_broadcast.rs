@@ -105,7 +105,8 @@ pub struct History {
     /// gets it.
     pub parents: Vec<Transaction>,
     /// The pending store: every peer the transaction (or a parent) is
-    /// handed to goes in, and to disk, before the bytes are written to it,
+    /// handed to goes in, for the transaction and every held ancestor in one
+    /// write to disk, before the first bytes are written to it,
     /// so a broadcast that is dropped halfway (a settings restart, the
     /// daemon stopping) still leaves its recipients for the next attempt.
     /// A peer that cannot be written to disk gets nothing, and the
@@ -293,6 +294,9 @@ struct Ledger {
     closed: bool,
     /// (transaction, peer), in the order they were let through.
     handed: Vec<(Txid, PeerAddr)>,
+    /// Peers in the pending store with the transaction and every held
+    /// ancestor ([`Job::may_send`]).
+    recorded: HashSet<PeerAddr>,
     /// Hand-over slots taken ([`Job::claim_hand_over`]) and allowed: with
     /// hedged senders, no more than `slots` hand the transaction over;
     /// [`SENDERS`], raised by each rotation.
@@ -396,26 +400,29 @@ impl Job {
     }
 
     /// May `txid` be written to `addr` now? If so, `addr` is in the final
-    /// list from here on, and on disk in the pending store. Not when the
-    /// store's file cannot be written: the broadcast then ends with that
-    /// error ([`Event::StoreFailed`]). Blocking (the store is written): only
-    /// from a connection's thread.
+    /// list from here on, and on disk in the pending store. The first time
+    /// for `addr` it goes into the store with the transaction and every held
+    /// ancestor (the peer may ask for any of them) in one write, so the file
+    /// is rewritten once per peer, not per transaction. Not when the store's
+    /// file cannot be written: the broadcast then ends with that error
+    /// ([`Event::StoreFailed`]). Blocking (the store is written): only from a
+    /// connection's thread.
     fn may_send(&self, addr: &PeerAddr, txid: Txid) -> bool {
         let entry = (txid, addr.clone());
-        let known = {
+        let recorded = {
             let ledger = self.ledger();
             if ledger.closed || self.over() {
                 return false;
             }
-            ledger.handed.contains(&entry)
+            ledger.recorded.contains(addr)
         };
         // Written before the ledger is locked again (the store may be busy,
         // and the broadcast's end waits for the ledger): a peer written down
         // that the end then keeps from getting it is only passed over later.
-        if let Some(store) = self.store.as_ref().filter(|_| !known) {
-            let mut store = store.blocking_lock();
-            store.note_handed_to(&txid.to_string(), std::slice::from_ref(addr));
-            if let Err(error) = store.save() {
+        if !recorded && let Some(store) = &self.store {
+            let txids = std::iter::once(self.candidate.txid)
+                .chain(self.parents.iter().map(Transaction::compute_txid));
+            if let Err(error) = record_hand_over(store, addr, txids) {
                 tracing::error!(peer = %addr, %txid, %error, "broadcast: cannot record the peer, so it gets nothing");
                 self.tell(Event::StoreFailed {
                     error: error.to_string(),
@@ -427,6 +434,7 @@ impl Job {
         if ledger.closed || self.over() {
             return false;
         }
+        ledger.recorded.insert(addr.clone());
         if !ledger.handed.contains(&entry) {
             ledger.handed.push(entry);
         }
@@ -1577,6 +1585,7 @@ pub fn hand_over(
 mod tests {
     use super::*;
     use crate::electrum::fake_peer::{FakeNet, FakePeer, Script, TxPolicy};
+    use crate::electrum::pending::PendingStore;
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version;
     use bitcoin::{
@@ -2387,6 +2396,78 @@ mod tests {
             vec![(txid, first)],
             "closing again changes nothing"
         );
+    }
+
+    /// A peer goes into the pending store with the transaction and every
+    /// held ancestor in one write, before the first of them is written to
+    /// it: the ancestors it asks for after that need no write (here the
+    /// file can no longer be written), while another peer needs one.
+    #[tokio::test]
+    async fn a_peer_goes_on_disk_with_every_held_ancestor_in_one_write() {
+        let spending = |prev: &Candidate| {
+            let mut tx = prev.tx.clone();
+            tx.input[0].previous_output = OutPoint {
+                txid: prev.txid,
+                vout: 0,
+            };
+            Candidate::decode(bitcoin::consensus::encode::serialize(&tx)).unwrap()
+        };
+        let grandparent = candidate(31);
+        let parent = spending(&grandparent);
+        let child = Arc::new(spending(&parent));
+        let dir = std::env::temp_dir().join(format!(
+            "friglet-net-broadcast-test-{}-one-write",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.pending.json");
+        let mut store = PendingStore::load(path.clone());
+        for held in [&*grandparent, &parent] {
+            store.insert(held.txid.to_string(), hex::encode(&held.raw), &[]);
+        }
+        let parents = store.held_ancestors(&child.tx);
+        assert_eq!(parents.len(), 2);
+        let history = History {
+            handed_to: HashSet::new(),
+            parents,
+            store: Some(Arc::new(tokio::sync::Mutex::new(store))),
+        };
+        let peers = pool(&["127.106.0.1:1".parse().unwrap()]).await;
+        let (events, mut received) = mpsc::unbounded_channel();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let job = Job::new(
+            peers,
+            child.clone(),
+            history,
+            Timing::DIRECT,
+            deadline,
+            events,
+        );
+        let (first, second): (PeerAddr, PeerAddr) = (
+            "127.107.0.1:1".parse::<SocketAddr>().unwrap().into(),
+            "127.108.0.1:1".parse::<SocketAddr>().unwrap().into(),
+        );
+        let ids = [child.txid, parent.txid, grandparent.txid];
+        let (ancestors, other) = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || {
+                assert!(job.may_send(&first, ids[0]));
+                let on_disk = PendingStore::load(path.clone());
+                for id in ids {
+                    let got = on_disk.handed_to(&id.to_string());
+                    assert!(got.contains(&first), "{id} not on disk for the peer");
+                }
+                std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+                let ancestors = [ids[1], ids[2]].map(|id| job.may_send(&first, id));
+                (ancestors, job.may_send(&second, ids[0]))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ancestors, [true, true], "they needed no further write");
+        assert!(!other, "another peer needed a write, which failed");
+        assert!(matches!(received.try_recv(), Ok(Event::StoreFailed { .. })));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

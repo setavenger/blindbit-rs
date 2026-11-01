@@ -308,7 +308,8 @@ dbus-run-session -- bash -c '
   for the own node; recent outcomes are keyed by wtxid); a peer ever handed
   the tx never confirms it (`History::handed_to`: not an observer or
   sender, its netgroup passed over while others are left). Each recipient
-  is written to the pending file before any bytes go to it; when that write
+  is written to the pending file before any bytes go to it (a broadcast's
+  sender for the tx and every held ancestor in one write); when that write
   fails it gets nothing (a broadcast ends with a "local storage error", a
   recheck logs one), and a copy from
   a peer listed there never counts, also when a recheck handed it over
