@@ -453,6 +453,9 @@ async function loadConfigFile() {
     fillForm(fileConfig);
   } catch (e) {
     if (!fileMode) return;
+    // The file changed and cannot be read now (e.g. a hand edit): Save
+    // must not write the older copy over it.
+    fileConfig = null;
     fileLoadError = String(e);
   } finally {
     fileLoadInFlight = false;

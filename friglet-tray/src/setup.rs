@@ -425,13 +425,13 @@ pub fn ensure_key_file(cfg: &DaemonConfig, scan_key: Option<&str>) -> Result<(),
 
 /// Persist a settings save made while the daemon is down. With a new scan
 /// key this is [`write_local_config`]; without one the config file is
-/// rewritten and the existing key file kept ([`ensure_key_file`]).
+/// rewritten and the existing key file kept (check it first with
+/// [`ensure_key_file`]).
 pub fn write_config_file(
     config_path: &Path,
     cfg: &DaemonConfig,
     scan_key: Option<&str>,
 ) -> Result<(), String> {
-    ensure_key_file(cfg, scan_key)?;
     match scan_key {
         Some(key) => write_local_config(config_path, cfg, key).map(drop),
         None => friglet_ipc::write_config_toml(config_path, cfg),
@@ -874,13 +874,14 @@ mod tests {
             ..valid_config()
         };
 
-        // No key file and no new key: refused, nothing written.
-        let err = write_config_file(&config_path, &cfg, None).unwrap_err();
+        // No key file and no new key: refused.
+        let err = ensure_key_file(&cfg, None).unwrap_err();
         assert!(err.contains("no scan key"), "{err}");
-        assert!(!config_path.exists());
+        ensure_key_file(&cfg, Some(KEY_HEX)).unwrap();
 
         // With the key file in place the config is rewritten, the key kept.
         fs::write(&key_path, KEY_HEX).unwrap();
+        ensure_key_file(&cfg, None).unwrap();
         write_config_file(&config_path, &cfg, None).unwrap();
         assert_eq!(friglet_ipc::read_config_toml(&config_path).unwrap(), cfg);
         assert_eq!(fs::read_to_string(&key_path).unwrap(), KEY_HEX);
