@@ -41,10 +41,13 @@
 //! recipients for unrelated peers.
 //!
 //! Every connection goes through the pool's [`Dialer`](blindbit_lib::net::Dialer):
-//! [`connect`] is the only place one is opened. Through a proxy (Tor,
-//! `p2p_proxy`) each one logs in with credentials of its own, so Tor gives
-//! it a circuit of its own (two circuits may still share an exit relay),
-//! and the waits are longer ([`Timing`]).
+//! [`connect`] and [`open`] are the only places one is opened. A
+//! broadcast's connections open asynchronously, so its end abandons the
+//! ones still connecting or handshaking, and shuts the others down
+//! ([`Job::close`]). Through a proxy (Tor, `p2p_proxy`) each one logs in
+//! with credentials of its own, so Tor gives it a circuit of its own (two
+//! circuits may still share an exit relay), and the waits are longer
+//! ([`Timing`]).
 
 use std::collections::{HashMap, HashSet};
 use std::net::{Shutdown, TcpStream};
@@ -57,7 +60,7 @@ use blindbit_lib::net::{NetGroup, NoPeers, PeerAddr, PeerEvent, PeerSource, Purp
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches, random_u64};
+use super::p2p::{HangUpOnDrop, P2pError, Peer, SETTLE_WAIT, inventory_matches, random_u64};
 use super::pending::SharedStore;
 use super::relay::{self, Candidate, Parents, Signals};
 
@@ -350,6 +353,18 @@ impl Job {
         ledger.slots_taken = ledger.slots_taken.saturating_sub(1);
     }
 
+    /// Connect to `addr` for this broadcast, relay on for an observer
+    /// ([`open`]): given up the moment the broadcast ends, connect and
+    /// handshake alike, so none of its connections outlives it.
+    async fn connect(&self, addr: &PeerAddr, relay: bool) -> Result<Peer, P2pError> {
+        tokio::select! {
+            connected = open(&self.peers, addr, relay) => connected,
+            () = self.stop.cancelled() => {
+                Err(P2pError::Protocol("the broadcast has ended".into()))
+            }
+        }
+    }
+
     /// Shut `peer`'s connection down when the broadcast ends, until the
     /// returned guard drops. An error, and the connection shut down, when
     /// it has ended already.
@@ -593,11 +608,11 @@ impl Round {
         let (task_job, task_addr) = (job.clone(), addr.clone());
         if observer {
             self.peers.insert(addr, State::Watching { ready: false });
-            tokio::task::spawn_blocking(move || observe(task_job, task_addr));
+            tokio::spawn(observe(task_job, task_addr));
         } else {
             self.peers
                 .insert(addr, State::Sending { handed_over: false });
-            tokio::task::spawn_blocking(move || send(task_job, task_addr));
+            tokio::spawn(send(task_job, task_addr));
         }
         true
     }
@@ -941,15 +956,40 @@ async fn broadcast_paced(
 
 /// Open a connection to `addr` through the pool's dialer and report how it
 /// went. A peer that relays no transactions is refused: it is no use as a
-/// sender or observer.
+/// sender or observer. Blocking.
 fn connect(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2pError> {
-    match Peer::connect(
+    let connected = Peer::connect(
         peers.dialer(),
         addr,
         peers.network(),
         relay,
         CONNECT_TIMEOUT,
-    ) {
+    );
+    reported(peers, addr, connected)
+}
+
+/// [`connect`] for async callers: dropping the future abandons the
+/// connection at once, connect and handshake alike ([`Peer::open`]), and
+/// reports nothing.
+async fn open(peers: &PeerSource, addr: &PeerAddr, relay: bool) -> Result<Peer, P2pError> {
+    let connected = Peer::open(
+        peers.dialer(),
+        addr,
+        peers.network(),
+        relay,
+        CONNECT_TIMEOUT,
+    )
+    .await;
+    reported(peers, addr, connected)
+}
+
+/// Report how a connection to `addr` went ([`connect`]).
+fn reported(
+    peers: &PeerSource,
+    addr: &PeerAddr,
+    connected: Result<Peer, P2pError>,
+) -> Result<Peer, P2pError> {
+    match connected {
         Ok(peer) => {
             peers.report(addr, PeerEvent::Connected(peer.info()));
             if !peer.relays() {
@@ -989,9 +1029,16 @@ fn announces(message: &NetworkMessage, txid: Txid, wtxid: Wtxid) -> bool {
 
 /// An observer: connect with relay on, settle, then ask for the transaction
 /// until the peer serves it or the broadcast ends.
-fn observe(job: Job, addr: PeerAddr) {
+async fn observe(job: Job, addr: PeerAddr) {
+    let connected = job.connect(&addr, true).await;
+    let task_job = job.clone();
+    let _ = tokio::task::spawn_blocking(move || observe_on(task_job, addr, connected)).await;
+}
+
+/// [`observe`] once connected. Blocking.
+fn observe_on(job: Job, addr: PeerAddr, connected: Result<Peer, P2pError>) {
     let watched = (|| {
-        let mut peer = connect(&job.peers, &addr, true)?;
+        let mut peer = connected?;
         let _registered = job.register(&peer)?;
         peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
         job.tell(Event::Ready {
@@ -1129,16 +1176,24 @@ fn flush(
     }
 }
 
-/// A sender: hand the transaction over, then listen for the peer's refusal
-/// until the broadcast ends.
-fn send(job: Job, addr: PeerAddr) {
+/// A sender: connect (relay off, nothing asked for beyond the handshake),
+/// hand the transaction over, then listen for the peer's refusal until the
+/// broadcast ends.
+async fn send(job: Job, addr: PeerAddr) {
+    let connected = job.connect(&addr, false).await;
+    let task_job = job.clone();
+    let _ = tokio::task::spawn_blocking(move || send_on(task_job, addr, connected)).await;
+}
+
+/// [`send`] once connected. Blocking.
+fn send_on(job: Job, addr: PeerAddr, connected: Result<Peer, P2pError>) {
     let candidate = job.candidate.clone();
     let mut signals = job.signals_for(&addr);
     let mut flushed = false;
     let mut told_missing = false;
     let mut claimed = false;
     let result = (|| {
-        let mut peer = connect_sender(&job.peers, &addr)?;
+        let mut peer = connected?;
         let _registered = job.register(&peer)?;
         // Enough senders have it already (hedged senders through a proxy).
         if !job.claim_hand_over() {
@@ -1337,8 +1392,10 @@ pub async fn ask_mempools(
             used.insert(addr.clone());
             groups.insert(addr.netgroup());
             let (task_peers, task_candidates) = (peers.clone(), candidates.clone());
-            asking.spawn_blocking(move || {
-                let answer = ask(&task_peers, &addr, &task_candidates);
+            // Dropped with `asking` once enough answered: the racing ones
+            // still at work hang up then.
+            asking.spawn(async move {
+                let answer = ask(&task_peers, &addr, task_candidates).await;
                 (addr, answer)
             });
         }
@@ -1388,24 +1445,30 @@ pub async fn ask_mempools(
     })
 }
 
-/// One observer connection that asks for each candidate.
-fn ask(
+/// One observer connection that asks for each candidate. Dropping the
+/// future hangs up at once, also while it is asking.
+async fn ask(
     peers: &PeerSource,
     addr: &PeerAddr,
-    candidates: &[Candidate],
+    candidates: Arc<Vec<Candidate>>,
 ) -> Result<(Vec<bool>, Option<u64>), P2pError> {
-    let mut peer = connect(peers, addr, true)?;
-    peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
-    let mut present = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        present.push(peer.mempool_has(
-            candidate.txid,
-            candidate.wtxid,
-            Instant::now() + ANNOUNCE_WAIT,
-            |_, _| Ok(()),
-        )?);
-    }
-    Ok((present, peer.fee_filter()))
+    let mut peer = open(peers, addr, true).await?;
+    let _hang_up = HangUpOnDrop(Some(peer.closer()?));
+    tokio::task::spawn_blocking(move || {
+        peer.wait_until_settled(Instant::now() + SETTLE_WAIT)?;
+        let mut present = Vec::with_capacity(candidates.len());
+        for candidate in candidates.iter() {
+            present.push(peer.mempool_has(
+                candidate.txid,
+                candidate.wtxid,
+                Instant::now() + ANNOUNCE_WAIT,
+                |_, _| Ok(()),
+            )?);
+        }
+        Ok((present, peer.fee_filter()))
+    })
+    .await
+    .map_err(|error| P2pError::Protocol(format!("the mempool check task failed: {error}")))?
 }
 
 /// Hand `candidates` to `addr` on one sender connection and wait until the
@@ -2104,10 +2167,7 @@ mod tests {
         let (job, mut received) = job_for(&fake, 11).await;
         job.close();
         let addr = PeerAddr::from(fake.addr);
-        let task_job = job.clone();
-        tokio::task::spawn_blocking(move || send(task_job, addr))
-            .await
-            .unwrap();
+        send(job.clone(), addr).await;
         assert!(!got_tx(&fake));
         assert!(!fake.commands().iter().any(|c| c == "inv"));
         assert!(matches!(received.recv().await, Some(Event::Gone { .. })));
@@ -2124,8 +2184,7 @@ mod tests {
         };
         let fake = net.peer(ip(101, 0), quiet);
         let (job, mut received) = job_for(&fake, 12).await;
-        let (task_job, addr) = (job.clone(), PeerAddr::from(fake.addr));
-        tokio::task::spawn_blocking(move || observe(task_job, addr));
+        tokio::spawn(observe(job.clone(), PeerAddr::from(fake.addr)));
         assert!(matches!(received.recv().await, Some(Event::Ready { .. })));
         wait_for("the observer's request", || {
             fake.commands().iter().any(|c| c == "getdata")
@@ -2152,8 +2211,7 @@ mod tests {
         };
         let fake = net.peer(ip(102, 0), quiet);
         let (job, mut received) = job_for(&fake, 13).await;
-        let (task_job, addr) = (job.clone(), PeerAddr::from(fake.addr));
-        tokio::task::spawn_blocking(move || send(task_job, addr));
+        tokio::spawn(send(job.clone(), PeerAddr::from(fake.addr)));
         wait_for("the ping after the hand-over", || {
             let commands = fake.commands();
             commands.iter().any(|c| c == "tx") && commands.iter().any(|c| c == "ping")
@@ -2404,12 +2462,59 @@ mod tests {
         }
     }
 
+    /// Connections still opening when a broadcast ends end with it: through
+    /// Tor a dead address keeps a connect waiting 20 s, and so does a peer
+    /// that takes the connection and never answers the handshake.
+    #[test]
+    fn connections_still_opening_end_with_the_broadcast() {
+        use blindbit_lib::net::testing::FakeSocks5;
+
+        let net = FakeNet::new();
+        let fakes = net_of(&net, 120, vec![Script::default(); 3]);
+        let proxy = FakeSocks5::start();
+        let mut all = addrs(&fakes);
+        let dead = SocketAddr::from(([10, 150, 0, 1], 18444));
+        proxy.stall(dead.into());
+        all.push(dead);
+        let silent = std::net::TcpListener::bind((ip(120, 5), 0)).unwrap();
+        all.push(silent.local_addr().unwrap());
+        // Through a proxy six observers start at once: all five peers.
+        // With none left for a sender, the broadcast ends as soon as the
+        // three live ones are ready.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let peers = pool_via(&all, proxy.dialer()).await;
+            broadcast(
+                peers,
+                candidate(27),
+                Duration::from_secs(45),
+                History::default(),
+            )
+            .await
+        });
+        let ended = Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(60));
+        let lingered = ended.elapsed();
+        let error = result.unwrap_err();
+        assert!(
+            error.starts_with("no Bitcoin peers reachable to take the transaction"),
+            "{error}"
+        );
+        assert!(
+            lingered < Duration::from_secs(10),
+            "connections went on {lingered:?} after the broadcast"
+        );
+    }
+
     /// Through Tor a dead address keeps a connection waiting the whole
     /// 20 s: more observers and senders are started alongside, so the
     /// broadcast succeeds long before, and still hands the transaction to
-    /// no more than two peers.
-    #[test]
-    fn through_a_proxy_dead_addresses_are_hedged_around() {
+    /// no more than two peers. (The connects still waiting end with it.)
+    #[tokio::test]
+    async fn through_a_proxy_dead_addresses_are_hedged_around() {
         use blindbit_lib::net::testing::FakeSocks5;
 
         let net = FakeNet::new();
@@ -2422,26 +2527,17 @@ mod tests {
             proxy.stall(dead.into());
             all.push(dead);
         }
-        // The stalled connects outlive the broadcast; a plain runtime drop
-        // would wait for them.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (report, waited) = runtime.block_on(async {
-            let peers = pool_via(&all, proxy.dialer()).await;
-            let started = Instant::now();
-            let report = broadcast(
-                peers,
-                candidate(17),
-                Duration::from_secs(45),
-                History::default(),
-            )
-            .await
-            .unwrap();
-            (report, started.elapsed())
-        });
-        runtime.shutdown_background();
+        let peers = pool_via(&all, proxy.dialer()).await;
+        let started = Instant::now();
+        let report = broadcast(
+            peers,
+            candidate(17),
+            Duration::from_secs(45),
+            History::default(),
+        )
+        .await
+        .unwrap();
+        let waited = started.elapsed();
         assert!(
             matches!(report.verdict, Verdict::InMempool { .. }),
             "{report:?}"

@@ -132,6 +132,37 @@ fn useless_address() -> Address {
     )
 }
 
+/// The connect and handshake timeout through `dialer`: at least
+/// [`PROXY_CONNECT_TIMEOUT`] through a proxy, where every message crosses a
+/// Tor circuit.
+fn through(dialer: &Dialer, timeout: Duration) -> Duration {
+    if dialer.proxy().is_some() {
+        timeout.max(PROXY_CONNECT_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
+/// Shuts a connection down when dropped, unless disarmed: whatever blocks
+/// on it in another thread ends at once. For blocking work whose async
+/// caller may stop waiting.
+pub struct HangUpOnDrop(pub Option<TcpStream>);
+
+impl HangUpOnDrop {
+    /// Keep the connection open after all.
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for HangUpOnDrop {
+    fn drop(&mut self) {
+        if let Some(socket) = self.0.take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 /// One open, handshaken P2P connection.
 pub struct Peer {
     stream: TcpStream,
@@ -168,12 +199,43 @@ impl Peer {
         relay: bool,
         timeout: Duration,
     ) -> Result<Self, P2pError> {
-        let timeout = if dialer.proxy().is_some() {
-            timeout.max(PROXY_CONNECT_TIMEOUT)
-        } else {
-            timeout
-        };
+        let timeout = through(dialer, timeout);
         let stream = dialer.connect(addr, timeout)?;
+        Self::handshake_on(stream, addr, network, relay, timeout)
+    }
+
+    /// [`Self::connect`] for async callers, and cancellable: dropping the
+    /// future abandons the connection at once, also during the handshake
+    /// (which runs on a blocking thread whose socket is shut down then).
+    pub async fn open(
+        dialer: &Dialer,
+        addr: &PeerAddr,
+        network: Network,
+        relay: bool,
+        timeout: Duration,
+    ) -> Result<Self, P2pError> {
+        let timeout = through(dialer, timeout);
+        let stream = dialer.open(addr, timeout).await?;
+        let hang_up = HangUpOnDrop(Some(stream.try_clone()?));
+        let addr = addr.clone();
+        let peer = tokio::task::spawn_blocking(move || {
+            Self::handshake_on(stream, &addr, network, relay, timeout)
+        })
+        .await
+        .map_err(|error| P2pError::Protocol(format!("the handshake task failed: {error}")))??;
+        hang_up.disarm();
+        Ok(peer)
+    }
+
+    /// Complete the version handshake on `stream`, a connection just opened
+    /// to `addr`, within `timeout`.
+    fn handshake_on(
+        stream: TcpStream,
+        addr: &PeerAddr,
+        network: Network,
+        relay: bool,
+        timeout: Duration,
+    ) -> Result<Self, P2pError> {
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
