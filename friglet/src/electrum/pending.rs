@@ -150,10 +150,21 @@ impl PendingStore {
     }
 }
 
+/// Write the file owner-only (0600): it names the peers friglet handed the
+/// wallet's transactions to.
 fn write_atomic(path: &Path, txs: &BTreeMap<String, PendingTx>) -> io::Result<()> {
     let json = serde_json::to_vec_pretty(txs).map_err(io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, json)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp)?;
+    // `mode` only applies to a file it creates: a leftover one keeps its own.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    io::Write::write_all(&mut file, &json)?;
+    drop(file);
     fs::rename(&tmp, path)
 }
 
@@ -271,6 +282,25 @@ mod tests {
 
         fs::write(&path, b"{broken").unwrap();
         assert!(PendingStore::load(path.clone()).is_empty());
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The file names the peers the wallet's transactions went to: owner
+    /// only, also when an earlier write left a readable one behind.
+    #[cfg(unix)]
+    #[test]
+    fn the_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("mode");
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, b"{}").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o664)).unwrap();
+        let mut store = PendingStore::load(path.clone());
+        let sender: PeerAddr = "203.0.113.5:38333".parse::<SocketAddr>().unwrap().into();
+        store.insert("aa".into(), "0100".into(), &[sender]);
+        store.save();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
