@@ -51,6 +51,9 @@ enum Answer {
     Split,
     /// One byte every 100 ms, for at most 15 s, never complete.
     Trickle,
+    /// This many messages of one address each (the answer's first), then
+    /// the answer, then the node hangs up.
+    SinglesFirst(usize),
 }
 
 /// A regtest node on 127.0.0.1 that answers `getaddr` with `addrs`, as
@@ -139,6 +142,14 @@ fn serve(
                             stream.write_all(&[*byte])?;
                             std::thread::sleep(Duration::from_millis(100));
                         }
+                    }
+                    Answer::SinglesFirst(count) => {
+                        let single = bytes(NetworkMessage::AddrV2(addrs[..1].to_vec()));
+                        for _ in 0..count {
+                            stream.write_all(&single)?;
+                        }
+                        stream.write_all(&answer_bytes)?;
+                        return Ok(());
                     }
                 }
             }
@@ -259,6 +270,47 @@ fn a_seed_that_trickles_its_answer_is_hung_up_on_in_time() {
     let took = started.elapsed();
     assert!(asked.is_err(), "{asked:?}");
     assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+/// A seed's node that sends one address after another cannot make friglet
+/// keep them all: of single addresses only the first is kept, and reading
+/// stops after a hundred messages. An answer that comes before then is
+/// kept, each address once.
+#[test]
+fn a_seed_node_sending_single_addresses_gets_one_of_them_kept() {
+    let proxy = FakeSocks5::start();
+    let mut answer = gossip_of(1, 25);
+    answer.push(answer[3].clone());
+    proxy.route(
+        "x9.flooding-seed.invalid",
+        seed_node(Answer::SinglesFirst(5_000), answer.clone()).0,
+    );
+    proxy.route(
+        "x9.announcing-seed.invalid",
+        seed_node(Answer::SinglesFirst(3), answer.clone()).0,
+    );
+    let ask = |seed| {
+        run(super::seeds::ask_seed_node(
+            &proxy.dialer(),
+            seed,
+            18444,
+            Network::Regtest,
+            Duration::from_secs(20),
+        ))
+    };
+    let flooded = ask("flooding-seed.invalid").expect("the first address");
+    assert!(
+        flooded == answer[..1],
+        "{} addresses kept, first {:?}",
+        flooded.len(),
+        flooded.first()
+    );
+    let announced = ask("announcing-seed.invalid").expect("the answer");
+    assert!(
+        announced == answer[..25],
+        "{} addresses kept, not each of the 25 once",
+        announced.len()
+    );
 }
 
 /// Seeding through the proxy returns once one seed's node has given enough

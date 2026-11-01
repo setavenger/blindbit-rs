@@ -7,6 +7,7 @@
 //! (the proxy, Tor's exit, resolves them to one of their nodes), asks that
 //! node for addresses and hangs up.
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
@@ -17,6 +18,7 @@ use bitcoin::p2p::address::AddrV2Message;
 use bitcoin_p2p::handshake::ConnectionConfig;
 use bitcoin_p2p::net::{ConnectionExt, TimeoutParams};
 
+use super::pool::MAX_GOSSIP_PER_MESSAGE;
 use super::{Dialer, PeerAddr, PeerHost, ShutdownOnDrop, USER_AGENT, is_proxy_down, random_u64};
 
 /// How long one DNS seed lookup may take.
@@ -30,6 +32,10 @@ const PROXIED_SEED_WAIT: Duration = Duration::from_secs(20);
 /// have given this many, seeding returns, and the answers of the seeds
 /// still being asked join the book as they come.
 const ENOUGH_SEEDED: usize = 20;
+/// A seed's node answers `getaddr` within this many messages after the
+/// handshake (Bitcoin Core sends a few first: feature messages, a ping, its
+/// own address); reading stops after them.
+const SEED_MESSAGES: usize = 100;
 
 /// Where a discovering [`super::PeerSource`] gets its first addresses.
 #[derive(Debug, Clone)]
@@ -304,9 +310,12 @@ pub(super) async fn ask_seed_node(
 }
 
 /// Handshake on `stream`, ask for addresses and wait for them until
-/// `deadline`, then close. Each read may take all the time left, so a pause
-/// in the middle of a message does not cut it; a read that fails or times
-/// out ends the wait.
+/// `deadline` (or [`SEED_MESSAGES`] messages), then close. Each read may
+/// take all the time left, so a pause in the middle of a message does not
+/// cut it; a read that fails or times out ends the wait. What is kept:
+/// the first address the node sent on its own, and its answer, each address
+/// once and at most [`MAX_GOSSIP_PER_MESSAGE`] in all, however much it
+/// sends.
 fn addresses_from(
     stream: TcpStream,
     network: Network,
@@ -323,8 +332,10 @@ fn addresses_from(
             .request_addr()
             .handshake(stream, TimeoutParams::default())
             .map_err(|e| io::Error::other(format!("handshake failed: {e}")))?;
-        let mut got = Vec::new();
-        loop {
+        // Bitcoin Core answers `getaddr` with one big message; a single
+        // address is a node announcing itself (kept in case it is all).
+        let mut announced = None;
+        for _ in 0..SEED_MESSAGES {
             let left = left();
             if left.is_zero() {
                 break;
@@ -335,13 +346,12 @@ fn addresses_from(
                     let _ = writer.send_message(bitcoin::p2p::message::NetworkMessage::Pong(nonce));
                 }
                 Ok(Some(message)) => {
-                    // Bitcoin Core answers `getaddr` with one big message;
-                    // a single address is a node announcing itself.
                     if let Some(addrs) = super::gossiped_addrs(&message) {
-                        let answer = addrs.len() > 1;
-                        got.extend(addrs);
-                        if answer {
-                            return Ok(got);
+                        if addrs.len() > 1 {
+                            return Ok(kept(announced, addrs));
+                        }
+                        if announced.is_none() {
+                            announced = addrs.into_iter().next();
                         }
                     }
                 }
@@ -354,20 +364,33 @@ fn addresses_from(
                 {
                     break;
                 }
-                Err(_) if !got.is_empty() => break,
+                Err(_) if announced.is_some() => break,
                 Err(e) => return Err(io::Error::other(e.to_string())),
             }
         }
-        if got.is_empty() {
-            return Err(io::Error::new(
+        match announced {
+            Some(announced) => Ok(vec![announced]),
+            None => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the seed's node sent no addresses",
-            ));
+            )),
         }
-        Ok(got)
     })();
     let _ = socket.shutdown(std::net::Shutdown::Both);
     result
+}
+
+/// A seed node's answer as kept: the address it `announced` on its own
+/// first, then the answer, each address once, at most
+/// [`MAX_GOSSIP_PER_MESSAGE`] (what a peer may send in one message).
+fn kept(announced: Option<AddrV2Message>, answer: Vec<AddrV2Message>) -> Vec<AddrV2Message> {
+    let mut seen = HashSet::new();
+    announced
+        .into_iter()
+        .chain(answer)
+        .filter(|message| seen.insert((message.addr.clone(), message.port)))
+        .take(MAX_GOSSIP_PER_MESSAGE)
+        .collect()
 }
 
 /// Every DNS name this process looked up as a seed, for tests that check a

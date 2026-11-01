@@ -369,9 +369,10 @@ dbus-run-session -- bash -c '
   `.local`; `friglet_ipc::network::is_local_host`, daemon and tray setup);
   `Seeds::resolve` with a proxy connects to `x9.<seed>` (then the bare
   name) of 3 random seeds through it, handshakes with `getaddr` and keeps
-  the `addr`/`addrv2` answer (≤ 20 s); it returns once they gave 20
-  addresses (`ENOUGH_SEEDED`; later answers still join the book) or all
-  answered. The tray's Save does a 2 s TCP check of the proxy instead of a
+  the `addr`/`addrv2` answer (≤ 20 s, ≤ 100 messages; of single-address
+  messages only the first; ≤ 1,000 addresses, each once); it returns once
+  they gave 20 addresses (`ENOUGH_SEEDED`; later answers still join the
+  book) or all answered. The tray's Save does a 2 s TCP check of the proxy instead of a
   DNS lookup of the node.
 - Through a proxy: connect ≥ 20 s (`PROXY_CONNECT_TIMEOUT`, enforced in the
   dialer), block deadline ≥ 60 s (`RetryPolicy::through_proxy`). Tor keeps

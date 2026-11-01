@@ -51,7 +51,7 @@ const MAX_DRAWS: usize = 64;
 const WANT_ADDRS_BELOW: usize = 200;
 /// At most this many addresses are taken from one gossip message (Bitcoin
 /// Core's `MAX_ADDR_TO_SEND`).
-const MAX_GOSSIP_PER_MESSAGE: usize = 1_000;
+pub(crate) const MAX_GOSSIP_PER_MESSAGE: usize = 1_000;
 /// A peer that could not be reached rests this long, and is forgotten after
 /// [`MAX_UNREACHABLE`] failures in a row: the seeds and gossip cannot bring
 /// it back for [`FORGET_FOR`].
