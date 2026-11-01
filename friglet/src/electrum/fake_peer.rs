@@ -79,6 +79,9 @@ pub struct Script {
     /// After the handshake answer no `getdata` and no `ping` (it still
     /// sends its own and takes transactions): a peer that went quiet.
     pub unresponsive: bool,
+    /// Close connections that asked for transaction relay (observers) this
+    /// long after the handshake.
+    pub drop_relay_after: Option<Duration>,
 }
 
 impl Default for Script {
@@ -94,6 +97,7 @@ impl Default for Script {
             echo_inv: false,
             wtxid_relay: true,
             unresponsive: false,
+            drop_relay_after: None,
         }
     }
 }
@@ -332,7 +336,15 @@ fn serve(
     let mut echoed: Option<(Vec<u8>, Instant)> = None;
     // The parent asked for, and the transaction waiting for it.
     let mut orphan: Option<(bitcoin::Txid, Vec<u8>)> = None;
+    let connected = Instant::now();
     loop {
+        if their_relay
+            && script
+                .drop_relay_after
+                .is_some_and(|after| connected.elapsed() >= after)
+        {
+            return Ok(());
+        }
         if script.announce && script.relay && their_relay {
             let fresh: Vec<Vec<u8>> = shared
                 .mempool

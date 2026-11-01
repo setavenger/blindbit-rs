@@ -986,6 +986,13 @@ async fn broadcast_to_network(
                 error: (1, message),
             }
         }
+        Verdict::ObserversLost { waited } => {
+            let message = net_broadcast::observers_lost_message(candidate, waited, sent_to.len());
+            tracing::warn!(%txid, sent_to = %senders, elapsed_ms, reason = %message, "broadcast not confirmed: every observer went away");
+            RecentBroadcast::Inconclusive {
+                error: (1, message),
+            }
+        }
     })
 }
 

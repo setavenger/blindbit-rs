@@ -118,6 +118,9 @@ pub enum Verdict {
     /// No observer had it `waited` after the first hand-over (observers that
     /// went away are replaced while the pool has peers).
     Unconfirmed { waited: Duration },
+    /// Every observer went away `waited` after the first hand-over and none
+    /// could replace them: whether anyone else has it is unknown.
+    ObserversLost { waited: Duration },
 }
 
 /// How a broadcast paces its connections.
@@ -660,38 +663,78 @@ impl Round {
             return gave_up.then(|| Err(self.unreachable("to confirm the broadcast")));
         }
         if self.sent_to.is_empty() {
+            // Nobody is left to confirm it: better not hand it over at all.
+            if !observers_left {
+                return Some(Err(self.unreachable("to confirm the broadcast")));
+            }
             let gave_up = Instant::now() >= deadline || self.senders_connecting() == 0;
             return gave_up.then(|| Err(self.unreachable("to take the transaction")));
         }
         if Instant::now() >= deadline {
             return Some(Ok(self.unconfirmed()));
         }
-        // Every sender that got it, and at least [`REFUSALS`] of them,
-        // refused it the same way, and no other sender may still get it:
-        // none is connecting, or all the hand-over slots are taken (hedged
-        // senders still connecting hand nothing over then).
-        if self.sent_to.len() >= REFUSALS
-            && (self.senders_connecting() == 0 || self.sent_to.len() >= self.slots)
-        {
-            let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
-            let first = signals.next().flatten().copied()?;
-            if signals.all(|signal| signal == Some(&first)) {
-                let message = rejected_message(first, self.sent_to.len());
-                return Some(Ok(match first {
-                    Signal::MissingInputs => Verdict::Rejected(message),
-                    Signal::Dropped => Verdict::Dropped(message),
-                }));
-            }
+        if let Some(refused) = self.refused_by_all() {
+            return Some(Ok(refused));
+        }
+        // Every observer went away and none can replace them (they are
+        // replaced as they go while the pool has peers): nothing can
+        // confirm it any more, so waiting on says nothing.
+        if !observers_left {
+            return Some(Ok(self.unconfirmed()));
         }
         None
     }
 
-    /// No observer had it: since the first hand-over (or the start).
-    fn unconfirmed(&self) -> Verdict {
-        let since = self.handed_over_at.unwrap_or(self.started);
-        Verdict::Unconfirmed {
-            waited: since.elapsed(),
+    /// Every sender that got it, and at least [`REFUSALS`] of them, refused
+    /// it the same way, and no other sender may still get it: none is
+    /// connecting, or all the hand-over slots are taken (hedged senders
+    /// still connecting hand nothing over then).
+    fn refused_by_all(&self) -> Option<Verdict> {
+        if self.sent_to.len() < REFUSALS
+            || (self.senders_connecting() > 0 && self.sent_to.len() < self.slots)
+        {
+            return None;
         }
+        let mut signals = self.sent_to.iter().map(|addr| self.refused.get(addr));
+        let first = signals.next().flatten().copied()?;
+        if !signals.all(|signal| signal == Some(&first)) {
+            return None;
+        }
+        let message = rejected_message(first, self.sent_to.len());
+        Some(match first {
+            Signal::MissingInputs => Verdict::Rejected(message),
+            Signal::Dropped => Verdict::Dropped(message),
+        })
+    }
+
+    /// No observer had it: since the first hand-over (or the start). With
+    /// no observer left, it is unknown whether anyone else has it.
+    fn unconfirmed(&self) -> Verdict {
+        let waited = self.handed_over_at.unwrap_or(self.started).elapsed();
+        if self.observers_ready() + self.observers_connecting() == 0 {
+            Verdict::ObserversLost { waited }
+        } else {
+            Verdict::Unconfirmed { waited }
+        }
+    }
+
+    /// When the loop has to look again without an event: the next of its
+    /// timed steps that is still ahead (one that has passed already was
+    /// taken, or waits for an event).
+    fn next_wake(&self, deadline: Instant, next_hedge: Option<Instant>) -> Instant {
+        let now = Instant::now();
+        let mut times = vec![deadline];
+        if !self.senders_started {
+            times.push(self.started + self.timing.observer_window);
+            times.push(self.started + self.timing.observer_limit);
+        }
+        times.extend(next_hedge);
+        times.extend(self.rotation_due());
+        times
+            .into_iter()
+            .filter(|at| *at > now)
+            .min()
+            .unwrap_or(deadline)
     }
 
     fn unreachable(&self, what: &str) -> String {
@@ -791,6 +834,7 @@ async fn broadcast_paced(
             let sent_to: Vec<PeerAddr> = handed.into_iter().map(|(_, addr)| addr).collect();
             let verdict = match end {
                 Ok(verdict) => verdict,
+                // A sender may have handed it over after all.
                 Err(_) if !sent_to.is_empty() => round.unconfirmed(),
                 Err(message) => return Err(message),
             };
@@ -801,18 +845,7 @@ async fn broadcast_paced(
                 fee_filters: round.fee_filters,
             });
         }
-        let mut wake = deadline;
-        if !round.senders_started {
-            wake = wake
-                .min(round.started + timing.observer_window)
-                .min(round.started + timing.observer_limit);
-        }
-        if let Some(at) = next_hedge {
-            wake = wake.min(at);
-        }
-        if let Some(at) = round.rotation_due() {
-            wake = wake.min(at);
-        }
+        let wake = round.next_wake(deadline, next_hedge);
         tokio::select! {
             event = received.recv() => {
                 if let Some(event) = event {
@@ -1140,6 +1173,20 @@ pub fn unconfirmed_message(
     )
 }
 
+/// The error for a transaction whose observers all went away
+/// ([`Verdict::ObserversLost`]): nothing is known either way.
+pub fn observers_lost_message(candidate: &Candidate, waited: Duration, sent_to: usize) -> String {
+    format!(
+        "friglet handed the transaction to {sent_to} peer{}, but {} seconds later every other \
+         peer that could confirm it had gone away and no further one could be reached, so \
+         whether it reached the network's mempools is unknown.{} Sending it again checks \
+         whether it has spread since.",
+        if sent_to == 1 { "" } else { "s" },
+        waited.as_secs(),
+        candidate.fee_rate_note(),
+    )
+}
+
 /// What [`ask_mempools`] found.
 #[derive(Debug)]
 pub struct Asked {
@@ -1462,6 +1509,62 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// Every observer goes away after the hand-over and no other peer is
+    /// left: the broadcast ends then, saying that nothing is known, instead
+    /// of waiting out its budget to claim nobody had it.
+    #[tokio::test]
+    async fn with_every_observer_gone_it_ends_at_once_and_says_so() {
+        let net = FakeNet::new();
+        let script = Script {
+            policy: TxPolicy::Ignore,
+            drop_relay_after: Some(Duration::from_millis(1500)),
+            ..Script::default()
+        };
+        let fakes = net_of(&net, 240, vec![script; 5]);
+        let started = Instant::now();
+        let report = run(&fakes, &candidate(24), Duration::from_secs(20)).await;
+        let Verdict::ObserversLost { .. } = report.verdict else {
+            panic!("expected every observer lost, got {report:?}");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "ended after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.sent_to.len(), SENDERS);
+        let message = observers_lost_message(&candidate(24), Duration::from_secs(1), 2);
+        assert!(message.contains("is unknown"), "{message}");
+        assert!(!message.contains("no other peer"), "{message}");
+    }
+
+    /// Once the observer window has passed with no observer ready yet, the
+    /// loop waits for the next step still ahead (here the observer limit)
+    /// or an event, not every 250 ms.
+    #[test]
+    fn the_loop_never_wakes_for_a_moment_that_has_passed() {
+        let mut round = Round::new(Timing::DIRECT, HashSet::new());
+        round.started = Instant::now()
+            .checked_sub(Timing::DIRECT.observer_window + Duration::from_secs(1))
+            .unwrap();
+        round
+            .peers
+            .insert(fake_addr(1), State::Watching { ready: false });
+        let deadline = round.started + Duration::from_secs(25);
+        let wake = round.next_wake(deadline, None);
+        assert_eq!(wake, round.started + Timing::DIRECT.observer_limit);
+        // A rotation that is due already (it found no peer): only the
+        // deadline is ahead.
+        round.senders_started = true;
+        round.sent_to = vec![fake_addr(2), fake_addr(3)];
+        round.last_handed_over_at = round.started.checked_sub(Timing::DIRECT.rotate_after);
+        assert!(round.rotation_due().unwrap() < Instant::now());
+        assert_eq!(round.next_wake(deadline, None), deadline);
+    }
+
+    fn fake_addr(n: u8) -> PeerAddr {
+        SocketAddr::from(([127, 250, 0, n], 1)).into()
     }
 
     /// [`Timing::DIRECT`] with a further sender after `rotate_after`.
