@@ -355,11 +355,20 @@ fn disconnected_message() -> String {
         .into()
 }
 
+/// The highest fee filter that is a mempool minimum (0.1 BTC/kvB). Above it
+/// a peer says "send me no transactions" (Bitcoin Core does that during its
+/// initial block download, and a filter outside 0..=u32::MAX reads as
+/// `u64::MAX / 1000`): no fee would be enough, so no fee is short.
+const MAX_FEE_FILTER: u64 = 10_000_000;
+
 /// The fee `candidate` would need to pass a mempool minimum of `fee_filter`
 /// sat/kvB, with what it pays, when it pays less.
 pub(super) fn fee_shortfall(candidate: &Candidate, fee_filter: Option<u64>) -> Option<(u64, u64)> {
     let (fee, filter) = (candidate.fee?, fee_filter?);
-    let required = (filter * candidate.vsize).div_ceil(1000);
+    if filter > MAX_FEE_FILTER {
+        return None;
+    }
+    let required = filter.saturating_mul(candidate.vsize).div_ceil(1000);
     (fee < required).then_some((fee, required))
 }
 
@@ -522,6 +531,34 @@ mod tests {
         candidate.fee = None;
         let message = not_accepted_message(&candidate, Some(1000), Duration::from_secs(25));
         assert!(!message.contains("sat/vB"));
+    }
+
+    /// A peer saying "send me nothing" (a fee filter out of range, or one in
+    /// its initial block download) sets no fee anyone could pay: no fee
+    /// claim, and no overflow for a transaction over 1 kvB.
+    #[test]
+    fn a_relay_nothing_fee_filter_makes_no_fee_claim() {
+        let mut candidate = Candidate::decode(bitcoin::consensus::encode::serialize(&tx(
+            vec![outpoint(1, 0)],
+            vec![1000; 150],
+        )))
+        .unwrap();
+        assert!(candidate.vsize > 1000, "{}", candidate.vsize);
+        candidate.fee = Some(500);
+        for filter in [u64::MAX / 1000, 2_100_000_000_000_000, MAX_FEE_FILTER + 1] {
+            assert_eq!(fee_shortfall(&candidate, Some(filter)), None, "{filter}");
+            let message = not_accepted_message(&candidate, Some(filter), Duration::from_secs(25));
+            assert!(
+                message.starts_with("the P2P peer did not accept the transaction"),
+                "{message}"
+            );
+        }
+        // The highest real minimum still counts.
+        let required = (MAX_FEE_FILTER * candidate.vsize).div_ceil(1000);
+        assert_eq!(
+            fee_shortfall(&candidate, Some(MAX_FEE_FILTER)),
+            Some((500, required))
+        );
     }
 
     use crate::electrum::fake_peer::{FakePeer, Script, TxPolicy};
