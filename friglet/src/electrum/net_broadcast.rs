@@ -795,9 +795,10 @@ impl Round {
         }
         // Every observer went away and none can replace them (they are
         // replaced as they go while the pool has peers): nothing can
-        // confirm it any more, so waiting on says nothing.
+        // confirm it any more, so waiting on says nothing. Nor is it known
+        // whether its inputs are missing: that needs the whole budget.
         if !observers_left {
-            return Some(Ok(self.final_verdict()));
+            return Some(Ok(self.unconfirmed()));
         }
         None
     }
@@ -1820,6 +1821,35 @@ mod tests {
 
     fn fake_addr(n: u8) -> PeerAddr {
         SocketAddr::from(([127, 250, 0, n], 1)).into()
+    }
+
+    /// Every observer goes away before the budget ends while every sender
+    /// asked for a parent: the broadcast ends with the observers lost, not
+    /// missing inputs, which only the end of the budget with no observer
+    /// having it reports.
+    #[test]
+    fn with_every_observer_gone_early_missing_inputs_are_not_reported() {
+        let mut round = Round::new(Timing::DIRECT, HashSet::new());
+        round.senders_started = true;
+        round.sent_to = vec![fake_addr(2), fake_addr(3)];
+        round.handed_over_at = Some(Instant::now());
+        for addr in &round.sent_to {
+            round
+                .peers
+                .insert(addr.clone(), State::Sending { handed_over: true });
+            round.refused.insert(addr.clone(), Signal::MissingInputs);
+        }
+        round.peers.insert(fake_addr(1), State::ObserverGone);
+        let early = round.end(Instant::now() + Duration::from_secs(60));
+        assert!(
+            matches!(early, Some(Ok(Verdict::ObserversLost { .. }))),
+            "{early:?}"
+        );
+        let at_the_end = round.end(Instant::now());
+        assert!(
+            matches!(at_the_end, Some(Ok(Verdict::Rejected(_)))),
+            "{at_the_end:?}"
+        );
     }
 
     /// Through a proxy a hedged sender to a dead address is "connecting"
