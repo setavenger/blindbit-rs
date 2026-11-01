@@ -337,6 +337,36 @@ fn seeds_that_gave_nothing_are_asked_again_sooner() {
     assert_ne!(pool.seeded_at(), Some(first), "after 30 s");
 }
 
+/// A seed that answers after seeding returned (through a proxy, once the
+/// others gave enough) is not lost to the next seeding, and what it gave
+/// counts: seeds that gave something are asked again only after 5 min.
+#[test]
+fn a_seed_answering_late_counts_and_outlasts_the_next_seeding() {
+    let source = PeerSource::discover(Network::Regtest, Dialer::Direct, Seeds::Static(Vec::new()));
+    let pool = pool(&source);
+    let (answer, later) = tokio::sync::mpsc::unbounded_channel();
+    pool.queue_later_seeds(later);
+    // A seeding that finds nothing while that seed is still being asked.
+    run(source.next(Purpose::Block, &none())).expect_err("nothing yet");
+    answer
+        .send(vec![super::seeds::Seeded {
+            addr: addr(PEERS[0]),
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            seed: "late",
+            gossiped: false,
+        }])
+        .expect("its answer is still awaited");
+    assert_eq!(
+        run(source.next(Purpose::Block, &none())).unwrap(),
+        addr(PEERS[0])
+    );
+    pool.age_last_seed(Duration::from_secs(30));
+    let aged = pool.seeded_at();
+    let asked = HashSet::from([addr(PEERS[0])]);
+    run(source.next(Purpose::Block, &asked)).expect_err("nobody else");
+    assert_eq!(pool.seeded_at(), aged, "not asked again after 30 s");
+}
+
 #[test]
 fn regtest_has_no_seeds() {
     assert!(matches!(Seeds::for_network(Network::Regtest), Seeds::None));

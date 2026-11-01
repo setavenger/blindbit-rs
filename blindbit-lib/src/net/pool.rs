@@ -446,9 +446,11 @@ struct Inner {
     /// When a connection through the proxy last completed a handshake, and
     /// how many connects through it got no clear answer since.
     proxy_worked: Option<(Instant, u8)>,
-    /// Answers of seeds still being asked when seeding returned; added to
-    /// the book on the next [`PeerPool::next`].
-    later_seeds: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
+    /// Answers of seeds still being asked when a seeding returned, one
+    /// receiver per seeding until its last seed answered (a later seeding
+    /// does not drop them); added to the book on the next
+    /// [`PeerPool::next`].
+    later_seeds: Vec<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
     /// The tables changed since they were last saved.
     changed: bool,
 }
@@ -478,7 +480,7 @@ impl PeerPool {
                 no_tx_relay: HashSet::new(),
                 seed_error: None,
                 proxy_worked: None,
-                later_seeds: None,
+                later_seeds: Vec::new(),
                 changed: false,
             }),
             seeding: tokio::sync::Mutex::new(()),
@@ -574,7 +576,7 @@ impl PeerPool {
         let found = seeding.found;
         let mut inner = self.lock();
         inner.seed_error = seeding.proxy_error;
-        inner.later_seeds = seeding.later;
+        inner.later_seeds.extend(seeding.later);
         let added = self.add_seeded(&mut inner, &found);
         inner.last_seed = Some((Instant::now(), added));
         let seeds: Vec<&str> = match &self.seeds {
@@ -627,25 +629,27 @@ impl PeerPool {
         added
     }
 
-    /// Add what seeds that answered after seeding returned gave.
+    /// Add what seeds that answered after seeding returned gave, counted
+    /// with what the last seeding added (which decides when the seeds are
+    /// asked again).
     fn add_later_seeds(&self) {
+        use tokio::sync::mpsc::error::TryRecvError;
         let mut inner = self.lock();
-        let Some(later) = inner.later_seeds.as_mut() else {
-            return;
-        };
         let mut answers = Vec::new();
-        loop {
-            match later.try_recv() {
-                Ok(found) => answers.push(found),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    inner.later_seeds = None;
-                    break;
+        inner.later_seeds.retain_mut(|later| {
+            loop {
+                match later.try_recv() {
+                    Ok(found) => answers.push(found),
+                    Err(TryRecvError::Empty) => break true,
+                    Err(TryRecvError::Disconnected) => break false,
                 }
             }
-        }
+        });
         for found in answers {
             let added = self.add_seeded(&mut inner, &found);
+            if let Some((_, last_added)) = inner.last_seed.as_mut() {
+                *last_added += added;
+            }
             tracing::debug!(
                 addresses = found.len(),
                 added,
@@ -879,6 +883,16 @@ impl PeerPool {
     #[cfg(test)]
     pub(crate) fn place(&self, addr: &PeerAddr) -> Option<Where> {
         self.lock().meta.get(addr).and_then(|meta| meta.table)
+    }
+
+    /// As if a seeding had returned while seeds were still being asked:
+    /// their answers come through `later`.
+    #[cfg(test)]
+    pub(crate) fn queue_later_seeds(
+        &self,
+        later: tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>,
+    ) {
+        self.lock().later_seeds.push(later);
     }
 
     #[cfg(test)]
