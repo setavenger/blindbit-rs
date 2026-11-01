@@ -1508,14 +1508,16 @@ impl P2pConnection {
         }
     }
 
-    /// Hand addresses the peer gossiped to `peers`.
+    /// Hand addresses the peer gossiped to `peers`. Whether they answer the
+    /// `getaddr`, rather than the peer announcing itself (see
+    /// [`PeerSource::add_gossip`]); `false` for any other message.
     fn take_gossip(&mut self, message: &NetworkMessage, peers: &PeerSource) -> bool {
         let Some(addrs) = crate::net::gossiped_addrs(message) else {
             return false;
         };
-        self.got_addr = true;
-        peers.add_gossip(&self.peer, addrs);
-        true
+        let answer = peers.add_gossip(&self.peer, addrs);
+        self.got_addr |= answer;
+        answer
     }
 
     fn fetch_block(

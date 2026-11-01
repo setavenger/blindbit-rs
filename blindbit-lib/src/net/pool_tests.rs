@@ -370,6 +370,31 @@ fn gossip_keeps_full_nodes_and_public_peers_cannot_name_local_ones() {
     assert_eq!(source.known(), 5);
 }
 
+/// A message holding only the peer's own address is the peer announcing
+/// itself, not its answer to `getaddr`: it is asked again. One other
+/// address, or more, is an answer.
+#[test]
+fn a_peer_announcing_itself_has_not_answered_getaddr() {
+    let source = seeded(&PEERS);
+    let peer = addr("93.184.216.1:8333");
+    let message = |ip: [u8; 4]| AddrV2Message {
+        time: 0,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        addr: AddrV2::Ipv4(ip.into()),
+        port: 8333,
+    };
+    assert!(!source.add_gossip(&peer, [message([93, 184, 216, 1])]));
+    assert!(source.wants_addr(&peer));
+    assert!(source.add_gossip(&peer, [message([93, 184, 216, 2])]));
+    assert!(!source.wants_addr(&peer));
+    let other = addr("93.184.217.1:8333");
+    assert!(source.add_gossip(
+        &other,
+        [message([93, 184, 217, 1]), message([93, 184, 217, 3])]
+    ));
+    assert!(!source.wants_addr(&other));
+}
+
 #[test]
 fn an_own_node_is_the_only_peer_and_learns_nothing() {
     let node = addr("192.0.2.1:8333");

@@ -307,11 +307,19 @@ impl PeerSource {
         }
     }
 
-    /// Addresses `from` gossiped (`addr` / `addrv2`). Nothing for an own
-    /// node.
-    pub fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) {
-        if let Self::Discovered(pool) = self {
-            pool.add_gossip(from, addrs);
+    /// Addresses `from` gossiped (`addr` / `addrv2`). Whether they answer
+    /// the peer's `getaddr`: more than one address, or one that is not the
+    /// peer's own (a node announces itself with a message of its own
+    /// address alone). Only an answer stops [`Self::wants_addr`] asking the
+    /// peer again. Nothing for an own node.
+    pub fn add_gossip(
+        &self,
+        from: &PeerAddr,
+        addrs: impl IntoIterator<Item = AddrV2Message>,
+    ) -> bool {
+        match self {
+            Self::Discovered(pool) => pool.add_gossip(from, addrs),
+            Self::OwnNode { .. } => false,
         }
     }
 
@@ -708,20 +716,32 @@ impl PeerPool {
         }
     }
 
-    fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) {
+    fn add_gossip(&self, from: &PeerAddr, addrs: impl IntoIterator<Item = AddrV2Message>) -> bool {
         let Some(from_ip) = from.ip() else {
-            return;
+            return false;
         };
+        let addrs: Vec<AddrV2Message> = addrs.into_iter().take(MAX_GOSSIP_PER_MESSAGE).collect();
+        let own = |message: &AddrV2Message| {
+            let ip = match message.addr {
+                AddrV2::Ipv4(ip) => IpAddr::V4(ip),
+                AddrV2::Ipv6(ip) => IpAddr::V6(ip),
+                _ => return false,
+            };
+            // An IPv4-mapped address is the IPv4 address it maps.
+            PeerAddr::from(SocketAddr::new(ip, 0)).ip() == Some(from_ip)
+        };
+        let answer = addrs.len() > 1 || addrs.first().is_some_and(|message| !own(message));
         // A peer on the public internet cannot point friglet at this
         // computer or its local network; a local one (a test, a LAN node)
         // may name local peers.
         let local_source = !is_public(from_ip);
         let source = addrv2(from_ip);
         let mut inner = self.lock();
-        inner.gossiped.insert(from.clone());
-        let (mut offered, mut added) = (0, 0);
-        for message in addrs.into_iter().take(MAX_GOSSIP_PER_MESSAGE) {
-            offered += 1;
+        if answer {
+            inner.gossiped.insert(from.clone());
+        }
+        let (offered, mut added) = (addrs.len(), 0);
+        for message in addrs {
             let ip = match message.addr {
                 AddrV2::Ipv4(ip) => IpAddr::V4(ip),
                 AddrV2::Ipv6(ip) => IpAddr::V6(ip),
@@ -745,9 +765,11 @@ impl PeerPool {
             peer = %from,
             offered,
             added,
+            answer,
             known = inner.known(),
             "peer gossiped addresses"
         );
+        answer
     }
 
     /// A gossiped address worth a place in the book: a full node (every

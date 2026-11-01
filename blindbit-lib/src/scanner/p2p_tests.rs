@@ -62,6 +62,9 @@ pub(super) enum Conn {
     /// [`Conn::Serve`], then start a message and send one byte of it every
     /// 100 ms (for at most 15 s), never completing it.
     ServeThenTrickle,
+    /// Announce its own address right after the handshake, as Bitcoin Core
+    /// does, then [`Conn::Serve`], then answer `getaddr` with [`GOSSIP`].
+    AnnounceThenServeThenAddr,
 }
 
 /// What a [`Conn::ServeWithAddr`] node gossips: two loopback peers (that
@@ -336,6 +339,18 @@ fn serve(
     wire.send(NetworkMessage::Verack)?;
     while !matches!(wire.recv()?, NetworkMessage::Verack) {}
     wire.send(NetworkMessage::Ping(1))?;
+    if conn == Conn::AnnounceThenServeThenAddr {
+        let own = wire.stream.local_addr()?;
+        let IpAddr::V4(ip) = own.ip() else {
+            unreachable!("IPv4 test node")
+        };
+        wire.send(NetworkMessage::AddrV2(vec![AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            addr: AddrV2::Ipv4(ip),
+            port: own.port(),
+        }]))?;
+    }
     let items = loop {
         let message = wire.recv()?;
         commands.lock().unwrap().push(message.command().to_string());
@@ -370,6 +385,11 @@ fn serve(
         Conn::ServeThenTrickle => {
             wire.send(NetworkMessage::Block(served.full.clone()))?;
             trickle(&mut wire.stream, magic, moments)?;
+        }
+        Conn::AnnounceThenServeThenAddr => {
+            wire.send(NetworkMessage::Block(served.full.clone()))?;
+            std::thread::sleep(Duration::from_millis(100));
+            wire.send(NetworkMessage::AddrV2(gossip()))?;
         }
         Conn::NotFound => wire.send(NetworkMessage::NotFound(items))?,
         Conn::CloseAfterRequest => wire.stream.shutdown(Shutdown::Write)?,

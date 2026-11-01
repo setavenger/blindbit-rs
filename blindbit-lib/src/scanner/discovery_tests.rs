@@ -278,6 +278,30 @@ fn addresses_that_pause_halfway_after_the_block_still_land_in_the_book() {
     });
 }
 
+/// A peer announcing its own address has not answered `getaddr`: the
+/// connection still waits for the answer after the block.
+#[test]
+fn a_peer_announcing_itself_is_still_waited_for_its_addresses() {
+    run(async {
+        let block = genesis();
+        let gossiping = node(39, &block, vec![Conn::AnnounceThenServeThenAddr]);
+        let source = discovering(&[&gossiping]);
+        BlockFetcher::new(source.clone())
+            .with_policy(quick())
+            .fetch(block.block_hash(), 100)
+            .await
+            .expect("served");
+        assert!(
+            comes_true(Duration::from_secs(5), || source.known()
+                == 1 + GOSSIP.len())
+            .await,
+            "known: {}",
+            source.known()
+        );
+        assert!(!source.wants_addr(&gossiping.addr.into()), "it answered");
+    });
+}
+
 /// A peer that trickles a message after the block cannot keep the
 /// connection: it closes when the wait for addresses is over (3 s).
 #[test]
