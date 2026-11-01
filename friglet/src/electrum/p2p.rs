@@ -52,6 +52,12 @@ pub const SETTLE_WAIT: Duration = Duration::from_secs(2);
 /// on the wire only through `MAX_SIZE` (32 MB). Anything above is garbage.
 const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
 
+/// Messages a peer may send while it answers one header request before it
+/// is given up on: the answer is one `headers` message, and little else
+/// arrives on a `relay = false` connection meanwhile. Without a bound a peer
+/// could keep sending until the request times out.
+const HEADER_ANSWER_MESSAGES: usize = 100;
+
 #[derive(Debug)]
 pub enum P2pError {
     Io(io::Error),
@@ -471,8 +477,10 @@ impl Peer {
     }
 
     /// The header of block `hash`, `None` when the peer does not know the
-    /// block. Only a header whose hash is `hash` is returned. One round trip:
-    /// the `getheaders` is answered before the trailing ping's pong.
+    /// block. Only a header whose hash is `hash` is kept and returned; a peer
+    /// that sends more than [`HEADER_ANSWER_MESSAGES`] messages before its
+    /// pong is given up on. One round trip: the `getheaders` is answered
+    /// before the trailing ping's pong.
     pub fn header_by_hash(
         &mut self,
         hash: BlockHash,
@@ -483,13 +491,26 @@ impl Peer {
             locator_hashes: Vec::new(),
             stop_hash: hash,
         }))?;
-        let mut found = Vec::new();
+        let mut found = None;
+        let mut messages = 0;
         self.sync_with_ping(deadline, "block headers", |message| {
-            if let NetworkMessage::Headers(headers) = message {
-                found.extend(headers.iter().copied());
+            messages += 1;
+            if messages > HEADER_ANSWER_MESSAGES {
+                return Err(P2pError::Protocol(format!(
+                    "more than {HEADER_ANSWER_MESSAGES} messages in answer to one header request"
+                )));
             }
+            if let NetworkMessage::Headers(headers) = message
+                && found.is_none()
+            {
+                found = headers
+                    .iter()
+                    .find(|header| header.block_hash() == hash)
+                    .copied();
+            }
+            Ok(())
         })?;
-        Ok(found.into_iter().find(|header| header.block_hash() == hash))
+        Ok(found)
     }
 
     /// Wait until the peer has processed everything sent so far: it answers
@@ -497,22 +518,23 @@ impl Peer {
     /// a socket with unread input resets it, which can make the peer drop
     /// what it has not read yet; call this before closing after a hand-over.
     pub fn flush(&mut self, deadline: Instant) -> Result<(), P2pError> {
-        self.sync_with_ping(deadline, "a pong", |_| {})
+        self.sync_with_ping(deadline, "a pong", |_| Ok(()))
     }
 
-    /// Send a ping and feed every message to `on_message` until its pong.
+    /// Send a ping and feed every message to `on_message` until its pong; an
+    /// error from `on_message` ends the wait.
     fn sync_with_ping(
         &mut self,
         deadline: Instant,
         what: &'static str,
-        mut on_message: impl FnMut(&NetworkMessage),
+        mut on_message: impl FnMut(&NetworkMessage) -> Result<(), P2pError>,
     ) -> Result<(), P2pError> {
         let nonce = random_u64();
         self.send(NetworkMessage::Ping(nonce))?;
         loop {
             match self.recv_until(deadline)? {
                 Some(NetworkMessage::Pong(n)) if n == nonce => return Ok(()),
-                Some(message) => on_message(&message),
+                Some(message) => on_message(&message)?,
                 None => return Err(P2pError::Timeout(what)),
             }
         }
@@ -552,5 +574,47 @@ pub fn inventory_matches(item: &Inventory, txid: Txid, wtxid: Wtxid) -> bool {
         Inventory::Transaction(id) | Inventory::WitnessTransaction(id) => *id == txid,
         Inventory::WTx(id) => *id == wtxid,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::electrum::fake_peer::{FakePeer, Script, header};
+
+    /// A peer that answers a header request with message after message
+    /// about other blocks, and never with the pong, is given up on after
+    /// [`HEADER_ANSWER_MESSAGES`] of them, not when the request's deadline
+    /// (here five minutes) passes; what it sent is not kept meanwhile.
+    #[test]
+    fn a_peer_flooding_a_header_request_is_given_up_on() {
+        let fake = FakePeer::spawn(
+            Script {
+                flood_headers: 10_000,
+                ..Script::default()
+            },
+            1,
+        );
+        let wanted = header(u32::MAX).block_hash();
+        let (answered, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut peer = Peer::connect(
+                &Dialer::Direct,
+                &PeerAddr::from(fake.addr),
+                Network::Regtest,
+                false,
+                Duration::from_secs(10),
+            )
+            .expect("handshake");
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let _ = answered.send(peer.header_by_hash(wanted, deadline));
+        });
+        let answer = answer
+            .recv_timeout(Duration::from_secs(60))
+            .expect("given up on long before the request's deadline");
+        assert!(
+            matches!(&answer, Err(P2pError::Protocol(message)) if message.contains("messages")),
+            "{answer:?}"
+        );
     }
 }

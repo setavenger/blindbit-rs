@@ -88,6 +88,10 @@ pub struct Script {
     /// Close connections that asked for transaction relay (observers) this
     /// long after the handshake.
     pub drop_relay_after: Option<Duration>,
+    /// Answer a `getheaders` with this many `headers` messages, each with
+    /// the header of another block, then say nothing more (no `pong`) until
+    /// the connection closes. Zero: answer as Bitcoin Core does.
+    pub flood_headers: u32,
 }
 
 impl Default for Script {
@@ -105,6 +109,7 @@ impl Default for Script {
             wtxid_relay: true,
             unresponsive: false,
             drop_relay_after: None,
+            flood_headers: 0,
         }
     }
 }
@@ -389,6 +394,16 @@ fn serve(
         }
         match message {
             NetworkMessage::Ping(nonce) => wire.send(NetworkMessage::Pong(nonce))?,
+            NetworkMessage::GetHeaders(request) if script.flood_headers > 0 => {
+                for nonce in 0..script.flood_headers {
+                    let other = header(nonce);
+                    if other.block_hash() != request.stop_hash {
+                        wire.send(NetworkMessage::Headers(vec![other]))?;
+                    }
+                }
+                while wire.recv().is_ok() {}
+                return Ok(());
+            }
             NetworkMessage::GetHeaders(request) if request.locator_hashes.is_empty() => {
                 if let Some(header) = script
                     .headers

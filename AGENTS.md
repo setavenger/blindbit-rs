@@ -290,7 +290,9 @@ dbus-run-session -- bash -c '
   that served the last block, and asks for addresses while < 200 are known.
   Headers try up to 3 peers, the peer of the open header connection first
   while it is fresh; a peer that lacks a header is skipped for that request
-  only (not rested, still the block peer). `blockchain.relayfee` is the
+  only (not rested, still the block peer). Of a header answer only the
+  matching header is kept, and a peer sending more than 100 messages before
+  its pong is given up on (`p2p.rs` `HEADER_ANSWER_MESSAGES`). `blockchain.relayfee` is the
   median of fresh feefilters (from any connection: headers, broadcasts,
   rechecks) of >= 3 (up to 5) peers, the lowest below that; sampling (at
   Electrum start, and when fewer are fresh) stops once the quorum is in, and
