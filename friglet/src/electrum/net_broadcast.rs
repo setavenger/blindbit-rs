@@ -107,6 +107,8 @@ pub struct History {
     /// handed to goes in, and to disk, before the bytes are written to it,
     /// so a broadcast that is dropped halfway (a settings restart, the
     /// daemon stopping) still leaves its recipients for the next attempt.
+    /// A peer that cannot be written to disk gets nothing, and the
+    /// broadcast ends with that error.
     pub store: Option<SharedStore>,
 }
 
@@ -247,6 +249,9 @@ enum Event {
     /// The proxy every connection goes through failed (`p2p_proxy`): no
     /// peer can be reached, and none is to blame.
     ProxyDown { error: String },
+    /// A peer could not be written to the pending store's file, so it got
+    /// nothing; nor can any other peer.
+    StoreFailed { error: String },
     /// The connection ended (failed, closed, or stopped).
     Gone { addr: PeerAddr },
 }
@@ -390,8 +395,10 @@ impl Job {
     }
 
     /// May `txid` be written to `addr` now? If so, `addr` is in the final
-    /// list from here on, and on disk in the pending store. Blocking (the
-    /// store is written): only from a connection's thread.
+    /// list from here on, and on disk in the pending store. Not when the
+    /// store's file cannot be written: the broadcast then ends with that
+    /// error ([`Event::StoreFailed`]). Blocking (the store is written): only
+    /// from a connection's thread.
     fn may_send(&self, addr: &PeerAddr, txid: Txid) -> bool {
         let entry = (txid, addr.clone());
         let known = {
@@ -407,7 +414,13 @@ impl Job {
         if let Some(store) = self.store.as_ref().filter(|_| !known) {
             let mut store = store.blocking_lock();
             store.note_handed_to(&txid.to_string(), std::slice::from_ref(addr));
-            store.save();
+            if let Err(error) = store.save() {
+                tracing::error!(peer = %addr, %txid, %error, "broadcast: cannot record the peer, so it gets nothing");
+                self.tell(Event::StoreFailed {
+                    error: error.to_string(),
+                });
+                return false;
+            }
         }
         let mut ledger = self.ledger();
         if ledger.closed || self.over() {
@@ -520,6 +533,8 @@ struct Round {
     no_peers: Option<String>,
     /// The proxy failed: nothing more is tried.
     proxy_down: Option<String>,
+    /// The pending store's file could not be written: the broadcast ends.
+    store_failed: Option<String>,
 }
 
 impl Round {
@@ -543,6 +558,7 @@ impl Round {
             seen_by: None,
             no_peers: None,
             proxy_down: None,
+            store_failed: None,
         }
     }
 
@@ -651,6 +667,9 @@ impl Round {
                 tracing::warn!(%error, "broadcast: the P2P proxy failed");
                 self.proxy_down.get_or_insert(error);
             }
+            Event::StoreFailed { error } => {
+                self.store_failed.get_or_insert(error);
+            }
             Event::Gone { addr } => match self.peers.get(&addr).copied() {
                 Some(State::Watching { .. }) => {
                     self.peers.insert(addr, State::ObserverGone);
@@ -735,10 +754,14 @@ impl Round {
     }
 
     /// The broadcast's end, once it is decided. `Err` is a message for the
-    /// user: no peer could be asked.
+    /// user: no peer could be asked, or the pending store's file could not
+    /// be written.
     fn end(&self, deadline: Instant) -> Option<Result<Verdict, String>> {
         if let Some(by) = &self.seen_by {
             return Some(Ok(Verdict::InMempool { by: by.clone() }));
+        }
+        if let Some(error) = &self.store_failed {
+            return Some(Err(store_failed_message(error)));
         }
         let observers_left = self.observers_ready() + self.observers_connecting() > 0;
         if !self.senders_started {
@@ -936,8 +959,11 @@ async fn broadcast_paced(
             let sent_to: Vec<PeerAddr> = handed.into_iter().map(|(_, addr)| addr).collect();
             let verdict = match end {
                 Ok(verdict) => verdict,
-                // A sender may have handed it over after all.
-                Err(_) if !sent_to.is_empty() => round.unconfirmed(),
+                // A sender may have handed it over after all; a failed
+                // write of the pending store is reported all the same.
+                Err(_) if !sent_to.is_empty() && round.store_failed.is_none() => {
+                    round.unconfirmed()
+                }
                 Err(message) => return Err(message),
             };
             return Ok(Report {
@@ -1289,6 +1315,16 @@ fn rejected_message(signal: Signal, senders: usize) -> String {
              spread since."
         ),
     }
+}
+
+/// The error for a broadcast that ended because the pending store's file
+/// could not be written (`error` names the file).
+fn store_failed_message(error: &str) -> String {
+    format!(
+        "local storage error: {error}. friglet hands a transaction to a peer only once that peer \
+         is written to this file, so it went to no further peer. Check that the disk has space \
+         and that friglet can write next to its state file, then send it again."
+    )
 }
 
 /// The error for a transaction no observer had when the wait ended:

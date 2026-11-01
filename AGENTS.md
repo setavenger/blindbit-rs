@@ -308,7 +308,9 @@ dbus-run-session -- bash -c '
   for the own node; recent outcomes are keyed by wtxid); a peer ever handed
   the tx never confirms it (`History::handed_to`: not an observer or
   sender, its netgroup passed over while others are left). Each recipient
-  is written to the pending file before any bytes go to it, and a copy from
+  is written to the pending file before any bytes go to it; when that write
+  fails it gets nothing (a broadcast ends with a "local storage error", a
+  recheck logs one), and a copy from
   a peer listed there never counts, also when a recheck handed it over
   during the broadcast. Missing inputs are reported only when the budget
   ends with no observer having the tx and at least 2 senders (`REFUSALS`),
@@ -321,7 +323,8 @@ dbus-run-session -- bash -c '
   tx is pending (≤ 14 days): 2 peers it was never handed to (in any
   attempt) are asked about all pending txids on one connection each (so
   they can link them; README privacy note), and a lost tx goes to one of
-  them. `<state>.pending.json` (0600) is `{"pending": {…}, "handed_to":
+  them. `<state>.pending.json` (0600; written to a temp file that is synced,
+  renamed, then the directory synced on Unix) is `{"pending": {…}, "handed_to":
   {…}}`: every tx's recipients whatever the verdict, kept 14 days
   (`EXPIRY_SECS`) once it is no longer pending; the older bare map still
   loads, older builds ignore the new file. Own node:

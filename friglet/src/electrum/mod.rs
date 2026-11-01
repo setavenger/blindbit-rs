@@ -1069,7 +1069,7 @@ async fn accept_pending(state: &ElectrumServerState, candidate: &Candidate, sent
             store.retire(other);
         }
         store.insert(txid.clone(), raw_hex, sent_to);
-        store.save();
+        save_or_warn(&store);
         replaced
     };
     if !replaced.is_empty() {
@@ -1144,7 +1144,7 @@ async fn recheck_pending(state: &ElectrumServerState) {
             tracing::warn!(%txid, %reason, "dropped a pending broadcast that can no longer confirm");
         }
         if !confirmed.is_empty() || !dropped.is_empty() {
-            store.save();
+            save_or_warn(&store);
         }
         candidates
     };
@@ -1256,13 +1256,24 @@ async fn recheck_on_network(
         for target in &asked.peers {
             // Recorded (and saved) before anything is sent: a hand-over
             // that fails halfway may still have left the peer holding some.
-            {
+            // A peer that cannot be written down gets nothing.
+            let saved = {
                 let mut store = state.pending.lock().await;
                 for &i in &lost {
                     let txid = candidates[i].txid.to_string();
                     store.note_handed_to(&txid, std::slice::from_ref(target));
                 }
-                store.save();
+                store.save()
+            };
+            if let Err(error) = saved {
+                tracing::error!(
+                    peer = %target,
+                    %error,
+                    "local storage error: cannot record the peer pending broadcasts would go to, \
+                     so they were handed to nobody; check the disk space and that friglet can \
+                     write next to its state file"
+                );
+                break;
             }
             let (task_peers, task_candidates, task_target, task_lost) = (
                 peers.clone(),
@@ -1368,8 +1379,16 @@ async fn settle_rechecked(state: &ElectrumServerState, checked: Vec<Rechecked>) 
             );
         }
     }
-    store.save();
+    save_or_warn(&store);
     index_changed
+}
+
+/// Write the pending store where a failed write holds nothing up: the
+/// store in memory has the change, and the next successful write saves it.
+fn save_or_warn(store: &PendingStore) {
+    if let Err(error) = store.save() {
+        tracing::warn!(%error, "failed to persist pending broadcasts");
+    }
 }
 
 /// `blockchain.relayfee`: the lowest fee rate the P2P peer's mempool accepts
@@ -2082,7 +2101,7 @@ mod tests {
         {
             let mut store = PendingStore::load(dir.join("state.pending.json"));
             store.insert(txid.clone(), raw_hex, &[]);
-            store.save();
+            store.save().unwrap();
         }
         let state = state(index, Some(node.addr), &dir);
         restore_pending(&state).await;
@@ -2115,7 +2134,7 @@ mod tests {
         {
             let mut store = PendingStore::load(dir.join("state.pending.json"));
             store.insert(txid.clone(), raw_hex.clone(), &[]);
-            store.save();
+            store.save().unwrap();
         }
 
         // Restart: shown as unconfirmed again.
@@ -2478,7 +2497,7 @@ mod tests {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&parent));
                 store.insert(parent_txid.clone(), raw_hex, &[]);
-                store.save();
+                store.save().unwrap();
             }
             let state = state_with(index, discovered(&fakes).await, &dir);
             let raw = hex::encode(bitcoin::consensus::encode::serialize(&child));
@@ -2516,7 +2535,7 @@ mod tests {
                     let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(tx));
                     store.insert(tx.compute_txid().to_string(), raw_hex, &[]);
                 }
-                store.save();
+                store.save().unwrap();
             }
             let state = state_with(index, discovered(&fakes).await, &dir);
             let raw = hex::encode(bitcoin::consensus::encode::serialize(&child));
@@ -2538,7 +2557,7 @@ mod tests {
             let txid = tx.compute_txid().to_string();
             let mut store = state.pending.lock().await;
             store.note_handed_to(&txid, sent_to);
-            store.save();
+            store.save().unwrap();
             drop(store);
             remember_broadcast(
                 state,
@@ -2657,6 +2676,84 @@ mod tests {
             std::fs::remove_dir_all(dir).unwrap();
         }
 
+        /// Keep the pending store's file in `dir` from being written: a
+        /// directory has the name of its replacement (unwritable for root
+        /// too).
+        fn make_unwritable(dir: &Path) {
+            std::fs::create_dir(dir.join("state.pending.json.tmp")).unwrap();
+        }
+
+        /// With the pending store's file unwritable, a broadcast hands the
+        /// transaction to nobody (a peer gets it only once the peer is on
+        /// disk) and says why.
+        #[tokio::test]
+        async fn with_the_pending_file_unwritable_a_broadcast_hands_nothing_over() {
+            let dir = temp_dir("net-unwritable");
+            let (index, received) = wallet();
+            let net = FakeNet::new();
+            let fakes = fake_net(&net, 205, vec![Script::default(); 5]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            make_unwritable(&dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&spend(
+                &received, 1_000, 0,
+            )));
+            let response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await;
+            assert_eq!(response["error"]["code"], 2, "{response}");
+            let message = response["error"]["message"].as_str().unwrap();
+            for expected in [
+                "local storage error: cannot write",
+                "state.pending.json",
+                "it went to no further peer",
+            ] {
+                assert!(message.contains(expected), "{expected:?} in {message}");
+            }
+            let commands = |fake: &FakePeer| fake.commands();
+            assert!(
+                fakes.iter().any(|f| commands(f).iter().any(|c| c == "inv")),
+                "a sender announced it"
+            );
+            for fake in &fakes {
+                assert!(
+                    !commands(fake).iter().any(|c| c == "tx"),
+                    "{} got it",
+                    fake.addr
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// With the pending store's file unwritable, a recheck hands a lost
+        /// transaction to none of the peers it asked.
+        #[tokio::test]
+        async fn with_the_pending_file_unwritable_a_recheck_hands_nothing_over() {
+            let dir = temp_dir("net-recheck-unwritable");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let net = FakeNet::new();
+            let fakes = fake_net(&net, 210, vec![Script::default(); 2]);
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), raw_hex, &[]);
+                store.save().unwrap();
+            }
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            make_unwritable(&dir);
+            recheck_pending(&state).await;
+            for fake in &fakes {
+                assert!(!fake.conns().is_empty(), "{} was not asked", fake.addr);
+                assert!(
+                    !fake.commands().iter().any(|c| c == "tx"),
+                    "{} got it",
+                    fake.addr
+                );
+            }
+            assert!(!net.has(tx.compute_txid()));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
         /// A recheck runs while a resend of the same transaction is under
         /// way, finds it in no mempool and hands it to one of the resend's
         /// observers: that observer's copy is then friglet's own and never
@@ -2673,7 +2770,7 @@ mod tests {
             {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 store.insert(txid.clone(), hex::encode(&raw), &[]);
-                store.save();
+                store.save().unwrap();
             }
             // Three observers and one sender.
             let fakes: Vec<FakePeer> = (0..4)
@@ -2789,7 +2886,7 @@ mod tests {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 let handed: Vec<PeerAddr> = earlier.iter().map(|f| f.addr.into()).collect();
                 store.note_handed_to(&txid, &handed);
-                store.save();
+                store.save().unwrap();
             }
             let all: Vec<FakePeer> = earlier.into_iter().chain(others).collect();
             let state = state_with(index, discovered(&all).await, &dir);
@@ -2828,7 +2925,7 @@ mod tests {
             {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 store.insert(txid.clone(), hex::encode(&raw), &[fakes[0].addr.into()]);
-                store.save();
+                store.save().unwrap();
             }
             let state = state_with(index, discovered(&fakes).await, &dir);
             restore_pending(&state).await;
@@ -2865,7 +2962,7 @@ mod tests {
             {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 store.insert(txid.clone(), raw_hex, &[fakes[0].addr.into()]);
-                store.save();
+                store.save().unwrap();
             }
             let state = state_with(index, discovered(&fakes).await, &dir);
             restore_pending(&state).await;
@@ -2896,7 +2993,7 @@ mod tests {
             {
                 let mut store = PendingStore::load(dir.join("state.pending.json"));
                 store.insert(txid.clone(), raw_hex.clone(), &senders);
-                store.save();
+                store.save().unwrap();
             }
             let state = state_with(index, discovered(&fakes).await, &dir);
             restore_pending(&state).await;

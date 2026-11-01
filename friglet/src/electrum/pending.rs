@@ -106,7 +106,8 @@ fn parse_peers(peers: &[String]) -> impl Iterator<Item = PeerAddr> + '_ {
 
 /// The store as the Electrum server shares it: a broadcast still running
 /// writes every peer it hands a transaction to into it (and to disk)
-/// before the bytes go out, as a recheck does, and a peer's copy of a
+/// before the bytes go out, as a recheck does (a peer that cannot be
+/// written to disk gets nothing), and a peer's copy of a
 /// transaction counts only while the peer is not in it for that
 /// transaction, looked up after the copy arrived. So a broadcast and a
 /// recheck running at the same time never take each other's recipients
@@ -154,10 +155,16 @@ impl PendingStore {
         store
     }
 
-    pub fn save(&self) {
-        if let Err(error) = write_atomic(&self.path, &self.txs, &self.handed_to) {
-            tracing::warn!(path = %self.path.display(), %error, "failed to persist pending broadcasts");
-        }
+    /// Write the store to its file. An error (naming the file) means the
+    /// file still holds what it held before; the store in memory keeps
+    /// every change.
+    pub fn save(&self) -> io::Result<()> {
+        write_atomic(&self.path, &self.txs, &self.handed_to).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot write {}: {error}", self.path.display()),
+            )
+        })
     }
 
     /// Forget who got transactions that are not pending once they would
@@ -309,7 +316,9 @@ impl PendingStore {
 }
 
 /// Write the file owner-only (0600): it names the peers friglet handed the
-/// wallet's transactions to.
+/// wallet's transactions to. Durable once this returns: the new file is on
+/// disk before it replaces the old one, and the replacement too, so a crash
+/// or power loss leaves the old file or the new one, never less.
 fn write_atomic(
     path: &Path,
     pending: &BTreeMap<String, PendingTx>,
@@ -333,8 +342,34 @@ fn write_atomic(
     #[cfg(unix)]
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     io::Write::write_all(&mut file, &json)?;
+    file.sync_all()?;
     drop(file);
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    sync_dir(path)
+}
+
+/// Put a rename in `path`'s directory on disk. Only on Unix, where a
+/// directory can be opened and synced, and not on a file system that
+/// cannot sync one.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        if let Err(error) = fs::File::open(dir)?.sync_all()
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            )
+        {
+            return Err(error);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 pub fn decode(raw_hex: &str) -> Option<Transaction> {
@@ -431,7 +466,7 @@ mod tests {
         assert!(store.is_empty());
         let sender: PeerAddr = "203.0.113.5:38333".parse::<SocketAddr>().unwrap().into();
         store.insert("aa".into(), "0100".into(), std::slice::from_ref(&sender));
-        store.save();
+        store.save().unwrap();
 
         let reloaded = PendingStore::load(path.clone());
         let entries: Vec<_> = reloaded.entries().collect();
@@ -479,7 +514,7 @@ mod tests {
         let mut store = PendingStore::load(path.clone());
         let sender: PeerAddr = "203.0.113.5:38333".parse::<SocketAddr>().unwrap().into();
         store.insert("aa".into(), "0100".into(), &[sender]);
-        store.save();
+        store.save().unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -500,7 +535,7 @@ mod tests {
         store.note_handed_to("aa", &[peer(2), peer(3)]);
         store.note_handed_to("aa", &[]);
         assert!(store.is_empty(), "not pending");
-        store.save();
+        store.save().unwrap();
 
         let mut store = PendingStore::load(path.clone());
         assert_eq!(
@@ -520,7 +555,7 @@ mod tests {
         // Replaced: no longer shown, still not asked to confirm it.
         store.retire("aa");
         assert!(store.is_empty());
-        store.save();
+        store.save().unwrap();
         let mut store = PendingStore::load(path.clone());
         assert_eq!(store.handed_to("aa").len(), 5);
         // Confirmed (or conflicting): nothing more to keep.
