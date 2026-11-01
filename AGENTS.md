@@ -323,7 +323,8 @@ dbus-run-session -- bash -c '
   tx is pending (≤ 14 days): 2 peers it was never handed to (in any
   attempt) are asked about all pending txids on one connection each (so
   they can link them; README privacy note), and a lost tx goes to one of
-  them. `<state>.pending.json` (0600; written to a temp file that is synced,
+  them (written down once its connection is up, before the tx goes out; a
+  peer that could not be reached is not kept). `<state>.pending.json` (0600; written to a temp file that is synced,
   renamed, then the directory synced on Unix) is `{"pending": {…}, "handed_to":
   {…}}`: every tx's recipients whatever the verdict, kept 14 days
   (`EXPIRY_SECS`) once it is no longer pending; the older bare map still

@@ -45,7 +45,7 @@ mod pending;
 mod relay;
 
 use self::chain::ChainSource;
-use self::net_broadcast::Verdict;
+use self::net_broadcast::{HandOverError, Verdict};
 use self::p2p::P2pError;
 pub(crate) use self::pending::now_secs;
 use self::pending::{PendingStore, SharedStore};
@@ -1252,39 +1252,23 @@ async fn recheck_on_network(
         .filter(|&i| !asked.present[i])
         .collect();
     if !lost.is_empty() {
-        // The first asked peer that takes them.
+        // The first asked peer that takes them. Each is recorded (and
+        // saved) once reached, before anything is sent: a hand-over that
+        // fails halfway may still have left the peer holding some, and a
+        // peer never reached is not kept. One that cannot be written down
+        // gets nothing.
         for target in &asked.peers {
-            // Recorded (and saved) before anything is sent: a hand-over
-            // that fails halfway may still have left the peer holding some.
-            // A peer that cannot be written down gets nothing.
-            let saved = {
-                let mut store = state.pending.lock().await;
-                for &i in &lost {
-                    let txid = candidates[i].txid.to_string();
-                    store.note_handed_to(&txid, std::slice::from_ref(target));
-                }
-                store.save()
-            };
-            if let Err(error) = saved {
-                tracing::error!(
-                    peer = %target,
-                    %error,
-                    "local storage error: cannot record the peer pending broadcasts would go to, \
-                     so they were handed to nobody; check the disk space and that friglet can \
-                     write next to its state file"
-                );
-                break;
-            }
-            let (task_peers, task_candidates, task_target, task_lost) = (
+            let (task_peers, task_candidates, task_target, task_lost, task_store) = (
                 peers.clone(),
                 candidates.clone(),
                 target.clone(),
                 lost.clone(),
+                state.pending.clone(),
             );
             let handed = tokio::task::spawn_blocking(move || {
                 let lost: Vec<&Candidate> =
                     task_lost.iter().map(|&i| &task_candidates[i]).collect();
-                net_broadcast::hand_over(&task_peers, &task_target, &lost)
+                net_broadcast::hand_over(&task_peers, &task_target, &lost, Some(&task_store))
             })
             .await;
             match handed {
@@ -1297,7 +1281,17 @@ async fn recheck_on_network(
                     );
                     break;
                 }
-                Ok(Err(error)) => {
+                Ok(Err(HandOverError::Store(error))) => {
+                    tracing::error!(
+                        peer = %target,
+                        %error,
+                        "local storage error: cannot record the peer pending broadcasts would go \
+                         to, so they were handed to nobody; check the disk space and that friglet \
+                         can write next to its state file"
+                    );
+                    break;
+                }
+                Ok(Err(HandOverError::Peer(error))) => {
                     tracing::warn!(peer = %target, %error, "could not hand pending broadcasts over again")
                 }
                 Err(error) => tracing::warn!(%error, "pending hand-over task failed"),
@@ -2751,6 +2745,97 @@ mod tests {
                 );
             }
             assert!(!net.has(tx.compute_txid()));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A pending transaction lost from every mempool, as the store has
+        /// it in `dir`.
+        fn lost_pending(dir: &Path, tx: &Transaction) {
+            let mut store = PendingStore::load(dir.join("state.pending.json"));
+            let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(tx));
+            store.insert(tx.compute_txid().to_string(), raw_hex, &[]);
+            store.save().unwrap();
+        }
+
+        /// A recheck keeps no peer it could not reach: both asked peers take
+        /// no connection after the question, so the lost transaction goes to
+        /// neither, and neither is written down as having it.
+        #[tokio::test]
+        async fn a_recheck_keeps_no_peer_it_could_not_reach() {
+            let dir = temp_dir("net-recheck-unreached");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            lost_pending(&dir, &tx);
+            // Each serves one connection: the mempool question.
+            let fakes: Vec<FakePeer> = [215, 216]
+                .into_iter()
+                .map(|b| FakePeer::spawn_on([127, b, 0, 1].into(), Script::default(), 1))
+                .collect();
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            recheck_pending(&state).await;
+            for fake in &fakes {
+                let conns = fake.conns();
+                assert!(
+                    matches!(&conns[..], [question] if question.version.relay),
+                    "{} served {} connections",
+                    fake.addr,
+                    conns.len()
+                );
+                assert!(!fake.commands().iter().any(|c| c == "tx"));
+            }
+            let in_memory = state.pending.lock().await.handed_to(&txid);
+            assert!(in_memory.is_empty(), "kept {in_memory:?}");
+            let on_disk = PendingStore::load(dir.join("state.pending.json")).handed_to(&txid);
+            assert!(on_disk.is_empty(), "kept {on_disk:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// The peer a recheck hands a lost transaction to is on disk as
+        /// having it by the time the transaction reaches it.
+        #[tokio::test]
+        async fn a_recheck_writes_a_peer_down_before_the_transaction_reaches_it() {
+            let dir = temp_dir("net-recheck-written-first");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            lost_pending(&dir, &tx);
+            // What the file says as each transaction reaches a peer.
+            let on_arrival = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let script = Script {
+                on_tx: Some(Arc::new({
+                    let (on_arrival, path, txid) = (
+                        on_arrival.clone(),
+                        dir.join("state.pending.json"),
+                        txid.clone(),
+                    );
+                    move || {
+                        let on_disk = PendingStore::load(path.clone()).handed_to(&txid);
+                        on_arrival.lock().unwrap().push(on_disk);
+                    }
+                })),
+                ..Script::default()
+            };
+            let net = FakeNet::new();
+            let fakes = fake_net(&net, 217, vec![script; 2]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            restore_pending(&state).await;
+            recheck_pending(&state).await;
+            let got_it: Vec<PeerAddr> = fakes
+                .iter()
+                .filter(|fake| fake.commands().iter().any(|c| c == "tx"))
+                .map(|fake| fake.addr.into())
+                .collect();
+            let [recipient] = &got_it[..] else {
+                panic!("handed to {got_it:?}");
+            };
+            let on_arrival = on_arrival.lock().unwrap();
+            assert!(!on_arrival.is_empty());
+            for on_disk in on_arrival.iter() {
+                assert!(on_disk.contains(recipient), "{on_disk:?} lacks {recipient}");
+            }
+            drop(on_arrival);
             std::fs::remove_dir_all(dir).unwrap();
         }
 

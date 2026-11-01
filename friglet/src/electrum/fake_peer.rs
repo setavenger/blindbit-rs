@@ -92,6 +92,9 @@ pub struct Script {
     /// the header of another block, then say nothing more (no `pong`) until
     /// the connection closes. Zero: answer as Bitcoin Core does.
     pub flood_headers: u32,
+    /// Called as each transaction arrives, before the peer does anything
+    /// with it: a test looks at what friglet had done by then.
+    pub on_tx: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for Script {
@@ -110,6 +113,7 @@ impl Default for Script {
             unresponsive: false,
             drop_relay_after: None,
             flood_headers: 0,
+            on_tx: None,
         }
     }
 }
@@ -454,6 +458,9 @@ fn serve(
                 }
             }
             NetworkMessage::Tx(tx) => {
+                if let Some(on_tx) = &script.on_tx {
+                    on_tx();
+                }
                 let raw = encode::serialize(&tx);
                 known.insert(raw.clone());
                 // The parent this connection asked for last: when it has

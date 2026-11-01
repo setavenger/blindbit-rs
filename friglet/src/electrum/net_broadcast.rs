@@ -50,6 +50,7 @@
 //! ([`Timing`]).
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -1512,26 +1513,60 @@ async fn ask(
     .map_err(|error| P2pError::Protocol(format!("the mempool check task failed: {error}")))?
 }
 
+/// Why [`hand_over`] ended before every candidate was handed over.
+#[derive(Debug)]
+pub enum HandOverError {
+    /// The peer could not be reached, or the connection failed.
+    Peer(P2pError),
+    /// The peer could not be written to the pending store's file: it got
+    /// nothing.
+    Store(io::Error),
+}
+
+/// Write down in `store`, and to disk in one write, that `txids` go to
+/// `addr`. Blocking.
+fn record_hand_over(
+    store: &SharedStore,
+    addr: &PeerAddr,
+    txids: impl IntoIterator<Item = Txid>,
+) -> io::Result<()> {
+    let mut store = store.blocking_lock();
+    for txid in txids {
+        store.note_handed_to(&txid.to_string(), std::slice::from_ref(addr));
+    }
+    store.save()
+}
+
 /// Hand `candidates` to `addr` on one sender connection and wait until the
-/// peer has processed them. Blocking. Returns, per candidate, whether the
+/// peer has processed them. Blocking. Once the connection is up, and before
+/// anything of theirs is sent, the peer goes into `store` (and to disk) for
+/// every candidate: a peer that cannot be reached is not kept, one that a
+/// hand-over fails with halfway is. Returns, per candidate, whether the
 /// peer asked for it (it did not when it knows it already).
 pub fn hand_over(
     peers: &PeerSource,
     addr: &PeerAddr,
     candidates: &[&Candidate],
-) -> Result<Vec<bool>, P2pError> {
-    let mut peer = connect_sender(peers, addr)?;
+    store: Option<&SharedStore>,
+) -> Result<Vec<bool>, HandOverError> {
+    let mut peer = connect_sender(peers, addr).map_err(HandOverError::Peer)?;
+    if let Some(store) = store {
+        record_hand_over(store, addr, candidates.iter().map(|c| c.txid))
+            .map_err(HandOverError::Store)?;
+    }
     let mut requested = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let mut signals = Signals::default();
-        let asked = announce_and_hand_over(&mut peer, candidate, &mut signals, || false)?;
+        let asked = announce_and_hand_over(&mut peer, candidate, &mut signals, || false)
+            .map_err(HandOverError::Peer)?;
         requested.push(asked == Some(true));
         flush(
             &mut peer,
             candidate,
             &mut signals,
             Instant::now() + Timing::for_peers(peers).flush_wait,
-        )?;
+        )
+        .map_err(HandOverError::Peer)?;
     }
     Ok(requested)
 }
@@ -2381,7 +2416,7 @@ mod tests {
         let requested = tokio::task::spawn_blocking({
             let (peers, target, candidate) =
                 (peers.clone(), asked.peers[0].clone(), candidate.clone());
-            move || hand_over(&peers, &target, &[&candidate])
+            move || hand_over(&peers, &target, &[&candidate], None)
         })
         .await
         .unwrap()
