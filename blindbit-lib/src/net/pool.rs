@@ -31,7 +31,7 @@ use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin_address_book::io::FileExt;
 use bitcoin_address_book::{Record, Table};
 
-use super::seeds::Seeds;
+use super::seeds::{Seeded, Seeds};
 use super::{Dialer, NetGroup, PeerAddr, PeerHost, Purpose, random_u64};
 use crate::scanner::PeerInfo;
 
@@ -411,6 +411,9 @@ struct Inner {
     gossiped: HashSet<PeerAddr>,
     /// The proxy failed the last time the seeds were asked: why.
     seed_error: Option<String>,
+    /// Answers of seeds still being asked when seeding returned; added to
+    /// the book on the next [`PeerPool::next`].
+    later_seeds: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
     /// The tables changed since they were last saved.
     changed: bool,
 }
@@ -438,6 +441,7 @@ impl PeerPool {
                 last_seed: None,
                 gossiped: HashSet::new(),
                 seed_error: None,
+                later_seeds: None,
                 changed: false,
             }),
             seeding: tokio::sync::Mutex::new(()),
@@ -450,6 +454,7 @@ impl PeerPool {
     }
 
     async fn next(&self, want: Want<'_>) -> Result<PeerAddr, NoPeers> {
+        self.add_later_seeds();
         let mut seeded = false;
         loop {
             if let Some(addr) = self.lock().pick(want) {
@@ -531,9 +536,33 @@ impl PeerPool {
         let found = seeding.found;
         let mut inner = self.lock();
         inner.seed_error = seeding.proxy_error;
+        inner.later_seeds = seeding.later;
+        let added = self.add_seeded(&mut inner, &found);
+        inner.last_seed = Some((Instant::now(), added));
+        let seeds: Vec<&str> = match &self.seeds {
+            Seeds::Dns(names) => names.to_vec(),
+            Seeds::Static(_) => vec!["static"],
+            Seeds::None => Vec::new(),
+        };
+        tracing::info!(
+            seeds = %seeds.join(", "),
+            via = %self.dialer,
+            addresses = found.len(),
+            added,
+            known = inner.known(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer discovery: asked the DNS seeds"
+        );
+        if let Some(error) = &inner.seed_error {
+            tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+        }
+    }
+
+    /// Put the addresses the seeds gave in the book; how many were new.
+    fn add_seeded(&self, inner: &mut Inner, found: &[Seeded]) -> usize {
         let mut added = 0;
         let from_dns = matches!(self.seeds, Seeds::Dns(_));
-        for seeded in &found {
+        for seeded in found {
             let Some(ip) = seeded.addr.ip() else {
                 continue;
             };
@@ -557,23 +586,34 @@ impl PeerPool {
                 added += 1;
             }
         }
-        inner.last_seed = Some((Instant::now(), added));
-        let seeds: Vec<&str> = match &self.seeds {
-            Seeds::Dns(names) => names.to_vec(),
-            Seeds::Static(_) => vec!["static"],
-            Seeds::None => Vec::new(),
+        added
+    }
+
+    /// Add what seeds that answered after seeding returned gave.
+    fn add_later_seeds(&self) {
+        let mut inner = self.lock();
+        let Some(later) = inner.later_seeds.as_mut() else {
+            return;
         };
-        tracing::info!(
-            seeds = %seeds.join(", "),
-            via = %self.dialer,
-            addresses = found.len(),
-            added,
-            known = inner.known(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "peer discovery: asked the DNS seeds"
-        );
-        if let Some(error) = &inner.seed_error {
-            tracing::warn!(%error, "peer discovery: the seeds could not be asked");
+        let mut answers = Vec::new();
+        loop {
+            match later.try_recv() {
+                Ok(found) => answers.push(found),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    inner.later_seeds = None;
+                    break;
+                }
+            }
+        }
+        for found in answers {
+            let added = self.add_seeded(&mut inner, &found);
+            tracing::debug!(
+                addresses = found.len(),
+                added,
+                known = inner.known(),
+                "peer discovery: a seed answered after seeding returned"
+            );
         }
     }
 

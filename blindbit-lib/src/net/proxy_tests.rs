@@ -4,7 +4,8 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bitcoin::Network;
 use bitcoin::consensus::encode;
@@ -14,7 +15,7 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, ServiceFlags};
 
 use super::testing::FakeSocks5;
-use super::{Dialer, PeerAddr, PeerHost, PeerSource, Purpose, Seeds, seeds_asked};
+use super::{Dialer, PeerAddr, PeerHost, PeerSource, Purpose, Seeds, USER_AGENT, seeds_asked};
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -26,59 +27,121 @@ fn run<F: std::future::Future>(future: F) -> F::Output {
 
 /// Public addresses a seed's node gossips.
 fn gossip() -> Vec<AddrV2Message> {
-    (1..=5u8)
+    gossip_of(1, 5)
+}
+
+/// `count` public addresses, `45.<n>.<7n>.<n>:18444` from `n = first` on.
+fn gossip_of(first: u8, count: u8) -> Vec<AddrV2Message> {
+    (first..first + count)
         .map(|i| AddrV2Message {
             time: 0,
             services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            addr: AddrV2::Ipv4(Ipv4Addr::new(45, i, 7 * i, i)),
+            addr: AddrV2::Ipv4(Ipv4Addr::new(45, i, i.wrapping_mul(7), i)),
             port: 18444,
         })
         .collect()
 }
 
-/// A regtest node on 127.0.0.1 that answers `getaddr` with [`gossip`].
-fn seed_node() -> SocketAddr {
+/// How a seed's node answers `getaddr`.
+#[derive(Clone, Copy)]
+enum Answer {
+    Now,
+    After(Duration),
+    /// In a message that pauses for 700 ms halfway through.
+    Split,
+    /// One byte every 100 ms, for at most 15 s, never complete.
+    Trickle,
+}
+
+/// A regtest node on 127.0.0.1 that answers `getaddr` with `addrs`, as
+/// `answer` says; and the `version` messages it got.
+fn seed_node(
+    answer: Answer,
+    addrs: Vec<AddrV2Message>,
+) -> (SocketAddr, Arc<Mutex<Vec<VersionMessage>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let versions = Arc::new(Mutex::new(Vec::new()));
+    let got = versions.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (addrs, got) = (addrs.clone(), got.clone());
+            std::thread::spawn(move || {
+                let _ = serve(stream, answer, addrs, &got);
+            });
+        }
+    });
+    (addr, versions)
+}
+
+/// A listener that accepts connections and never says anything.
+fn silent_node() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
+        let mut open = Vec::new();
         for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || {
-                let _ = serve(stream);
-            });
+            open.push(stream);
         }
     });
     addr
 }
 
-fn serve(mut stream: TcpStream) -> std::io::Result<()> {
+fn serve(
+    mut stream: TcpStream,
+    answer: Answer,
+    addrs: Vec<AddrV2Message>,
+    versions: &Mutex<Vec<VersionMessage>>,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let magic = Network::Regtest.magic();
     let mut buf = Vec::new();
-    let send = |stream: &mut TcpStream, message| {
-        stream.write_all(&encode::serialize(&RawNetworkMessage::new(magic, message)))
-    };
+    let bytes = |message| encode::serialize(&RawNetworkMessage::new(magic, message));
     let useless = Address::new(&"127.0.0.1:1".parse().unwrap(), ServiceFlags::NONE);
     loop {
         let message = recv(&mut stream, &mut buf)?;
         match message {
-            NetworkMessage::Version(_) => {
-                send(
-                    &mut stream,
-                    NetworkMessage::Version(VersionMessage {
-                        version: 70016,
-                        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-                        timestamp: 0,
-                        receiver: useless.clone(),
-                        sender: useless.clone(),
-                        nonce: 9,
-                        user_agent: "/FakeSeedNode:1.0/".to_string(),
-                        start_height: 100,
-                        relay: true,
-                    }),
-                )?;
-                send(&mut stream, NetworkMessage::Verack)?;
+            NetworkMessage::Version(version) => {
+                versions.lock().unwrap().push(version);
+                stream.write_all(&bytes(NetworkMessage::Version(VersionMessage {
+                    version: 70016,
+                    services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+                    timestamp: 0,
+                    receiver: useless.clone(),
+                    sender: useless.clone(),
+                    nonce: 9,
+                    user_agent: "/FakeSeedNode:1.0/".to_string(),
+                    start_height: 100,
+                    relay: true,
+                })))?;
+                stream.write_all(&bytes(NetworkMessage::Verack))?;
             }
-            NetworkMessage::GetAddr => send(&mut stream, NetworkMessage::AddrV2(gossip()))?,
+            NetworkMessage::GetAddr => {
+                let answer_bytes = bytes(NetworkMessage::AddrV2(addrs.clone()));
+                match answer {
+                    Answer::Now => stream.write_all(&answer_bytes)?,
+                    Answer::After(wait) => {
+                        std::thread::sleep(wait);
+                        stream.write_all(&answer_bytes)?;
+                    }
+                    Answer::Split => {
+                        let (first, rest) = answer_bytes.split_at(answer_bytes.len() / 2);
+                        stream.write_all(first)?;
+                        std::thread::sleep(Duration::from_millis(700));
+                        stream.write_all(rest)?;
+                    }
+                    Answer::Trickle => {
+                        let started = Instant::now();
+                        for byte in &answer_bytes {
+                            if started.elapsed() > Duration::from_secs(15) {
+                                break;
+                            }
+                            stream.write_all(&[*byte])?;
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -114,7 +177,8 @@ fn name(host: &str) -> PeerAddr {
 #[test]
 fn through_a_proxy_the_seeds_are_asked_by_name_and_never_looked_up() {
     let proxy = FakeSocks5::start();
-    proxy.route("x9.proxied-seed.invalid", seed_node());
+    let (seed, versions) = seed_node(Answer::Now, gossip());
+    proxy.route("x9.proxied-seed.invalid", seed);
     let source = PeerSource::discover(
         Network::Regtest,
         proxy.dialer(),
@@ -143,12 +207,107 @@ fn through_a_proxy_the_seeds_are_asked_by_name_and_never_looked_up() {
         "{}",
         source.summary()
     );
+    // What the seed's node learns about friglet: the shared user agent, no
+    // height, no relay, and placeholders for both addresses.
+    let [version] = &versions.lock().unwrap()[..] else {
+        panic!("one handshake with the seed's node");
+    };
+    let placeholder = Address::new(&"127.0.0.1:1".parse().unwrap(), ServiceFlags::NONE);
+    assert_eq!(version.user_agent, USER_AGENT);
+    assert_eq!(version.start_height, 0);
+    assert_eq!(version.services, ServiceFlags::NONE);
+    assert!(!version.relay);
+    assert_eq!(version.sender, placeholder);
+    assert_eq!(version.receiver, placeholder);
+}
+
+/// The answer of a seed's node arrives whole even when it pauses halfway
+/// (700 ms, longer than a short poll would wait).
+#[test]
+fn a_seed_answer_that_pauses_halfway_still_arrives() {
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.pausing-seed.invalid",
+        seed_node(Answer::Split, gossip()).0,
+    );
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Dns(&["pausing-seed.invalid"]),
+    );
+    run(source.next(Purpose::Block, &HashSet::new())).expect("seeded");
+    assert_eq!(source.known(), gossip().len());
+}
+
+/// A seed's node that trickles its answer is hung up on when the wait for
+/// it is over.
+#[test]
+fn a_seed_that_trickles_its_answer_is_hung_up_on_in_time() {
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.trickling-seed.invalid",
+        seed_node(Answer::Trickle, gossip_of(1, 100)).0,
+    );
+    let started = Instant::now();
+    let asked = run(super::seeds::ask_seed_node(
+        &proxy.dialer(),
+        "trickling-seed.invalid",
+        18444,
+        Network::Regtest,
+        Duration::from_secs(1),
+    ));
+    let took = started.elapsed();
+    assert!(asked.is_err(), "{asked:?}");
+    assert!(took < Duration::from_secs(3), "took {took:?}");
+}
+
+/// Seeding through the proxy returns once one seed's node has given enough
+/// addresses; a slower seed's answer joins the book later, and one that
+/// never answers holds up nothing.
+#[test]
+fn proxied_seeding_does_not_wait_for_the_slowest_seed() {
+    let proxy = FakeSocks5::start();
+    proxy.route(
+        "x9.quick-seed.invalid",
+        seed_node(Answer::Now, gossip_of(1, 25)).0,
+    );
+    proxy.route(
+        "x9.slow-seed.invalid",
+        seed_node(Answer::After(Duration::from_millis(800)), gossip_of(101, 5)).0,
+    );
+    proxy.route("x9.mute-seed.invalid", silent_node());
+    let source = PeerSource::discover(
+        Network::Regtest,
+        proxy.dialer(),
+        Seeds::Dns(&[
+            "quick-seed.invalid",
+            "slow-seed.invalid",
+            "mute-seed.invalid",
+        ]),
+    );
+    run(async {
+        let started = Instant::now();
+        source
+            .next(Purpose::Block, &HashSet::new())
+            .await
+            .expect("seeded");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(5), "seeding took {took:?}");
+        let first = source.known();
+        assert!(first > 0 && first <= 25, "{first} known");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        source
+            .next(Purpose::Block, &HashSet::new())
+            .await
+            .expect("a peer");
+        assert!(source.known() > first, "the slow seed's addresses joined");
+    });
 }
 
 #[test]
 fn a_seed_without_the_filter_name_is_asked_by_its_bare_name() {
     let proxy = FakeSocks5::start();
-    proxy.route("bare-seed.invalid", seed_node());
+    proxy.route("bare-seed.invalid", seed_node(Answer::Now, gossip()).0);
     let source = PeerSource::discover(
         Network::Regtest,
         proxy.dialer(),
