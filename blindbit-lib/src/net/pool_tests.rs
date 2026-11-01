@@ -669,3 +669,38 @@ fn a_peer_that_relays_no_transactions_is_never_handed_out_for_relay() {
         blocks_only
     );
 }
+
+/// A peer that relays no transactions stays out of relaying after it left
+/// the tables and gossip brought it back (as after a slot collision).
+#[test]
+fn a_blocks_only_peer_stays_out_of_relay_after_it_left_the_book_and_came_back() {
+    let source = seeded(&PEERS[..2]);
+    let blocks_only = addr(PEERS[0]);
+    source.report(&blocks_only, PeerEvent::Connected(info()));
+    source.report(&blocks_only, PeerEvent::NoTxRelay);
+    // Forgotten after failing three times; an hour later gossip names it.
+    for _ in 0..3 {
+        source.report(&blocks_only, PeerEvent::Unreachable);
+    }
+    assert_eq!(pool(&source).place(&blocks_only), None);
+    pool(&source).age_rest(&blocks_only, Duration::from_secs(60 * 60));
+    let Some(std::net::IpAddr::V4(ip)) = blocks_only.ip() else {
+        panic!("IPv4 test peer");
+    };
+    source.add_gossip(
+        &addr("10.0.0.1:18444"),
+        [AddrV2Message {
+            time: 0,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            addr: AddrV2::Ipv4(ip),
+            port: blocks_only.port,
+        }],
+    );
+    assert_eq!(pool(&source).place(&blocks_only), Some(Where::New));
+    for _ in 0..30 {
+        assert_eq!(
+            run(source.next(Purpose::Relay, &none())).unwrap(),
+            addr(PEERS[1])
+        );
+    }
+}

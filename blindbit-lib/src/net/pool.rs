@@ -408,8 +408,6 @@ struct Meta {
     /// Ignored for the rest of the session; kept so gossip cannot add it
     /// back.
     ignored: bool,
-    /// Said it relays no transactions: never handed out for relaying.
-    no_tx_relay: bool,
 }
 
 /// What a caller of [`PeerSource::next_outside`] asks for and rules out.
@@ -442,6 +440,10 @@ struct Inner {
     last_seed: Option<(Instant, usize)>,
     /// Peers that gossiped addresses this session.
     gossiped: HashSet<PeerAddr>,
+    /// Peers that said they relay no transactions: never handed out for
+    /// relaying this session, also after they left the tables (a slot
+    /// collision, failures) and came back. Learnt again after a restart.
+    no_tx_relay: HashSet<PeerAddr>,
     /// The proxy failed the last time the seeds were asked: why.
     seed_error: Option<String>,
     /// When a connection through the proxy last completed a handshake, and
@@ -476,6 +478,7 @@ impl PeerPool {
                 ipv6_dead_since: None,
                 last_seed: None,
                 gossiped: HashSet::new(),
+                no_tx_relay: HashSet::new(),
                 seed_error: None,
                 proxy_worked: None,
                 later_seeds: None,
@@ -714,9 +717,7 @@ impl PeerPool {
             PeerEvent::Behind => inner.rest(peer, now + BEHIND_REST),
             PeerEvent::Misbehaved => inner.ignore(peer),
             PeerEvent::NoTxRelay => {
-                if let Some(meta) = inner.meta.get_mut(peer) {
-                    meta.no_tx_relay = true;
-                }
+                inner.no_tx_relay.insert(peer.clone());
             }
         }
     }
@@ -1036,7 +1037,7 @@ impl Inner {
         };
         meta.table.is_some()
             && !meta.ignored
-            && !(want.purpose == Purpose::Relay && meta.no_tx_relay)
+            && !(want.purpose == Purpose::Relay && self.no_tx_relay.contains(addr))
             && want.allows(addr)
             && !(self.ipv6_dead() && addr.is_ipv6())
     }
@@ -1140,7 +1141,6 @@ impl Inner {
                 failures: 0,
                 connected: false,
                 ignored: false,
-                no_tx_relay: false,
             },
         );
         self.changed = true;
@@ -1172,8 +1172,6 @@ impl Inner {
                 failures: 0,
                 connected: false,
                 ignored: false,
-                // Learnt again from the next handshake.
-                no_tx_relay: false,
             },
         );
         true
@@ -1273,7 +1271,6 @@ impl Inner {
                             failures: 0,
                             connected: false,
                             ignored: true,
-                            no_tx_relay: false,
                         },
                     );
                 }
