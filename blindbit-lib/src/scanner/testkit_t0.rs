@@ -81,7 +81,7 @@ use crate::oracle_grpc::{BlockIdentifier, BlockScanDataShortResponse, ComputeInd
 
 use super::Scanner;
 use crate::scanner::stream_safety_tests::{TestStream, serve};
-use crate::scanner::test_support::{TempState, run};
+use crate::scanner::test_support::{TempState, own_node, run};
 
 // ---------------------------------------------------------------------------
 // Pinned fixtures
@@ -465,7 +465,7 @@ fn wallet_scanner(fixture: &Fixture, wallet: &FixtureWallet) -> Scanner {
     let socket: SocketAddr = "127.0.0.1:18444".parse().expect("socket address");
     Scanner::new(
         oracle_client(),
-        socket,
+        own_node(socket),
         scan_sk,
         spend_pk,
         max_label,
