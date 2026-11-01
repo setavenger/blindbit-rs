@@ -397,9 +397,19 @@ pub fn resolve(raw: DaemonConfig) -> Result<ResolvedConfig, String> {
 
 /// The own node's address. Without a proxy a host name is resolved here,
 /// i.e. at every daemon (re)start; through one it is left for the proxy to
-/// resolve (no local DNS), which also reaches a Tor onion service.
+/// resolve (no local DNS), which also reaches a Tor onion service. A node
+/// on this computer or the local network cannot be reached through a
+/// proxy.
 fn own_node_addr(addr: &str, network: &str, proxy: Option<SocketAddr>) -> Result<PeerAddr, String> {
     let (host, port) = friglet_ipc::network::split_peer_addr(addr, network)?;
+    if proxy.is_some() && friglet_ipc::network::is_local_host(&host) {
+        return Err(
+            "a node on this computer or the local network cannot be reached through \
+             p2p_proxy (Tor connects from the internet): clear p2p_proxy (with your own node \
+             every P2P connection stays on your network), or use the node's .onion address"
+                .to_string(),
+        );
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port).into());
     }
@@ -1035,6 +1045,36 @@ mod tests {
         cfg.p2p_proxy = Some("  ".to_string());
         let r = resolve(cfg).unwrap();
         assert_eq!((r.p2p_proxy, r.raw.p2p_proxy), (None, None));
+    }
+
+    #[test]
+    fn a_node_on_the_local_network_is_refused_with_a_proxy() {
+        for local in [
+            "127.0.0.1",
+            "192.168.1.20:8333",
+            "[fe80::1]:38333",
+            "localhost",
+            "bitcoin.local",
+        ] {
+            let mut cfg = resolvable("signet", "http://127.0.0.1:1", local);
+            cfg.p2p_proxy = Some("127.0.0.1:9050".to_string());
+            let err = resolve(cfg).unwrap_err();
+            for expected in [
+                "p2p_node_addr",
+                "local network",
+                "clear p2p_proxy",
+                ".onion",
+            ] {
+                assert!(err.contains(expected), "{expected:?} in {err}");
+            }
+            // Without the proxy it is fine.
+            if local != "bitcoin.local" {
+                assert!(
+                    resolve(resolvable("signet", "http://127.0.0.1:1", local)).is_ok(),
+                    "{local}"
+                );
+            }
+        }
     }
 
     #[test]
