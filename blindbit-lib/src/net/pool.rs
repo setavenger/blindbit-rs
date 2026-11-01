@@ -91,7 +91,8 @@ pub(crate) fn required_services() -> ServiceFlags {
 /// How a connection to a peer went, reported with [`PeerSource::report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEvent {
-    /// The handshake completed; what the peer said about itself.
+    /// The handshake completed; what the peer said about itself. A full
+    /// node (every block, with witnesses) moves to "tried".
     Connected(PeerInfo),
     /// The peer served the block asked for.
     Served,
@@ -669,7 +670,11 @@ impl PeerPool {
                 if self.dialer.proxy().is_some() {
                     inner.proxy_worked = Some((now, 0));
                 }
-                inner.promote(peer, info.services);
+                // Header and fee connections take any peer, but the book is
+                // for block downloads: only a full node earns "tried".
+                if info.services.has(required_services()) {
+                    inner.promote(peer, info.services);
+                }
             }
             PeerEvent::Served => {
                 inner.preferred = Some(peer.clone());

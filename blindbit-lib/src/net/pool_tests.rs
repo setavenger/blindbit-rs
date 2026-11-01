@@ -122,6 +122,25 @@ fn a_handshake_moves_a_peer_to_tried_and_a_bad_block_ignores_it_for_good() {
     assert_eq!(source.known(), 2);
 }
 
+/// A handshake with a peer that does not serve every block with witnesses
+/// (a pruned node, met by a header or fee connection) does not move it to
+/// "tried".
+#[test]
+fn only_a_full_node_moves_to_tried() {
+    let source = seeded(&PEERS);
+    let (pruned, full) = (addr(PEERS[0]), addr(PEERS[1]));
+    source.report(
+        &pruned,
+        PeerEvent::Connected(PeerInfo {
+            services: ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            height: 1_000,
+        }),
+    );
+    assert_eq!(pool(&source).place(&pruned), Some(Where::New));
+    source.report(&full, PeerEvent::Connected(info()));
+    assert_eq!(pool(&source).place(&full), Some(Where::Tried));
+}
+
 #[test]
 fn the_peer_that_served_a_block_is_asked_first_but_not_for_relay() {
     let source = seeded(&PEERS);
