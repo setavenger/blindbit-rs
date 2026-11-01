@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use bitcoin::Network;
 use bitcoin::p2p::ServiceFlags;
 
-use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy};
+use super::p2p::{BlockFetchError, BlockFetcher, FetchFailure, RetryPolicy, connect_failure};
 use super::p2p_tests::{Conn, Node, fast};
 use super::test_support::run;
 use crate::net::testing::FakeSocks5;
-use crate::net::{Dialer, PeerAddr, PeerHost, PeerSource, Seeds};
+use crate::net::{Dialer, PeerAddr, PeerEvent, PeerHost, PeerSource, Seeds};
 
 fn genesis() -> bitcoin::Block {
     bitcoin::constants::genesis_block(Network::Regtest)
@@ -216,9 +216,35 @@ fn a_racer_that_opens_during_a_download_is_handshaken_at_once() {
     );
 }
 
+/// A connect the proxy gave no clear answer about (a general failure, a
+/// timeout) is reported as such, for the peer source to weigh by whether
+/// the proxy works; a refusal is the peer's.
+#[test]
+fn an_unclear_answer_of_the_proxy_is_reported_as_unclear() {
+    let proxy = FakeSocks5::start();
+    let peer: PeerAddr = "203.0.113.79:18444".parse::<SocketAddr>().unwrap().into();
+    for (code, event) in [
+        (0x01, PeerEvent::ProxyUnclear),
+        (0x06, PeerEvent::ProxyUnclear),
+        (0x05, PeerEvent::Unreachable),
+    ] {
+        proxy.refuse_with(code);
+        let err = proxy
+            .dialer()
+            .connect(&peer, Duration::from_secs(5))
+            .unwrap_err();
+        assert_eq!(
+            connect_failure(err).peer_event(false),
+            event,
+            "SOCKS5 reply {code}"
+        );
+    }
+}
+
 /// A refusal through the proxy counts against the peer (forgotten after
 /// three); a general failure, what Tor without a working circuit answers,
-/// only rests it, so an outage cannot empty the address book.
+/// only rests it while nothing went through the proxy, so an outage cannot
+/// empty the address book.
 #[test]
 fn only_a_clear_refusal_through_the_proxy_counts_against_a_peer() {
     for (code, kept) in [(0x05, 0), (0x01, 1)] {

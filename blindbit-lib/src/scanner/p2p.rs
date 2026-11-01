@@ -235,10 +235,10 @@ impl FetchFailure {
 /// connection without spending the full retry budget on repeated 90 s waits.
 /// It is still exposed to callers as a broken connection. A missing route
 /// is kept distinct so a discovering source can skip that address family,
-/// and a connect the proxy gave no clear answer about so the peer is only
-/// rested, not counted unreachable (Tor without a working circuit would
-/// otherwise empty the address book).
-enum AttemptFailure {
+/// and a connect the proxy gave no clear answer about so the source counts
+/// it against the peer only while the proxy works (Tor without a working
+/// circuit would otherwise empty the address book).
+pub(super) enum AttemptFailure {
     Regular(FetchFailure),
     QuietDeadline(Duration),
     NoRoute(String),
@@ -259,10 +259,11 @@ impl AttemptFailure {
 
     /// What it says about a discovered peer. `connected`: the handshake
     /// completed.
-    fn peer_event(&self, connected: bool) -> PeerEvent {
+    pub(super) fn peer_event(&self, connected: bool) -> PeerEvent {
         match self {
             Self::NoRoute(_) => PeerEvent::NoRoute,
-            Self::QuietDeadline(_) | Self::ProxyUnclear(_) => PeerEvent::Unhelpful,
+            Self::ProxyUnclear(_) => PeerEvent::ProxyUnclear,
+            Self::QuietDeadline(_) => PeerEvent::Unhelpful,
             Self::Regular(failure) => match failure {
                 FetchFailure::WrongNetwork(_)
                 | FetchFailure::WitnessStripped
@@ -1363,7 +1364,7 @@ fn too_slow(cap: Duration) -> AttemptFailure {
 /// How a failed connect counts: the proxy failing, the proxy saying nothing
 /// clear about the peer, no route to the peer's network, or the peer
 /// unreachable.
-fn connect_failure(error: io::Error) -> AttemptFailure {
+pub(super) fn connect_failure(error: io::Error) -> AttemptFailure {
     if is_proxy_down(&error) {
         FetchFailure::Proxy(error.to_string()).into()
     } else if is_proxy_unclear(&error) {

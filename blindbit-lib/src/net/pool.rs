@@ -58,6 +58,11 @@ const FORGET_FOR: Duration = Duration::from_secs(60 * 60);
 const IPV6_DEAD_FOR: Duration = Duration::from_secs(30 * 60);
 /// A peer that connected but did not help (no block, closed, stalled).
 const UNHELPFUL_REST: Duration = Duration::from_secs(10 * 60);
+/// The proxy counts as working this long after a connection through it
+/// completed a handshake…
+const PROXY_WORKS_FOR: Duration = Duration::from_secs(10 * 60);
+/// …until this many connects through it got no clear answer since.
+const PROXY_UNCLEAR_COUNTED: u8 = 8;
 /// A peer whose chain is below the block asked for: it may catch up soon.
 const BEHIND_REST: Duration = Duration::from_secs(2 * 60);
 /// The DNS seeds are asked again at most this often…
@@ -93,6 +98,14 @@ pub enum PeerEvent {
     NoRoute,
     /// Connected, but did not help: no block, closed, went quiet.
     Unhelpful,
+    /// Through the proxy, the connect got no clear answer about the peer:
+    /// no reply in time, or a general failure. Tor answers that for a dead
+    /// address, and for every address while it has no working circuit. So
+    /// it counts as [`Self::Unreachable`] only while the proxy works (a
+    /// connection through it completed a handshake in the last 10 minutes,
+    /// and fewer than 8 connects have failed this way since); otherwise the
+    /// peer only rests, and a Tor outage cannot empty the address book.
+    ProxyUnclear,
     /// Its chain is below the block asked for.
     Behind,
     /// Sent a block that fails its checks, or speaks another network.
@@ -411,6 +424,9 @@ struct Inner {
     gossiped: HashSet<PeerAddr>,
     /// The proxy failed the last time the seeds were asked: why.
     seed_error: Option<String>,
+    /// When a connection through the proxy last completed a handshake, and
+    /// how many connects through it got no clear answer since.
+    proxy_worked: Option<(Instant, u8)>,
     /// Answers of seeds still being asked when seeding returned; added to
     /// the book on the next [`PeerPool::next`].
     later_seeds: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<Seeded>>>,
@@ -441,6 +457,7 @@ impl PeerPool {
                 last_seed: None,
                 gossiped: HashSet::new(),
                 seed_error: None,
+                proxy_worked: None,
                 later_seeds: None,
                 changed: false,
             }),
@@ -628,7 +645,12 @@ impl PeerPool {
             inner.preferred = None;
         }
         match event {
-            PeerEvent::Connected(info) => inner.promote(peer, info.services),
+            PeerEvent::Connected(info) => {
+                if self.dialer.proxy().is_some() {
+                    inner.proxy_worked = Some((now, 0));
+                }
+                inner.promote(peer, info.services);
+            }
             PeerEvent::Served => {
                 inner.preferred = Some(peer.clone());
                 if let Some(meta) = inner.meta.get_mut(peer) {
@@ -647,6 +669,23 @@ impl PeerPool {
             }
             PeerEvent::Unreachable | PeerEvent::NoRoute => inner.failed(peer, now),
             PeerEvent::Unhelpful => inner.rest(peer, now + UNHELPFUL_REST),
+            PeerEvent::ProxyUnclear => {
+                let proxy_works = inner
+                    .proxy_worked
+                    .as_mut()
+                    .filter(|(at, unclear)| {
+                        now.duration_since(*at) < PROXY_WORKS_FOR
+                            && *unclear < PROXY_UNCLEAR_COUNTED
+                    })
+                    .map(|(_, unclear)| *unclear += 1)
+                    .is_some();
+                // Tor works: the address does not.
+                if proxy_works {
+                    inner.failed(peer, now);
+                } else {
+                    inner.rest(peer, now + UNHELPFUL_REST);
+                }
+            }
             PeerEvent::Behind => inner.rest(peer, now + BEHIND_REST),
             PeerEvent::Misbehaved => inner.ignore(peer),
             PeerEvent::NoTxRelay => {
@@ -827,6 +866,14 @@ impl PeerPool {
     pub(crate) fn age_rest(&self, addr: &PeerAddr, by: Duration) {
         if let Some(meta) = self.lock().meta.get_mut(addr) {
             meta.resting_until = meta.resting_until.and_then(|until| until.checked_sub(by));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_proxy_worked(&self, by: Duration) {
+        let mut inner = self.lock();
+        if let Some((at, unclear)) = inner.proxy_worked {
+            inner.proxy_worked = Some((at.checked_sub(by).unwrap_or(at), unclear));
         }
     }
 

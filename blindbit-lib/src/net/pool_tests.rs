@@ -35,9 +35,14 @@ fn pool(source: &PeerSource) -> &PeerPool {
 
 /// A discovering regtest source seeded with `addrs`, seeded already.
 fn seeded(addrs: &[&str]) -> Arc<PeerSource> {
+    seeded_via(addrs, Dialer::Direct)
+}
+
+/// [`seeded`], its connections going through `dialer`.
+fn seeded_via(addrs: &[&str], dialer: Dialer) -> Arc<PeerSource> {
     let source = PeerSource::discover(
         Network::Regtest,
-        Dialer::Direct,
+        dialer,
         Seeds::Static(addrs.iter().map(|a| addr(a)).collect()),
     );
     run(source.next(Purpose::Block, &HashSet::new())).ok();
@@ -153,6 +158,56 @@ fn failed_peers_rest_and_are_only_handed_out_when_nothing_else_is_left() {
     assert_eq!(pool(&source).place(&a), None);
     assert!(!pool(&source).is_ignored(&a));
     assert_eq!(source.known(), 1);
+}
+
+/// Connections through a proxy (seeding a static list makes none).
+fn proxied() -> Dialer {
+    Dialer::Socks5 {
+        proxy: "127.0.0.1:1".parse().unwrap(),
+    }
+}
+
+#[test]
+fn through_a_working_proxy_an_unclear_connect_counts_against_the_peer() {
+    let source = seeded_via(&PEERS, proxied());
+    let (works, dead) = (addr(PEERS[0]), addr(PEERS[1]));
+    // Nothing went through the proxy yet (Tor may have no circuit): the
+    // peer only rests.
+    for _ in 0..3 {
+        source.report(&dead, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(source.known(), 3);
+    assert!(pool(&source).is_resting(&dead));
+    // A connection through it works: the address is what fails.
+    source.report(&works, PeerEvent::Connected(info()));
+    for _ in 0..3 {
+        source.report(&dead, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&dead), None, "forgotten");
+    assert_eq!(source.known(), 2);
+}
+
+#[test]
+fn once_the_proxy_stopped_working_an_unclear_connect_only_rests_the_peer() {
+    let source = seeded_via(&PEERS, proxied());
+    let (works, many, last) = (addr(PEERS[0]), addr(PEERS[1]), addr(PEERS[2]));
+    // The last connection through the proxy worked 10 minutes ago.
+    source.report(&works, PeerEvent::Connected(info()));
+    pool(&source).age_proxy_worked(Duration::from_secs(10 * 60));
+    for _ in 0..3 {
+        source.report(&last, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&last), Some(Where::New));
+    // It worked just now, but then 8 connects got no clear answer.
+    source.report(&works, PeerEvent::Connected(info()));
+    for _ in 0..8 {
+        source.report(&many, PeerEvent::ProxyUnclear);
+    }
+    for _ in 0..3 {
+        source.report(&last, PeerEvent::ProxyUnclear);
+    }
+    assert_eq!(pool(&source).place(&last), Some(Where::New));
+    assert!(pool(&source).is_resting(&last));
 }
 
 #[test]
