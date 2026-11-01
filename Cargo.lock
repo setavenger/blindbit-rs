@@ -1621,6 +1621,7 @@ dependencies = [
 name = "friglet-tray"
 version = "0.1.0"
 dependencies = [
+ "bitcoin 0.32.7",
  "friglet-ipc",
  "serde",
  "serde_json",
