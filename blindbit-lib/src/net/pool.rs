@@ -393,18 +393,15 @@ pub(crate) enum Where {
 
 /// What the pool knows about one address beyond its table record.
 struct Meta {
-    /// The record as added: its source decides its bucket, so table
-    /// operations on it need this one.
+    /// The record as the table holds it: its source decides its bucket, so
+    /// table operations on it need this one; connections stamp it as they
+    /// stamp the table's copy (see [`count`]), and a saved book keeps it.
     record: Record,
     /// The table it is in; `None` once it is ignored.
     table: Option<Where>,
     resting_until: Option<Instant>,
     /// Failed connections in a row.
     failures: u8,
-    /// A handshake completed this session. With `failures`, what the table
-    /// did to its copy of `record` since it was added, which a saved copy
-    /// of the table repeats.
-    connected: bool,
     /// Ignored for the rest of the session; kept so gossip cannot add it
     /// back.
     ignored: bool,
@@ -953,59 +950,43 @@ impl PeerPool {
     }
 }
 
-/// A record in a table, with what the table did to its copy since it was
-/// added.
-struct SavedRecord {
-    record: Record,
-    table: Where,
-    connected: bool,
-    failures: u8,
-}
-
-/// The tables `saved` describes: each record as added, then the successful
-/// and failed connections the live table counted for it, so the copy
-/// matches the live table record for record.
-fn saved_tables(saved: &[SavedRecord]) -> (Box<NewTable>, Box<TriedTable>) {
+/// The tables `saved` describes, each record as the live table holds it,
+/// with the times connections gave it.
+fn saved_tables(saved: &[(Record, Where)]) -> (Box<NewTable>, Box<TriedTable>) {
     let (mut new, mut tried) = (Box::<NewTable>::default(), Box::<TriedTable>::default());
-    for saved in saved {
-        let record = &saved.record;
-        match saved.table {
-            Where::New => {
-                new.add(record);
-                if saved.connected {
-                    new.successful_connection(record);
-                }
-                for _ in 0..saved.failures {
-                    new.failed_connection(record);
-                }
-            }
-            Where::Tried => {
-                tried.add(record);
-                if saved.connected {
-                    tried.successful_connection(record);
-                }
-                for _ in 0..saved.failures {
-                    tried.failed_connection(record);
-                }
-            }
-        }
+    for (record, table) in saved {
+        match table {
+            Where::New => new.add(record),
+            Where::Tried => tried.add(record),
+        };
     }
     (new, tried)
 }
 
+/// Do to `record` what a table's `successful_connection` (`connected`) or
+/// `failed_connection` does to its copy now: stamp the attempt (and the
+/// connection), count or clear the failures. The pool's copy then matches
+/// the table's and keeps those times when saved.
+fn count(record: &mut Record, connected: bool) {
+    // A table of one slot holds only this record, so `select` gives it back.
+    let mut one = Table::<1, 1, 1>::new();
+    one.add(record);
+    if connected {
+        one.successful_connection(record);
+    } else {
+        one.failed_connection(record);
+    }
+    if let Some(counted) = one.select() {
+        *record = counted;
+    }
+}
+
 impl Inner {
     /// Every record in a table, to save.
-    fn saved_records(&self) -> Vec<SavedRecord> {
+    fn saved_records(&self) -> Vec<(Record, Where)> {
         self.meta
             .values()
-            .filter_map(|meta| {
-                Some(SavedRecord {
-                    record: meta.record.clone(),
-                    table: meta.table?,
-                    connected: meta.connected,
-                    failures: meta.failures,
-                })
-            })
+            .filter_map(|meta| Some((meta.record.clone(), meta.table?)))
             .collect()
     }
 
@@ -1143,7 +1124,6 @@ impl Inner {
                 table: Some(Where::New),
                 resting_until: None,
                 failures: 0,
-                connected: false,
                 ignored: false,
             },
         );
@@ -1174,7 +1154,6 @@ impl Inner {
                 table: Some(place),
                 resting_until: None,
                 failures: 0,
-                connected: false,
                 ignored: false,
             },
         );
@@ -1192,8 +1171,8 @@ impl Inner {
         };
         self.changed = true;
         meta.failures = 0;
-        meta.connected = true;
         meta.record.update_service_flags(services);
+        count(&mut meta.record, true);
         let (record, table) = (meta.record.clone(), meta.table);
         match table {
             Some(Where::Tried) => {
@@ -1232,6 +1211,7 @@ impl Inner {
         };
         meta.failures = meta.failures.saturating_add(1);
         meta.resting_until = Some(now + UNREACHABLE_REST);
+        count(&mut meta.record, false);
         let (record, table, failures) = (meta.record.clone(), meta.table, meta.failures);
         match table {
             Some(Where::New) => self.new.failed_connection(&record),
@@ -1280,7 +1260,6 @@ impl Inner {
                             table: None,
                             resting_until: None,
                             failures: 0,
-                            connected: false,
                             ignored: true,
                         },
                     );
@@ -1342,6 +1321,29 @@ fn read_book(path: &Path, max: u64) -> io::Result<Vec<Record>> {
         ));
     }
     Ok(records)
+}
+
+/// When each record of a saved table was last tried and last connected to
+/// (Unix seconds), by address.
+#[cfg(test)]
+pub(crate) fn saved_times(path: &Path) -> HashMap<PeerAddr, (Option<u64>, Option<u64>)> {
+    let time = |field: &[u8]| {
+        (field[0] == 1).then(|| u64::from_le_bytes(field[1..9].try_into().expect("8 bytes")))
+    };
+    read_book(path, u64::MAX)
+        .expect("a readable book")
+        .into_iter()
+        .filter_map(|record| {
+            let addr = peer_addr(&record)?;
+            // A serialized record ends with its two times, 9 bytes each.
+            let bytes = record.serialize();
+            let end = bytes.len();
+            Some((
+                addr,
+                (time(&bytes[end - 18..end - 9]), time(&bytes[end - 9..])),
+            ))
+        })
+        .collect()
 }
 
 /// Write `path` through a temporary file, so a crash leaves the old file.

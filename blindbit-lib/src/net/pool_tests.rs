@@ -493,6 +493,32 @@ fn the_address_book_survives_a_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A saved book keeps when each peer was last tried and connected to:
+/// saving it again later does not make those times the time of the save.
+#[test]
+fn saving_the_address_book_keeps_when_peers_were_tried() {
+    let dir = temp_dir("times");
+    let source = kept_in(&dir, &PEERS);
+    run(source.next(Purpose::Block, &none())).unwrap();
+    let (connected, failed) = (addr(PEERS[0]), addr(PEERS[1]));
+    source.report(&connected, PeerEvent::Connected(info()));
+    source.report(&failed, PeerEvent::Unreachable);
+    let times =
+        |table: &str| super::pool::saved_times(&dir.join(format!("peers-regtest-{table}.book")));
+    source.save_book();
+    let first = (times("tried")[&connected], times("new")[&failed]);
+    assert!(
+        matches!(first, ((Some(_), Some(_)), (Some(_), None))),
+        "tried and connected, tried only: {first:?}"
+    );
+    // A second later another peer fails, and the book is saved again.
+    std::thread::sleep(Duration::from_millis(1_100));
+    source.report(&addr(PEERS[2]), PeerEvent::Unreachable);
+    source.save_book();
+    assert_eq!((times("tried")[&connected], times("new")[&failed]), first);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_unreadable_address_book_is_ignored() {
     let dir = temp_dir("corrupt");
