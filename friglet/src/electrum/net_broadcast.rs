@@ -31,7 +31,11 @@
 //!
 //! Pending broadcasts are rechecked the same way: peers they were not handed
 //! to are asked, and a lost one is handed to one of those
-//! ([`ask_mempools`], [`hand_over`]).
+//! ([`ask_mempools`], [`hand_over`]). A recheck may run while the same
+//! transaction is broadcast again: every hand-over goes into the pending
+//! store before its bytes go out, and a peer's copy counts only while the
+//! peer is not in it ([`History::store`]), so neither takes the other's
+//! recipients for unrelated peers.
 //!
 //! Every connection goes through the pool's [`Dialer`](blindbit_lib::net::Dialer):
 //! [`connect`] is the only place one is opened. Through a proxy (Tor,
@@ -388,6 +392,27 @@ impl Job {
             ledger.handed.push(entry);
         }
         true
+    }
+
+    /// Has the transaction been handed to `addr`, by this broadcast or,
+    /// meanwhile, by a recheck? Then its copy may be friglet's own, and
+    /// says nothing. Asked after the peer served it: a hand-over is in the
+    /// store before its bytes go out. Blocking: only from a connection's
+    /// thread.
+    fn handed_to(&self, addr: &PeerAddr) -> bool {
+        let txid = self.candidate.txid;
+        let by_this_one = self
+            .ledger()
+            .handed
+            .iter()
+            .any(|(id, peer)| *id == txid && peer == addr);
+        by_this_one
+            || self.store.as_ref().is_some_and(|store| {
+                store
+                    .blocking_lock()
+                    .handed_to(&txid.to_string())
+                    .contains(addr)
+            })
     }
 
     /// Signals for a sender to `addr`: the transaction (or a held parent)
@@ -947,6 +972,12 @@ fn observe(job: Job, addr: PeerAddr) {
         watch(&mut peer, &job)
     })();
     match watched {
+        // A recheck running meanwhile handed it to this peer: it is no
+        // observer any more (it is replaced as it goes).
+        Ok(Some(_)) if job.handed_to(&addr) => tracing::debug!(
+            peer = %addr,
+            "broadcast: an observer the transaction was handed to meanwhile served it; not counted"
+        ),
         Ok(Some(announced)) => job.tell(Event::Seen {
             addr: addr.clone(),
             announced,
@@ -1235,13 +1266,16 @@ pub struct Asked {
 /// whether each candidate is in their mempool, on observer connections
 /// opened at once. Unreachable peers are replaced a few times; through a
 /// proxy two more connections race from the start (a dead address costs
-/// 20 s there). `Err` when none answered.
+/// 20 s there). A peer a candidate was handed to by the time it answered
+/// (`store`: by a broadcast or recheck running meanwhile) does not count
+/// as having it. `Err` when none answered.
 pub async fn ask_mempools(
     peers: &Arc<PeerSource>,
     candidates: Arc<Vec<Candidate>>,
     exclude: &HashSet<PeerAddr>,
     avoid_groups: bool,
     count: usize,
+    store: Option<&SharedStore>,
 ) -> Result<Asked, String> {
     let mut used = exclude.clone();
     let mut groups: HashSet<NetGroup> = if avoid_groups {
@@ -1300,6 +1334,17 @@ pub async fn ask_mempools(
             "no Bitcoin peer could be asked{}",
             last_error.map(|e| format!(" ({e})")).unwrap_or_default()
         ));
+    }
+    // Looked up after the answers: a hand-over is in the store before its
+    // bytes go out, so a copy friglet gave the peer is caught.
+    if let Some(store) = store {
+        let store = store.lock().await;
+        for (i, candidate) in candidates.iter().enumerate() {
+            let handed_to = store.handed_to(&candidate.txid.to_string());
+            for (addr, present, _) in &mut answers {
+                present[i] &= !handed_to.contains(addr);
+            }
+        }
     }
     let present = (0..candidates.len())
         .map(|i| answers.iter().any(|(_, present, _)| present[i]))
@@ -2114,6 +2159,7 @@ mod tests {
             &sent_to,
             true,
             2,
+            None,
         )
         .await
         .unwrap();
@@ -2259,6 +2305,7 @@ mod tests {
             &HashSet::new(),
             true,
             2,
+            None,
         )
         .await
         .unwrap_err();

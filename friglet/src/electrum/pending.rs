@@ -106,7 +106,11 @@ fn parse_peers(peers: &[String]) -> impl Iterator<Item = PeerAddr> + '_ {
 
 /// The store as the Electrum server shares it: a broadcast still running
 /// writes every peer it hands a transaction to into it (and to disk)
-/// before the bytes go out.
+/// before the bytes go out, as a recheck does, and a peer's copy of a
+/// transaction counts only while the peer is not in it for that
+/// transaction, looked up after the copy arrived. So a broadcast and a
+/// recheck running at the same time never take each other's recipients
+/// for unrelated peers.
 pub type SharedStore = Arc<tokio::sync::Mutex<PendingStore>>;
 
 #[derive(Debug)]

@@ -831,7 +831,7 @@ async fn in_mempool_now(state: &ElectrumServerState, candidate: &Arc<Candidate>)
         .await
         .handed_to(&candidate.txid.to_string());
     let candidates = Arc::new(vec![Candidate::clone(candidate)]);
-    match ask_others(&peers, candidates, &exclude, 1).await {
+    match ask_others(state, candidates, &exclude, 1).await {
         Ok(asked) => {
             for (peer, rate) in &asked.fee_filters {
                 state.chain.note_fee_filter(peer, Some(*rate));
@@ -1231,7 +1231,7 @@ async fn recheck_on_network(
             .map(|(candidate, _)| candidate)
             .collect(),
     );
-    let asked = match ask_others(&peers, candidates.clone(), &sent_to, RECHECK_PEERS).await {
+    let asked = match ask_others(state, candidates.clone(), &sent_to, RECHECK_PEERS).await {
         Ok(asked) => asked,
         Err(error) => {
             tracing::warn!(%error, "could not recheck pending broadcasts");
@@ -1307,18 +1307,26 @@ async fn recheck_on_network(
 /// Ask up to `count` discovered peers outside `exclude` (the peers the
 /// candidates were handed to), and outside their network groups while the
 /// pool has others: many pending transactions can rule out every group it
-/// knows, and then only the peers themselves are passed over.
+/// knows, and then only the peers themselves are passed over. A peer a
+/// candidate is handed to meanwhile (a broadcast running at the same time)
+/// does not count as having it.
 async fn ask_others(
-    peers: &Arc<PeerSource>,
+    state: &ElectrumServerState,
     candidates: Arc<Vec<Candidate>>,
     exclude: &HashSet<PeerAddr>,
     count: usize,
 ) -> Result<net_broadcast::Asked, String> {
     let mut asked = Err(String::new());
     for avoid_groups in [true, false] {
-        asked =
-            net_broadcast::ask_mempools(peers, candidates.clone(), exclude, avoid_groups, count)
-                .await;
+        asked = net_broadcast::ask_mempools(
+            state.chain.peers(),
+            candidates.clone(),
+            exclude,
+            avoid_groups,
+            count,
+            Some(&state.pending),
+        )
+        .await;
         if asked.is_ok() {
             break;
         }
@@ -2603,6 +2611,109 @@ mod tests {
             let handed_to = reloaded.handed_to(&txid);
             assert!(!got.is_empty());
             assert!(got.is_subset(&handed_to), "{got:?} not in {handed_to:?}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A recheck runs while a resend of the same transaction is under
+        /// way, finds it in no mempool and hands it to one of the resend's
+        /// observers: that observer's copy is then friglet's own and never
+        /// confirms the resend. Each peer has a mempool of its own, so
+        /// nothing spreads and nobody else can have it.
+        #[tokio::test]
+        async fn a_recheck_during_a_broadcast_never_makes_an_observer_confirm_it() {
+            let dir = temp_dir("net-recheck-during-broadcast");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            // Accepted before, lost from every mempool since.
+            {
+                let mut store = PendingStore::load(dir.join("state.pending.json"));
+                store.insert(txid.clone(), hex::encode(&raw), &[]);
+                store.save();
+            }
+            // Three observers and one sender.
+            let fakes: Vec<FakePeer> = (0..4)
+                .map(|n| FakeNet::new().peer([127, 245 + n, 0, 1].into(), Script::default()))
+                .collect();
+            let state = Arc::new(state_with(index, discovered(&fakes).await, &dir));
+            restore_pending(&state).await;
+            let resend = tokio::spawn({
+                let (state, raw) = (state.clone(), hex::encode(&raw));
+                async move { call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]).await }
+            });
+            // The sender has it, and the three observers are watching.
+            let got_it = |fake: &FakePeer| fake.commands().iter().any(|c| c == "tx");
+            let watching = |fake: &FakePeer| fake.commands().iter().any(|c| c == "getdata");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let sender = loop {
+                let senders: Vec<&FakePeer> = fakes.iter().filter(|f| got_it(f)).collect();
+                if let [sender] = senders[..]
+                    && fakes
+                        .iter()
+                        .filter(|f| !std::ptr::eq(*f, sender))
+                        .all(watching)
+                {
+                    break sender;
+                }
+                assert!(Instant::now() < deadline, "the resend never got going");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            // Now the recheck: it asks two of the observers, which lack
+            // it, and hands it to one of them.
+            recheck_pending(&state).await;
+            let handed: Vec<&FakePeer> = fakes
+                .iter()
+                .filter(|f| !std::ptr::eq(*f, sender) && got_it(f))
+                .collect();
+            assert_eq!(handed.len(), 1, "the recheck handed it to an observer");
+            let response = tokio::time::timeout(Duration::from_secs(60), resend)
+                .await
+                .expect("the resend ends within its budget")
+                .unwrap();
+            assert!(
+                response["result"].is_null(),
+                "confirmed by {} after the recheck handed it over: {response}",
+                handed[0].addr
+            );
+            let store = state.pending.lock().await;
+            let recipients = store.handed_to(&txid);
+            assert!(recipients.contains(&sender.addr.into()));
+            assert!(recipients.contains(&handed[0].addr.into()));
+            drop(store);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A recheck that picked its peers before a broadcast running at
+        /// the same time handed the transaction to one of them: that
+        /// peer's copy does not count.
+        #[tokio::test]
+        async fn a_peer_handed_it_after_a_recheck_picked_it_does_not_count() {
+            let dir = temp_dir("net-recheck-stale");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let raw = bitcoin::consensus::encode::serialize(&tx);
+            let holding = Script {
+                mempool: vec![raw.clone()],
+                ..Script::default()
+            };
+            let fakes = [FakeNet::new().peer([127, 250, 0, 1].into(), holding)];
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let candidates = Arc::new(vec![Candidate::decode(raw).unwrap()]);
+            // Picked outside the recipients known then (none) ...
+            let picked_outside = HashSet::new();
+            // ... and handed it before it answered.
+            state
+                .pending
+                .lock()
+                .await
+                .note_handed_to(&txid, &[fakes[0].addr.into()]);
+            let asked = ask_others(&state, candidates, &picked_outside, 1)
+                .await
+                .unwrap();
+            assert_eq!(asked.peers, vec![PeerAddr::from(fakes[0].addr)]);
+            assert_eq!(asked.present, vec![false]);
             std::fs::remove_dir_all(dir).unwrap();
         }
 
