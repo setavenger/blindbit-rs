@@ -2016,6 +2016,86 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// With an own node, a resend after an inconclusive wait asks the own
+    /// node, and only it: also one whose version says it relays nothing
+    /// (`-blocksonly`), which still serves its mempool and which the
+    /// discovered-peer path would refuse.
+    #[tokio::test]
+    async fn with_an_own_node_a_resend_looks_at_the_own_node() {
+        let dir = temp_dir("own-node-resend");
+        let (index, received) = wallet();
+        let tx = spend(&received, 1_000, 0);
+        let txid = tx.compute_txid().to_string();
+        let raw = bitcoin::consensus::encode::serialize(&tx);
+        let node = crate::electrum::fake_peer::FakeNet::new().peer(
+            [127, 0, 0, 1].into(),
+            Script {
+                mempool: vec![raw.clone()],
+                relay: false,
+                ..Script::default()
+            },
+        );
+        let state = state(index, Some(node.addr), &dir);
+        remember_broadcast(
+            &state,
+            &tx.compute_wtxid().to_string(),
+            RecentBroadcast::Inconclusive {
+                error: (1, "not accepted".into()),
+            },
+        )
+        .await;
+        let response = call(
+            &state,
+            "blockchain.transaction.broadcast",
+            vec![json!(hex::encode(raw))],
+        )
+        .await;
+        assert_eq!(response["result"], json!(txid), "{response}");
+        let conns = node.conns();
+        assert_eq!(conns.len(), 1, "{conns:?}");
+        assert!(conns[0].version.relay);
+        assert!(!conns[0].commands.iter().any(|c| c == "inv" || c == "tx"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// With an own node, a recheck asks it on one relay connection and
+    /// re-announces what its mempool lost on that same connection; no
+    /// peer is remembered as a recipient.
+    #[tokio::test]
+    async fn with_an_own_node_a_recheck_reannounces_to_the_own_node() {
+        let dir = temp_dir("own-node-recheck");
+        let (index, received) = wallet();
+        let tx = spend(&received, 1_000, 0);
+        let txid = tx.compute_txid().to_string();
+        let raw_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+        let node = crate::electrum::fake_peer::FakeNet::new()
+            .peer([127, 0, 0, 1].into(), Script::default());
+        {
+            let mut store = PendingStore::load(dir.join("state.pending.json"));
+            store.insert(txid.clone(), raw_hex, &[]);
+            store.save();
+        }
+        let state = state(index, Some(node.addr), &dir);
+        restore_pending(&state).await;
+        recheck_pending(&state).await;
+        let conns = node.conns();
+        assert_eq!(conns.len(), 1, "{conns:?}");
+        assert!(conns[0].version.relay);
+        for command in ["getdata", "inv", "tx"] {
+            assert!(
+                conns[0].commands.iter().any(|c| c == command),
+                "{command} in {:?}",
+                conns[0].commands
+            );
+        }
+        let store = state.pending.lock().await;
+        let (_, pending) = store.entries().next().unwrap();
+        assert_eq!(pending.reannounced, 1);
+        assert!(pending.sent_to.is_empty(), "{:?}", pending.sent_to);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn pending_broadcasts_survive_a_restart_until_they_confirm_or_conflict() {
         let dir = temp_dir("pending-restart");
