@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use blindbit_lib::net::{Dialer, PeerSource, Seeds};
 use blindbit_lib::scanner;
 
 use config::ScanArgs;
@@ -242,9 +243,20 @@ async fn run(
     // config::tighten_state_file_perms), so keep the file owner-only.
     config::tighten_state_file_perms(&cfg.state_file);
 
+    // Where blocks, headers and broadcasts go: the own node, or peers of
+    // the network found through its DNS seeds (asked from now on). Shared by
+    // the scanner and the Electrum server.
+    let peers = PeerSource::new(
+        cfg.network,
+        Dialer::Direct,
+        cfg.p2p_node.map(Into::into),
+        Seeds::for_network(cfg.network),
+    );
+    peers.start();
+
     tracing::info!(
         oracle_url = %cfg.raw.oracle_url,
-        p2p_peer = %cfg.p2p_addr,
+        p2p = %peers.summary(),
         network = %cfg.network,
         start_height = cfg.start_height,
         state_file = %cfg.state_file.display(),
@@ -253,7 +265,7 @@ async fn run(
 
     let scanner_config = scanner::ScannerConfig::new(
         cfg.raw.oracle_url.clone(),
-        cfg.p2p_addr,
+        peers.clone(),
         secret_scan,
         cfg.spend_pubkey,
         cfg.raw.max_label_num,
@@ -371,14 +383,14 @@ async fn run(
         shutdown: shutdown_token.clone(),
         restart_requested: std::sync::atomic::AtomicBool::new(false),
         spawned_by_tray: control::ControlCtx::spawned_by_tray_from_env(),
+        peers: peers.clone(),
     });
     let control_server = control::run(cfg.control_socket.clone(), control_ctx.clone());
 
     let electrum_server = {
         let electrum_addr = cfg.raw.electrum_addr.clone();
         let electrum_clients = electrum_clients.clone();
-        let p2p_addr = cfg.p2p_addr;
-        let network = cfg.network;
+        let peers = peers.clone();
         let oracle_url = cfg.raw.oracle_url.clone();
         async move {
             if let Err(e) = electrum::run(
@@ -386,8 +398,7 @@ async fn run(
                 found_utxos_rx,
                 reorg_rx,
                 &electrum_addr,
-                p2p_addr,
-                network,
+                peers,
                 oracle_url,
                 block_checkpoints,
                 header_sidecar,

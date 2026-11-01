@@ -18,6 +18,7 @@ use friglet_ipc::network::{self, NETWORKS};
 /// settings the tray checks (`figment::Env::prefixed("FRIGLET_")` plus the
 /// scan-secret override in `resolve_scan_secret`).
 const ENV_P2P_NODE_ADDR: &str = "FRIGLET_P2P_NODE_ADDR";
+const ENV_NETWORK: &str = "FRIGLET_NETWORK";
 const ENV_START_HEIGHT: &str = "FRIGLET_START_HEIGHT";
 const ENV_SPEND_PUBKEY: &str = "FRIGLET_SPEND_PUBKEY";
 const ENV_SCAN_SECRET: &str = "FRIGLET_SCAN_SECRET";
@@ -28,9 +29,10 @@ const ENV_CONTROL_SOCKET: &str = "FRIGLET_CONTROL_SOCKET";
 /// Is the daemon plausibly configured, i.e. is spawning it likely to get
 /// past `missing required setting ...`? Conservative merged view:
 ///
-/// - the required settings (`p2p_node_addr`, `start_height` — or
-///   `start_at_tip` —, `spend_pubkey`) are each present in the config file at
-///   `config_path` OR supplied via their `FRIGLET_*` environment variable, AND
+/// - the required settings (`start_height` — or `start_at_tip` —,
+///   `spend_pubkey`, and on a network without public peers (regtest)
+///   `p2p_node_addr`) are each present in the config file at `config_path`
+///   OR supplied via their `FRIGLET_*` environment variable, AND
 /// - a scan secret is available: the key file (the config's `key_file` or
 ///   `default_key_file`) exists, or `FRIGLET_SCAN_SECRET` is set.
 ///
@@ -64,7 +66,19 @@ pub fn is_configured(
         .or_else(|| config_path.and_then(file_descriptor))
         .and_then(|d| SpDescriptor::parse(&d).ok());
 
-    let p2p = file_has(|c| c.p2p_node_addr.is_some()) || env_set(ENV_P2P_NODE_ADDR);
+    // The node is optional where the network has public peers; the network
+    // is the daemon's: env over file, bitcoin by default.
+    let network = env(ENV_NETWORK)
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| file_cfg.as_ref().map(|c| c.network.clone()))
+        .unwrap_or_else(|| "bitcoin".to_string());
+    let p2p = !network::needs_own_node(network.trim())
+        || file_has(|c| {
+            c.p2p_node_addr
+                .as_deref()
+                .is_some_and(|a| !a.trim().is_empty())
+        })
+        || env_set(ENV_P2P_NODE_ADDR);
     let start = file_has(|c| c.start_height.is_some() || c.start_at_tip)
         || env_set(ENV_START_HEIGHT)
         || env_set(ENV_START_AT_TIP)
@@ -216,14 +230,24 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
         ));
     }
 
-    let p2p = cfg
+    match cfg
         .p2p_node_addr
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or("P2P node address is required (host:port of a Bitcoin node)")?;
-    network::split_peer_addr(p2p, &cfg.network)
-        .map_err(|e| format!("invalid P2P node address: {e}"))?;
+    {
+        Some(p2p) => {
+            network::split_peer_addr(p2p, &cfg.network)
+                .map_err(|e| format!("invalid Bitcoin node address: {e}"))?;
+        }
+        None if network::needs_own_node(&cfg.network) => {
+            return Err(format!(
+                "{} has no public peers: enter your {} node (host:port)",
+                cfg.network, cfg.network
+            ));
+        }
+        None => {}
+    }
 
     match cfg.start_height {
         None if cfg.start_at_tip => {}
@@ -267,7 +291,11 @@ pub fn validate_setup(cfg: &DaemonConfig, scan_key: &str) -> Result<(), String> 
 /// DNS check for the P2P node so a typo fails at Save instead of as a
 /// daemon that never connects.
 pub async fn resolve_peer(cfg: &DaemonConfig) -> Result<(), String> {
-    let Some(p2p) = cfg.p2p_node_addr.as_deref() else {
+    let Some(p2p) = cfg
+        .p2p_node_addr
+        .as_deref()
+        .filter(|addr| !addr.trim().is_empty())
+    else {
         return Ok(());
     };
     let (host, port) = network::split_peer_addr(p2p, &cfg.network)?;
@@ -417,6 +445,38 @@ mod tests {
         ));
     }
 
+    /// Without a node, blocks come from random peers: only regtest (no
+    /// public peers) needs one, whether the network comes from the file or
+    /// `FRIGLET_NETWORK`.
+    #[test]
+    fn the_node_is_required_only_where_there_are_no_public_peers() {
+        let dir = temp_dir("node-optional");
+        let key = dir.join("scan.key");
+        fs::write(&key, format!("{KEY_HEX}\n")).unwrap();
+        let config = dir.join("config.toml");
+        let without_node = format!("start_height = 274010\nspend_pubkey = \"{SPEND_HEX}\"\n");
+        // Default network (bitcoin), signet, and an empty node: configured.
+        for toml in [
+            without_node.clone(),
+            format!("network = \"signet\"\n{without_node}"),
+            format!("network = \"signet\"\np2p_node_addr = \"\"\n{without_node}"),
+        ] {
+            fs::write(&config, &toml).unwrap();
+            assert!(is_configured(Some(&config), Some(&key), &no_env), "{toml}");
+        }
+        fs::write(&config, format!("network = \"regtest\"\n{without_node}")).unwrap();
+        assert!(!is_configured(Some(&config), Some(&key), &no_env));
+        fs::write(&config, &without_node).unwrap();
+        let regtest = |name: &str| (name == ENV_NETWORK).then(|| "regtest".to_string());
+        assert!(!is_configured(Some(&config), Some(&key), &regtest));
+
+        let cfg = DaemonConfig {
+            p2p_node_addr: None,
+            ..valid_config()
+        };
+        assert_eq!(validate_setup(&cfg, KEY_HEX), Ok(()));
+    }
+
     #[test]
     fn configured_via_env_vars_alone() {
         let dir = temp_dir("env-only");
@@ -487,11 +547,13 @@ mod tests {
             ),
             (
                 DaemonConfig {
-                    p2p_node_addr: None,
+                    network: "regtest".to_string(),
+                    oracle_url: "http://127.0.0.1:7000".to_string(),
+                    p2p_node_addr: Some("  ".to_string()),
                     ..valid_config()
                 },
                 KEY_HEX,
-                "P2P node address is required",
+                "regtest has no public peers: enter your regtest node",
             ),
             (
                 DaemonConfig {
@@ -499,7 +561,7 @@ mod tests {
                     ..valid_config()
                 },
                 KEY_HEX,
-                "invalid P2P node address",
+                "invalid Bitcoin node address",
             ),
             (
                 DaemonConfig {

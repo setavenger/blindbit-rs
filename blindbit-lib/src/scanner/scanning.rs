@@ -590,7 +590,8 @@ impl Scanner {
     }
 
     /// Fetch a full block over P2P (see [`p2p::BlockFetcher::fetch`]: a
-    /// fresh connection per attempt, exponential backoff between attempts).
+    /// fresh connection per attempt; the own node with exponential backoff
+    /// between attempts, discovered peers one after another).
     /// When every attempt fails the error is a [`p2p::BlockFetchError`]
     /// whose message says what the node did and what the user can do;
     /// `watch_chain_until` then retries the block on a growing interval
@@ -609,9 +610,12 @@ impl Scanner {
 
         // Unsized as is, so `watch_step` can downcast it to add when it is
         // tried again.
-        p2p::BlockFetcher::new(self.p2p_peer, self.network)
-            .with_policy(self.p2p_retry)
-            .with_cancel(self.cancel.clone())
+        let mut fetcher =
+            p2p::BlockFetcher::new(self.peers.clone()).with_cancel(self.cancel.clone());
+        if let Some(policy) = self.p2p_retry {
+            fetcher = fetcher.with_policy(policy);
+        }
+        fetcher
             .fetch(block_hash, height)
             .await
             .map_err(|e| -> ScannerError {

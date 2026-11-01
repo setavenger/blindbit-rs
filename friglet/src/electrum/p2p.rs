@@ -32,10 +32,10 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Address, Magic, ServiceFlags};
 use bitcoin::{BlockHash, Network, Txid, Wtxid};
 
-/// Same user agent as the scanner's block-fetch connections (blindbit-lib's
-/// `USER_AGENT`), so friglet does not present two different fingerprints to
-/// the same peer.
-const USER_AGENT: &str = "/SwiftSync:0.1.0/";
+// The scanner's block downloads send the same user agent, so friglet does
+// not present two different fingerprints to the same peer.
+use blindbit_lib::net::{Dialer, PeerAddr, USER_AGENT};
+use blindbit_lib::scanner::PeerInfo;
 
 /// BIP 339's `WTXID_RELAY_VERSION`: the protocol version friglet speaks.
 const WTXID_RELAY_VERSION: u32 = 70016;
@@ -114,7 +114,12 @@ pub struct Peer {
     stream: TcpStream,
     magic: Magic,
     buf: Vec<u8>,
-    addr: SocketAddr,
+    addr: PeerAddr,
+    /// What the peer said about itself in its `version` message: services,
+    /// chain height, and whether it relays transactions to friglet (BIP 37
+    /// `fRelay`; false for a blocks-only node).
+    info: PeerInfo,
+    their_relay: bool,
     /// Both sides sent `wtxidrelay` (BIP 339): transactions are announced
     /// and requested by wtxid.
     wtxid_relay: bool,
@@ -132,12 +137,13 @@ impl Peer {
     /// Connect and complete the version handshake. `relay` is the BIP 37
     /// `fRelay` flag; it must be true for mempool `getdata` to work.
     pub fn connect(
-        addr: SocketAddr,
+        dialer: &Dialer,
+        addr: &PeerAddr,
         network: Network,
         relay: bool,
         timeout: Duration,
     ) -> Result<Self, P2pError> {
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let stream = dialer.connect(addr, timeout)?;
         stream.set_read_timeout(Some(READ_POLL))?;
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
@@ -145,13 +151,34 @@ impl Peer {
             stream,
             magic: network.magic(),
             buf: Vec::new(),
-            addr,
+            addr: addr.clone(),
+            info: PeerInfo {
+                services: ServiceFlags::NONE,
+                height: 0,
+            },
+            their_relay: false,
             wtxid_relay: false,
             pinged: false,
             fee_filter: None,
         };
         peer.handshake(relay, Instant::now() + timeout)?;
         Ok(peer)
+    }
+
+    pub fn addr(&self) -> &PeerAddr {
+        &self.addr
+    }
+
+    /// What the peer said about itself in its `version` message.
+    pub fn info(&self) -> PeerInfo {
+        self.info
+    }
+
+    /// Whether the peer relays transactions to friglet (its `version`
+    /// message's `fRelay`); a blocks-only node does not.
+    #[allow(dead_code)] // for choosing broadcast peers (SNB-856)
+    pub fn relays(&self) -> bool {
+        self.their_relay
     }
 
     /// The peer's advertised mempool minimum fee rate in sat/kvB, if it sent
@@ -185,6 +212,11 @@ impl Peer {
                 None => return Err(P2pError::Timeout("the version message")),
             }
         };
+        self.info = PeerInfo {
+            services: their_version.services,
+            height: their_version.start_height,
+        };
+        self.their_relay = their_version.relay;
         let we_sent_wtxidrelay = their_version.version >= WTXID_RELAY_VERSION;
         // BIP 339: wtxidrelay must come between version and verack.
         if we_sent_wtxidrelay {

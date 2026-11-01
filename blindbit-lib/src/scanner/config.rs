@@ -1,7 +1,9 @@
 use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, SecretKey};
-use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use crate::net::PeerSource;
 
 /// Configuration struct for Scanner initialization
 ///
@@ -12,8 +14,9 @@ pub struct ScannerConfig {
     /// Oracle service URL for block data
     pub oracle_url: String,
 
-    /// P2P node socket address  
-    pub p2p_socket_addr: SocketAddr,
+    /// Where full blocks are downloaded from: the own node or discovered
+    /// peers (see [`PeerSource`])
+    pub peers: Arc<PeerSource>,
 
     /// Secret key for scanning silent payments
     pub secret_scan: SecretKey,
@@ -35,7 +38,7 @@ impl ScannerConfig {
     /// Create a new ScannerConfig with all required parameters
     pub fn new(
         oracle_url: String,
-        p2p_socket_addr: SocketAddr,
+        peers: Arc<PeerSource>,
         secret_scan: SecretKey,
         public_spend: PublicKey,
         max_label_num: u32,
@@ -44,7 +47,7 @@ impl ScannerConfig {
     ) -> Self {
         Self {
             oracle_url,
-            p2p_socket_addr,
+            peers,
             secret_scan,
             public_spend,
             max_label_num,

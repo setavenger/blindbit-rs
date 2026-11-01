@@ -41,7 +41,7 @@ fn config(state_file: &Path) -> ScannerConfig {
     let (secret, spend) = keys();
     ScannerConfig::new(
         "http://127.0.0.1:1".to_string(),
-        "127.0.0.1:1".parse().unwrap(),
+        super::test_support::own_node("127.0.0.1:1".parse().unwrap()),
         secret,
         spend,
         0,

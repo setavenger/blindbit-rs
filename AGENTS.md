@@ -29,7 +29,7 @@ cargo fmt --all -- --check
 
 ## Running against signet
 
-- E2E needs two **external** services: a BlindBit Oracle (signet: `https://signet.oracle.setor.dev`) and a Bitcoin P2P peer (signet: `152.53.151.148:38333`). Both are reachable from the VM. No DB.
+- E2E needs two **external** services: a BlindBit Oracle (signet: `https://signet.oracle.setor.dev`) and Bitcoin P2P: an own node (signet: `152.53.151.148:38333`) or, with `p2p_node_addr` empty, random peers found through the network's DNS seeds (signet seeds resolve from the VM; the VM has no IPv6 route, so IPv6 peers are skipped after the first try). Both are reachable from the VM. No DB.
 - Keys are BIP-352 hex: `--scan-secret` (32-byte secp256k1 secret), `--spend-pubkey` (33-byte compressed pubkey). For smoke tests any valid pair works, e.g. secret `0000...0001` and pubkey `0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798` (no outputs, balance 0).
 - Fast check, ~1 s for 50 blocks:
   ```bash
@@ -41,7 +41,7 @@ cargo fmt --all -- --check
     --oracle-url https://signet.oracle.setor.dev \
     --state-file blindbit-test/cli-state.json
   ```
-  `--end-height` is required; `--p2p-node-addr` must be `ip:port` (no hostnames); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
+  `--end-height` is required; `--p2p-node-addr` must be `ip:port` (no hostnames) and may be left out (random peers; not on regtest); the state file defaults to `scanner_state.json` in the working directory; it is loaded at start and saved at the end, and the given range is scanned either way.
 - `friglet scan` from `--start-height 274010` to the signet tip is ~50k blocks (minutes); use blindbit-cli for quick checks.
 - State persists to a JSON file (`--state-file`).
 
@@ -74,8 +74,10 @@ cargo fmt --all -- --check
   when unreachable it checks whether the daemon is plausibly configured
   BEFORE spawning (`friglet-tray/src/setup.rs::is_configured`): the default
   config file (`friglet_ipc::default_config_path()`, i.e.
-  `<config dir>/friglet/config.toml`) must supply `p2p_node_addr`,
-  `start_height` and `spend_pubkey` (each satisfiable via
+  `<config dir>/friglet/config.toml`) must supply `start_height` and
+  `spend_pubkey`, plus `p2p_node_addr` only on regtest (network from
+  `FRIGLET_NETWORK` or the file, default bitcoin;
+  `friglet_ipc::network::needs_own_node`) (each satisfiable via
   `FRIGLET_P2P_NODE_ADDR`/`FRIGLET_START_HEIGHT`/`FRIGLET_SPEND_PUBKEY`
   env instead), and a scan secret must exist (key file from the config's
   `key_file` or `<config dir>/friglet/scan.key`, or `FRIGLET_SCAN_SECRET`).
@@ -264,7 +266,33 @@ dbus-run-session -- bash -c '
   by patching only that key in the config file (`config::persist_start_height`).
 - `oracle_url` follows `network` when no layer sets it; a hosted oracle URL
   of another network is rejected. `p2p_node_addr` accepts hostnames (DNS at
-  start, IPv4 preferred) and bare hosts (network default port).
+  start, IPv4 preferred) and bare hosts (network default port); empty or
+  unset = random peers (refused on regtest).
+
+## P2P peers: own node or discovery (SNB-855)
+
+- `blindbit-lib/src/net/`: `PeerSource` (`OwnNode` | `Discovered(PeerPool)`)
+  decides every P2P connection; `Dialer` opens the TCP stream (the seam for a
+  proxy); `Seeds::for_network` = kernel-node's DNS seed lists (`x9.` first),
+  regtest none. friglet `main.rs` builds one `Arc<PeerSource>` and hands it
+  to the scanner (`ScannerConfig.peers`), the Electrum server and `GetStatus`
+  (`StatusInfo.p2p`, the tray's "Blocks from" row).
+- Own node: every connection goes to it; no DNS, no `getaddr`; retries,
+  timeouts and error wording are the pre-855 ones.
+- Discovered: `bitcoin-address-book` new/tried tables (Kyoto's sizes). A
+  block fetch asks up to 8 different peers (`RetryPolicy::discovered`),
+  requires `NETWORK|WITNESS`, skips peers below the block height, ignores a
+  peer that sends a bad/stripped block for the session, prefers the peer
+  that served the last block, and asks for addresses while < 200 are known.
+  Headers try up to 3 peers; `blockchain.relayfee` is the median of fresh
+  feefilters from >= 3 (up to 5) peers, sampled at Electrum start, the lowest
+  until then; broadcast (until SNB-856) goes to one relay peer. DNS seed
+  answers must be public IPs; gossip may name local IPs only when it comes
+  from a local peer, and only the network's port or ports >= 1024.
+- Tests: `blindbit-lib/src/net/pool_tests.rs` (pure),
+  `scanner/discovery_tests.rs` (fake nodes on 127.0.0.x; not on macOS),
+  `blindbit-lib/tests/thread_soak.rs` (Linux; thread count after 50
+  fetches). `fetch_block` example: peer `dns` = discovery.
 
 ## SetConfig / SetScanKey / ApplySettings semantics (SNB-624)
 
