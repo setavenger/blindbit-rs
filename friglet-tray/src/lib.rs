@@ -486,7 +486,9 @@ async fn apply_settings(
     send_with_note(
         &state.socket_path,
         Request::ApplySettings {
-            config: Box::new(config),
+            // Names p2p_proxy also when empty: an omitted one keeps the
+            // daemon's.
+            config: Box::new(config.into()),
             scan_key,
         },
     )

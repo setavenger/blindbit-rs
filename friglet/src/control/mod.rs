@@ -27,7 +27,9 @@ use bdk_sp::encoding::SilentPaymentCode;
 use bitcoin::Network as BitcoinNetwork;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use blindbit_lib::scanner::{self, Scanner, WalletElectrumIndex};
-use friglet_ipc::{DaemonConfig, LabelAddress, Listener, Request, Response, StatusInfo};
+use friglet_ipc::{
+    ConfigUpdate, DaemonConfig, LabelAddress, Listener, Request, Response, StatusInfo,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -263,7 +265,7 @@ impl ControlCtx {
             }
             Request::Stop => self.pause_scanning().await,
             Request::GetConfig => Response::Config(self.settings.lock().unwrap().clone()),
-            Request::SetConfig(new_cfg) => self.apply(Some(*new_cfg), None).await,
+            Request::SetConfig(update) => self.apply(Some(*update), None).await,
             Request::SetScanKey(hex) => self.apply(None, Some(&hex)).await,
             Request::ApplySettings { config, scan_key } => {
                 self.apply(Some(*config), scan_key.as_deref()).await
@@ -399,17 +401,22 @@ impl ControlCtx {
         save_scanner_state(&self.scanner, &self.state_file).await;
     }
 
-    /// Validate → persist → restart. `new_cfg = None` keeps the current
-    /// settings; `scan_key = None` keeps the current key.
+    /// Validate → persist → restart. `update = None` keeps the current
+    /// settings, an update without `p2p_proxy` the current proxy;
+    /// `scan_key = None` keeps the current key.
     ///
     /// The steps that can wait on the network (a new wallet's birthday from
     /// the oracle, the DNS lookup of the P2P host) never run under
     /// `apply_lock`, so Start and Stop do not wait behind them. Comparing with
     /// and persisting the settings happens under the lock.
-    async fn apply(&self, new_cfg: Option<DaemonConfig>, scan_key: Option<&str>) -> Response {
-        let keep_config = new_cfg.is_none();
+    async fn apply(&self, update: Option<ConfigUpdate>, scan_key: Option<&str>) -> Response {
+        // The settings to apply in place of `settings`.
+        let target = |settings: &DaemonConfig| match &update {
+            Some(update) => update.apply_to(settings),
+            None => settings.clone(),
+        };
         let mut current = self.settings.lock().unwrap().clone();
-        let mut prepared = match prepare(new_cfg.unwrap_or_else(|| current.clone())).await {
+        let mut prepared = match prepare(target(&current)).await {
             Ok(prepared) => prepared,
             Err(e) => return Response::Error(e),
         };
@@ -429,18 +436,19 @@ impl ControlCtx {
             );
         };
 
-        // Without a config of its own the apply keeps the current settings.
-        // Should another apply have changed them meanwhile, prepare again from
-        // the new ones (outside the lock) and check again, as if the two had
-        // run one after the other.
+        // What the apply keeps of the current settings (all of them without
+        // a config of its own, else perhaps the proxy) it read before the
+        // lock. Should another apply have changed that meanwhile, prepare
+        // again from the new settings (outside the lock) and check again, as
+        // if the two had run one after the other.
         let (_guard, old_cfg, (new_cfg, resolved)) = loop {
             let guard = self.apply_lock.lock().await;
             let old_cfg = self.settings.lock().unwrap().clone();
-            if !keep_config || old_cfg == current {
+            if target(&old_cfg) == target(&current) {
                 break (guard, old_cfg, prepared);
             }
             drop(guard);
-            prepared = match prepare(old_cfg.clone()).await {
+            prepared = match prepare(target(&old_cfg)).await {
                 Ok(prepared) => prepared,
                 Err(e) => return Response::Error(e),
             };
@@ -458,14 +466,13 @@ impl ControlCtx {
             if let Err(e) = friglet_ipc::write_config_toml(config_path, &new_cfg) {
                 return Response::Error(e);
             }
-            // An older tray does not know p2p_proxy and drops it when it
-            // saves: Tor would go off without anyone asking for it.
+            // Only an explicit clear gets here (an update without the field
+            // keeps the proxy), but Tor going off deserves a line in the log.
             if let (Some(proxy), None) = (&old_cfg.p2p_proxy, &resolved.p2p_proxy) {
                 tracing::warn!(
                     previous = %proxy,
                     "this settings change clears p2p_proxy: P2P connections no longer go \
-                     through the proxy (Tor). An older friglet-tray drops p2p_proxy when it saves \
-                     settings; if that was not meant, set p2p_proxy again"
+                     through the proxy (Tor); if that was not meant, set p2p_proxy again"
                 );
             }
             tracing::info!(path = %config_path.display(), "configuration persisted via control socket");
@@ -1132,7 +1139,7 @@ mod tests {
             ..test_config(&dir)
         };
         let resp = client
-            .request(&Request::SetConfig(Box::new(new_cfg.clone())))
+            .request(&Request::SetConfig(Box::new(new_cfg.clone().into())))
             .await
             .unwrap();
         match &resp {
@@ -1158,7 +1165,7 @@ mod tests {
 
         let resp = client
             .request(&Request::ApplySettings {
-                config: Box::new(test_config(&dir)),
+                config: Box::new(test_config(&dir).into()),
                 scan_key: Some(SECRET_HEX.to_string()),
             })
             .await
@@ -1214,7 +1221,7 @@ mod tests {
             ),
         ] {
             let resp = client
-                .request(&Request::SetConfig(Box::new(broken)))
+                .request(&Request::SetConfig(Box::new(broken.into())))
                 .await
                 .unwrap();
             match &resp {
@@ -1283,7 +1290,7 @@ mod tests {
         };
         let resp = client
             .request(&Request::ApplySettings {
-                config: Box::new(new_cfg.clone()),
+                config: Box::new(new_cfg.clone().into()),
                 scan_key: Some(OTHER_SECRET_HEX.to_string()),
             })
             .await
@@ -1299,6 +1306,49 @@ mod tests {
         assert!(restarted(&ctx).await);
     }
 
+    /// A tray from before `p2p_proxy` sends settings without it: saving
+    /// them keeps the proxy, so Tor stays on. Only an explicit `null`, what
+    /// the current tray sends for an empty field, clears it.
+    #[tokio::test]
+    async fn settings_without_p2p_proxy_keep_it_and_only_null_clears_it() {
+        let dir = temp_dir("apply-keeps-proxy");
+        let ctx = test_ctx(&dir);
+        let with_proxy = DaemonConfig {
+            p2p_node_addr: Some("198.51.100.7:18444".to_string()),
+            p2p_proxy: Some("127.0.0.1:9050".to_string()),
+            ..test_config(&dir)
+        };
+        *ctx.settings.lock().unwrap() = with_proxy.clone();
+
+        // An older tray's request: today's without p2p_proxy.
+        let edited = DaemonConfig {
+            start_height: Some(250),
+            p2p_proxy: None,
+            ..with_proxy.clone()
+        };
+        let current = serde_json::to_string(&Request::ApplySettings {
+            config: Box::new(edited.clone().into()),
+            scan_key: None,
+        })
+        .unwrap();
+        let older = current.replace(r#""p2p_proxy":null,"#, "");
+        assert_ne!(older, current);
+        let answer = ctx.handle(serde_json::from_str(&older).unwrap()).await;
+        assert!(matches!(answer, Response::OkWithNote(_)), "{answer:?}");
+        let kept = DaemonConfig {
+            start_height: Some(250),
+            ..with_proxy
+        };
+        assert_eq!(read_config_file(&dir), kept);
+        assert_eq!(*ctx.settings.lock().unwrap(), kept);
+
+        // The current tray, the field emptied.
+        let answer = ctx.handle(serde_json::from_str(&current).unwrap()).await;
+        assert!(matches!(answer, Response::OkWithNote(_)), "{answer:?}");
+        assert_eq!(read_config_file(&dir), edited);
+        assert_eq!(ctx.settings.lock().unwrap().p2p_proxy, None);
+    }
+
     #[tokio::test]
     async fn apply_settings_rejects_bad_key_before_persisting_anything() {
         let dir = temp_dir("apply-badkey");
@@ -1308,10 +1358,13 @@ mod tests {
 
         let resp = client
             .request(&Request::ApplySettings {
-                config: Box::new(DaemonConfig {
-                    start_height: Some(50),
-                    ..test_config(&dir)
-                }),
+                config: Box::new(
+                    DaemonConfig {
+                        start_height: Some(50),
+                        ..test_config(&dir)
+                    }
+                    .into(),
+                ),
                 scan_key: Some("zz".to_string()),
             })
             .await
@@ -1476,7 +1529,7 @@ mod tests {
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 ctx.handle(Request::ApplySettings {
-                    config: Box::new(new_wallet),
+                    config: Box::new(new_wallet.into()),
                     scan_key: None,
                 })
                 .await

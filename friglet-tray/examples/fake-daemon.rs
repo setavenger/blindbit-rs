@@ -114,11 +114,12 @@ async fn main() -> std::io::Result<()> {
                         Response::Ok
                     }
                     Request::GetConfig => Response::Config(config.lock().unwrap().clone()),
-                    Request::SetConfig(new_cfg) => match check_config(&new_cfg) {
+                    Request::SetConfig(update) => match check_config(&update.config) {
                         Ok(()) => {
                             let mut cfg = config.lock().unwrap();
+                            let new_cfg = update.apply_to(&cfg);
                             let bind_changed = new_cfg.electrum_addr != cfg.electrum_addr;
-                            *cfg = *new_cfg;
+                            *cfg = new_cfg;
                             eprintln!("fake daemon config updated");
                             if bind_changed {
                                 Response::OkWithNote(
@@ -143,17 +144,18 @@ async fn main() -> std::io::Result<()> {
                         }
                     }
                     Request::ApplySettings {
-                        config: new_cfg,
+                        config: update,
                         scan_key,
                     } => {
                         let key_ok = scan_key.as_deref().is_none_or(valid_scan_key);
-                        match check_config(&new_cfg) {
+                        match check_config(&update.config) {
                             Err(e) => Response::Error(e),
                             Ok(()) if !key_ok => Response::Error(
                                 "invalid scan key: must be a 32-byte hex string".to_string(),
                             ),
                             Ok(()) => {
-                                *config.lock().unwrap() = *new_cfg;
+                                let mut cfg = config.lock().unwrap();
+                                *cfg = update.apply_to(&cfg);
                                 Response::OkWithNote(
                                     "saved; the daemon restarts to apply it (fake daemon: \
                                      applied in memory)"

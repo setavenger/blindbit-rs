@@ -356,8 +356,11 @@ dbus-run-session -- bash -c '
   a tip header behind three dead addresses otherwise held a broadcast's
   answer for 40 s. Senders keep listening after the pong (bounded by the
   budget).
-- An older tray drops `p2p_proxy` on Save (unknown field); the daemon logs a
-  warning when an apply clears it.
+- An older tray drops `p2p_proxy` on Save (unknown field): a
+  `SetConfig`/`ApplySettings` without the field keeps the daemon's proxy
+  (`friglet_ipc::ConfigUpdate`); only an explicit `null`, which the current
+  tray sends for an empty field, clears it, and the daemon logs a warning
+  then.
 - Tests: `net/socks5.rs` (reply codes, credentials per connection, proxy
   down / not SOCKS5), `net/proxy_tests.rs` (seeding by name, no local
   lookup), `scanner/proxy_tests.rs` (own node `node.invalid` through the
