@@ -26,7 +26,8 @@ pub mod testing;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::net::{IpAddr, SocketAddr};
+use std::io;
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 
 use bitcoin::p2p::address::{AddrV2, AddrV2Message};
 use bitcoin::p2p::message::NetworkMessage;
@@ -192,6 +193,31 @@ pub(crate) fn gossiped_addrs(message: &NetworkMessage) -> Option<Vec<AddrV2Messa
                 .collect(),
         ),
         _ => None,
+    }
+}
+
+/// A second handle on a connection's socket that shuts the connection down
+/// when dropped. A shutdown ends a read or write blocked on the socket in
+/// another thread at once (it then sees the connection closed), so the
+/// owner of this handle bounds the connection however its I/O waits.
+pub(crate) struct ShutdownOnDrop(Option<TcpStream>);
+
+impl ShutdownOnDrop {
+    pub(crate) fn new(stream: &TcpStream) -> io::Result<Self> {
+        Ok(Self(Some(stream.try_clone()?)))
+    }
+
+    /// Leave the connection to the thread that owns it.
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        if let Some(stream) = &self.0 {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
     }
 }
 

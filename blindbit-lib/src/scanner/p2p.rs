@@ -18,8 +18,8 @@ use bitcoin_p2p::net::{
 use tokio_util::sync::CancellationToken;
 
 use crate::net::{
-    PROXY_CONNECT_TIMEOUT, PeerAddr, PeerEvent, PeerSource, Purpose, USER_AGENT, is_proxy_down,
-    is_proxy_unclear,
+    PROXY_CONNECT_TIMEOUT, PeerAddr, PeerEvent, PeerSource, Purpose, ShutdownOnDrop, USER_AGENT,
+    is_proxy_down, is_proxy_unclear,
 };
 
 // ---------------------------------------------------------------------------
@@ -1094,9 +1094,8 @@ impl BlockFetcher {
 
     /// One attempt on a fresh connection to `peer`.
     ///
-    /// The TCP connect runs on a blocking thread through the source's
-    /// [`crate::net::Dialer`]; cancelling stops waiting for it at once. Then
-    /// [`Self::attempt_on`].
+    /// The connection opens through the source's [`crate::net::Dialer`];
+    /// cancelling abandons the connect at once. Then [`Self::attempt_on`].
     async fn attempt(
         &self,
         peer: &PeerAddr,
@@ -1108,21 +1107,14 @@ impl BlockFetcher {
     ) -> Result<Block, AttemptFailure> {
         tracing::debug!(%peer, "opening P2P connection for a block fetch");
         let opened = Instant::now();
-        let connect = {
-            let (dialer, target) = (self.peers.dialer().clone(), peer.clone());
-            let timeout = self.policy.connect_timeout;
-            tokio::task::spawn_blocking(move || dialer.connect(&target, timeout))
-        };
+        let connect = self
+            .peers
+            .dialer()
+            .open(peer, self.policy.connect_timeout);
         let stream = tokio::select! {
             biased;
             () = self.cancel.cancelled() => return Err(FetchFailure::Cancelled.into()),
-            connected = connect => match connected {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(e)) => return Err(connect_failure(e)),
-                Err(e) => {
-                    return Err(FetchFailure::Connect(format!("the connect task failed: {e}")).into());
-                }
-            },
+            connected = connect => connected.map_err(connect_failure)?,
         };
         self.attempt_on(
             stream,
@@ -1164,11 +1156,8 @@ impl BlockFetcher {
         {
             *local_ip = Some(local.ip());
         }
-        let mut shutdown = ShutdownOnDrop(Some(
-            stream
-                .try_clone()
-                .map_err(|e| FetchFailure::Broken(e.to_string()))?,
-        ));
+        let mut shutdown =
+            ShutdownOnDrop::new(&stream).map_err(|e| FetchFailure::Broken(e.to_string()))?;
         let lingers = discovery.as_ref().is_some_and(|d| d.request_addr);
         // A discovered peer gets a deadline for the whole connection.
         let cap = if discovery.is_some() {
@@ -1297,26 +1286,6 @@ fn download(
         && !connection.got_addr
     {
         connection.wait_for_addr(GOSSIP_WAIT, cancel, &discovery.peers);
-    }
-}
-
-/// A second handle on a connection's socket that shuts the connection down
-/// when dropped. A shutdown ends a read or write blocked on the socket in
-/// another thread at once (it then sees the connection closed).
-struct ShutdownOnDrop(Option<TcpStream>);
-
-impl ShutdownOnDrop {
-    /// Leave the connection to the thread that owns it.
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for ShutdownOnDrop {
-    fn drop(&mut self) {
-        if let Some(stream) = &self.0 {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
     }
 }
 

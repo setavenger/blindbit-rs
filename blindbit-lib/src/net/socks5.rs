@@ -116,6 +116,18 @@ pub(crate) fn connect(
     target: &PeerAddr,
     timeout: Duration,
 ) -> io::Result<TcpStream> {
+    connect_watched(proxy, target, timeout, |_| Ok(()))
+}
+
+/// [`connect`], handing the socket to `opened` as soon as the proxy accepted
+/// the TCP connection, so another thread can shut it down to end the
+/// exchange early. An error from `opened` ends the connect.
+pub(crate) fn connect_watched(
+    proxy: SocketAddr,
+    target: &PeerAddr,
+    timeout: Duration,
+    opened: impl FnOnce(&TcpStream) -> io::Result<()>,
+) -> io::Result<TcpStream> {
     let deadline = Instant::now() + timeout;
     let mut stream = TcpStream::connect_timeout(&proxy, timeout).map_err(|e| {
         proxy_failed(
@@ -123,6 +135,7 @@ pub(crate) fn connect(
             format!("cannot connect to p2p_proxy {proxy}: {e}"),
         )
     })?;
+    opened(&stream)?;
     let _ = stream.set_nodelay(true);
     let proxy_io = |e: io::Error| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => proxy_failed(

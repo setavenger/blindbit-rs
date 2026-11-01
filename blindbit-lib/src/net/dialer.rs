@@ -2,7 +2,8 @@
 
 use std::fmt;
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{PeerAddr, PeerHost, socks5};
@@ -29,7 +30,7 @@ pub enum Dialer {
 impl Dialer {
     /// Connect to `peer`, waiting at most `timeout` per address tried (at
     /// least [`PROXY_CONNECT_TIMEOUT`] through a proxy). Blocking: async
-    /// callers run it on a blocking thread.
+    /// callers use [`Self::open`].
     ///
     /// Through a proxy, an error for which [`super::is_proxy_down`] holds
     /// means the proxy itself failed, not the peer.
@@ -63,11 +64,112 @@ impl Dialer {
         }
     }
 
+    /// [`Self::connect`] for async callers, and cancellable: dropping the
+    /// future abandons the connection at once. A direct connection opens on
+    /// the async runtime (a host name is looked up on a blocking thread);
+    /// one through the proxy runs on a blocking thread whose socket is shut
+    /// down when the future is dropped, which ends its wait for the proxy.
+    pub async fn open(&self, peer: &PeerAddr, timeout: Duration) -> io::Result<TcpStream> {
+        match self {
+            Self::Direct => open_direct(peer, timeout).await,
+            Self::Socks5 { proxy } => {
+                let pending = Arc::new(Mutex::new(Pending::default()));
+                let mut abandon = AbandonOnDrop(Some(pending.clone()));
+                let (proxy, target) = (*proxy, peer.clone());
+                let timeout = timeout.max(PROXY_CONNECT_TIMEOUT);
+                let connect = tokio::task::spawn_blocking(move || {
+                    socks5::connect_watched(proxy, &target, timeout, |socket| {
+                        let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                        if pending.abandoned {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "the connection was abandoned",
+                            ));
+                        }
+                        pending.socket = Some(socket.try_clone()?);
+                        Ok(())
+                    })
+                });
+                let connected = connect
+                    .await
+                    .map_err(|e| io::Error::other(format!("the connect task failed: {e}")))?;
+                abandon.0 = None;
+                connected
+            }
+        }
+    }
+
     /// The proxy every connection goes through, if any.
     pub fn proxy(&self) -> Option<SocketAddr> {
         match self {
             Self::Direct => None,
             Self::Socks5 { proxy } => Some(*proxy),
+        }
+    }
+}
+
+/// A direct connection opened on the async runtime, so dropping the future
+/// abandons it: the same addresses, order and timeout as
+/// [`Dialer::connect`].
+async fn open_direct(peer: &PeerAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = match &peer.host {
+        PeerHost::Ip(ip) => vec![SocketAddr::new(*ip, peer.port)],
+        PeerHost::Name(name) => {
+            // IPv4 first, as in `Dialer::connect`.
+            let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), peer.port))
+                .await?
+                .collect();
+            addrs.sort_by_key(|addr| addr.is_ipv6());
+            if addrs.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{name} has no addresses"),
+                ));
+            }
+            addrs
+        }
+    };
+    let mut last = None;
+    for addr in addrs {
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                let stream = stream.into_std()?;
+                stream.set_nonblocking(false)?;
+                return Ok(stream);
+            }
+            Ok(Err(e)) => last = Some(e),
+            // What `TcpStream::connect_timeout` says.
+            Err(_) => {
+                last = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection timed out",
+                ))
+            }
+        }
+    }
+    Err(last.expect("at least one address"))
+}
+
+/// The socket of a connect running on a blocking thread, once it has one,
+/// and whether its async caller has stopped waiting.
+#[derive(Default)]
+struct Pending {
+    abandoned: bool,
+    socket: Option<TcpStream>,
+}
+
+/// Abandons a pending connect when dropped (unless disarmed): its socket is
+/// shut down, which ends any read or write blocked on it.
+struct AbandonOnDrop(Option<Arc<Mutex<Pending>>>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        if let Some(pending) = self.0.take() {
+            let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.abandoned = true;
+            if let Some(socket) = pending.socket.take() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
         }
     }
 }
