@@ -18,6 +18,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::consensus::encode::deserialize;
@@ -102,6 +103,11 @@ fn parse_peers(peers: &[String]) -> impl Iterator<Item = PeerAddr> + '_ {
         .filter_map(|addr| addr.parse::<SocketAddr>().ok())
         .map(PeerAddr::from)
 }
+
+/// The store as the Electrum server shares it: a broadcast still running
+/// writes every peer it hands a transaction to into it (and to disk)
+/// before the bytes go out.
+pub type SharedStore = Arc<tokio::sync::Mutex<PendingStore>>;
 
 #[derive(Debug)]
 pub struct PendingStore {

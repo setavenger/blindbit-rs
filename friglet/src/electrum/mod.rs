@@ -47,8 +47,8 @@ mod relay;
 use self::chain::ChainSource;
 use self::net_broadcast::Verdict;
 use self::p2p::P2pError;
-use self::pending::PendingStore;
 pub(crate) use self::pending::now_secs;
+use self::pending::{PendingStore, SharedStore};
 use self::relay::{Candidate, Outcome};
 
 /// How long a broadcast may wait for the peer to accept the transaction.
@@ -196,8 +196,9 @@ struct ElectrumServerState {
     tip_cache: Mutex<Option<(u32, BlockHash, String)>>,
     /// The tip last announced to clients, so a tip is announced once.
     last_tip_sent: Mutex<Option<(u32, BlockHash)>>,
-    /// Broadcasts the peer accepted that have not confirmed yet.
-    pending: Mutex<PendingStore>,
+    /// Broadcasts the peer accepted that have not confirmed yet, and who
+    /// got each transaction; shared with a broadcast's connections.
+    pending: SharedStore,
     /// One broadcast at a time; a client's resend waits for the first.
     broadcast_lock: Mutex<()>,
     /// wtxid → when and how recent broadcasts ended. By wtxid: the same
@@ -239,7 +240,7 @@ pub async fn run(
         push_tx: push_tx.clone(),
         tip_cache: Mutex::new(None),
         last_tip_sent: Mutex::new(None),
-        pending: Mutex::new(PendingStore::load(pending_file)),
+        pending: Arc::new(Mutex::new(PendingStore::load(pending_file))),
         broadcast_lock: Mutex::new(()),
         recent_broadcasts: Mutex::new(HashMap::new()),
     });
@@ -912,12 +913,15 @@ async fn broadcast_to_network(
     };
     // Peers that got it from an earlier attempt (before a restart too)
     // never confirm it; a peer that asks for a parent friglet broadcast
-    // itself gets that parent.
+    // itself gets that parent. Whatever the verdict, and also when this
+    // attempt is dropped halfway, every peer it is handed to is in the
+    // store before it gets it: the next attempt and every recheck know.
     let history = {
         let store = state.pending.lock().await;
         net_broadcast::History {
             handed_to: store.handed_to(&txid),
             parents: store.held_parents(&candidate.tx),
+            store: Some(state.pending.clone()),
         }
     };
     let report = net_broadcast::broadcast(peers, candidate.clone(), budget, history)
@@ -929,16 +933,10 @@ async fn broadcast_to_network(
     for (peer, rate) in &report.fee_filters {
         state.chain.note_fee_filter(peer, Some(*rate));
     }
-    let sent_to = report.sent_to;
-    // Whatever the verdict: the next attempt and every recheck know.
-    {
-        let mut store = state.pending.lock().await;
-        store.note_handed_to(&txid, &sent_to);
-        for (parent, peer) in &report.parents_sent_to {
-            store.note_handed_to(&parent.to_string(), std::slice::from_ref(peer));
-        }
-        store.save();
+    for (parent, peer) in &report.parents_sent_to {
+        tracing::debug!(%txid, %parent, %peer, "handed a pending parent to a peer that asked for it");
     }
+    let sent_to = report.sent_to;
     let senders = sent_to
         .iter()
         .map(ToString::to_string)
@@ -1635,7 +1633,9 @@ mod tests {
             push_tx: broadcast::channel(64).0,
             tip_cache: Mutex::new(None),
             last_tip_sent: Mutex::new(None),
-            pending: Mutex::new(PendingStore::load(dir.join("state.pending.json"))),
+            pending: Arc::new(Mutex::new(PendingStore::load(
+                dir.join("state.pending.json"),
+            ))),
             broadcast_lock: Mutex::new(()),
             recent_broadcasts: Mutex::new(HashMap::new()),
         }
@@ -2560,6 +2560,49 @@ mod tests {
             assert_eq!(got_it.len(), 2);
             let reloaded = PendingStore::load(dir.join("state.pending.json"));
             assert_eq!(reloaded.handed_to(&txid), got_it);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        /// A broadcast dropped right after a hand-over (a settings restart
+        /// drops the runtime it runs on) has its recipients on disk all the
+        /// same: after the restart, they never confirm it.
+        #[tokio::test]
+        async fn a_dropped_attempt_s_recipients_are_on_disk() {
+            let dir = temp_dir("net-dropped-kept");
+            let (index, received) = wallet();
+            let tx = spend(&received, 1_000, 0);
+            let txid = tx.compute_txid().to_string();
+            let net = FakeNet::new();
+            // They keep it to themselves: the attempt runs until dropped.
+            let silent = Script {
+                policy: crate::electrum::fake_peer::TxPolicy::Ignore,
+                ..Script::default()
+            };
+            let fakes = fake_net(&net, 195, vec![silent; 5]);
+            let state = state_with(index, discovered(&fakes).await, &dir);
+            let raw = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+            let got_it = |fake: &FakePeer| fake.commands().iter().any(|c| c == "tx");
+            tokio::select! {
+                response = call(&state, "blockchain.transaction.broadcast", vec![json!(raw)]) => {
+                    panic!("ended before any hand-over: {response}");
+                }
+                () = async {
+                    while !fakes.iter().any(got_it) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+            // Dropped: nothing more is handed over, and no normal end saved
+            // anything.
+            let got: HashSet<PeerAddr> = fakes
+                .iter()
+                .filter(|fake| got_it(fake))
+                .map(|fake| fake.addr.into())
+                .collect();
+            let reloaded = PendingStore::load(dir.join("state.pending.json"));
+            let handed_to = reloaded.handed_to(&txid);
+            assert!(!got.is_empty());
+            assert!(got.is_subset(&handed_to), "{got:?} not in {handed_to:?}");
             std::fs::remove_dir_all(dir).unwrap();
         }
 

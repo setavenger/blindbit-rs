@@ -51,6 +51,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::p2p::{P2pError, Peer, SETTLE_WAIT, inventory_matches, random_u64};
+use super::pending::SharedStore;
 use super::relay::{self, Candidate, Parents, Signals};
 
 /// Peers that watch for the transaction.
@@ -91,6 +92,11 @@ pub struct History {
     /// Its unconfirmed parents that friglet broadcast itself and still
     /// holds: a sender's peer that asks for one gets it.
     pub parents: Vec<Transaction>,
+    /// The pending store: every peer the transaction (or a parent) is
+    /// handed to goes in, and to disk, before the bytes are written to it,
+    /// so a broadcast that is dropped halfway (a settings restart, the
+    /// daemon stopping) still leaves its recipients for the next attempt.
+    pub store: Option<SharedStore>,
 }
 
 /// How a broadcast ended, unless no peer could be asked.
@@ -250,13 +256,15 @@ struct Job {
     deadline: Instant,
     events: mpsc::UnboundedSender<Event>,
     ledger: Arc<Mutex<Ledger>>,
+    /// [`History::store`].
+    store: Option<SharedStore>,
 }
 
 /// Who may hold the transaction and whether anyone else may get it, for
 /// every connection of one broadcast. A peer goes in before the bytes are
-/// written to it, under the lock that ends the broadcast ([`Job::close`]):
-/// the final list has every peer that may hold it, and nobody gets it
-/// afterwards.
+/// written to it (and into the pending store, [`History::store`]), under
+/// the lock that ends the broadcast ([`Job::close`]): the final list has
+/// every peer that may hold it, and nobody gets it afterwards.
 #[derive(Default)]
 struct Ledger {
     closed: bool,
@@ -276,7 +284,7 @@ impl Job {
     fn new(
         peers: Arc<PeerSource>,
         candidate: Arc<Candidate>,
-        parents: Vec<Transaction>,
+        history: History,
         timing: Timing,
         deadline: Instant,
         events: mpsc::UnboundedSender<Event>,
@@ -284,7 +292,7 @@ impl Job {
         Self {
             peers,
             candidate,
-            parents: Arc::new(parents),
+            parents: Arc::new(history.parents),
             timing,
             stop: CancellationToken::new(),
             deadline,
@@ -293,6 +301,7 @@ impl Job {
                 slots: SENDERS,
                 ..Ledger::default()
             })),
+            store: history.store,
         }
     }
 
@@ -352,13 +361,29 @@ impl Job {
     }
 
     /// May `txid` be written to `addr` now? If so, `addr` is in the final
-    /// list from here on.
+    /// list from here on, and on disk in the pending store. Blocking (the
+    /// store is written): only from a connection's thread.
     fn may_send(&self, addr: &PeerAddr, txid: Txid) -> bool {
+        let entry = (txid, addr.clone());
+        let known = {
+            let ledger = self.ledger();
+            if ledger.closed || self.over() {
+                return false;
+            }
+            ledger.handed.contains(&entry)
+        };
+        // Written before the ledger is locked again (the store may be busy,
+        // and the broadcast's end waits for the ledger): a peer written down
+        // that the end then keeps from getting it is only passed over later.
+        if let Some(store) = self.store.as_ref().filter(|_| !known) {
+            let mut store = store.blocking_lock();
+            store.note_handed_to(&txid.to_string(), std::slice::from_ref(addr));
+            store.save();
+        }
         let mut ledger = self.ledger();
         if ledger.closed || self.over() {
             return false;
         }
-        let entry = (txid, addr.clone());
         if !ledger.handed.contains(&entry) {
             ledger.handed.push(entry);
         }
@@ -790,15 +815,15 @@ async fn broadcast_paced(
     peers: Arc<PeerSource>,
     candidate: Arc<Candidate>,
     budget: Duration,
-    history: History,
+    mut history: History,
     timing: Timing,
 ) -> Result<Report, String> {
     let deadline = Instant::now() + budget;
     let (events, mut received) = mpsc::unbounded_channel();
-    let job = Job::new(peers, candidate, history.parents, timing, deadline, events);
+    let mut round = Round::new(timing, std::mem::take(&mut history.handed_to));
+    let job = Job::new(peers, candidate, history, timing, deadline, events);
     // Every connection of this broadcast ends when it returns.
     let _close = CloseOnDrop(job.clone());
-    let mut round = Round::new(timing, history.handed_to);
     for _ in 0..timing.observers_at_start {
         if !round.launch(&job, true).await {
             break;
@@ -1908,7 +1933,7 @@ mod tests {
         let job = Job::new(
             peers,
             candidate(seed),
-            Vec::new(),
+            History::default(),
             Timing::DIRECT,
             deadline,
             events,
