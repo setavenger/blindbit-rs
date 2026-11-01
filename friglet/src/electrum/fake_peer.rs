@@ -1,7 +1,8 @@
 //! A scripted Bitcoin P2P peer for tests: it speaks the v1 wire protocol
 //! the way Bitcoin Core does for the parts friglet uses (handshake with
 //! `wtxidrelay`, `ping`/`feefilter` after `verack`, `getheaders` with an
-//! empty locator, transaction `inv`/`getdata`/`notfound`).
+//! empty locator, transaction `inv`/`getdata`/`notfound`, `MSG_TX` served
+//! without witnesses).
 //!
 //! Peers of one [`FakeNet`] share a mempool, as peers of a real network do
 //! eventually: a transaction one accepts is announced by the others to
@@ -409,7 +410,16 @@ fn serve(
                         .cloned();
                     match found {
                         Some(raw) => {
-                            wire.send(NetworkMessage::Tx(encode::deserialize(&raw).unwrap()))?;
+                            let mut tx: Transaction = encode::deserialize(&raw).unwrap();
+                            // As Bitcoin Core: `MSG_TX` gets the transaction
+                            // without witnesses, `MSG_WITNESS_TX` and
+                            // `MSG_WTX` with them (BIP 144, BIP 339).
+                            if matches!(item, Inventory::Transaction(_)) {
+                                for input in &mut tx.input {
+                                    input.witness.clear();
+                                }
+                            }
+                            wire.send(NetworkMessage::Tx(tx))?;
                             if echoed.as_ref().is_some_and(|(echo, _)| *echo == raw) {
                                 return Ok(());
                             }

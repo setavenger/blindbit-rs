@@ -375,10 +375,10 @@ impl Peer {
     }
 
     /// Is this transaction, witness included, in the peer's mempool? Asks
-    /// with `getdata`, which Bitcoin Core answers with the transaction or
-    /// with `notfound`. Only meaningful on a `relay = true` connection that
-    /// has settled. `on_other` sees every other message that arrives
-    /// meanwhile.
+    /// with `getdata` ([`Self::tx_request`]), which Bitcoin Core answers
+    /// with the transaction or with `notfound`. Only meaningful on a
+    /// `relay = true` connection that has settled. `on_other` sees every
+    /// other message that arrives meanwhile.
     pub fn mempool_has(
         &mut self,
         txid: Txid,
@@ -386,7 +386,7 @@ impl Peer {
         deadline: Instant,
         mut on_other: impl FnMut(&mut Self, NetworkMessage) -> Result<(), P2pError>,
     ) -> Result<bool, P2pError> {
-        self.send_getdata(self.tx_inventory(txid, wtxid))?;
+        self.send_getdata(self.tx_request(txid, wtxid))?;
         loop {
             match self.recv_until(deadline)? {
                 // Asked by txid (no wtxid relay), a peer serves whichever
@@ -456,10 +456,24 @@ impl Peer {
         }
     }
 
-    /// The inventory item this peer uses for a transaction.
+    /// The inventory item this peer uses to announce a transaction.
     pub fn tx_inventory(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
         if self.wtxid_relay {
             Inventory::WTx(wtxid)
+        } else {
+            Inventory::Transaction(txid)
+        }
+    }
+
+    /// The inventory item that asks this peer for a transaction with its
+    /// witness. By wtxid with BIP 339; without it, `MSG_WITNESS_TX` from a
+    /// peer that offers witnesses (BIP 144): Bitcoin Core answers `MSG_TX`
+    /// without them, and that copy's wtxid is not the transaction's.
+    pub fn tx_request(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
+        if self.wtxid_relay {
+            Inventory::WTx(wtxid)
+        } else if self.info.services.has(ServiceFlags::WITNESS) {
+            Inventory::WitnessTransaction(txid)
         } else {
             Inventory::Transaction(txid)
         }

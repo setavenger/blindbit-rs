@@ -779,6 +779,34 @@ mod tests {
         assert!(present.unwrap());
     }
 
+    /// A witness-capable own node without wtxid relay (protocol 70015): a
+    /// copy asked for with `MSG_TX` comes without its witness, so friglet
+    /// asks with `MSG_WITNESS_TX` and finds the transaction it has, witness
+    /// and all, whether it was there already or was just handed over.
+    #[test]
+    fn a_peer_without_wtxid_relay_is_asked_for_the_witness() {
+        let witnessed = |seed: u8| {
+            let mut tx = tx(vec![outpoint(seed, 0)], vec![5_000]);
+            tx.input[0].witness = Witness::from_slice(&[[seed; 64]]);
+            Candidate::decode(bitcoin::consensus::encode::serialize(&tx)).unwrap()
+        };
+        let (held, sent) = (witnessed(11), witnessed(12));
+        assert_ne!(held.txid.to_string(), held.wtxid.to_string());
+        let script = Script {
+            mempool: vec![held.raw.clone()],
+            wtxid_relay: false,
+            ..Script::default()
+        };
+        let peer = FakePeer::spawn(script.clone(), 1);
+        let present = in_mempool(&Dialer::Direct, &peer.addr.into(), Network::Regtest, &held);
+        assert!(present.unwrap(), "its own copy, witness and all");
+
+        let (outcome, peer) = run(script, &sent, Duration::from_secs(10));
+        assert_eq!(outcome, Outcome::InMempool);
+        // Announced by txid all the same: no wtxid relay.
+        assert!(peer.commands().iter().any(|c| c == "inv"));
+    }
+
     #[test]
     fn an_unreachable_peer_is_an_error_not_a_rejection() {
         let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
